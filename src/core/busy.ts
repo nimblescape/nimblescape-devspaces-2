@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Liveness of busy marks (the registry marks a devspace as busy while an operation runs on it). One rule for the
+// windows (sidebar, devspace service, their heartbeats), so that they never disagree about a mark.
+import type { BusyMark, PendingConnection, WindowStatus } from './types';
+
+/**
+ * A window status file whose `updatedAt` is older than this does not make its devspace in use.
+ * otherWindowUsesDevspace and SessionCoordinator.otherActiveWindows use it.
+ */
+export const HEARTBEAT_MAX_AGE_MS = 60_000;
+/** A pending connection file older than this does not make its devspace in use. */
+export const PENDING_MAX_AGE_MS = 120_000;
+/**
+ * A gap in the updates of the own status file larger than this means that the computer slept, or that the clock was
+ * changed: the devspace service reads it from the status file of its own window (sleepGraceOfWindow).
+ */
+export const SLEEP_GAP_MS = 30_000;
+/**
+ * The slack after HEARTBEAT_MAX_AGE_MS before the status file of a live window counts as stale (a window reload takes
+ * less). A fixed value, not a setting.
+ */
+export const WINDOW_STATUS_SLACK_MS = 30_000;
+
+/**
+ * A busy mark older than this does not protect its devspace, even when a process with the owner's ID exists: the ID
+ * may belong to another program by now (process IDs are reused, for example after a restart of the computer). No update,
+ * rebuild, or delete takes this long.
+ */
+export const BUSY_MARK_MAX_AGE_MS = 6 * 60 * 60_000;
+
+/**
+ * With window status files: the owner window writes its status file every 15 seconds. A status file that was not
+ * updated for this time belongs to a window that does not work anymore (or to a process ID from before a restart).
+ * Longer than HEARTBEAT_MAX_AGE_MS (60 seconds), so that a short delay of the owner (computer sleep) does not end its
+ * mark.
+ */
+export const BUSY_OWNER_STATUS_MAX_AGE_MS = 2 * 60_000;
+
+export interface BusyMarkLivenessInput {
+  /** Milliseconds since the epoch. */
+  now: number;
+  /** `process.kill(pid, 0)` does not fail with ESRCH (see `isProcessAlive`). */
+  isAlive: (pid: number) => boolean;
+  /**
+   * All window status files. When given, the owner window must also have a status file with the process ID of the
+   * mark, updated at most BUSY_OWNER_STATUS_MAX_AGE_MS ago. This detects a reused process ID within the 6 hours.
+   */
+  windowStatuses?: readonly WindowStatus[];
+  /**
+   * With `windowStatuses`: the owner window must still have a status file of the process of the mark, but its age does
+   * not matter. For a sleep grace (computer sleep): after a gap, the owner may
+   * not have written its file since the computer woke up.
+   */
+  ignoreOwnerStatusAge?: boolean;
+}
+
+/**
+ * What the liveness of a busy mark reads: its window, the process of that window, and its start (an ISO time). Also the
+ * entry of a removal of Devspaces from an engine that runs in a window (EngineRemoval of docker-engines.json), which
+ * follows the same rule.
+ */
+export type WindowMark = Pick<BusyMark, 'windowId' | 'pid' | 'since'>;
+
+/**
+ * True if the busy mark still protects its devspace: its owner process exists, and the mark is younger than
+ * BUSY_MARK_MAX_AGE_MS (a `since` that cannot be parsed does not end the mark). With `windowStatuses`, the owner window
+ * must also have a recent status file of the same process (see BusyMarkLivenessInput; `ignoreOwnerStatusAge` drops only
+ * the "recent").
+ */
+export function isBusyMarkLive(mark: WindowMark, input: BusyMarkLivenessInput): boolean {
+  if (!input.isAlive(mark.pid)) return false;
+  const since = Date.parse(mark.since);
+  if (Number.isFinite(since) && input.now - since > BUSY_MARK_MAX_AGE_MS) return false;
+  if (input.windowStatuses) {
+    const owner = input.windowStatuses.find((status) => status.windowId === mark.windowId);
+    if (!owner || owner.pid !== mark.pid) return false;
+    if (input.ignoreOwnerStatusAge) return true;
+    const updatedAt = Date.parse(owner.updatedAt);
+    if (!Number.isFinite(updatedAt) || input.now - updatedAt > BUSY_OWNER_STATUS_MAX_AGE_MS) return false;
+  }
+  return true;
+}
+
+/**
+ * True if the mark keeps the window `owner` from changing the devspace: it is a live mark (`isBusyMarkLive`) of
+ * another process. A mark of the same process (this window, or an earlier activation of it) never blocks.
+ */
+export function isBlockingBusyMark(
+  mark: WindowMark,
+  owner: { windowId: string; pid: number },
+  input: BusyMarkLivenessInput,
+): boolean {
+  if (mark.pid === owner.pid) return false;
+  return isBusyMarkLive(mark, input);
+}
+
+export interface OtherWindowInput {
+  /** Milliseconds since the epoch. */
+  now: number;
+  /** `process.kill(pid, 0)` does not fail with ESRCH (see `isProcessAlive`). */
+  isAlive: (pid: number) => boolean;
+  /** All window status files; `undefined` when they could not be read. */
+  windowStatuses?: readonly WindowStatus[];
+  /** All pending connection files; `undefined` when they could not be read. */
+  pendings?: readonly PendingConnection[];
+}
+
+/** The ISO time is valid and at most `maxAgeMs` away from `now` (also a time far in the future is not fresh). */
+function isFreshTime(time: string, now: number, maxAgeMs: number): boolean {
+  const at = Date.parse(time);
+  return Number.isFinite(at) && Math.abs(now - at) <= maxAgeMs;
+}
+
+/**
+ * The pending connection file `pending` is at most PENDING_MAX_AGE_MS old: a window opens its devspace now (the window
+ * that connects removes the file when it writes its status file).
+ */
+export function isFreshPending(pending: Pick<PendingConnection, 'createdAt'>, now: number): boolean {
+  return isFreshTime(pending.createdAt, now, PENDING_MAX_AGE_MS);
+}
+
+/**
+ * Whether the status file `status` names the devspace `devspaceId`: the window is connected to it, or works without
+ * Devspaces on it on an engine with the removal mark (WindowStatus.plainDevspaceId).
+ */
+export function statusNamesDevspace(status: Pick<WindowStatus, 'devspaceId' | 'plainDevspaceId'>, devspaceId: string): boolean {
+  return status.devspaceId === devspaceId || status.plainDevspaceId === devspaceId;
+}
+
+/**
+ * What shows that a window other than `ownWindowId` uses the devspace `devspaceId` (without the sleep grace), as
+ * SessionCoordinator.otherActiveWindows filters: a status file of another window that names the devspace
+ * (statusNamesDevspace, also a window that works without Devspaces on it), in the state `active`, whose process exists,
+ * updated at most HEARTBEAT_MAX_AGE_MS ago; or a pending connection file of another window for it, at most
+ * PENDING_MAX_AGE_MS old. `undefined`: none (also for files that could not be read).
+ */
+export function otherWindowUsesDevspace(
+  devspaceId: string,
+  ownWindowId: string,
+  input: OtherWindowInput,
+): { window: WindowStatus } | { pending: PendingConnection } | undefined {
+  const window = (input.windowStatuses ?? []).find(
+    (status) =>
+      status.windowId !== ownWindowId &&
+      statusNamesDevspace(status, devspaceId) &&
+      status.state === 'active' &&
+      isFreshTime(status.updatedAt, input.now, HEARTBEAT_MAX_AGE_MS) &&
+      input.isAlive(status.pid),
+  );
+  if (window !== undefined) return { window };
+  const pending = (input.pendings ?? []).find(
+    (entry) => entry.windowId !== ownWindowId && entry.devspaceId === devspaceId && isFreshPending(entry, input.now),
+  );
+  return pending !== undefined ? { pending } : undefined;
+}
+
+/**
+ * The rule for the status file of a window whose process exists (the window's cleanup of the status files uses it): it
+ * is stale (a reused process ID, or a hanging extension host) when it was not updated for HEARTBEAT_MAX_AGE_MS plus the
+ * waiting time; never during the sleep grace (`grace`). Shared with the destructive checks of the devspace service
+ * (otherWindowMayUseDevspace).
+ */
+export function isStaleLiveWindowStatus(
+  status: Pick<WindowStatus, 'updatedAt'>,
+  alive: boolean,
+  now: number,
+  grace: boolean,
+  waitingMs: number,
+): boolean {
+  return alive && !grace && !isFreshTime(status.updatedAt, now, HEARTBEAT_MAX_AGE_MS + waitingMs);
+}
+
+/**
+ * The sleep grace as a window sees it without the state of the Monitor. The status file of the own window
+ * (`own.windowId`, process `own.pid`) is written every 15 seconds; when it was not updated for SLEEP_GAP_MS, the timers
+ * of this window did not run (the computer slept, or the clock was changed), so the files of the other windows may be
+ * old for the same reason. False when the own file is missing.
+ */
+export function sleepGraceOfWindow(
+  windowStatuses: readonly WindowStatus[] | undefined,
+  own: { windowId: string; pid: number },
+  now: number,
+): boolean {
+  const status = (windowStatuses ?? []).find((entry) => entry.windowId === own.windowId && entry.pid === own.pid);
+  return status !== undefined && !isFreshTime(status.updatedAt, now, SLEEP_GAP_MS);
+}
+
+/**
+ * A status file of a window other than `ownWindowId` that names the devspace, in the state `active`, whose process
+ * exists, and that is not fresh (HEARTBEAT_MAX_AGE_MS, so otherWindowUsesDevspace does not count it), but not stale
+ * either (isStaleLiveWindowStatus, with its waiting time and sleep grace): that window may only have missed its updates
+ * (for example after computer sleep). The destructive checks of the devspace service count it as "not known", and
+ * only while a container of the devspace runs. `undefined`: none.
+ */
+export function otherWindowMayUseDevspace(
+  devspaceId: string,
+  ownWindowId: string,
+  input: OtherWindowInput & { waitingMs: number; grace: boolean },
+): WindowStatus | undefined {
+  return (input.windowStatuses ?? []).find(
+    (status) =>
+      status.windowId !== ownWindowId &&
+      statusNamesDevspace(status, devspaceId) &&
+      status.state === 'active' &&
+      input.isAlive(status.pid) &&
+      !isFreshTime(status.updatedAt, input.now, HEARTBEAT_MAX_AGE_MS) &&
+      !isStaleLiveWindowStatus(status, true, input.now, input.grace, input.waitingMs),
+  );
+}

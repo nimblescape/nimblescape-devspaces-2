@@ -1,0 +1,660 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Docker setup: the context keys of the welcome view (the setup in the sidebar) and the commands of its buttons.
+// Nothing runs hidden: after a modal confirmation that lists the exact commands, they run in a visible terminal, or the
+// installer of Docker Desktop is downloaded from desktop.docker.com with a progress notification and opened. The rules
+// are pure functions in src/core/docker/dockerSetup.ts.
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
+import { findExecutable } from '../core/docker/dockerCli';
+import { downloadFile, type DownloadOptions } from '../core/docker/dockerDownload';
+import {
+  DockerSetupTexts,
+  INITIAL_DOCKER_SETUP_STATE,
+  INSTALL_WATCH_INTERVAL_MS,
+  LINUX_ENGINE_START_COMMAND,
+  MISSING_CLI_CHECK_MS,
+  DOCKER_APP_PATH,
+  WSL_INSTALL_COMMAND,
+  brewCaskroomFolder,
+  changedContextValues,
+  dockerContextValues,
+  dockerSetupRequired,
+  type DockerContextKey,
+  hardwareArch,
+  installConfirmation,
+  installPlan,
+  keepWatchingInstall,
+  needsMissingCliCheck,
+  nextDockerSetupState,
+  parseOsRelease,
+  terminalConfirmation,
+  terminalLines,
+  type Confirmation,
+  type DockerSetupEvent,
+  type DockerSetupState,
+  type InstallPlan,
+  type InstallPlanInput,
+  installTerminalOptions,
+  namesDockerSource,
+  quarantineAttribute,
+  zoneIdentifier,
+} from '../core/docker/dockerSetup';
+import { MAC_OPEN, ensureDockerRunning, launchDetachedProcess } from '../core/docker/dockerStart';
+import { errorMessage, isUserFacingError } from '../core/errors';
+import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner } from '../core/ports';
+import { showErrorMessage, showInformationMessage, showWarningMessage } from './notifications';
+import { withNotificationProgress } from './progress';
+
+/**
+ * Command Start Docker (package.json), offered once an installation has put the CLI in place, and as the action of the
+ * error "Docker is not running." (Docker Engine on Linux) in a local window.
+ */
+export const DOCKER_SETUP_START_COMMAND = 'devspaces.dockerSetup.start';
+/** Shows the sidebar view (VS Code contributes `<view id>.focus` for each view of package.json). */
+const SHOW_SIDEBAR_COMMAND = 'devspaces.repositories.focus';
+/** Name of the terminal of the installation commands. */
+export const INSTALL_TERMINAL_NAME = 'Install Docker';
+const XATTR = '/usr/bin/xattr';
+const WSL_STATUS_TIMEOUT_MS = 15_000;
+const OS_RELEASE_FILES = ['/etc/os-release', '/usr/lib/os-release'];
+
+// User-visible texts that messages.ts lacks; to be moved there.
+export const DockerSetupUiTexts = {
+  /** A terminal of a remote window runs on the remote computer, not on this one. */
+  localWindowNeeded: 'Open a local window to install Docker.',
+  /** Start Docker in a remote window. */
+  localWindowNeededToStart: 'Open a local window to start Docker.',
+  downloading: 'Downloading Docker Desktop…',
+  downloadProgress: (receivedMb: number, totalMb: number | undefined) =>
+    totalMb === undefined ? `${receivedMb} MB.` : `${receivedMb} of ${totalMb} MB.`,
+  /** Title of the progress notification of Start Docker. */
+  starting: 'Starting Docker…',
+  downloadFailed: 'The installer of Docker Desktop could not be downloaded.',
+  openFailed: (file: string) => `The installer could not be opened. Open it yourself: ${file}`,
+  manualInstall: 'Devspaces cannot install Docker on this computer by itself. The installation guide of Docker opens.',
+  installedStartNow: 'Docker is installed. Start it now?',
+  startDocker: 'Start Docker',
+  dockerRunning: 'Docker is running.',
+  showDetails: 'Show details',
+  alreadyInstalled: 'Docker is already installed on this computer.',
+  notMarked: (file: string) =>
+    `The installer was downloaded, but it could not be marked as downloaded, so the system would not check its signature. It was not opened: ${file}`,
+  wslAlreadyInstalled: 'WSL 2 is already installed on this computer.',
+} as const;
+
+export interface DockerSetupDeps {
+  docker: BootstrapDocker;
+  runner: ProcessRunner;
+  logger: Logger;
+  /** Opens the log (action Show details). */
+  showLog: () => void;
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  /** The CLI was found or lost: the sidebar shows the repositories or the Docker setup (`setupRequired`). */
+  onDidChangeInstalled: () => void;
+  /** True when a remote Docker host is configured: a missing local CLI then needs no setup (see `dockerSetupRequired`). */
+  remoteDockerHostConfigured: () => boolean;
+  /**
+   * True while the sidebar view is visible. Windows: `wsl --status` runs only while the view shows the Docker setup
+   * (see `onViewShown`), and after an installation started.
+   */
+  viewVisible: () => boolean;
+  /** For tests. Default: `readInstallPlanInput` (this computer). */
+  planInput?: () => Promise<InstallPlanInput>;
+  /** For tests. Default: the folder Downloads of the home folder. */
+  downloadFolder?: string;
+  /** For tests. Default: `downloadFile`. */
+  download?: (options: DownloadOptions) => Promise<void>;
+  /** For tests: starts a program without waiting for it (`/usr/bin/open` of the .dmg). Default: launchDetachedProcess. */
+  launch?: (file: string, args: readonly string[]) => Promise<void>;
+  /** For tests. Default: `ensureDockerRunning`. */
+  startDocker?: (signal: AbortSignal, onStarting: () => void) => Promise<void>;
+  clock?: Clock;
+  /** For tests: MISSING_CLI_CHECK_MS and INSTALL_WATCH_INTERVAL_MS. */
+  timing?: { missingCheckMs?: number; watchIntervalMs?: number };
+}
+
+/** What the installation plan needs to know about this computer. */
+export async function readInstallPlanInput(
+  runner: ProcessRunner,
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+): Promise<InstallPlanInput> {
+  let translated = false;
+  if (platform === 'darwin' && process.arch === 'x64') {
+    // VS Code for Intel under Rosetta on a Mac with Apple silicon: Docker Desktop for Apple silicon is the right one.
+    const result = await runner.run('/usr/sbin/sysctl', ['-in', 'sysctl.proc_translated'], { timeoutMs: 5_000 }).catch(() => undefined);
+    translated = result?.exitCode === 0 && result.stdout.trim() === '1';
+  }
+  let osRelease: Record<string, string> | undefined;
+  let existingDockerSource = false;
+  if (platform === 'linux') {
+    existingDockerSource = await hasDockerAptSource();
+    for (const file of OS_RELEASE_FILES) {
+      try {
+        osRelease = parseOsRelease(await fs.promises.readFile(file, 'utf8'));
+        break;
+      } catch {
+        // The next file.
+      }
+    }
+  }
+  const brewPath = platform === 'darwin' ? findExecutable('brew', env, platform) : undefined;
+  return {
+    platform,
+    arch: hardwareArch(platform, process.arch, translated),
+    osRelease,
+    // findExecutable also searches /opt/homebrew/bin and /usr/local/bin on macOS.
+    has: (tool) => findExecutable(tool, env, platform) !== undefined,
+    brewPath,
+    ...(platform === 'darwin' ? readBrewCaskState(brewPath, fs.existsSync, env.HOMEBREW_CASK_OPTS, os.homedir()) : {}),
+    userName: currentUserName(),
+    existingDockerSource,
+  };
+}
+
+/**
+ * macOS: whether Homebrew records the cask docker-desktop (in the prefix of the `brew` that was found) and whether
+ * Docker.app exists. Without a Homebrew the cask counts as not recorded. Docker.app counts as present in
+ * /Applications, in ~/Applications, and in the folder of `--appdir` in HOMEBREW_CASK_OPTS: a cask installed with another
+ * appdir must not be uninstalled as "missing" (that would quit Docker Desktop and remove a working app).
+ */
+export function readBrewCaskState(
+  brewPath: string | undefined,
+  exists: (file: string) => boolean = fs.existsSync,
+  caskOpts?: string,
+  home?: string,
+): Pick<InstallPlanInput, 'brewCaskRecorded' | 'dockerAppPresent'> {
+  return {
+    brewCaskRecorded: brewPath !== undefined && exists(brewCaskroomFolder(brewPath)),
+    dockerAppPresent: dockerAppLocations(caskOpts, home).some((location) => exists(location)),
+  };
+}
+
+/** The places where a cask may have put Docker.app (see readBrewCaskState). */
+export function dockerAppLocations(caskOpts: string | undefined, home: string | undefined): string[] {
+  const expand = (folder: string) => (home && (folder === '~' || folder.startsWith('~/')) ? home + folder.slice(1) : folder);
+  const locations = [DOCKER_APP_PATH];
+  if (home) locations.push(`${home}/Applications/Docker.app`);
+  const match = /(?:^|\s)--appdir(?:=|\s+)(["']?)([^"'\s]+)\1/.exec(caskOpts ?? '');
+  if (match) locations.push(`${expand(match[2]).replace(/\/+$/, '')}/Docker.app`);
+  return [...new Set(locations)];
+}
+
+function currentUserName(): string | undefined {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True if a source of apt (sources.list, sources.list.d/*.list and *.sources) names download.docker.com. */
+async function hasDockerAptSource(): Promise<boolean> {
+  const files = ['/etc/apt/sources.list'];
+  const folder = '/etc/apt/sources.list.d';
+  try {
+    for (const name of await fs.promises.readdir(folder)) {
+      if (name.endsWith('.list') || name.endsWith('.sources')) files.push(path.join(folder, name));
+    }
+  } catch {
+    // No folder: only sources.list.
+  }
+  for (const file of files) {
+    try {
+      if (namesDockerSource(await fs.promises.readFile(file, 'utf8'))) return true;
+    } catch {
+      // Not readable: the next file.
+    }
+  }
+  return false;
+}
+
+export class DockerSetup implements vscode.Disposable {
+  private readonly clock: Clock;
+  private state: DockerSetupState = INITIAL_DOCKER_SETUP_STATE;
+  /** The values that the context keys show; `undefined` until they were set once. */
+  private shown: Record<DockerContextKey, boolean> | undefined;
+  private missingTimer: NodeJS.Timeout | undefined;
+  private watchTimer: NodeJS.Timeout | undefined;
+  private watchStartedAt = 0;
+  /** The `wsl --status` that runs (one at a time). */
+  private wslCheck: Promise<void> | undefined;
+  /** True once a `wsl --status` ended. */
+  private wslChecked = false;
+  private disposed = false;
+
+  constructor(private readonly deps: DockerSetupDeps) {
+    this.clock = deps.clock ?? systemClock;
+  }
+
+  /** True while no Docker CLI is found. */
+  get dockerMissing(): boolean {
+    return !this.state.cliFound;
+  }
+
+  /**
+   * True while the sidebar shows the Docker setup instead of the repositories (`dockerSetupRequired`: no remote Docker
+   * host is configured and the local Docker is not available).
+   */
+  get setupRequired(): boolean {
+    return dockerSetupRequired(this.dockerMissing, this.deps.remoteDockerHostConfigured());
+  }
+
+  /**
+   * Sets the context keys; while the CLI is missing, it is looked up again every 10 seconds. No `docker info`. Windows:
+   * `wsl --status` only while the view is visible and shows the Docker setup.
+   */
+  initialize(): void {
+    this.checkCli();
+    this.checkWslWhileShown();
+  }
+
+  /**
+   * The sidebar view became visible. Windows: while it shows the Docker setup and WSL is not known to be ready,
+   * `wsl --status` runs, so that the step Install WSL 2 shows the state of WSL.
+   */
+  onViewShown(): void {
+    this.checkWslWhileShown();
+  }
+
+  /**
+   * Asks BootstrapDocker whether the CLI is found. A missing CLI is looked up again (at most every 10 seconds); a CLI
+   * that was found counts as found until a call of it fails with ENOENT (then BootstrapDocker reports `reportCliLost`).
+   */
+  checkCli(): boolean {
+    return this.lookUp(() => this.deps.docker.isInstalled());
+  }
+
+  /**
+   * BootstrapDocker option `onCliLost`: a CLI that was found cannot be started anymore. The sidebar shows the setup at
+   * once; no lookup runs here, so the next call of the adapter (or the check every 10 seconds) looks the CLI up again,
+   * for example after Docker Desktop has updated itself.
+   */
+  reportCliLost(): void {
+    this.apply({ kind: 'cli', found: false });
+  }
+
+  /**
+   * Command devspaces.dockerSetup.show (action Install Docker… of the error "Docker Desktop is not installed."):
+   * updates the context keys from the adapter (a missing CLI may be found again; a lost CLI was reported already by
+   * `reportCliLost`), then shows the sidebar view.
+   */
+  async show(): Promise<void> {
+    this.checkCli();
+    await vscode.commands.executeCommand(SHOW_SIDEBAR_COMMAND);
+  }
+
+  /** The result of a `docker info` that ran anyway (BootstrapDocker option `onDaemonStatus`). */
+  reportDaemonStatus(running: boolean): void {
+    this.apply({ kind: 'engine', running });
+  }
+
+  /**
+   * Command devspaces.dockerSetup.install (sidebar button "Install Docker"): the installation plan of this
+   * computer, after a modal confirmation. Afterwards, the CLI is looked up every 5 seconds for at most 30 minutes.
+   */
+  async install(): Promise<void> {
+    if (this.refuseInRemoteWindow()) return;
+    // The command may run after the installation (for example from an older notification): an installed Docker is never
+    // installed again.
+    if (this.dockerAlreadyInstalled()) return;
+    const plan = installPlan(await (this.deps.planInput ?? (() => readInstallPlanInput(this.deps.runner, this.deps.platform, this.deps.env)))());
+    this.deps.logger.info(`Docker installation: ${describePlan(plan)}`);
+    switch (plan.kind) {
+      case 'manual':
+        void showInformationMessage(DockerSetupUiTexts.manualInstall).then(undefined, () => undefined);
+        await vscode.env.openExternal(vscode.Uri.parse(plan.url));
+        return;
+      case 'terminal': {
+        const confirmation = installConfirmation(plan);
+        if (!confirmation || !(await this.confirm(confirmation))) return;
+        this.runInTerminal(plan.commands);
+        this.startInstallWatch();
+        return;
+      }
+      case 'download':
+        await this.downloadAndOpen(plan);
+        return;
+    }
+  }
+
+  /**
+   * Command devspaces.dockerSetup.start (action Start Docker after an installation, and of the error "Docker is not
+   * running." of Docker Engine on Linux): starts Docker Desktop with the
+   * documented commands and waits until it is ready. Docker Engine on Linux: `sudo systemctl enable --now docker` in the
+   * terminal, after a confirmation.
+   */
+  async start(): Promise<void> {
+    if (this.refuseInRemoteWindow(DockerSetupUiTexts.localWindowNeededToStart, 'started')) return;
+    try {
+      await withNotificationProgress(
+        { title: DockerSetupUiTexts.starting, cancellable: true },
+        (_progress, token) => {
+          const abort = new AbortController();
+          const subscription = token.onCancellationRequested(() => abort.abort());
+          const run =
+            this.deps.startDocker ??
+            ((signal: AbortSignal, onStarting: () => void) =>
+              ensureDockerRunning(this.deps.docker, this.deps.runner, this.deps.logger, {
+                platform: this.deps.platform,
+                env: this.deps.env,
+                signal,
+                onStarting,
+              }));
+          return run(abort.signal, () => this.deps.logger.info('Starting Docker from the Docker setup.')).finally(() =>
+            subscription.dispose(),
+          );
+        },
+      );
+    } catch (error) {
+      if (isUserFacingError(error) && error.code === 'dockerEngineNotRunning') {
+        await this.startEngineInTerminal();
+        return;
+      }
+      throw error;
+    }
+    void showInformationMessage(DockerSetupUiTexts.dockerRunning).then(undefined, () => undefined);
+  }
+
+  /** Command devspaces.dockerSetup.installWsl (sidebar button "Install WSL 2", Windows): `wsl --install` in the terminal. */
+  async installWsl(): Promise<void> {
+    if (this.refuseInRemoteWindow()) return;
+    // The button shows until a check finds WSL ready, so a click before the first check ended waits for one.
+    if (!this.wslChecked) await this.checkWsl();
+    if (this.state.wslReady) {
+      this.inform(DockerSetupUiTexts.wslAlreadyInstalled);
+      return;
+    }
+    const confirmation = terminalConfirmation(DockerSetupTexts.confirmWsl, [WSL_INSTALL_COMMAND], {
+      needsAdmin: false,
+      note: DockerSetupTexts.wslRestart,
+    });
+    if (!(await this.confirm(confirmation))) return;
+    this.runInTerminal([WSL_INSTALL_COMMAND]);
+    this.startInstallWatch();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.stopMissingTimer();
+    this.stopInstallWatch();
+  }
+
+  private async startEngineInTerminal(): Promise<void> {
+    const confirmation = terminalConfirmation(DockerSetupTexts.confirmStartEngine, [LINUX_ENGINE_START_COMMAND], {
+      needsAdmin: true,
+      button: DockerSetupTexts.start,
+    });
+    if (!(await this.confirm(confirmation))) return;
+    this.runInTerminal([LINUX_ENGINE_START_COMMAND]);
+  }
+
+  private async downloadAndOpen(plan: Extract<InstallPlan, { kind: 'download' }>): Promise<void> {
+    const folder = this.deps.downloadFolder ?? path.join(os.homedir(), 'Downloads');
+    const target = path.join(folder, plan.fileName);
+    const confirmation = installConfirmation(plan, target);
+    if (!confirmation || !(await this.confirm(confirmation))) return;
+    try {
+      await fs.promises.mkdir(folder, { recursive: true });
+      await withNotificationProgress(
+        { title: DockerSetupUiTexts.downloading, cancellable: true },
+        async (progress, token) => {
+          const abort = new AbortController();
+          const subscription = token.onCancellationRequested(() => abort.abort());
+          let reported = 0;
+          try {
+            await (this.deps.download ?? downloadFile)({
+              url: plan.url,
+              target,
+              signal: abort.signal,
+              onProgress: (received, total) => {
+                const mb = Math.floor(received / 1_048_576);
+                if (mb === reported) return;
+                const increment = total ? ((mb - reported) * 1_048_576 * 100) / total : undefined;
+                reported = mb;
+                progress.report({
+                  message: DockerSetupUiTexts.downloadProgress(mb, total ? Math.ceil(total / 1_048_576) : undefined),
+                  increment,
+                });
+              },
+            });
+          } finally {
+            subscription.dispose();
+          }
+        },
+      );
+    } catch (error) {
+      if (isAbortError(error)) {
+        this.deps.logger.info('The download of Docker Desktop was cancelled.');
+        return;
+      }
+      this.deps.logger.error(DockerSetupUiTexts.downloadFailed, error);
+      this.showErrorWithDetails(DockerSetupUiTexts.downloadFailed);
+      return;
+    }
+    this.deps.logger.info(`Docker Desktop was downloaded to ${target}.`);
+    if (!(await this.markAsDownloaded(target, plan.url))) {
+      // The confirmation said that the system checks the installer; it would not.
+      this.showErrorWithDetails(DockerSetupUiTexts.notMarked(target));
+      return;
+    }
+    try {
+      if (plan.open === 'dmg') await (this.deps.launch ?? launchDetachedProcess)(MAC_OPEN, [target]);
+      // The installer asks for elevation itself; the shell of the system (not a child process) handles that prompt.
+      else if (!(await vscode.env.openExternal(vscode.Uri.file(target)))) throw new Error(`VS Code did not open ${target}.`);
+    } catch (error) {
+      this.deps.logger.error(DockerSetupUiTexts.openFailed(target), error);
+      this.showErrorWithDetails(DockerSetupUiTexts.openFailed(target));
+    }
+    this.startInstallWatch();
+  }
+
+  /**
+   * Marks the downloaded installer as a file from the internet, as a browser does, so that the system checks its
+   * signature (Gatekeeper on macOS, SmartScreen on Windows). False (logged) when that failed: the installer does not open.
+   */
+  private async markAsDownloaded(file: string, url: string): Promise<boolean> {
+    try {
+      if (this.deps.platform === 'darwin') {
+        const result = await this.deps.runner.run(XATTR, ['-w', 'com.apple.quarantine', quarantineAttribute(this.clock.now()), file], { timeoutMs: 10_000 });
+        if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `xattr ended with ${result.exitCode}`);
+      } else if (this.deps.platform === 'win32') {
+        await fs.promises.writeFile(`${file}:Zone.Identifier`, zoneIdentifier(url));
+      }
+      return true;
+    } catch (error) {
+      this.deps.logger.warn(`The installer could not be marked as downloaded: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  /** True (with a message) when the CLI of Docker is found now. */
+  private dockerAlreadyInstalled(): boolean {
+    if (!this.lookUp(() => this.deps.docker.lookUpCliNow())) return false;
+    this.deps.logger.info('Docker is installed already. Nothing is installed.');
+    this.inform(DockerSetupUiTexts.alreadyInstalled);
+    return true;
+  }
+
+  private inform(message: string): void {
+    showInformationMessage(message).then(undefined, (error: unknown) => this.deps.logger.error('Could not show the message.', error));
+  }
+
+  /** Modal confirmation; true only for the confirming button. */
+  private async confirm(confirmation: Confirmation): Promise<boolean> {
+    const choice = await showWarningMessage(
+      confirmation.message,
+      { modal: true, detail: confirmation.detail },
+      confirmation.button,
+    );
+    return choice === confirmation.button;
+  }
+
+  /** The commands run visibly in a new terminal of VS Code; the user follows them and enters a password there. */
+  private runInTerminal(commands: readonly string[]): void {
+    // A fixed shell, folder, and environment: no terminal setting of the workspace and no file of the opened folder
+    // changes what the listed commands run.
+    const options = installTerminalOptions(this.deps.platform, this.deps.env, os.homedir(), currentUserName());
+    const terminal = vscode.window.createTerminal({ name: INSTALL_TERMINAL_NAME, ...options });
+    terminal.show();
+    for (const line of terminalLines(commands, this.deps.platform)) {
+      this.deps.logger.info(`Terminal "${INSTALL_TERMINAL_NAME}": ${line}`);
+      terminal.sendText(line);
+    }
+  }
+
+  private showErrorWithDetails(message: string): void {
+    showErrorMessage(message, DockerSetupUiTexts.showDetails).then(
+      (choice) => {
+        if (choice === DockerSetupUiTexts.showDetails) this.deps.showLog();
+      },
+      (error: unknown) => this.deps.logger.error('Could not show the message.', error),
+    );
+  }
+
+  /** In a remote window, a terminal would run on the remote computer: the user is asked to open a local window. */
+  private refuseInRemoteWindow(text: string = DockerSetupUiTexts.localWindowNeeded, done = 'installed'): boolean {
+    if (vscode.env.remoteName === undefined) return false;
+    this.deps.logger.info(`Docker is ${done} only from a local window (this window: ${vscode.env.remoteName}).`);
+    showInformationMessage(text)
+      .then(undefined, (error: unknown) => this.deps.logger.error('Could not show the message.', error));
+    return true;
+  }
+
+  /** After an installation started: the CLI every 5 seconds until it is found, for at most 30 minutes. */
+  private startInstallWatch(): void {
+    if (this.disposed) return;
+    this.watchStartedAt = this.clock.now();
+    if (this.watchTimer) return;
+    this.watchTimer = setInterval(() => this.watchInstall(), this.deps.timing?.watchIntervalMs ?? INSTALL_WATCH_INTERVAL_MS);
+  }
+
+  private watchInstall(): void {
+    this.lookUp(() => this.deps.docker.lookUpCliNow());
+    // Follows the installation that the user started, also while the view is hidden.
+    if (!this.state.wslReady) void this.checkWsl();
+    if (this.watchTimer && !keepWatchingInstall(this.state, this.watchStartedAt, this.clock.now())) {
+      if (!this.state.cliFound) this.deps.logger.info('Docker was not found within 30 minutes after the installation started.');
+      this.stopInstallWatch();
+    }
+  }
+
+  private stopInstallWatch(): void {
+    if (this.watchTimer) clearInterval(this.watchTimer);
+    this.watchTimer = undefined;
+  }
+
+  /** `wsl --status` while the view is visible and shows the Docker setup, and WSL is not known to be ready. */
+  private checkWslWhileShown(): void {
+    if (this.setupRequired && !this.state.wslReady && this.deps.viewVisible()) void this.checkWsl();
+  }
+
+  /**
+   * Windows: `wsl --status` (exit code 0: WSL is installed). One check at a time: a call while one runs gets that one.
+   * Resolves when it ended; a `wsl` that cannot run counts as not ready.
+   */
+  private checkWsl(): Promise<void> {
+    if (this.deps.platform !== 'win32' || this.disposed) return Promise.resolve();
+    // Assumption: `wsl --status` ends with exit code 0 only when WSL is installed and set up.
+    this.wslCheck ??= this.deps.runner
+      .run('wsl.exe', ['--status'], { timeoutMs: WSL_STATUS_TIMEOUT_MS })
+      .then(
+        (result) => this.apply({ kind: 'wsl', ready: result.exitCode === 0 }),
+        (error: unknown) => {
+          this.deps.logger.info(`wsl --status could not run: ${errorMessage(error)}`);
+          this.apply({ kind: 'wsl', ready: false });
+        },
+      )
+      .finally(() => {
+        this.wslChecked = true;
+        this.wslCheck = undefined;
+      });
+    return this.wslCheck;
+  }
+
+  private lookUp(find: () => boolean): boolean {
+    let found: boolean;
+    try {
+      found = find();
+    } catch (error) {
+      this.deps.logger.warn(`The Docker CLI could not be looked up: ${errorMessage(error)}`);
+      found = false;
+    }
+    this.apply({ kind: 'cli', found });
+    return found;
+  }
+
+  private apply(event: DockerSetupEvent): void {
+    if (this.disposed) return;
+    const before = this.state;
+    const first = this.shown === undefined;
+    this.state = nextDockerSetupState(before, event);
+    const values = dockerContextValues(this.state, this.deps.remoteDockerHostConfigured());
+    for (const [key, value] of changedContextValues(this.shown, values)) {
+      vscode.commands.executeCommand('setContext', key, value).then(undefined, (error: unknown) => {
+        this.deps.logger.warn(`Could not set the context key ${key}: ${errorMessage(error)}`);
+      });
+    }
+    this.shown = values;
+    // The first check only sets the keys: the sidebar reads `setupRequired` when it renders.
+    if (!first && before.cliFound !== this.state.cliFound) {
+      this.deps.logger.info(this.state.cliFound ? 'The Docker CLI was found.' : 'The Docker CLI was not found.');
+      this.deps.onDidChangeInstalled();
+      if (this.state.cliFound && this.watchTimer) {
+        this.stopInstallWatch();
+        this.offerStart();
+      }
+      // Windows: a CLI found at activation skipped `wsl --status`; the setup now shows the step Install WSL 2, so it
+      // needs the state of WSL, now while the view is visible, else when it is shown (onViewShown). Returns at once on
+      // other platforms.
+      if (!this.state.cliFound) this.checkWslWhileShown();
+    }
+    this.updateMissingTimer();
+  }
+
+  /** Start Docker, offered once the installation has put the CLI in place. */
+  private offerStart(): void {
+    showInformationMessage(DockerSetupUiTexts.installedStartNow, DockerSetupUiTexts.startDocker).then(
+      (choice) => {
+        if (choice !== DockerSetupUiTexts.startDocker) return;
+        vscode.commands
+          .executeCommand(DOCKER_SETUP_START_COMMAND)
+          .then(undefined, (error: unknown) => this.deps.logger.error('Docker could not be started.', error));
+      },
+      (error: unknown) => this.deps.logger.error('Could not show the message.', error),
+    );
+  }
+
+  private updateMissingTimer(): void {
+    if (!needsMissingCliCheck(this.state)) {
+      this.stopMissingTimer();
+      return;
+    }
+    if (this.missingTimer) return;
+    this.missingTimer = setInterval(() => this.checkCli(), this.deps.timing?.missingCheckMs ?? MISSING_CLI_CHECK_MS);
+  }
+
+  private stopMissingTimer(): void {
+    if (this.missingTimer) clearInterval(this.missingTimer);
+    this.missingTimer = undefined;
+  }
+}
+
+/** One line for the log. */
+function describePlan(plan: InstallPlan): string {
+  switch (plan.kind) {
+    case 'terminal':
+      return `terminal: ${plan.commands.join(' && ')}`;
+    case 'download':
+      return `download ${plan.url}`;
+    case 'manual':
+      return `manual: ${plan.url}`;
+  }
+}

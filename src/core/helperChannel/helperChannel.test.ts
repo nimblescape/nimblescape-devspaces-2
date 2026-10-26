@@ -1,0 +1,905 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
+import { abortError, silentLogger, type Logger, type StartedProcess } from '../ports';
+import { NodeProcessRunner } from '../process';
+import { CHANNEL_RESULT_GRACE_MS, HelperChannel, HelperOperationError } from './helperChannel';
+import {
+  CHANNEL_CLEANUP_TIMEOUT_MS,
+  CHANNEL_KILL_GRACE_MS,
+  CHANNEL_PROTOCOL_VERSION,
+  CHANNEL_SLOT_WAIT_MS,
+  MAX_CHANNEL_REQUEST_BYTES,
+  MAX_CLIENT_LINE,
+  MAX_CONCURRENT_OPERATIONS,
+  encodeMessage,
+  parseClientMessage,
+  type ClientMessage,
+  type ServerMessage,
+} from './protocol';
+
+/** A `docker run` process of a channel: records what the extension writes; the test answers as the script. */
+function fakeProcess() {
+  let stdout: ((text: string) => void) | undefined;
+  let stderr: ((text: string) => void) | undefined;
+  let resolveExit!: (value: { exitCode: number | null; error?: Error }) => void;
+  const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => (resolveExit = resolve));
+  const lines: string[] = [];
+  const state = { ended: false, killed: false, exited: false };
+  const process: StartedProcess = {
+    write: (text) => {
+      if (state.ended || state.exited) return false;
+      lines.push(...text.split('\n').filter((line) => line !== ''));
+      return true;
+    },
+    end: () => {
+      state.ended = true;
+    },
+    kill: () => {
+      state.killed = true;
+      exit(null);
+    },
+    onStdout: (listener) => (stdout = listener),
+    onStderr: (listener) => (stderr = listener),
+    exited,
+  };
+  const exit = (exitCode: number | null) => {
+    if (state.exited) return;
+    state.exited = true;
+    resolveExit({ exitCode });
+  };
+  const messages = (): ClientMessage[] => lines.slice(1).map((line) => parseClientMessage(line)!);
+  return {
+    process,
+    state,
+    lines,
+    messages,
+    answer: (message: ServerMessage) => stdout?.(encodeMessage(message)),
+    raw: (text: string) => stdout?.(text),
+    stderr: (text: string) => stderr?.(text),
+    exit,
+  };
+}
+
+function recordingLogger() {
+  const lines: { level: string; text: string }[] = [];
+  const logger: Logger = {
+    info: (text) => lines.push({ level: 'info', text }),
+    warn: (text) => lines.push({ level: 'warn', text }),
+    error: (text) => lines.push({ level: 'error', text }),
+    output: (text) => lines.push({ level: 'output', text }),
+  };
+  return { logger, lines };
+}
+
+const HELLO: ServerMessage = { t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION, node: 'v24.0.0', ops: ['probe', 'refresh'] };
+
+async function openChannel(options: { pingIntervalMs?: number; pongTimeoutMs?: number } = {}) {
+  const fake = fakeProcess();
+  const { logger, lines } = recordingLogger();
+  const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box', ...options });
+  await vi.advanceTimersByTimeAsync(0);
+  fake.answer(HELLO);
+  const channel = await opening;
+  return { channel, fake, lines };
+}
+
+/** The last operation that the extension sent. */
+function lastOp(fake: ReturnType<typeof fakeProcess>) {
+  const ops = fake.messages().filter((message) => message.t === 'op');
+  return ops[ops.length - 1] as Extract<ClientMessage, { t: 'op' }>;
+}
+
+describe('HelperChannel', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('writes the script as the first line, then hello; opens with the answer', async () => {
+    const { channel, fake, lines } = await openChannel();
+    expect(fake.lines[0]).toBe(JSON.stringify('SCRIPT'));
+    expect(fake.messages()[0]).toEqual({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION });
+    expect(channel.isOpen).toBe(true);
+    // The fake worker names `probe` and `refresh`.
+    expect(channel.operations).toEqual(['probe', 'refresh']);
+    expect(lines).toContainEqual({ level: 'info', text: 'Helper channel to build-box is open (Node.js v24.0.0; operations: probe, refresh).' });
+  });
+
+  it('fails to open when the process ends before hello, naming its error output, and when no answer comes in time', async () => {
+    const early = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(early.process, 'SCRIPT', { logger, name: 'build-box' });
+    early.stderr('Unable to find image devspaces-worker:abc locally\n');
+    early.exit(125);
+    await expect(opening).rejects.toThrow(/could not be opened: the helper ended \(Unable to find image/);
+
+    const silent = fakeProcess();
+    const waiting = HelperChannel.open(silent.process, 'SCRIPT', { logger, name: 'build-box', openTimeoutMs: 1_000 });
+    const check = expect(waiting).rejects.toMatchObject({ code: 'open' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await check;
+    expect(silent.state.killed).toBe(true);
+  });
+
+  // A `docker run` that the daemon refused at once can end before the extension writes the script: the write fails,
+  // and its error output and its end come after the write, because the extension reads the pipes of the ended process
+  // only later.
+  it('fails to open with the reason of the end of a process that ended before its input was written, not of the write', async () => {
+    let stderr: ((text: string) => void) | undefined;
+    let exit!: (value: { exitCode: number | null }) => void;
+    let kills = 0;
+    const ended: StartedProcess = {
+      write: () => false,
+      end: () => {},
+      kill: () => {
+        kills++;
+      },
+      onStdout: () => {},
+      onStderr: (listener) => (stderr = listener),
+      exited: new Promise((resolve) => (exit = resolve)),
+    };
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(ended, 'SCRIPT', { logger, name: 'build-box' });
+    const failure = opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    // Stopped, in case it still runs with its input closed.
+    expect(kills).toBe(1);
+    stderr?.('docker: Error response from daemon: Conflict. The container name "/devspaces-api-worker1" is already in use by container "0123456789ab".\n');
+    exit({ exitCode: 125 });
+    expect((await failure)?.message).toBe(
+      'The helper channel to build-box could not be opened: the helper ended (docker: Error response from daemon: Conflict. The container name "/devspaces-api-worker1" is already in use by container "0123456789ab".)',
+    );
+
+    // The other kinds of end after a failed write: error output with an end by a signal; an error of the start; no error
+    // output (exit code null after the stop, or 1 after taskkill on Windows), where the reason is the failed write.
+    const ends: Array<{ output?: string; end: { exitCode: number | null; error?: Error }; reason: string }> = [
+      { output: 'docker: Error response from daemon: network bridge not found.\n', end: { exitCode: null }, reason: 'the helper ended (docker: Error response from daemon: network bridge not found.)' },
+      { end: { exitCode: null, error: new Error('spawn docker ENOENT') }, reason: 'the helper ended (spawn docker ENOENT)' },
+      { end: { exitCode: null }, reason: 'its input cannot be written' },
+      { end: { exitCode: 1 }, reason: 'its input cannot be written' },
+    ];
+    for (const { output, end, reason } of ends) {
+      let onStderr: ((text: string) => void) | undefined;
+      let finish!: (value: { exitCode: number | null; error?: Error }) => void;
+      const closed: StartedProcess = { ...ended, onStderr: (listener) => (onStderr = listener), exited: new Promise((resolve) => (finish = resolve)) };
+      const failed = HelperChannel.open(closed, 'SCRIPT', { logger, name: 'build-box' }).then(
+        () => undefined,
+        (error: Error) => error,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      if (output !== undefined) onStderr?.(output);
+      finish(end);
+      expect((await failed)?.message, reason).toBe(`The helper channel to build-box could not be opened: ${reason}`);
+    }
+  });
+
+  it('without a failed write, an end without error output names its exit code', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+    fake.exit(null);
+    await expect(opening).rejects.toThrow('The helper channel to build-box could not be opened: the helper ended (exit code null)');
+  });
+
+  it('a long line of stderr (the source line of an uncaught error) is not in the reason, the loader line is', async () => {
+    const crashed = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(crashed.process, 'SCRIPT', { logger, name: 'build-box' });
+    crashed.stderr(`${'y'.repeat(4_000)}\n`);
+    crashed.stderr('devspace loader: x\n');
+    crashed.exit(3);
+    const failure = await opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toBe('The helper channel to build-box could not be opened: the helper ended (devspace loader: x)');
+    expect(JSON.stringify(lines)).not.toContain('yyyyyyyyyy');
+  });
+
+  it('at the cap of the stderr tail its first line (the cut end of a longer one) is not in the reason, even when it is short', async () => {
+    const crashed = fakeProcess();
+    const { logger, lines } = recordingLogger();
+    const opening = HelperChannel.open(crashed.process, 'SCRIPT', { logger, name: 'build-box' });
+    const rest = `${'short line\n'.repeat(300)}devspace loader: x\n`;
+    const cut = 4_000 - rest.length - 1;
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThanOrEqual(1_000);
+    crashed.stderr(`${'z'.repeat(10_000)}\n${rest}`);
+    crashed.exit(3);
+    const failure = await opening.then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toContain('short line\ndevspace loader: x)');
+    expect(failure?.message).not.toContain('z');
+    expect(JSON.stringify(lines)).not.toContain('zzz');
+  });
+
+  it('a script whose line is exactly MAX_BUNDLE_LINE_LENGTH is written', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'a'.repeat(MAX_BUNDLE_LINE_LENGTH - 2), { logger, name: 'build-box' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.lines[0]).toHaveLength(MAX_BUNDLE_LINE_LENGTH);
+    fake.answer(HELLO);
+    expect((await opening).isOpen).toBe(true);
+  });
+
+  it('closes a channel whose script speaks another protocol', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+    fake.answer({ ...HELLO, protocol: CHANNEL_PROTOCOL_VERSION + 1 } as ServerMessage);
+    // The protocol is version 3; the test sends the next one.
+    await expect(opening).rejects.toThrow(/speaks version 4, not 3/);
+    expect(fake.state.ended).toBe(true);
+  });
+
+  it('resolves an operation with its value; logs its start, its progress, its log lines, and its end; its output goes to the log', async () => {
+    const { channel, fake, lines } = await openChannel();
+    const progress: string[] = [];
+    const result = channel.operation('start', { repository: 'acme/api' }, { secrets: { token: 'ghp_token' }, onProgress: (step) => progress.push(step) });
+    const op = lastOp(fake);
+    // Named secrets.
+    expect(op).toEqual({ t: 'op', id: op.id, op: 'start', params: { repository: 'acme/api' }, secrets: { token: 'ghp_token' } });
+    fake.answer({ t: 'progress', id: op.id, step: 'Cloning', detail: 'acme/api' });
+    fake.answer({ t: 'log', id: op.id, level: 'info', text: '$ docker run …' });
+    fake.answer({ t: 'log', id: op.id, level: 'warn', text: 'exit code 1 after 0.2 s' });
+    fake.answer({ t: 'out', id: op.id, stream: 'stderr', data: 'Cloning into …\n' });
+    fake.answer({ t: 'result', id: op.id, ok: true, value: { branch: 'main' } });
+    await expect(result).resolves.toEqual({ branch: 'main' });
+    expect(progress).toEqual(['Cloning']);
+    const id = op.id;
+    expect(lines.slice(1)).toEqual([
+      { level: 'info', text: `[build-box] start#${id}: started.` },
+      { level: 'info', text: `[build-box] start#${id}: Cloning – acme/api` },
+      { level: 'info', text: `[build-box] start#${id}: $ docker run …` },
+      { level: 'warn', text: `[build-box] start#${id}: exit code 1 after 0.2 s` },
+      { level: 'output', text: 'Cloning into …\n' },
+      { level: 'info', text: `[build-box] start#${id}: done after 0.0 s.` },
+    ]);
+    expect(JSON.stringify(lines)).not.toContain('ghp_token');
+  });
+
+  it('rejects a failed operation with HelperOperationError and logs the failure', async () => {
+    const { channel, fake, lines } = await openChannel();
+    const result = channel.operation('start', {});
+    const { id } = lastOp(fake);
+    fake.answer({ t: 'result', id, ok: false, error: { code: 'failed', message: 'git clone failed' }, cancelled: false, timedOut: false });
+    await expect(result).rejects.toEqual(new HelperOperationError('failed', 'git clone failed', false));
+    expect(lines[lines.length - 1]).toEqual({ level: 'warn', text: `[build-box] start#${id}: failed: git clone failed after 0.0 s.` });
+  });
+
+  // A cancel of the helper itself (its shutdown) is told apart from a refusal.
+  it('a result that the helper cancelled itself carries `aborted`; a refusal with the code cancelled does not', async () => {
+    const { channel, fake } = await openChannel();
+    const shutdown = channel.operation('open', {});
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: false, error: { code: 'cancelled', message: 'The worker ends.' }, cancelled: true, timedOut: false });
+    await expect(shutdown).rejects.toMatchObject({ code: 'cancelled', aborted: true, timedOut: false });
+    const refused = channel.operation('open', {});
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: false, error: { code: 'cancelled', message: 'The operation was cancelled.' }, cancelled: false, timedOut: false });
+    await expect(refused).rejects.toMatchObject({ code: 'cancelled', aborted: false });
+  });
+
+  // The AbortError comes when the script confirmed the cancel, not at once.
+  it('cancels an operation in the helper when its signal aborts: AbortError once the script confirms it, its late messages ignored', async () => {
+    const { channel, fake } = await openChannel();
+    const controller = new AbortController();
+    const result = channel.operation('start', {}, { signal: controller.signal, onProgress: () => expect.unreachable() });
+    let settled = false;
+    void result.catch(() => (settled = true));
+    const { id } = lastOp(fake);
+    controller.abort();
+    expect(fake.messages()).toContainEqual({ t: 'cancel', id });
+    fake.answer({ t: 'progress', id, step: 'late' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    fake.answer({ t: 'result', id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
+    expect(channel.isOpen).toBe(true);
+    expect(channel.busy).toBe(0);
+  });
+
+  it('a cancel that crossed a successful result is an AbortError on its confirmation; a lost channel before it is `lost`', async () => {
+    const { channel, fake } = await openChannel();
+    const first = new AbortController();
+    const crossed = channel.operation('run', {}, { signal: first.signal });
+    const crossedId = lastOp(fake).id;
+    first.abort();
+    // The script had ended it; it confirms the cancel.
+    fake.answer({ t: 'cancelled', id: crossedId });
+    await expect(crossed).rejects.toMatchObject({ name: 'AbortError' });
+    const second = new AbortController();
+    const unconfirmed = channel.operation('run', {}, { signal: second.signal });
+    second.abort();
+    fake.exit(1);
+    await expect(unconfirmed).rejects.toMatchObject({ code: 'lost' });
+  });
+
+  it('gives up on a helper that does not answer after the time limit and the grace time', async () => {
+    const { channel, fake } = await openChannel({ pingIntervalMs: 10 * 60_000 });
+    const result = channel.operation('start', {}, { timeoutMs: 1_000 });
+    const check = expect(result).rejects.toMatchObject({ code: 'timeout', timedOut: true });
+    await vi.advanceTimersByTimeAsync(1_000 + CHANNEL_RESULT_GRACE_MS);
+    await check;
+    expect(fake.messages()).toContainEqual({ t: 'cancel', id: lastOp(fake).id });
+  });
+
+  it('distinguishes a closed channel (not sent) from one lost while the operation ran', async () => {
+    const { channel, fake } = await openChannel();
+    const running = channel.operation('start', {});
+    fake.exit(1);
+    await expect(running).rejects.toEqual(expect.objectContaining({ code: 'lost' }));
+    await expect(channel.operation('start', {})).rejects.toEqual(expect.objectContaining({ code: 'closed' }));
+    expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(1);
+  });
+
+  it('pings while open and takes the channel as lost without an answer: stops docker run and logs it', async () => {
+    const { channel, fake, lines } = await openChannel({ pingIntervalMs: 1_000, pongTimeoutMs: 3_000 });
+    const closed: string[] = [];
+    channel.onClose((reason) => closed.push(reason));
+    await vi.advanceTimersByTimeAsync(1_000);
+    const ping = fake.messages().find((message) => message.t === 'ping') as { n: number };
+    fake.answer({ t: 'pong', n: ping.n });
+    // Lost at the first ping at which no answer came for exactly pongTimeoutMs (the answer at 1 s, the ping at 4 s),
+    // not one ping later.
+    const running = expect(channel.operation('start', {})).rejects.toMatchObject({ code: 'lost' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(channel.isOpen).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(channel.isOpen).toBe(false);
+    await running;
+    expect(channel.isOpen).toBe(false);
+    expect(fake.state.killed).toBe(true);
+    expect(closed).toEqual(['the helper does not answer']);
+    expect(lines).toContainEqual({ level: 'warn', text: 'The helper channel to build-box was lost: the helper does not answer.' });
+  });
+
+  it('takes an open channel whose input cannot be written as lost at once, and stops docker run', async () => {
+    const { channel, fake, lines } = await openChannel({ pingIntervalMs: 1_000 });
+    const closed: string[] = [];
+    channel.onClose((reason) => closed.push(reason));
+    // Its input is closed: the next ping cannot be written. The stop does not end it here, so the channel cannot wait
+    // for its end.
+    let kills = 0;
+    fake.process.kill = () => {
+      kills++;
+    };
+    fake.state.ended = true;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(channel.isOpen).toBe(false);
+    expect(closed).toEqual(['its input cannot be written']);
+    expect(kills).toBe(1);
+    expect(lines).toContainEqual({ level: 'warn', text: 'The helper channel to build-box was lost: its input cannot be written.' });
+  });
+
+  it('takes an invalid message of the helper as a lost channel', async () => {
+    const { channel, fake } = await openChannel();
+    fake.raw('{"t":"result","id":1}\n');
+    expect(channel.isOpen).toBe(false);
+    expect(fake.state.killed).toBe(true);
+  });
+
+  it(`runs at most ${MAX_CONCURRENT_OPERATIONS} operations at the same time; the next one waits`, async () => {
+    const { channel, fake } = await openChannel();
+    const results = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, (_, index) => channel.operation('step', { index }));
+    await vi.advanceTimersByTimeAsync(0);
+    const sent = () => fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+    expect(sent()).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+    expect(channel.busy).toBe(MAX_CONCURRENT_OPERATIONS + 1);
+    fake.answer({ t: 'result', id: sent()[0].id, ok: true, value: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent()).toHaveLength(MAX_CONCURRENT_OPERATIONS + 1);
+    expect(sent()[MAX_CONCURRENT_OPERATIONS].params).toEqual({ index: MAX_CONCURRENT_OPERATIONS });
+    channel.close();
+    await Promise.allSettled(results);
+  });
+
+  // The wait for a place is bounded, also for a call with a short time limit: the time limit counts from the call, so
+  // the wait for a place is taken from it.
+  it('takes the wait for a place from the time limit that it sends', async () => {
+    const { channel, fake } = await openChannel();
+    const held = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }));
+    const waiting = channel.operation('step', { index: 'waiting' }, { timeoutMs: 10_000 });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const sent = () => fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+    fake.answer({ t: 'result', id: sent()[0].id, ok: true, value: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent()[MAX_CONCURRENT_OPERATIONS]).toMatchObject({ params: { index: 'waiting' }, timeoutMs: 8_000 });
+    channel.close();
+    await Promise.allSettled([...held, waiting]);
+  });
+
+  it(`waits at most CHANNEL_SLOT_WAIT_MS (or its time limit) for a place; then it is not sent (unsendable)`, async () => {
+    const { channel, fake } = await openChannel();
+    const held = Array.from({ length: MAX_CONCURRENT_OPERATIONS }, (_, index) => channel.operation('step', { index }));
+    const short = channel.operation('step', { index: 'short' }, { timeoutMs: 1_000 });
+    const plain = channel.operation('step', { index: 'plain' });
+    const shortResult = expect(short).rejects.toMatchObject({ code: 'unsendable' });
+    const plainResult = expect(plain).rejects.toMatchObject({ code: 'unsendable' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await shortResult;
+    await vi.advanceTimersByTimeAsync(CHANNEL_SLOT_WAIT_MS - 1_000);
+    await plainResult;
+    expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+    expect(channel.busy).toBe(MAX_CONCURRENT_OPERATIONS);
+    // A place that frees later goes to no one who left.
+    const sent = fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+    fake.answer({ t: 'result', id: sent[0].id, ok: true, value: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(channel.busy).toBe(MAX_CONCURRENT_OPERATIONS - 1);
+    const next = channel.operation('step', { index: 'next' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(MAX_CONCURRENT_OPERATIONS + 1);
+    channel.close();
+    await Promise.allSettled([...held, next]);
+  });
+
+  it('closeNow (the window closes) stops docker run and what it started at once, and rejects what runs as lost', async () => {
+    const { channel, fake } = await openChannel();
+    let killedNow = 0;
+    fake.process.killNow = () => {
+      killedNow++;
+      fake.exit(null);
+    };
+    const running = channel.operation('start', {});
+    channel.closeNow();
+    expect(killedNow).toBe(1);
+    await expect(running).rejects.toMatchObject({ code: 'lost' });
+    expect(channel.isOpen).toBe(false);
+  });
+
+  it('close ends the input of docker run and stops it only when it does not end by itself', async () => {
+    const { channel, fake } = await openChannel();
+    channel.close();
+    expect(fake.state.ended).toBe(true);
+    expect(fake.state.killed).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fake.state.killed).toBe(true);
+  });
+
+  describe('the places and the limits of operations', () => {
+    it('an operation that waits for a place and whose signal aborts meanwhile is never sent', async () => {
+      const { channel, fake } = await openChannel();
+      const controller = new AbortController();
+      const calls = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, () => channel.operation('step', {}, { signal: controller.signal }));
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort();
+      // The script confirms each cancel of the operations that were sent.
+      for (const message of fake.messages().filter((item) => item.t === 'cancel')) fake.answer({ t: 'cancelled', id: (message as { id: number }).id });
+      const outcomes = await Promise.allSettled(calls);
+      expect(outcomes.every((outcome) => outcome.status === 'rejected' && (outcome.reason as Error).name === 'AbortError')).toBe(true);
+      const sent = fake.messages().filter((message) => message.t === 'op');
+      expect(sent).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+      expect(fake.messages().filter((message) => message.t === 'cancel')).toHaveLength(MAX_CONCURRENT_OPERATIONS);
+      expect(channel.busy).toBe(0);
+    });
+
+    it('a caller that comes while a place goes to a waiting operation does not get past the limit', async () => {
+      const { channel, fake } = await openChannel();
+      const running = Array.from({ length: MAX_CONCURRENT_OPERATIONS + 1 }, (_, index) => channel.operation('step', { index }));
+      await vi.advanceTimersByTimeAsync(0);
+      const sent = () => fake.messages().filter((message) => message.t === 'op') as Extract<ClientMessage, { t: 'op' }>[];
+      fake.answer({ t: 'result', id: sent()[0].id, ok: true, value: 0 });
+      // In the same turn as the result: a new caller.
+      const late = channel.operation('step', { index: 'late' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sent()).toHaveLength(MAX_CONCURRENT_OPERATIONS + 1);
+      expect(sent()[MAX_CONCURRENT_OPERATIONS].params).toEqual({ index: MAX_CONCURRENT_OPERATIONS });
+      channel.close();
+      await Promise.allSettled([...running, late]);
+    });
+
+    it('an operation whose write fails is `closed` (not sent), so HelperChannels can send it once more', async () => {
+      const { channel, fake } = await openChannel();
+      fake.state.ended = true;
+      await expect(channel.operation('step', {})).rejects.toMatchObject({ code: 'closed' });
+      expect(channel.isOpen).toBe(false);
+    });
+
+    it('a channel whose output ends it right after the answer to hello does not open', async () => {
+      const fake = fakeProcess();
+      const { logger } = recordingLogger();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.raw(`${encodeMessage(HELLO)}not a message\n`);
+      await expect(opening).rejects.toMatchObject({ code: 'open' });
+      expect(fake.state.killed).toBe(true);
+    });
+
+    // The limits of the channel through an operation.
+    it('a request longer than the script reads, or than the channel carries, is not sent (`unsendable`)', async () => {
+      const { channel, fake } = await openChannel();
+      await expect(channel.operation('step', { data: 'x'.repeat(MAX_CLIENT_LINE) })).rejects.toMatchObject({ code: 'unsendable' });
+      // Beyond what reaches the script in time on a slow link (bytes of UTF-8, not characters).
+      await expect(channel.operation('step', { data: 'x'.repeat(MAX_CHANNEL_REQUEST_BYTES) })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.operation('step', { data: 'ä'.repeat(MAX_CHANNEL_REQUEST_BYTES / 2) })).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
+      expect(channel.isOpen).toBe(true);
+      expect(channel.busy).toBe(0);
+    });
+
+    it('refuses a script whose JSON line is longer than the loader reads', async () => {
+      const fake = fakeProcess();
+      const { logger } = recordingLogger();
+      // Each line feed doubles in JSON: short enough as text, too long as its line.
+      // MAX_BUNDLE_LINE_LENGTH of the pipe loader (8 MiB).
+      const script = '\n'.repeat(MAX_BUNDLE_LINE_LENGTH / 2 + 1);
+      await expect(HelperChannel.open(fake.process, script, { logger, name: 'build-box' })).rejects.toThrow(/too long/);
+      expect(fake.lines).toHaveLength(0);
+    });
+
+    it('the idle time counts from the end of the last operation', async () => {
+      const { channel, fake } = await openChannel({ pingIntervalMs: 60 * 60_000 });
+      const result = channel.operation('start', {});
+      await vi.advanceTimersByTimeAsync(12 * 60_000);
+      const { id } = lastOp(fake);
+      fake.answer({ t: 'result', id, ok: true, value: null });
+      await result;
+      expect(Date.now() - channel.lastUsed).toBe(0);
+    });
+
+    // The secret of an operation.
+    it('a secret too short to be masked is not sent', async () => {
+      const { channel, fake } = await openChannel();
+      await expect(channel.operation('start', {}, { secrets: { token: 'abc' } })).rejects.toMatchObject({ code: 'unsendable' });
+      await expect(channel.operation('start', {}, { secrets: { token: '' } })).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
+    });
+
+    it('a time limit that the script would refuse is not sent, and a missing params travels as null', async () => {
+      const { channel, fake } = await openChannel();
+      for (const timeoutMs of [0, -5, 1.5, Number.NaN, 25 * 60 * 60_000]) {
+        await expect(channel.operation('step', {}, { timeoutMs })).rejects.toMatchObject({ code: 'unsendable' });
+      }
+      expect(fake.messages().filter((message) => message.t === 'op')).toHaveLength(0);
+      const probe = channel.operation('probe', undefined);
+      const op = lastOp(fake);
+      expect(op.params).toBeNull();
+      expect(parseClientMessage(fake.lines[fake.lines.length - 1])).toMatchObject({ t: 'op', params: null });
+      fake.answer({ t: 'result', id: op.id, ok: true, value: {} });
+      await probe;
+    });
+
+    it('waits for the result of a timed-out operation longer than the kill grace and the cleanup of the script', () => {
+      expect(CHANNEL_RESULT_GRACE_MS).toBeGreaterThan(CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS);
+    });
+  });
+
+  // A flow in the worker, with its time limit; refused, sending nothing, by a worker that does not know it.
+  describe('flow', () => {
+    it('sends the operation with its parameters and time limit, and gives its value', async () => {
+      const fake = fakeProcess();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger: recordingLogger().logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ ...HELLO, ops: ['probe', 'tokenRemove'] } as ServerMessage);
+      const channel = await opening;
+      const removing = channel.flow('tokenRemove', { devspaceId: 'e1', containerName: 'c' }, { timeoutMs: 60_000 });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      expect(op).toMatchObject({ op: 'tokenRemove', params: { devspaceId: 'e1', containerName: 'c' }, timeoutMs: 60_000 });
+      fake.answer({ t: 'result', id: op.id, ok: true, value: { outcome: 'notRunning' } });
+      expect(await removing).toEqual({ outcome: 'notRunning' });
+    });
+
+    it('answers the requests of the flow with its onAsk, and a cancel of its signal ends it', async () => {
+      const fake = fakeProcess();
+      const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger: recordingLogger().logger, name: 'build-box' });
+      await vi.advanceTimersByTimeAsync(0);
+      fake.answer({ ...HELLO, ops: ['probe', 'tokenRemove'] } as ServerMessage);
+      const channel = await opening;
+      const controller = new AbortController();
+      const removing = channel.flow('tokenRemove', {}, { signal: controller.signal, onAsk: async () => ({ value: { remoteUser: 'dev' } }) });
+      await vi.advanceTimersByTimeAsync(0);
+      const op = lastOp(fake);
+      fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'record', payload: { call: 'get', args: ['e1'] } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.messages().filter((message) => message.t === 'answer')).toEqual([{ t: 'answer', id: op.id, ask: 1, ok: true, value: { remoteUser: 'dev' } }]);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.messages().some((message) => message.t === 'cancel' && (message as { id?: number }).id === op.id)).toBe(true);
+      fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'cancelled' }, cancelled: true, timedOut: false });
+      await expect(removing).rejects.toBeDefined();
+    });
+
+    it('refuses an operation that the worker does not know, sending nothing', async () => {
+      const { channel, fake } = await openChannel();
+      const before = fake.messages().length;
+      await expect(channel.flow('tokenRemove', {})).rejects.toMatchObject({ code: 'unsendable' });
+      expect(fake.messages()).toHaveLength(before);
+    });
+  });
+});
+
+// The worker is the deputy: the extension answers the requests of an operation.
+describe('HelperChannel: the requests of an operation', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const answers = (fake: ReturnType<typeof fakeProcess>) => fake.messages().filter((message) => message.t === 'answer');
+
+  it('answers with the value and the secrets of onAsk', async () => {
+    const { channel, fake } = await openChannel();
+    const seen: unknown[] = [];
+    const running = channel.operation('open', {}, {
+      onAsk: async (kind, payload) => {
+        seen.push([kind, payload]);
+        return kind === 'secret' ? { value: 'ok', secrets: { registry: 'reg-pass' } } : { value: { recreate: true } };
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: { text: 'Recreate?' } });
+    fake.answer({ t: 'ask', id: op.id, ask: 2, kind: 'secret', payload: { name: 'registry' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seen).toEqual([
+      ['question', { text: 'Recreate?' }],
+      ['secret', { name: 'registry' }],
+    ]);
+    expect(answers(fake)).toEqual([
+      { t: 'answer', id: op.id, ask: 1, ok: true, value: { recreate: true } },
+      { t: 'answer', id: op.id, ask: 2, ok: true, value: 'ok', secrets: { registry: 'reg-pass' } },
+    ]);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: 1 });
+    await expect(running).resolves.toBe(1);
+  });
+
+  it('answers `unsupported` without onAsk, the code of a HelperOperationError, `failed` otherwise, and `invalid` for secrets it cannot send', async () => {
+    const { channel, fake } = await openChannel();
+    const plain = channel.operation('open', {});
+    await vi.advanceTimersByTimeAsync(0);
+    const first = lastOp(fake);
+    fake.answer({ t: 'ask', id: first.id, ask: 1, kind: 'local', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake).at(-1)).toMatchObject({ id: first.id, ask: 1, ok: false, error: { code: 'unsupported' } });
+    fake.answer({ t: 'result', id: first.id, ok: true, value: null });
+    await plain;
+
+    let call = 0;
+    const failing = channel.operation('open', {}, {
+      onAsk: async () => {
+        call++;
+        if (call === 1) throw new HelperOperationError('declined', 'The user declined.', false);
+        if (call === 2) throw new Error('boom');
+        return { value: null, secrets: { token: 'ab' } };
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const second = lastOp(fake);
+    for (const ask of [1, 2, 3]) fake.answer({ t: 'ask', id: second.id, ask, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake).slice(-3).sort((a, b) => a.ask - b.ask)).toEqual([
+      { t: 'answer', id: second.id, ask: 1, ok: false, error: { code: 'declined', message: 'The user declined.' } },
+      { t: 'answer', id: second.id, ask: 2, ok: false, error: { code: 'failed', message: 'boom' } },
+      { t: 'answer', id: second.id, ask: 3, ok: false, error: { code: 'invalid', message: 'The secrets of the answer cannot be sent.' } },
+    ]);
+    fake.answer({ t: 'result', id: second.id, ok: true, value: null });
+    await failing;
+  });
+
+  it('aborts the handler when the operation ends, and sends no answer after the end; a request of an unknown operation is ignored', async () => {
+    const { channel, fake } = await openChannel();
+    let handlerSignal: AbortSignal | undefined;
+    let release!: () => void;
+    const running = channel.operation('open', {}, {
+      onAsk: (_kind, _payload, signal) => {
+        handlerSignal = signal;
+        return new Promise((resolve) => (release = () => resolve({ value: 'late' })));
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    fake.answer({ t: 'ask', id: 999, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(handlerSignal?.aborted).toBe(false);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: 'done' });
+    await expect(running).resolves.toBe('done');
+    expect(handlerSignal?.aborted).toBe(true);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake)).toEqual([]);
+  });
+
+  it('sends named secrets, and refuses secrets that it cannot send', async () => {
+    const { channel, fake } = await openChannel();
+    const sending = channel.operation('open', {}, { secrets: { token: 'tok-1234', registry: 'reg-5678' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastOp(fake).secrets).toEqual({ token: 'tok-1234', registry: 'reg-5678' });
+    fake.answer({ t: 'result', id: lastOp(fake).id, ok: true, value: null });
+    await sending;
+    await expect(channel.operation('open', {}, { secrets: { 'Bad-Name': 'abcd' } })).rejects.toMatchObject({ code: 'unsendable' });
+    await expect(channel.operation('open', {}, { secrets: { token: 'ab' } })).rejects.toMatchObject({ code: 'unsendable' });
+  });
+
+  it('answers `invalid` for a value it cannot encode, `tooLarge` beyond the channel, `failed` for a handler that throws at once', async () => {
+    const { channel, fake } = await openChannel();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      onAsk: ((): never | Promise<{ value: unknown }> => {
+        call++;
+        if (call === 1) return Promise.resolve({ value: cyclic });
+        if (call === 2) return Promise.resolve({ value: 'x'.repeat(300 * 1024) });
+        throw new Error('at once');
+      }) as never,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    for (const ask of [1, 2, 3]) fake.answer({ t: 'ask', id: op.id, ask, kind: 'local', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake).map((answer) => (answer.ok ? 'ok' : answer.error.code)).sort()).toEqual(['failed', 'invalid', 'tooLarge']);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+
+  it('aborts the handler of an open request at the cancel, before the script confirms it', async () => {
+    const { channel, fake } = await openChannel();
+    const controller = new AbortController();
+    let handlerSignal: AbortSignal | undefined;
+    const running = channel
+      .operation('open', {}, {
+        signal: controller.signal,
+        onAsk: (_kind, _payload, signal) => {
+          handlerSignal = signal;
+          return new Promise(() => {});
+        },
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    expect(handlerSignal?.aborted).toBe(true);
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await running;
+  });
+
+  it('answers `cancelled` for a handler that was aborted, ok without secrets for empty secrets, and sends no empty secrets', async () => {
+    const { channel, fake } = await openChannel();
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      secrets: {},
+      onAsk: async () => {
+        call++;
+        if (call === 1) throw abortError();
+        return { value: 1, secrets: {} };
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    expect(op).not.toHaveProperty('secrets');
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'ask', id: op.id, ask: 2, kind: 'local', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answers(fake)).toEqual([
+      { t: 'answer', id: op.id, ask: 1, ok: false, error: { code: 'cancelled', message: expect.any(String) } },
+      { t: 'answer', id: op.id, ask: 2, ok: true, value: 1 },
+    ]);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+
+  it('runs no handler for a request that comes after the cancel', async () => {
+    const { channel, fake } = await openChannel();
+    const controller = new AbortController();
+    let called = 0;
+    const running = channel
+      .operation('open', {}, {
+        signal: controller.signal,
+        onAsk: async () => {
+          called++;
+          return { value: null };
+        },
+      })
+      .catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    controller.abort();
+    fake.answer({ t: 'ask', id: op.id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(called).toBe(0);
+    expect(answers(fake)).toEqual([]);
+    fake.answer({ t: 'result', id: op.id, ok: false, error: { code: 'cancelled', message: 'x' }, cancelled: true, timedOut: false });
+    await running;
+  });
+
+  it('answers `invalid` for a handler that gives no answer object, and counts the size of an answer in bytes, up to the limit', async () => {
+    const fake = fakeProcess();
+    const { logger } = recordingLogger();
+    const opening = HelperChannel.open(fake.process, 'SCRIPT', { logger, name: 'build-box', maxRequestBytes: 1_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer(HELLO);
+    const channel = await opening;
+    const overhead = Buffer.byteLength(JSON.stringify({ t: 'answer', id: 1, ask: 1, ok: true, value: '' }), 'utf8');
+    const values: unknown[] = [undefined, 'é'.repeat(600), 'x'.repeat(1_000 - overhead), 'x'.repeat(1_000 - overhead + 1)];
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      onAsk: async () => {
+        const value = values[call++];
+        return (call === 1 ? value : { value }) as never;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    expect(op.id).toBe(1);
+    for (const ask of [1, 2, 3, 4]) {
+      fake.answer({ t: 'ask', id: op.id, ask, kind: 'local', payload: null });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(answers(fake).map((answer) => (answer.ok ? 'ok' : answer.error.code))).toEqual(['invalid', 'tooLarge', 'ok', 'tooLarge']);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+
+  it('aborts the handler of an open request when the operation times out on this side', async () => {
+    const { channel, fake } = await openChannel();
+    let handlerSignal: AbortSignal | undefined;
+    const running = channel
+      .operation('open', {}, {
+        timeoutMs: 1_000,
+        onAsk: (_kind, _payload, signal) => {
+          handlerSignal = signal;
+          return new Promise(() => {});
+        },
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    fake.answer({ t: 'ask', id: lastOp(fake).id, ask: 1, kind: 'question', payload: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(handlerSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000 + CHANNEL_RESULT_GRACE_MS + 1);
+    expect(handlerSignal?.aborted).toBe(true);
+    await running;
+  });
+
+  it('answers `invalid` for a null answer, and a rejection without text still gets an answer', async () => {
+    const { channel, fake } = await openChannel();
+    let call = 0;
+    const running = channel.operation('open', {}, {
+      onAsk: async () => {
+        call++;
+        if (call === 1) return null as never;
+        throw Object.create(null);
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const op = lastOp(fake);
+    for (const ask of [1, 2]) {
+      fake.answer({ t: 'ask', id: op.id, ask, kind: 'local', payload: null });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(answers(fake).map((answer) => (answer.ok ? 'ok' : answer.error.code))).toEqual(['invalid', 'failed']);
+    fake.answer({ t: 'result', id: op.id, ok: true, value: null });
+    await running;
+  });
+});
+
+// The same with a real program (NodeProcessRunner.start) that ended before the channel wrote to it: the write fails,
+// and the end of the program is handled only after that write.
+describe('HelperChannel with a program that ended before its input was written', () => {
+  it('fails to open with the error output of the program', async () => {
+    const conflict = 'docker: Error response from daemon: Conflict. The container name "/devspaces-window-worker1" is already in use by container "0123456789ab".';
+    const program = new NodeProcessRunner().start(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(`${conflict}\n`)}); process.exit(125)`]);
+    expect((await program.exited).exitCode).toBe(125);
+    await expect(HelperChannel.open(program, 'SCRIPT', { logger: silentLogger, name: 'the local Docker' })).rejects.toThrow(
+      `The helper channel to the local Docker could not be opened: the helper ended (${conflict})`,
+    );
+  });
+});

@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
+
+import { CommandError, UserFacingError } from '../core/errors';
+import { Actions, Messages } from '../core/messages';
+import { abortError, type Logger } from '../core/ports';
+import { RegistryVersionError } from '../core/storage/registry';
+import { isCancellation, OPERATION_FAILED, showError } from './errors';
+import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
+
+function recordingLogger() {
+  const lines: string[] = [];
+  const logger: Logger = {
+    info: (message) => lines.push(`info ${message}`),
+    warn: (message) => lines.push(`warn ${message}`),
+    error: (message, error) => lines.push(`error ${message}${error === undefined ? '' : ` | ${String(error)}`}`),
+    output: () => {},
+  };
+  return { logger, lines };
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('showError', () => {
+  beforeEach(() => resetFakeVscode());
+
+  const { window } = fakeVscode;
+
+  function shown(): { severity: 'error' | 'warning'; message: string; actions: string[] } {
+    const error = window.showErrorMessage.mock.calls[0];
+    const warning = window.showWarningMessage.mock.calls[0];
+    const call = error ?? warning;
+    expect(call, 'a message is shown').toBeDefined();
+    expect(window.showErrorMessage.mock.calls.length + window.showWarningMessage.mock.calls.length).toBe(1);
+    const [message, ...actions] = call as [string, ...string[]];
+    return { severity: error ? 'error' : 'warning', message, actions };
+  }
+
+  it('offers Install Docker… (the Docker setup in the sidebar) when Docker is not installed', async () => {
+    const { logger } = recordingLogger();
+    window.showErrorMessage.mockResolvedValue(Actions.installDocker);
+    showError(new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled), { logger, showLog: vi.fn() });
+    expect(shown()).toEqual({
+      severity: 'error',
+      message: 'Docker Desktop is not installed.',
+      actions: ['Install Docker…'],
+    });
+    await flush();
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledTimes(1);
+    // The command looks for the Docker CLI again before it shows the sidebar, so that the view shows the setup.
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devspaces.dockerSetup.show');
+    expect(fakeVscode.env.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('offers Start Docker when Docker Engine does not run (Linux), which runs Start Docker of the Docker setup', async () => {
+    const { logger } = recordingLogger();
+    const showLog = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.startDocker);
+    showError(new UserFacingError('dockerEngineNotRunning', Messages.dockerEngineNotRunning), { logger, showLog });
+    expect(shown()).toEqual({
+      severity: 'error',
+      message: Messages.dockerEngineNotRunning,
+      actions: ['Show details', 'Start Docker'],
+    });
+    await flush();
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devspaces.dockerSetup.start');
+    expect(showLog).not.toHaveBeenCalled();
+  });
+
+  it('offers no Start Docker in a remote window, where the Docker setup cannot start Docker', async () => {
+    fakeVscode.env.remoteName = 'ssh-remote';
+    const { logger } = recordingLogger();
+    const showLog = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.showDetails);
+    showError(new UserFacingError('dockerEngineNotRunning', Messages.dockerEngineNotRunning), { logger, showLog });
+    // The message names the command (sudo systemctl enable --now docker) to run on the Docker host.
+    expect(shown()).toEqual({
+      severity: 'error',
+      message: Messages.dockerEngineNotRunning,
+      actions: ['Show details'],
+    });
+    await flush();
+    expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalled();
+    expect(showLog).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['dockerStartFailed', Messages.dockerStartFailed],
+    ['buildFailed', Messages.buildFailed],
+    ['startFailed', 'The devspace could not be started.'],
+  ] as const)('offers Show details and Try again for %s', async (code, message) => {
+    const { logger } = recordingLogger();
+    const retry = vi.fn();
+    const showLog = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.tryAgain);
+    showError(new UserFacingError(code, message, 'technical detail'), { logger, showLog, retry });
+    expect(shown()).toEqual({ severity: 'error', message, actions: ['Show details', 'Try again'] });
+    await flush();
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(showLog).not.toHaveBeenCalled();
+  });
+
+  // A remote Docker host that cannot be reached gets its own message, never Start Docker or Install Docker….
+  it('offers Show details and Try again, not Start Docker or Install Docker…, for an unreachable remote host', async () => {
+    const { logger } = recordingLogger();
+    const retry = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.tryAgain);
+    const message = Messages.dockerHostUnreachable('build-box', 'The computer does not answer.');
+    showError(new UserFacingError('dockerHostUnreachable', message, 'ssh: connect to host build-box port 22: Connection timed out'), {
+      logger,
+      showLog: vi.fn(),
+      retry,
+    });
+    expect(shown()).toEqual({ severity: 'error', message: 'The Docker host build-box cannot be reached. The computer does not answer.', actions: ['Show details', 'Try again'] });
+    await flush();
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['dockerEndpointUnsupported', Messages.dockerEndpointUnsupported('tcp://box:2376')],
+    ['otherDockerHost', Messages.otherDockerHost('acme/api', 'build-box', '')],
+  ] as const)('shows %s as a warning with Show details', (code, message) => {
+    const { logger } = recordingLogger();
+    showError(new UserFacingError(code, message), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message, actions: ['Show details'] });
+  });
+
+  it('offers only Show details when the caller cannot retry', async () => {
+    const { logger } = recordingLogger();
+    const showLog = vi.fn();
+    window.showErrorMessage.mockResolvedValue(Actions.showDetails);
+    showError(new UserFacingError('buildFailed', Messages.buildFailed), { logger, showLog });
+    expect(shown().actions).toEqual(['Show details']);
+    await flush();
+    expect(showLog).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers only Try again for a first open without internet access', () => {
+    const { logger } = recordingLogger();
+    showError(new UserFacingError('firstOpenOffline', Messages.firstOpenOffline), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({
+      severity: 'error',
+      message: 'This repository cannot be opened without internet access.',
+      actions: ['Try again'],
+    });
+  });
+
+  it.each([
+    // Docker Compose configurations are supported; a Compose setting that the policy does not support is refused with
+    // hostAccess, which is shown as a warning.
+    ['hostAccess', Messages.unsupportedOptions('service db: restart always')],
+    ['noConfiguration', Messages.noConfiguration('acme/api')],
+  ] as const)('shows %s as a warning with Show details', (code, message) => {
+    const { logger } = recordingLogger();
+    showError(new UserFacingError(code, message), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message, actions: ['Show details'] });
+  });
+
+  it('offers Sign in when a sign-in is required', async () => {
+    const { logger } = recordingLogger();
+    window.showWarningMessage.mockResolvedValue(Actions.signIn);
+    showError(new UserFacingError('signInRequired', Messages.signInRequired), { logger, showLog: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message: Messages.signInRequired, actions: ['Sign in'] });
+    await flush();
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('devspaces.signIn');
+  });
+
+  it('shows a refused configuration and a devspace of another account as warnings', () => {
+    const { logger } = recordingLogger();
+    const hostAccess = Messages.hostAccess('bind mount /Users/x, privileged mode');
+    showError(new UserFacingError('hostAccess', hostAccess), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message: hostAccess, actions: ['Show details'] });
+    resetFakeVscode();
+    showError(new UserFacingError('otherAccount', Messages.otherAccount('acme/api')), { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'warning', message: Messages.otherAccount('acme/api'), actions: [] });
+  });
+
+  it('shows nothing for a cancellation, and logs it', () => {
+    for (const error of [new UserFacingError('cancelled', 'The operation was cancelled.'), abortError()]) {
+      resetFakeVscode();
+      const { logger, lines } = recordingLogger();
+      expect(isCancellation(error)).toBe(true);
+      showError(error, { logger, showLog: vi.fn(), retry: vi.fn() });
+      expect(window.showErrorMessage).not.toHaveBeenCalled();
+      expect(window.showWarningMessage).not.toHaveBeenCalled();
+      expect(lines).toEqual(['info The operation was cancelled.']);
+    }
+  });
+
+  it('shows a plain message for an unknown error and writes the technical error to the log only', () => {
+    const { logger, lines } = recordingLogger();
+    const error = new CommandError('docker run', 125, '', 'docker: Error response from daemon: conflict.');
+    showError(error, { logger, showLog: vi.fn(), retry: vi.fn() });
+    expect(shown()).toEqual({ severity: 'error', message: OPERATION_FAILED, actions: ['Show details'] });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('conflict');
+  });
+
+  it('shows the message of a registry file of a newer version', () => {
+    const { logger } = recordingLogger();
+    const error = new RegistryVersionError(2);
+    showError(error, { logger, showLog: vi.fn() });
+    expect(shown()).toEqual({ severity: 'error', message: error.message, actions: ['Show details'] });
+  });
+
+  it('never offers more than one action besides Show details', () => {
+    const codes = [
+      'dockerNotInstalled',
+      'dockerStartFailed',
+      'dockerEngineNotRunning',
+      'helperFailed',
+      'cloneFailed',
+      'firstOpenOffline',
+      'noConfiguration',
+      'buildFailed',
+      'startFailed',
+      'filesMissing',
+      'signInRequired',
+      'hostAccess',
+      'otherAccount',
+    ] as const;
+    for (const code of codes) {
+      for (const retry of [undefined, vi.fn()]) {
+        resetFakeVscode();
+        showError(new UserFacingError(code, `message of ${code}`), { logger: recordingLogger().logger, showLog: vi.fn(), retry });
+        const actions = shown().actions.filter((action) => action !== Actions.showDetails);
+        expect(actions.length, code).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it('reports a failed retry in the log instead of losing it', async () => {
+    const { logger, lines } = recordingLogger();
+    window.showErrorMessage.mockResolvedValue(Actions.tryAgain);
+    const retry = vi.fn(() => Promise.reject(new Error('retry failed')));
+    showError(new UserFacingError('buildFailed', Messages.buildFailed), { logger, showLog: vi.fn(), retry });
+    await flush();
+    await flush();
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(lines.some((line) => line.startsWith('error') && line.includes('retry failed'))).toBe(true);
+  });
+});

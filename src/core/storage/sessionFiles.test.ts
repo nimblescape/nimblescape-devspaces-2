@@ -1,0 +1,381 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import { spawn } from 'child_process';
+import { buildSync } from 'esbuild';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Clock } from '../ports';
+import type { PendingOperation, WindowStatus } from '../types';
+import { StoragePaths } from './paths';
+import {
+  DEFAULT_CLAIM_MAX_AGE_MS,
+  SessionFiles,
+  isPendingConnection,
+  isPendingOperation,
+  isReopenRecord,
+  isWindowStatus,
+} from './sessionFiles';
+
+const ENV_A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+const ENV_B = '7c1d2e3f-0000-4000-8000-000000000002';
+const WIN_1 = 'b7c1d2e3-0000-4000-8000-000000000001';
+const WIN_2 = 'b7c1d2e3-0000-4000-8000-000000000002';
+const T0 = Date.parse('2026-09-24T17:40:15.000Z');
+
+class FakeClock implements Clock {
+  constructor(public ms: number = T0) {}
+  now(): number {
+    return this.ms;
+  }
+}
+
+function status(windowId: string, extra: Partial<WindowStatus> = {}): WindowStatus {
+  return { windowId, pid: 48213, devspaceId: ENV_A, state: 'active', updatedAt: '2026-09-24T17:40:15.000Z', ...extra };
+}
+
+function operation(devspaceId: string, extra: Partial<PendingOperation> = {}): PendingOperation {
+  return {
+    devspaceId,
+    operation: 'rebuild',
+    requestedAt: '2026-09-24T17:40:15.000Z',
+    requestedBy: WIN_1,
+    reason: 'manual',
+    ...extra,
+  };
+}
+
+let root: string;
+let paths: StoragePaths;
+let clock: FakeClock;
+let files: SessionFiles;
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-test-'));
+  paths = new StoragePaths(root);
+  clock = new FakeClock();
+  files = new SessionFiles(paths, clock);
+});
+
+afterEach(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe('window status files', () => {
+  it('writes, reads, and removes status files (async and sync)', async () => {
+    await expect(files.readWindowStatuses()).resolves.toEqual([]);
+    await files.writeWindowStatus(status(WIN_2));
+    files.writeWindowStatusSync(status(WIN_1, { state: 'closing', devspaceId: null }));
+    expect(JSON.parse(fs.readFileSync(paths.sessionFile(WIN_1), 'utf8'))).toEqual(
+      status(WIN_1, { state: 'closing', devspaceId: null }),
+    );
+    await expect(files.readWindowStatuses()).resolves.toEqual([
+      status(WIN_1, { state: 'closing', devspaceId: null }),
+      status(WIN_2),
+    ]);
+    await files.writeWindowStatus(status(WIN_2, { updatedAt: '2026-09-24T17:40:30.000Z' }));
+    await expect(files.readWindowStatuses()).resolves.toContainEqual(
+      status(WIN_2, { updatedAt: '2026-09-24T17:40:30.000Z' }),
+    );
+    await files.removeWindowStatus(WIN_1);
+    await files.removeWindowStatus(WIN_1);
+    await expect(files.readWindowStatuses()).resolves.toEqual([
+      status(WIN_2, { updatedAt: '2026-09-24T17:40:30.000Z' }),
+    ]);
+    expect(fs.readdirSync(paths.sessionsDir)).toEqual([`${WIN_2}.json`]);
+  });
+
+  it('skips invalid files, temporary files, and files whose name does not match', async () => {
+    await files.writeWindowStatus(status(WIN_1));
+    fs.writeFileSync(path.join(paths.sessionsDir, 'broken.json'), '{');
+    fs.writeFileSync(path.join(paths.sessionsDir, 'other.json'), JSON.stringify(status(WIN_2)));
+    fs.writeFileSync(path.join(paths.sessionsDir, `.${WIN_2}.json.1.ab.tmp`), JSON.stringify(status(WIN_2)));
+    fs.writeFileSync(path.join(paths.sessionsDir, `${WIN_2}.json.tmp`), JSON.stringify(status(WIN_2)));
+    fs.writeFileSync(path.join(paths.sessionsDir, 'bad-state.json'), JSON.stringify(status('bad-state', { state: 'x' as 'active' })));
+    fs.writeFileSync(path.join(paths.sessionsDir, 'bad-pid.json'), JSON.stringify(status('bad-pid', { pid: -1 })));
+    fs.mkdirSync(path.join(paths.sessionsDir, 'folder.json'));
+    await expect(files.readWindowStatuses()).resolves.toEqual([status(WIN_1)]);
+  });
+
+  // Also for permissions (EACCES, EPERM), which readTextFile retries first.
+  it.each(['EIO', 'EACCES', 'EPERM'])('rejects when one status file cannot be read (%s): never "no window"', async (code) => {
+    await files.writeWindowStatus(status(WIN_1));
+    await files.writeWindowStatus(status(WIN_2));
+    const readFile = fs.promises.readFile;
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((async (file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === paths.sessionFile(WIN_2)) throw Object.assign(new Error(`${code}: cannot read`), { code });
+      return (readFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest);
+    }) as typeof fs.promises.readFile);
+    try {
+      await expect(files.readWindowStatuses()).rejects.toMatchObject({ code });
+      await expect(files.readPendings()).resolves.toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    await expect(files.readWindowStatuses()).resolves.toEqual([status(WIN_1), status(WIN_2)]);
+  });
+
+  it('keeps unknown fields of a newer version', async () => {
+    const withExtra = { ...status(WIN_1), future: 1 };
+    fs.mkdirSync(paths.sessionsDir, { recursive: true });
+    fs.writeFileSync(paths.sessionFile(WIN_1), JSON.stringify(withExtra));
+    await expect(files.readWindowStatuses()).resolves.toEqual([withExtra]);
+  });
+
+  it('refuses an unsafe window ID', async () => {
+    await expect(files.writeWindowStatus(status('../escape'))).rejects.toThrow(/Invalid window ID/);
+    expect(() => files.writeWindowStatusSync(status('a/b'))).toThrow(/Invalid window ID/);
+    expect(fs.existsSync(path.join(root, 'escape.json'))).toBe(false);
+  });
+});
+
+describe('pending connection files', () => {
+  it('writes with the current time, reads, and removes', async () => {
+    await files.writePending(ENV_A, WIN_1);
+    clock.ms += 1000;
+    await files.writePending(ENV_B, WIN_2);
+    await expect(files.readPendings()).resolves.toEqual([
+      { devspaceId: ENV_A, windowId: WIN_1, createdAt: '2026-09-24T17:40:15.000Z' },
+      { devspaceId: ENV_B, windowId: WIN_2, createdAt: '2026-09-24T17:40:16.000Z' },
+    ]);
+    await files.removePending(ENV_A);
+    await files.removePending(ENV_A);
+    await expect(files.readPendings()).resolves.toEqual([
+      { devspaceId: ENV_B, windowId: WIN_2, createdAt: '2026-09-24T17:40:16.000Z' },
+    ]);
+  });
+
+  it('skips invalid pending files', async () => {
+    fs.mkdirSync(paths.pendingDir, { recursive: true });
+    fs.writeFileSync(path.join(paths.pendingDir, `${ENV_A}.json`), JSON.stringify({ devspaceId: ENV_A, windowId: WIN_1, createdAt: 'yesterday' }));
+    fs.writeFileSync(path.join(paths.pendingDir, `${ENV_B}.json`), JSON.stringify({ devspaceId: ENV_A, windowId: WIN_1, createdAt: '2026-09-24T17:40:15Z' }));
+    await expect(files.readPendings()).resolves.toEqual([]);
+  });
+});
+
+// Delete removes the disconnect request of the devspace.
+describe('disconnect requests', () => {
+  it('removes the request of one devspace; a missing one is no error', async () => {
+    fs.mkdirSync(paths.disconnectDir, { recursive: true });
+    fs.writeFileSync(paths.disconnectFile(ENV_A), JSON.stringify(operation(ENV_A)));
+    fs.writeFileSync(paths.disconnectFile(ENV_B), JSON.stringify(operation(ENV_B)));
+    await files.removeDisconnectRequest(ENV_A);
+    await files.removeDisconnectRequest(ENV_A);
+    expect(fs.readdirSync(paths.disconnectDir)).toEqual([`${ENV_B}.json`]);
+  });
+});
+
+describe('pending operations', () => {
+  it('writes and reads operations', async () => {
+    await files.writeOperation(operation(ENV_A));
+    await files.writeOperation(
+      operation(ENV_B, { operation: 'delete', reason: 'configChanged', additionalVolumesToRemove: ['api-db'] }),
+    );
+    const operations = await files.readOperations();
+    expect(operations).toEqual([
+      operation(ENV_A),
+      operation(ENV_B, { operation: 'delete', reason: 'configChanged', additionalVolumesToRemove: ['api-db'] }),
+    ]);
+  });
+
+  it('reads and claims every operation kind of types.ts, also stop', async () => {
+    const kinds: Array<PendingOperation['operation']> = ['rebuild', 'delete', 'stop'];
+    const ids = [ENV_A, ENV_B, 'c0ffee00-0000-4000-8000-000000000003'];
+    for (const [index, kind] of kinds.entries()) {
+      await files.writeOperation(operation(ids[index], { operation: kind }));
+    }
+    await expect(files.readOperations()).resolves.toHaveLength(3);
+    for (const [index, kind] of kinds.entries()) {
+      expect(isPendingOperation(operation(ids[index], { operation: kind }))).toBe(true);
+      await expect(files.claimOperation(ids[index], WIN_1)).resolves.toEqual(operation(ids[index], { operation: kind }));
+    }
+    await expect(files.readOperations()).resolves.toEqual([]);
+  });
+
+  it('claims an operation once', async () => {
+    await files.writeOperation(operation(ENV_A));
+    await expect(files.claimOperation(ENV_A, WIN_2)).resolves.toEqual(operation(ENV_A));
+    await expect(files.readOperations()).resolves.toEqual([]);
+    expect(fs.readdirSync(paths.operationsDir)).toEqual([`${ENV_A}.claimed.${T0}.${WIN_2}`]);
+    await expect(files.claimOperation(ENV_A, WIN_1)).resolves.toBeUndefined();
+    await expect(files.claimOperation(ENV_B, WIN_1)).resolves.toBeUndefined();
+  });
+
+  it('lets exactly one of many parallel claims win', async () => {
+    for (let round = 0; round < 20; round++) {
+      await files.writeOperation(operation(ENV_A, { requestedBy: `round-${round}` }));
+      const contenders = Array.from({ length: 8 }, (_, i) => new SessionFiles(paths, clock).claimOperation(ENV_A, `window-${i}`));
+      const results = await Promise.all(contenders);
+      const winners = results.filter((result) => result !== undefined);
+      expect(winners).toHaveLength(1);
+      expect(winners[0]?.requestedBy).toBe(`round-${round}`);
+      await files.removeOperation(ENV_A);
+    }
+    expect(fs.readdirSync(paths.operationsDir)).toEqual([]);
+  });
+
+  it('removes an invalid claimed operation and reports no operation', async () => {
+    fs.mkdirSync(paths.operationsDir, { recursive: true });
+    fs.writeFileSync(paths.operationFile(ENV_A), JSON.stringify(operation(ENV_A, { operation: 'explode' as 'rebuild' })));
+    await expect(files.claimOperation(ENV_A, WIN_1)).resolves.toBeUndefined();
+    fs.writeFileSync(paths.operationFile(ENV_A), JSON.stringify(operation(ENV_B)));
+    await expect(files.claimOperation(ENV_A, WIN_1)).resolves.toBeUndefined();
+    fs.writeFileSync(paths.operationFile(ENV_A), '{');
+    await expect(files.claimOperation(ENV_A, WIN_1)).resolves.toBeUndefined();
+    expect(fs.readdirSync(paths.operationsDir)).toEqual([]);
+  });
+
+  it('removes the operation and the claimed files of one devspace only', async () => {
+    await files.writeOperation(operation(ENV_A));
+    await files.claimOperation(ENV_A, WIN_1);
+    await files.writeOperation(operation(ENV_A, { reason: 'update' }));
+    await files.writeOperation(operation(ENV_B));
+    await files.claimOperation(ENV_B, WIN_1);
+    await files.removeOperation(ENV_A);
+    expect(fs.readdirSync(paths.operationsDir)).toEqual([`${ENV_B}.claimed.${T0}.${WIN_1}`]);
+    await files.removeOperation(ENV_A);
+    await new SessionFiles(new StoragePaths(path.join(root, 'empty')), clock).removeOperation(ENV_A);
+  });
+
+  it('removes claimed files older than the maximum age', async () => {
+    await files.writeOperation(operation(ENV_A));
+    await files.claimOperation(ENV_A, WIN_1);
+    clock.ms += 10 * 60_000;
+    await files.writeOperation(operation(ENV_B));
+    await files.claimOperation(ENV_B, WIN_1);
+    await files.writeOperation(operation(ENV_A));
+    const oldForeign = path.join(paths.operationsDir, `x${'.claimed.'}unknown-form`);
+    fs.writeFileSync(oldForeign, '');
+    const past = new Date(T0 - 2 * DEFAULT_CLAIM_MAX_AGE_MS);
+    fs.utimesSync(oldForeign, past, past);
+
+    clock.ms = T0 + DEFAULT_CLAIM_MAX_AGE_MS + 1;
+    await files.cleanupStaleClaims();
+    expect(fs.readdirSync(paths.operationsDir).sort()).toEqual([`${ENV_A}.json`, `${ENV_B}.claimed.${T0 + 600_000}.${WIN_1}`]);
+
+    await files.cleanupStaleClaims(1000);
+    expect(fs.readdirSync(paths.operationsDir)).toEqual([`${ENV_A}.json`]);
+    await new SessionFiles(new StoragePaths(path.join(root, 'empty')), clock).cleanupStaleClaims();
+  });
+
+  it('treats a claim time far in the future as stale', async () => {
+    clock.ms = T0 + 5 * DEFAULT_CLAIM_MAX_AGE_MS;
+    await files.writeOperation(operation(ENV_A));
+    await files.claimOperation(ENV_A, WIN_1);
+    clock.ms = T0;
+    await files.cleanupStaleClaims();
+    expect(fs.readdirSync(paths.operationsDir)).toEqual([]);
+  });
+});
+
+describe('claimOperation across processes', () => {
+  it('lets exactly one process win', async () => {
+    const script = path.join(root, 'claim.js');
+    const entry = path.join(root, 'claim-entry.ts');
+    fs.writeFileSync(
+      entry,
+      [
+        `import { StoragePaths } from ${JSON.stringify(path.join(__dirname, 'paths'))};`,
+        `import { SessionFiles } from ${JSON.stringify(path.join(__dirname, 'sessionFiles'))};`,
+        'const [storage, id, windowId, startAt] = process.argv.slice(2);',
+        'while (Date.now() < Number(startAt)) { /* start together */ }',
+        'new SessionFiles(new StoragePaths(storage)).claimOperation(id, windowId).then(',
+        '  (result) => process.stdout.write(result ? "won" : "lost"),',
+        '  (error) => { console.error(error); process.exitCode = 1; },',
+        ');',
+      ].join('\n'),
+    );
+    buildSync({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', target: 'node24', outfile: script, logLevel: 'silent' });
+
+    const storage = path.join(root, 'storage');
+    await new SessionFiles(new StoragePaths(storage)).writeOperation(operation(ENV_A));
+    const startAt = Date.now() + 1500;
+    const outputs = await Promise.all(
+      Array.from(
+        { length: 4 },
+        (_, i) =>
+          new Promise<string>((resolve, reject) => {
+            const child = spawn(process.execPath, [script, storage, ENV_A, `window-${i}`, String(startAt)], {
+              stdio: ['ignore', 'pipe', 'inherit'],
+            });
+            let out = '';
+            child.stdout.on('data', (chunk: Buffer) => (out += chunk.toString()));
+            child.on('error', reject);
+            child.on('exit', (code) => (code === 0 ? resolve(out) : reject(new Error(`exit ${code}`))));
+          }),
+      ),
+    );
+    expect(outputs.filter((output) => output === 'won')).toHaveLength(1);
+    expect(outputs.filter((output) => output === 'lost')).toHaveLength(3);
+  }, 60_000);
+});
+
+describe('reopen record', () => {
+  it('writes synchronously, reads, and removes', async () => {
+    await expect(files.readReopen()).resolves.toBeUndefined();
+    files.writeReopenSync({ devspaceId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    await expect(files.readReopen()).resolves.toEqual({ devspaceId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    await files.removeReopen();
+    await files.removeReopen();
+    await expect(files.readReopen()).resolves.toBeUndefined();
+  });
+
+  // The close of a window that is not connected to a devspace, in deactivate().
+  it('removes synchronously, also when there is no record', async () => {
+    files.removeReopenSync();
+    files.writeReopenSync({ devspaceId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    files.removeReopenSync();
+    await expect(files.readReopen()).resolves.toBeUndefined();
+    files.removeReopenSync();
+  });
+
+  // The Delete of a devspace removes the reopen record only when it names that devspace.
+  it('removeReopenOf removes the record of the devspace, and keeps another one', async () => {
+    files.writeReopenSync({ devspaceId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    await files.removeReopenOf('6b1f0c2e-1d4a-4f5e-9a8b-7c6d5e4f3a2b');
+    await expect(files.readReopen()).resolves.toEqual({ devspaceId: ENV_A, closedAt: '2026-09-24T18:02:11Z' });
+    await files.removeReopenOf(ENV_A);
+    await expect(files.readReopen()).resolves.toBeUndefined();
+    await files.removeReopenOf(ENV_A);
+  });
+
+  it('ignores an invalid record', async () => {
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(paths.reopen, JSON.stringify({ devspaceId: ENV_A }));
+    await expect(files.readReopen()).resolves.toBeUndefined();
+    fs.writeFileSync(paths.reopen, 'nope');
+    await expect(files.readReopen()).resolves.toBeUndefined();
+  });
+});
+
+describe('validators', () => {
+  it('check the shapes', () => {
+    expect(isWindowStatus(status(WIN_1))).toBe(true);
+    expect(isWindowStatus(status(WIN_1, { devspaceId: null }))).toBe(true);
+    expect(isWindowStatus({ ...status(WIN_1), devspaceId: undefined })).toBe(false);
+    expect(isWindowStatus({ ...status(WIN_1), updatedAt: 'later' })).toBe(false);
+    expect(isWindowStatus([])).toBe(false);
+    // An optional, non-empty Docker context.
+    expect(isWindowStatus({ ...status(WIN_1), dockerContext: 'devspaces-remote-5709ff28' })).toBe(true);
+    expect(isWindowStatus({ ...status(WIN_1), dockerContext: '' })).toBe(false);
+    expect(isWindowStatus({ ...status(WIN_1), dockerContext: 3 })).toBe(false);
+    // The devspace of a window that works without Devspaces: an optional devspace ID.
+    expect(isWindowStatus({ ...status(WIN_1, { devspaceId: null }), plainDevspaceId: ENV_A })).toBe(true);
+    for (const plainDevspaceId of ['', '../x', 3, null]) expect(isWindowStatus({ ...status(WIN_1), plainDevspaceId })).toBe(false);
+    expect(isPendingConnection({ devspaceId: ENV_A, windowId: WIN_1, createdAt: '2026-09-24T17:40:15Z' })).toBe(true);
+    expect(isPendingConnection({ devspaceId: ENV_A, windowId: '', createdAt: '2026-09-24T17:40:15Z' })).toBe(false);
+    expect(isPendingOperation(operation(ENV_A))).toBe(true);
+    expect(isPendingOperation({ ...operation(ENV_A), reason: 'whim' })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: 'yes' })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db', 3] })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), additionalVolumesToRemove: ['db'] })).toBe(true);
+    // A devspace never switches its source (one devspace per source since 0.6.0): no operation carries one.
+    expect(isPendingOperation({ ...operation(ENV_A), reason: 'sourceSelected' })).toBe(false);
+    expect(isPendingOperation({ ...operation(ENV_A), reason: 'configurationSelected' })).toBe(false);
+    expect(isReopenRecord({ devspaceId: ENV_A, closedAt: '2026-09-24T18:02:11Z' })).toBe(true);
+    expect(isReopenRecord(null)).toBe(false);
+  });
+});

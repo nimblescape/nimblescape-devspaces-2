@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+// Mutation probes: the port of the engine of an operation (ENGINE_OF in operations.ts) masks the output of an exec with
+// OperationContext.maskedValues (every value the operation ever held), read at each call, not with the current secrets
+// alone.
+import { describe, expect, it, vi } from 'vitest';
+import { OP_REFRESH } from '../core/helperChannel/protocol';
+import type { OperationContext } from './server';
+
+const seen = vi.hoisted(() => ({ args: [] as unknown[][] }));
+
+vi.mock('./engineClient', async (original) => {
+  const actual = await original<typeof import('./engineClient')>();
+  return {
+    ...actual,
+    dockerEngine: (...args: unknown[]) => {
+      seen.args.push(args);
+      return { pull: async () => undefined };
+    },
+  };
+});
+
+describe('ENGINE_OF and maskedValues', () => {
+  it('hands dockerEngine the masked values of the operation, read at each call', async () => {
+    const { OPERATIONS } = await import('./operations');
+    const values = ['replaced-registry-pw-1'];
+    const context = {
+      secrets: {},
+      hasNoSecret: () => true,
+      maskedValues: () => [...values],
+      ask: async () => undefined,
+      progress: () => {},
+      log: () => {},
+      output: () => {},
+      signal: new AbortController().signal,
+    } as unknown as OperationContext;
+    // The refresh, which builds the port of the engine of the operation through ENGINE_OF; its outcome over the
+    // stand-in of the port does not matter here.
+    const before = seen.args.length;
+    await OPERATIONS[OP_REFRESH]({ devspaces: [] }, context).catch(() => undefined);
+    expect(seen.args.length).toBe(before + 1);
+    const args = seen.args.at(-1);
+    expect(typeof args?.[3]).toBe('function');
+    const secrets = args?.[3] as () => Iterable<string>;
+    expect([...secrets()]).toEqual(['replaced-registry-pw-1']);
+    values.push('later-value-123');
+    expect([...secrets()]).toEqual(['replaced-registry-pw-1', 'later-value-123']);
+  });
+});

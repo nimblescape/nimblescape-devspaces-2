@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
+# Run the VS Code jobs of ci.yml once per week on VS Code Insiders and on the
+# lowest VS Code version that the extension supports (engines.vscode in
+# package.json). Every push and every pull request already tests the current
+# stable version, so a failure here shows a change of the next VS Code version,
+# or a release of the Dev Containers extension that breaks the lowest version,
+# before users get it. The VS Code CLI installs the newest Dev Containers
+# release that supports the VS Code version of the run, and the tests print the
+# versions of VS Code and of Dev Containers. The call of ci.yml runs only its
+# job "test", for the VSIX, and its VS Code jobs. A change of this workflow
+# runs it on its pull request: GitHub starts a scheduled run only from the
+# workflow on the default branch, and a manual run only of a workflow that the
+# default branch has.
+
+name: VS Code versions
+
+on:
+  schedule:
+    # Mondays at 04:23 UTC.
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/vscode-versions.yml
+
+permissions:
+  # Checkout needs repository reads; the checks get no write scope.
+  contents: read
+
+jobs:
+  versions:
+    name: VS Code versions to test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version of engines.vscode (^x.y.z) is the lowest that the extension supports; another form fails the run,
+      # also a patch number of more than one digit, which @vscode/test-electron does not take as a stable version.
+      - name: List Insiders and the lowest supported version
+        id: list
+        run: |
+          node - >> "$GITHUB_OUTPUT" <<'JS'
+          const range = require("./package.json").engines.vscode;
+          const match = /^\^(\d+\.\d+\.\d)$/.exec(range);
+          if (!match) throw new Error(`engines.vscode is "${range}", not of the form ^x.y.z with a patch number of one digit`);
+          console.log(`list=${JSON.stringify(["insiders", match[1]])}`);
+          JS
+
+  ci:
+    name: VS Code ${{ matrix.vscode }}
+    needs: versions
+    strategy:
+      # Each version reports its failures, also when the other version failed.
+      fail-fast: false
+      matrix:
+        vscode: ${{ fromJSON(needs.versions.outputs.list) }}
+    uses: ./.github/workflows/ci.yml
+    with:
+      vscode-version: ${{ matrix.vscode }}

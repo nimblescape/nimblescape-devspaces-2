@@ -1,0 +1,27 @@
+{
+  "name": "devspaces-vscode-test-github",
+  "displayName": "Devspaces test GitHub sign-in",
+  "description": "Sign-in provider with the ID github for the attach tests (.vscode-test.mjs, label attach): the test account of the Docker tests with a dummy token.",
+  "version": "0.0.0",
+  "publisher": "nimblescape-test",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onAuthenticationRequest:github"
+  ],
+  "contributes": {
+    "authentication": [
+      {
+        "id": "github",
+        "label": "GitHub"
+      }
+    ]
+  }
+}

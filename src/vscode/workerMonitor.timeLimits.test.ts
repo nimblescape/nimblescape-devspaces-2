@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Mutation probes: workerMonitor.
+import { describe, expect, it } from 'vitest';
+import type { DockerTarget } from '../core/docker/dockerHost';
+import { silentLogger } from '../core/ports';
+import type { Devspace } from '../core/types';
+import { MONITOR_EXEC_TIMEOUT_MS } from '../core/worker/monitorFlow';
+import { MONITOR_FLOW_TIMEOUT_MS } from '../core/pipeline/operationBase';
+import { workerMonitor, type TargetFlow } from './workerMonitor';
+
+const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+const TARGET = { kind: 'remote', host: 'ssh://box', endpoint: 'ssh://box', context: 'box' } as DockerTarget;
+const LOCAL = { kind: 'local', host: '' } as DockerTarget;
+const DEVSPACE = { id: ID, repository: 'acme/api', containerName: 'devspaces-acme-api-brave-noether' } as Devspace;
+
+function monitorWith(answer: () => unknown) {
+  const calls: Parameters<TargetFlow>[] = [];
+  const lines: string[] = [];
+  const flow: TargetFlow = async (...args) => {
+    calls.push(args);
+    const value = answer();
+    if (value instanceof Error) throw value;
+    return value;
+  };
+  const logger = { ...silentLogger, warn: (text: string) => lines.push(`warn ${text}`), info: (text: string) => lines.push(`info ${text}`) };
+  return { monitor: workerMonitor({ flow, owner: () => ({ windowId: 'window-1', pid: 7 }), logger }), calls, lines };
+}
+
+describe('workerMonitor (mutation probes)', () => {
+  it('the time limit of a flow covers the command in the worker', () => {
+    expect(MONITOR_FLOW_TIMEOUT_MS).toBeGreaterThan(MONITOR_EXEC_TIMEOUT_MS);
+  });
+
+  it('containerExists: the time limit and the signal; parameters beyond the checks send nothing; the local Docker is named', async () => {
+    const signal = new AbortController().signal;
+    const { monitor, calls } = monitorWith(() => ({ state: 'running' }));
+    await monitor.containerExists(TARGET, DEVSPACE, signal);
+    expect(calls[0][2]).toEqual({ target: TARGET, timeoutMs: MONITOR_FLOW_TIMEOUT_MS, signal });
+    const odd = monitorWith(() => ({ state: 'running' }));
+    expect(await odd.monitor.containerExists(TARGET, { ...DEVSPACE, containerName: 'bad name/x' } as Devspace)).toBe(false);
+    expect(odd.calls).toEqual([]);
+    expect(odd.lines).toEqual(['info The container of acme/api could not be checked on ssh://box: its parameters are beyond the checks of the worker']);
+    const local = monitorWith(() => new Error('no worker'));
+    expect(await local.monitor.containerExists(LOCAL, DEVSPACE)).toBe(false);
+    expect(local.lines).toEqual(['info The container of acme/api could not be checked on the local Docker: no worker']);
+  });
+
+  it('recordGitState: the time limit and the signal', async () => {
+    const signal = new AbortController().signal;
+    const { monitor, calls } = monitorWith(() => ({ recorded: false }));
+    expect(await monitor.recordGitState(TARGET, DEVSPACE, signal)).toBe(false);
+    expect(calls[0][2]).toEqual({ target: TARGET, timeoutMs: MONITOR_FLOW_TIMEOUT_MS, signal });
+  });
+});

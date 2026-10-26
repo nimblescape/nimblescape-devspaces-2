@@ -1,0 +1,562 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import { describe, expect, it } from 'vitest';
+import {
+  FUTURE_RECORD_TOLERANCE_MS,
+  RECORD_MAX_AGE_MS,
+  REMOTE_GAP_MS,
+  REMOTE_GRACE_MS,
+  REMOTE_TICK_MS,
+  decide,
+  devContainerFirst,
+  initialRemoteState,
+  isRunningState,
+  type RemoteContainer,
+  type RemoteMonitorState,
+  type RemoteRecord,
+} from './rules';
+import { RELEASE_MARGIN_SECONDS } from '../core/session/windowRelease';
+
+const A = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+const B = '7c1d2e3f-0000-4000-8000-000000000002';
+const SOURCE = '0123456789abcdef0123456789abcdef';
+const OTHER = 'fedcba9876543210fedcba9876543210';
+const T0 = Date.parse('2026-09-27T12:00:00.000Z');
+const MINUTE = 60_000;
+
+function container(devspaceId: string, state = 'running', extra: Partial<RemoteContainer> = {}): RemoteContainer {
+  return { id: `${devspaceId.slice(0, 8)}${extra.composeService ?? ''}`, state, name: `devspaces-${devspaceId.slice(0, 8)}`, devspaceId, composeService: '', ...extra };
+}
+
+function record(devspaceId: string, at: number, extra: Partial<RemoteRecord> = {}): RemoteRecord {
+  return { source: SOURCE, devspaceId, at, keepRunning: false, limitSeconds: 600, ...extra };
+}
+
+/** A state after a tick one interval ago and no grace, as in a monitor that runs for a while. */
+function running(extra: Partial<RemoteMonitorState> = {}, now = T0): RemoteMonitorState {
+  return { lastTickAt: now - REMOTE_TICK_MS, ...extra };
+}
+
+describe('decide of the remote Monitor', () => {
+  it('keeps a devspace whose last heartbeat is younger than its limit', () => {
+    const decision = decide({ now: T0, containers: [container(A)], records: [record(A, T0 - 9 * MINUTE)], state: running() });
+    expect(decision.stop).toEqual([]);
+  });
+
+  it('stops a devspace without a heartbeat for longer than the limit of its newest record', () => {
+    const decision = decide({
+      now: T0,
+      containers: [container(A)],
+      records: [record(A, T0 - 11 * MINUTE), record(A, T0 - 20 * MINUTE, { source: OTHER, limitSeconds: 60 })],
+      state: running(),
+    });
+    expect(decision.stop.map((stop) => stop.devspaceId)).toEqual([A]);
+    expect(decision.stop[0].reason).toContain('11 minutes');
+  });
+
+  it('takes the limit of the newest record', () => {
+    // The newest record says 2 minutes: 3 minutes without contact is too long.
+    const records = [record(A, T0 - 3 * MINUTE, { limitSeconds: 120 }), record(A, T0 - 4 * MINUTE, { source: OTHER, limitSeconds: 3600 })];
+    expect(decide({ now: T0, containers: [container(A)], records, state: running() }).stop).toHaveLength(1);
+    // The newest record says an hour.
+    const later = [record(A, T0 - 3 * MINUTE, { limitSeconds: 3600 }), record(A, T0 - 4 * MINUTE, { source: OTHER, limitSeconds: 120 })];
+    expect(decide({ now: T0, containers: [container(A)], records: later, state: running() }).stop).toEqual([]);
+  });
+
+  it('keeps a devspace whose newest record keeps it running, however old', () => {
+    const records = [record(A, T0 - 5 * 24 * 60 * MINUTE, { keepRunning: true }), record(A, T0 - 6 * 24 * 60 * MINUTE, { source: OTHER })];
+    const decision = decide({ now: T0, containers: [container(A)], records, state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.kept).toEqual([A]);
+  });
+
+  // The newest record decides, across all sources.
+  it('an orphaned keep is overruled by a newer record without the flag of another source', () => {
+    // OTHER kept it long ago and never sent again (for example a computer.id that was replaced).
+    const records = [record(A, T0 - 30 * 24 * 60 * MINUTE, { source: OTHER, keepRunning: true }), record(A, T0 - 11 * MINUTE)];
+    const decision = decide({ now: T0, containers: [container(A)], records, state: running() });
+    expect(decision.kept).toEqual([]);
+    expect(decision.stop.map((stop) => stop.devspaceId)).toEqual([A]);
+  });
+
+  it('a newer keep of another source wins over an older record without the flag', () => {
+    const records = [record(A, T0 - 60 * MINUTE), record(A, T0 - 30 * MINUTE, { source: OTHER, keepRunning: true })];
+    const decision = decide({ now: T0, containers: [container(A)], records, state: running() });
+    expect(decision.kept).toEqual([A]);
+    expect(decision.stop).toEqual([]);
+  });
+
+  it('for records of the same time, a keep wins', () => {
+    const records = [record(A, T0 - 60 * MINUTE), record(A, T0 - 60 * MINUTE, { source: OTHER, keepRunning: true })];
+    expect(decide({ now: T0, containers: [container(A)], records, state: running() }).kept).toEqual([A]);
+    expect(decide({ now: T0, containers: [container(A)], records: [...records].reverse(), state: running() }).kept).toEqual([A]);
+  });
+
+  it('a new heartbeat without the flag ends the keeping', () => {
+    const records = [record(A, T0 - 20 * MINUTE, { keepRunning: false })];
+    expect(decide({ now: T0, containers: [container(A)], records, state: running() }).kept).toEqual([]);
+  });
+
+  it('never stops a devspace without any record, however long it runs (for example of the host\'s own local Docker)', () => {
+    let state = running();
+    for (let time = T0; time <= T0 + 24 * 60 * MINUTE; time += 60 * MINUTE) {
+      const decision = decide({ now: time, containers: [container(A)], records: [record(B, time - 60 * MINUTE)], state: { ...state, lastTickAt: time - REMOTE_TICK_MS } });
+      expect(decision.stop).toEqual([]);
+      expect(decision.kept).toEqual([]);
+      state = decision.state;
+    }
+  });
+
+  it('acts on a devspace once any computer sent a heartbeat for it', () => {
+    const decision = decide({ now: T0, containers: [container(A), container(B)], records: [record(B, T0 - 60 * MINUTE, { source: OTHER })], state: running() });
+    expect(decision.stop.map((stop) => stop.devspaceId)).toEqual([B]);
+  });
+
+  it('never stops a container that does not run, and counts restarting and paused as running', () => {
+    expect(isRunningState('running')).toBe(true);
+    expect(isRunningState('restarting')).toBe(true);
+    expect(isRunningState('paused')).toBe(true);
+    expect(isRunningState('exited')).toBe(false);
+    expect(isRunningState('created')).toBe(false);
+    const decision = decide({ now: T0, containers: [container(A, 'exited')], records: [record(A, T0 - 60 * MINUTE)], state: running() });
+    expect(decision.stop).toEqual([]);
+  });
+
+  it('stops the dev container first, then the other services, and only the running ones', () => {
+    const containers = [
+      container(A, 'running', { id: 'db', composeService: 'db' }),
+      container(A, 'exited', { id: 'cache', composeService: 'cache' }),
+      container(A, 'running', { id: 'dev' }),
+    ];
+    const decision = decide({ now: T0, containers, records: [record(A, T0 - 60 * MINUTE)], state: running() });
+    expect(decision.stop[0].containers.map((item) => item.id)).toEqual(['dev', 'db']);
+    expect(devContainerFirst([containers[0], containers[2]]).map((item) => item.id)).toEqual(['dev', 'db']);
+  });
+
+  it('decides each devspace on its own', () => {
+    const decision = decide({
+      now: T0,
+      containers: [container(A), container(B)],
+      records: [record(A, T0 - 60 * MINUTE), record(B, T0 - MINUTE)],
+      state: running(),
+    });
+    expect(decision.stop.map((stop) => stop.devspaceId)).toEqual([A]);
+  });
+
+  describe('the gap rule', () => {
+    it('stops nothing at the first tick and for the grace after it', () => {
+      const records = [record(A, T0 - 60 * MINUTE)];
+      let decision = decide({ now: T0, containers: [container(A)], records, state: initialRemoteState() });
+      expect(decision.grace).toBe(true);
+      expect(decision.stop).toEqual([]);
+      decision = decide({ now: T0 + REMOTE_GRACE_MS - 1, containers: [container(A)], records, state: { ...decision.state, lastTickAt: T0 + REMOTE_GRACE_MS - 1 - REMOTE_TICK_MS } });
+      expect(decision.stop).toEqual([]);
+      decision = decide({ now: T0 + REMOTE_GRACE_MS, containers: [container(A)], records, state: { ...decision.state, lastTickAt: T0 + REMOTE_GRACE_MS - REMOTE_TICK_MS } });
+      expect(decision.grace).toBe(false);
+      expect(decision.stop).toHaveLength(1);
+    });
+
+    it('starts the grace after a pause of more than a minute, also when the clock went back', () => {
+      const records = [record(A, T0 - 60 * MINUTE)];
+      const paused = decide({ now: T0, containers: [container(A)], records, state: running({ lastTickAt: T0 - REMOTE_GAP_MS - 1 }) });
+      expect(paused.grace).toBe(true);
+      expect(paused.stop).toEqual([]);
+      const back = decide({ now: T0, containers: [container(A)], records, state: running({ lastTickAt: T0 + 10 * MINUTE }) });
+      expect(back.grace).toBe(true);
+      // A gap within the limit is no pause.
+      const normal = decide({ now: T0, containers: [container(A)], records, state: running({ lastTickAt: T0 - REMOTE_GAP_MS }) });
+      expect(normal.grace).toBe(false);
+      expect(normal.stop).toHaveLength(1);
+    });
+
+    it('honours shorter times (the tests of the container)', () => {
+      const timing = { gapMs: 2000, graceMs: 4000 };
+      const records = [record(A, T0 - 60 * MINUTE)];
+      const first = decide({ now: T0, containers: [container(A)], records, state: initialRemoteState(), timing });
+      expect(first.stop).toEqual([]);
+      const later = decide({ now: T0 + 4000, containers: [container(A)], records, state: { ...first.state, lastTickAt: T0 + 3500 }, timing });
+      expect(later.stop).toHaveLength(1);
+    });
+  });
+
+  // A time in the future counts as now, and the record still counts.
+  it('takes a record with a time more than 5 minutes in the future as written when first seen, and lets it age', () => {
+    const future = [record(A, T0 + 365 * 24 * 60 * MINUTE, { limitSeconds: 60 })];
+    const first = decide({ now: T0, containers: [container(A)], records: future, state: running() });
+    expect(first.stop).toEqual([]);
+    // Not dropped (the devspace is still acted on), and not fresh for ever: stopped once the limit passed since then.
+    const later = decide({ now: T0 + 2 * MINUTE, containers: [container(A)], records: future, state: { ...first.state, lastTickAt: T0 + 2 * MINUTE - REMOTE_TICK_MS } });
+    expect(later.stop.map((stop) => stop.devspaceId)).toEqual([A]);
+    expect(later.stop[0].reason).toContain('2 minutes');
+  });
+
+  it('takes a record up to 5 minutes in the future as it is', () => {
+    const near = [record(A, T0 + FUTURE_RECORD_TOLERANCE_MS, { limitSeconds: 60 })];
+    const decision = decide({ now: T0, containers: [container(A)], records: near, state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.state.futureSeen).toBeUndefined();
+    const later = decide({ now: T0 + 5 * MINUTE, containers: [container(A)], records: near, state: running({}, T0 + 5 * MINUTE) });
+    expect(later.stop).toEqual([]);
+  });
+
+  describe('old records', () => {
+    it('removes a record older than 7 days whose devspace has no container at all', () => {
+      const old = record(B, T0 - RECORD_MAX_AGE_MS - 1);
+      const young = record(B, T0 - RECORD_MAX_AGE_MS + 1000, { source: OTHER });
+      const decision = decide({ now: T0, containers: [], records: [old, young], state: running() });
+      expect(decision.forget).toEqual([old]);
+    });
+
+    it('keeps an old record while a container of its devspace exists, also a stopped one', () => {
+      const old = record(A, T0 - RECORD_MAX_AGE_MS - 1);
+      expect(decide({ now: T0, containers: [container(A, 'exited')], records: [old], state: running() }).forget).toEqual([]);
+    });
+
+    // The absolute age, so a record far in the future is removed too.
+    it('removes a record more than 7 days in the future whose devspace has no container, and keeps a nearer one', () => {
+      const far = record(B, T0 + RECORD_MAX_AGE_MS + 1);
+      const near = record(B, T0 + RECORD_MAX_AGE_MS, { source: OTHER });
+      // A recent record of another devspace (with a container) stays, and it is earlier than `far` as the rules see
+      // it (`far` is clamped to now), so it would hold `far` if the records of other devspaces counted; only those
+      // of its own devspace do.
+      const recent = record(A, T0 - MINUTE);
+      const decision = decide({ now: T0, containers: [container(A)], records: [far, near, recent], state: running() });
+      expect(decision.forget).toEqual([far]);
+      // With a container, it stays.
+      expect(decide({ now: T0, containers: [container(B, 'exited')], records: [far], state: running() }).forget).toEqual([]);
+    });
+
+    // `forget` is in the order of removal, by the times as the rules see them (a time in the future counts from when it
+    // was first seen), of equal `at` a keep last; the loop removes them in this order.
+    describe('in the order of removal', () => {
+      const DAY = 24 * 60 * MINUTE;
+
+      it('puts a keep last of two far-future records seen at the same tick, whatever their written times', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const other = record(B, T0 + 9 * DAY, { source: OTHER });
+        const past = record(B, T0 - 8 * DAY, { source: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+        // Also after every start of the monitor, when nothing was seen before.
+        expect(decide({ now: T0, containers: [], records: [keep, other, past], state: running() }).forget).toEqual([past, other, keep]);
+      });
+
+      it('orders by the time first seen, not the written time', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const other = record(B, T0 + 9 * DAY, { source: OTHER });
+        const state = running({ futureSeen: { [`${OTHER}.${B}.${other.at}`]: T0 - DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, other], state }).forget).toEqual([other, keep]);
+      });
+
+      it('never forgets a far-future record seen later than a record of its devspace that stays', () => {
+        const keep = record(B, T0 + 8 * DAY, { keepRunning: true });
+        const young = record(B, T0 - DAY, { source: OTHER });
+        const past = record(B, T0 - 9 * DAY, { source: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+        expect(decide({ now: T0, containers: [], records: [keep, young, past], state: running() }).forget).toEqual([past]);
+        // A keep seen at the same time as the one that stays stays too; one seen before it is forgotten.
+        const same = running({ futureSeen: { [`${SOURCE}.${B}.${keep.at}`]: T0 - DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, young], state: same }).forget).toEqual([]);
+        const before = running({ futureSeen: { [`${SOURCE}.${B}.${keep.at}`]: T0 - 2 * DAY } });
+        expect(decide({ now: T0, containers: [], records: [keep, young], state: before }).forget).toEqual([keep]);
+      });
+    });
+
+    describe('superseded records', () => {
+      const THIRD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+      it('removes an old record without keepRunning when a newer record of the same devspace exists', () => {
+        const old = record(A, T0 - RECORD_MAX_AGE_MS - 1);
+        const newer = record(A, T0 - MINUTE, { source: OTHER });
+        const decision = decide({ now: T0, containers: [container(A)], records: [old, newer], state: running() });
+        expect(decision.superseded).toEqual([old]);
+        expect(decision.forget).toEqual([]);
+        // Without a container too; it is then in `forget` only.
+        const gone = decide({ now: T0, containers: [], records: [old, newer], state: running() });
+        expect(gone.forget).toEqual([old]);
+        expect(gone.superseded).toEqual([]);
+      });
+
+      it('keeps a superseded record that is not older than 7 days', () => {
+        const young = record(A, T0 - RECORD_MAX_AGE_MS);
+        const newer = record(A, T0 - MINUTE, { source: OTHER });
+        expect(decide({ now: T0, containers: [container(A)], records: [young, newer], state: running() }).superseded).toEqual([]);
+      });
+
+      it('keeps an old record that says keepRunning while a container exists, even with a newer record', () => {
+        const keep = record(A, T0 - RECORD_MAX_AGE_MS - 1, { keepRunning: true });
+        const newer = record(A, T0 - MINUTE, { source: OTHER });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, newer], state: running() });
+        expect(decision.superseded).toEqual([]);
+        expect(decision.forget).toEqual([]);
+      });
+
+      it('keeps the newest record of a devspace, however old', () => {
+        const newest = record(A, T0 - RECORD_MAX_AGE_MS - MINUTE);
+        const older = record(A, T0 - RECORD_MAX_AGE_MS - 2 * MINUTE, { source: OTHER });
+        const decision = decide({ now: T0, containers: [container(A, 'exited')], records: [newest, older], state: running() });
+        expect(decision.superseded).toEqual([older]);
+      });
+
+      it('keeps old records on a tie of their times, and removes only those with a strictly newer one', () => {
+        const at = T0 - RECORD_MAX_AGE_MS - MINUTE;
+        const one = record(A, at);
+        const two = record(A, at, { source: OTHER });
+        expect(decide({ now: T0, containers: [container(A)], records: [one, two], state: running() }).superseded).toEqual([]);
+        const newer = record(A, T0 - MINUTE, { source: THIRD });
+        expect(decide({ now: T0, containers: [container(A)], records: [one, two, newer], state: running() }).superseded).toEqual([one, two]);
+      });
+
+      it('compares the times as the rules see them: a record in the future counts from when it was first seen', () => {
+        const old = record(A, T0 - RECORD_MAX_AGE_MS - 1);
+        // Far in the future, first seen now: it is newer than the old record, so the old one goes.
+        const future = record(A, T0 + 30 * 24 * 60 * MINUTE, { source: OTHER });
+        const first = decide({ now: T0, containers: [container(A)], records: [old, future], state: running() });
+        expect(first.superseded).toEqual([old]);
+        // The future record itself is not removed by this rule: it is the newest.
+        expect(first.superseded).not.toContain(future);
+        // An old record whose clamped time is not older than 7 days stays, however far its written time is.
+        const later = decide({ now: T0 + MINUTE, containers: [container(A)], records: [future, record(A, T0 + MINUTE, { source: THIRD })], state: first.state });
+        expect(later.superseded).toEqual([]);
+      });
+
+      // The times of the rules for the record itself and for the others, with a record in the future that was first
+      // seen days ago (futureSeen, `<source>.<devspace id>.<at>`).
+      describe('with a record in the future first seen days ago', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const future = record(A, T0 + 30 * DAY, { source: OTHER });
+        const seenAt = (time: number) => running({ futureSeen: { [`${OTHER}.${A}.${future.at}`]: time } });
+
+        it('removes an old record older than the first sight of the future one', () => {
+          const old = record(A, T0 - 11 * DAY);
+          expect(decide({ now: T0, containers: [container(A)], records: [future, old], state: seenAt(T0 - 10 * DAY) }).superseded).toEqual([old]);
+        });
+
+        it('removes the future record itself when it was first seen more than 7 days ago and a newer record exists', () => {
+          const newer = record(A, T0 - 1000);
+          expect(decide({ now: T0, containers: [container(A)], records: [future, newer], state: seenAt(T0 - 8 * DAY) }).superseded).toEqual([future]);
+        });
+
+        it('compares the others by the time of the rules too: its written time does not make it newer', () => {
+          const old = record(A, T0 - 9 * DAY);
+          expect(decide({ now: T0, containers: [container(A)], records: [future, old], state: seenAt(T0 - 10 * DAY) }).superseded).toEqual([future]);
+        });
+      });
+
+      // An old keep of another computer that is not newer than the record holds the record back (rules.ts).
+      it('keeps an old record while a keepRunning record of another computer is not newer than it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 - 10 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() });
+        expect(decision.superseded).not.toContain(own);
+        // A keep of another computer that is newer than the record does not hold it back.
+        const newerKeep = record(A, T0 - 8 * DAY, { source: OTHER, keepRunning: true });
+        expect(decide({ now: T0, containers: [container(A)], records: [newerKeep, own, newest], state: running() }).superseded).toEqual([own]);
+      });
+
+      // A keep of another computer with the same time as the record holds it back too, as a precaution.
+      it('keeps an old record while a keepRunning record of another computer has the same time', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        expect(decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state: running() }).superseded).toEqual([]);
+      });
+
+      // Only a keep of the same devspace holds a record back, not one of another.
+      it('removes an old record although an old keepRunning record of another devspace is not newer than it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const otherKeep = record(B, T0 - 10 * DAY, { source: OTHER, keepRunning: true });
+        const sameTime = record(B, own.at, { source: OTHER, keepRunning: true });
+        for (const keep of [otherKeep, sameTime]) {
+          expect(decide({ now: T0, containers: [container(A), container(B)], records: [keep, own, newest], state: running() }).superseded).toEqual([own]);
+        }
+      });
+
+      // The keep check compares the written times: a record in the future first seen 10 days ago stays while an older
+      // keep of another computer exists, although its clamped time is older than that keep.
+      it('compares the keep of another computer by the written times', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const own = record(A, T0 + 30 * DAY);
+        const keep = record(A, T0 - 9 * DAY, { source: OTHER, keepRunning: true });
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const state = running({ futureSeen: { [`${SOURCE}.${A}.${own.at}`]: T0 - 10 * DAY } });
+        const decision = decide({ now: T0, containers: [container(A)], records: [own, keep, newest], state });
+        expect(decision.superseded).not.toContain(own);
+      });
+
+      // The other way round. A keep of another computer whose written time is later than the record, but that was first
+      // seen before it (a time in the future), does not hold the record back: by the written times it is newer.
+      it('removes an old record although a keep of another computer in the future was first seen before it', () => {
+        const DAY = 24 * 60 * MINUTE;
+        const keep = record(A, T0 + 30 * DAY, { source: OTHER, keepRunning: true });
+        const own = record(A, T0 - 9 * DAY);
+        const newest = record(A, T0 - 5 * MINUTE, { source: THIRD });
+        const state = running({ futureSeen: { [`${OTHER}.${A}.${keep.at}`]: T0 - 10 * DAY } });
+        const decision = decide({ now: T0, containers: [container(A)], records: [keep, own, newest], state });
+        expect(decision.superseded).toEqual([own]);
+      });
+    });
+  });
+
+  it('does not change the state it was given', () => {
+    const state = running({ graceUntil: T0 + MINUTE });
+    const copy = JSON.parse(JSON.stringify(state)) as RemoteMonitorState;
+    decide({ now: T0, containers: [container(A)], records: [], state });
+    expect(state).toEqual(copy);
+  });
+});
+
+// The activity of the engine for the idle exit of the monitor (main.ts).
+describe('decide: active', () => {
+  const at = (records: RemoteRecord[], containers: RemoteContainer[] = [], now = T0, state = running({}, now)) => decide({ now, containers, records, state });
+
+  it('is false without containers and records, and with only ended containers', () => {
+    expect(at([]).active).toBe(false);
+    expect(at([], [container(A, 'exited'), container(B, 'dead')]).active).toBe(false);
+  });
+
+  it('is true for a record within its limit, also without any container, and false once it aged past it', () => {
+    expect(at([record(A, T0 - 10 * MINUTE)]).active).toBe(true);
+    expect(at([record(A, T0 - 10 * MINUTE - 1)]).active).toBe(false);
+    expect(at([record(A, T0 - 2 * MINUTE, { limitSeconds: 60 })]).active).toBe(false);
+  });
+
+  // A container left `created` for ever (a failed start after `up`) must not keep the monitor; the window of an open
+  // sends heartbeats until its container started.
+  it('is false for a labelled container in the state created with only stale records', () => {
+    expect(at([], [container(A, 'created')]).active).toBe(false);
+    expect(at([record(A, T0 - 10 * MINUTE - 1)], [container(A, 'created')]).active).toBe(false);
+    // A fresh record still counts.
+    expect(at([record(A, T0 - 10 * MINUTE)], [container(A, 'created')]).active).toBe(true);
+  });
+
+  // An old keep never counts; a kept container that runs counts in the loop itself (anyRunning).
+  it('is false for an old keep, whatever the state of its containers', () => {
+    const keep = record(A, T0 - 60 * MINUTE, { keepRunning: true });
+    expect(at([keep], [container(A, 'created')]).active).toBe(false);
+    expect(at([keep], [container(A, 'paused')]).active).toBe(false);
+    expect(at([keep], [container(A, 'removing')]).active).toBe(false);
+    expect(at([keep], [container(A, 'exited')]).active).toBe(false);
+    expect(at([keep]).active).toBe(false);
+    // A container of another devspace is not its.
+    expect(at([keep], [container(B, 'removing')]).active).toBe(false);
+  });
+
+  it('ages a record from the future from when it was first seen, as the stop does', () => {
+    const future = [record(A, T0 + 60 * MINUTE, { limitSeconds: 60 })];
+    const first = at(future);
+    expect(first.active).toBe(true);
+    const later = at(future, [], T0 + 2 * MINUTE, { ...first.state, lastTickAt: T0 + 2 * MINUTE - REMOTE_TICK_MS });
+    expect(later.active).toBe(false);
+  });
+});
+
+// A release (the short limit of a window that left the devspace) never shortens the live record of another computer.
+describe('decide: release records', () => {
+  const stopped = (records: RemoteRecord[], now = T0) => decide({ now, containers: [container(A)], records, state: running({}, now) }).stop.map((stop) => stop.devspaceId);
+
+  it('a release decides alone: the devspace stops after its short limit', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    expect(stopped([release])).toEqual([A]);
+    expect(stopped([{ ...release, at: T0 - 3 * MINUTE }])).toEqual([]);
+  });
+
+  it('a release does not decide while a record of another computer is still within its own limit: that record decides', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    // Computer OTHER sent its long heartbeat 8 minutes ago (limit 10 minutes): it still uses the devspace.
+    const other = record(A, T0 - 8 * MINUTE, { source: OTHER, limitSeconds: 600 });
+    expect(stopped([release, other])).toEqual([]);
+    // Once that record ran out, the release decides again (it is the newest).
+    expect(stopped([release, other], T0 + 3 * MINUTE)).toEqual([A]);
+  });
+
+  it('the newest record that is no release decides then, also a keep of another computer that still sends', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    const keep = record(A, T0 - 5 * MINUTE, { source: OTHER, keepRunning: true, limitSeconds: 600 });
+    const decision = decide({ now: T0, containers: [container(A)], records: [release, keep], state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.kept).toEqual([A]);
+  });
+
+  it('an old record of another computer (beyond its limit) does not hold a release back, not even an old keep', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    expect(stopped([release, record(A, T0 - 30 * MINUTE, { source: OTHER, limitSeconds: 600 })])).toEqual([A]);
+    expect(stopped([release, record(A, T0 - 30 * MINUTE, { source: OTHER, keepRunning: true, limitSeconds: 600 })])).toEqual([A]);
+  });
+
+  it('a release of another computer does not hold a release back, and a newer plain record decides as before', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    const otherRelease = record(A, T0 - 5 * MINUTE, { source: OTHER, limitSeconds: 210, release: true });
+    expect(stopped([release, otherRelease])).toEqual([A]);
+    // Also while the release of the other computer is still within its own limit: the newest release decides.
+    const shortRelease = record(A, T0 - 2 * MINUTE, { limitSeconds: 60, release: true });
+    expect(stopped([shortRelease, record(A, T0 - 3 * MINUTE, { source: OTHER, limitSeconds: 210, release: true })])).toEqual([A]);
+    // A newer plain heartbeat of another computer decides by the usual rules.
+    expect(stopped([release, record(A, T0 - 1 * MINUTE, { source: OTHER, limitSeconds: 600 })])).toEqual([]);
+    // A live record of another devspace does not hold it back.
+    expect(stopped([release, record(B, T0, { limitSeconds: 600 })])).toEqual([A]);
+  });
+
+  // With three sources, an expired record of a third computer that is newer than the live one must not decide (it would
+  // stop the devspace at once).
+  const THIRD = '00112233445566778899aabbccddeeff';
+  it('decides among the live records of other sources only: a newer expired record of a third computer does not stop it', () => {
+    // S (SOURCE) released 2 minutes ago (210 s); T (OTHER) sent its long heartbeat 8 minutes ago (10 minutes, live); U
+    // (THIRD) sent a heartbeat 3 minutes ago with a limit of 1 minute (expired), newer than T's.
+    const release = record(A, T0 - 2 * MINUTE, { limitSeconds: 210, release: true });
+    const live = record(A, T0 - 8 * MINUTE, { source: OTHER, limitSeconds: 600 });
+    const expired = record(A, T0 - 3 * MINUTE, { source: THIRD, limitSeconds: 60 });
+    expect(stopped([release, live, expired])).toEqual([]);
+    // Neither after the release's own limit, while T is within its own: T decides.
+    expect(stopped([release, live, expired], T0 + 2 * MINUTE)).toEqual([]);
+    // Once T ran out too, the release decides (it is the newest): the stop.
+    expect(stopped([release, live, expired], T0 + 2 * MINUTE + 1)).toEqual([A]);
+    // An expired keep of the third computer does not keep it either; T decides (no stop, not kept).
+    const expiredKeep = { ...expired, keepRunning: true };
+    const decision = decide({ now: T0, containers: [container(A)], records: [release, live, expiredKeep], state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.kept).toEqual([]);
+  });
+
+  // An expired release of another computer never decides over the live plain record of a third one.
+  it('an expired release of another computer does not decide over the live plain record of a third one', () => {
+    const own = record(A, T0 - 1 * MINUTE, { limitSeconds: 210, release: true });
+    const otherRelease = record(A, T0 - 4 * MINUTE, { source: OTHER, limitSeconds: 210, release: true });
+    const live = record(A, T0 - 10 * MINUTE, { source: THIRD, limitSeconds: 3600 });
+    expect(stopped([own, otherRelease, live])).toEqual([]);
+    expect(stopped([own, otherRelease, live], T0 + 10 * MINUTE)).toEqual([]);
+  });
+
+  // A record exactly at its limit is still live (`<=`): it holds a release back, and it is not stopped itself.
+  it('a record of another computer exactly at its limit still holds the release back; one millisecond later it does not', () => {
+    const release = record(A, T0 - 4 * MINUTE, { limitSeconds: 210, release: true });
+    const other = record(A, T0 - 10 * MINUTE, { source: OTHER, limitSeconds: 600 });
+    expect(stopped([release, other])).toEqual([]);
+    expect(stopped([release, other], T0 + 1)).toEqual([A]);
+    // A record alone, exactly at its limit, is not stopped either.
+    expect(stopped([record(A, T0 - 10 * MINUTE, { limitSeconds: 600 })])).toEqual([]);
+    expect(stopped([record(A, T0 - 10 * MINUTE - 1, { limitSeconds: 600 })])).toEqual([A]);
+  });
+
+  it('an older record of the releasing source itself does not decide over the live record of another computer', () => {
+    const release = record(A, T0 - 2 * MINUTE, { limitSeconds: 210, release: true });
+    const ownKeep = record(A, T0 - 3 * MINUTE, { keepRunning: true, limitSeconds: 600 });
+    const live = record(A, T0 - 8 * MINUTE, { source: OTHER, limitSeconds: 600 });
+    const decision = decide({ now: T0, containers: [container(A)], records: [release, ownKeep, live], state: running() });
+    expect(decision.stop).toEqual([]);
+    expect(decision.kept).toEqual([]);
+    // Once the other computer's record ran out, the release decides: the stop.
+    expect(stopped([release, ownKeep, live], T0 + 2 * MINUTE + 1)).toEqual([A]);
+  });
+});
+
+describe('REMOTE_GRACE_MS', () => {
+  it('is 5 minutes: a waking or reloaded window has the time to send its first heartbeat (RELEASE_MARGIN_SECONDS)', () => {
+    expect(REMOTE_GRACE_MS).toBe(5 * MINUTE);
+    expect(REMOTE_GRACE_MS).toBeGreaterThanOrEqual(RELEASE_MARGIN_SECONDS * 1000);
+  });
+});

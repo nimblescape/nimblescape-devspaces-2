@@ -1,0 +1,393 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
+# Release and publish a version on a manual start from the branch main, with
+# the version as input. The version job checks the version, sets it in
+# package.json and package-lock.json, adds its section to CHANGELOG.md from the
+# notes of the start when the file has none, and pushes the commit "Release
+# <version>" to the temporary branch release/run-<run ID>, not to main. A push
+# with the token of a workflow starts no other workflow, so the CI job calls
+# the workflow ci.yml for that commit; the VSIX that this job tests and builds
+# is the VSIX of the release, so the release neither repeats the tests nor
+# builds the package again. Only when CI passes, the release job moves main to
+# the commit, as a fast-forward that fails when main changed during the run,
+# deletes the temporary branch, creates the tag v<version> on the commit and
+# the GitHub release of the tag, with the section of the version as its notes
+# and the VSIX as its file. So a failed CI job changes neither main nor a tag,
+# and the version can still be released. A release that exists keeps its notes
+# and receives only a missing VSIX. The publish job downloads the VSIX of the
+# GitHub release, signs in to Microsoft Entra ID with the official azure/login
+# action and publishes the VSIX with vsce, the official Marketplace tool. The
+# sign-in exchanges the OpenID Connect token of the job through the federated
+# credential of the publishing app registration, so no long-lived credential
+# is stored. A re-run keeps the VSIX that the release already holds, and the
+# Marketplace skips a version that it already holds, so no version is
+# published twice. A dry run, also from another branch than main, runs the
+# version job and CI only and then deletes its temporary branch, so it tests a
+# release, and a change of this workflow, without a change of main, a tag, a
+# release or the Marketplace; its run name ends with "(dry run)". In a release,
+# the version job checks with scripts/release-checks.mjs that a successful dry
+# run tested the files of the release process as they are (rule 4 of the
+# release rules in CONTRIBUTING.md).
+
+name: Release
+# "(dry run)" stays at the end: the check of rule 4 finds the dry runs by it.
+run-name: Release ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release, <major>.<minor>.<patch>, for example 0.1.6
+        required: true
+        type: string
+      notes:
+        description: The notes of the version, used only when CHANGELOG.md has no section for it
+        required: false
+        type: string
+      dry_run:
+        description: Dry run, test only; changes neither main, a tag, a release nor the Marketplace
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  # Every job reads the repository; the jobs below add their own scopes.
+  contents: read
+
+concurrency:
+  # One release at a time, and a running release is never cancelled.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Pushes the version commit to a temporary branch and deletes the branches of earlier runs.
+      contents: write
+      # Reads the runs of this workflow for the check of the dry run.
+      actions: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      # The tag v<version> of the release.
+      tag: ${{ steps.check.outputs.tag }}
+      # The file name of the VSIX, <name>-<version>.vsix from the manifest, for the later jobs.
+      vsix: ${{ steps.check.outputs.vsix }}
+      # The commit of the release: the version commit, or the head of main when main holds the version already.
+      sha: ${{ steps.commit.outputs.sha }}
+      # The temporary branch of the version commit; empty when the run made no commit.
+      branch: ${{ steps.commit.outputs.branch }}
+    steps:
+      - name: Check the branch
+        if: github.ref != 'refs/heads/main' && !inputs.dry_run
+        run: |
+          echo "::error::Start the release from the branch main, not from $GITHUB_REF_NAME, or start a dry run."
+          exit 1
+
+      # The job pushes the version commit with the token of the job.
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Check the version
+        id: check
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          version="${VERSION#v}"
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::The version $VERSION does not have the form <major>.<minor>.<patch>."
+            exit 1
+          fi
+          current=$(node -p 'require("./package.json").version')
+          order=$(node -e '
+            const [a, b] = process.argv.slice(1).map((v) => v.split(".").map(Number));
+            console.log(Math.sign(a.map((x, i) => x - b[i]).find((d) => d !== 0) ?? 0));
+          ' "$version" "$current")
+          if [ "$order" = "-1" ]; then
+            echo "::error::The version $version is lower than the version $current of package.json."
+            exit 1
+          fi
+          status=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null || status=$?
+          if [ "$status" = 0 ]; then
+            echo "::error::The tag v$version exists already."
+            exit 1
+          elif [ "$status" != 2 ]; then
+            echo "::error::The tags of the repository cannot be read."
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "vsix=$(node -p 'require("./package.json").name')-$version.vsix"
+          } >> "$GITHUB_OUTPUT"
+
+      # Rule 4 of CONTRIBUTING.md: a release runs only with the files of the release process that a dry run tested.
+      - name: Check that a dry run tested the release process
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node scripts/release-checks.mjs dry-run
+
+      # package.json keeps its formatting, so only its version line changes. npm
+      # writes package-lock.json with two spaces and a final line break.
+      - name: Set the version and its change-log section
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          node - <<'JS'
+          const fs = require("node:fs");
+          const version = process.env.VERSION;
+          const manifest = fs.readFileSync("package.json", "utf8");
+          const current = JSON.parse(manifest).version;
+          if (current !== version) {
+            const updated = manifest.replace(`"version": "${current}"`, `"version": "${version}"`);
+            if (JSON.parse(updated).version !== version) {
+              console.log(`::error::The version line of package.json cannot be changed.`);
+              process.exit(1);
+            }
+            fs.writeFileSync("package.json", updated);
+            const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+            lock.version = version;
+            lock.packages[""].version = version;
+            fs.writeFileSync("package-lock.json", JSON.stringify(lock, null, 2) + "\n");
+          }
+          const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+          if (!changelog.split("\n").includes(`## ${version}`)) {
+            const notes = (process.env.NOTES ?? "").trim();
+            if (!notes) {
+              console.log(`::error::CHANGELOG.md has no section for version ${version}: add it on main, or give the notes of the version.`);
+              process.exit(1);
+            }
+            // The new section goes before the first section, or before the closing rule of a log without sections.
+            let at = changelog.search(/^## /m);
+            if (at < 0) at = changelog.search(/^---$/m);
+            if (at < 0) at = changelog.length;
+            fs.writeFileSync("CHANGELOG.md", `${changelog.slice(0, at)}## ${version}\n\n${notes}\n\n${changelog.slice(at)}`);
+          }
+          JS
+
+      - name: Take the notes of the version
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          awk -v heading="## $VERSION" \
+            '$0 == heading { found = 1; next } found && (/^## / || /^---$/) { exit } found { print }' \
+            CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::The section of version $VERSION in CHANGELOG.md is empty."
+            exit 1
+          fi
+
+      # One release runs at a time, so a branch release/run-* of another run
+      # belongs to an earlier run that failed; this run replaces it.
+      - name: Delete the branches of earlier runs
+        run: |
+          git ls-remote --heads origin 'refs/heads/release/run-*' | while read -r _ ref; do
+            if [ "$ref" != "refs/heads/release/run-$GITHUB_RUN_ID" ]; then
+              git push --quiet origin --delete "$ref"
+            fi
+          done
+
+      # main receives the commit only after CI passed, so the commit goes to a temporary branch.
+      - name: Commit the version to a temporary branch
+        id: commit
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --quiet --all --message "Release $VERSION"
+            branch="release/run-$GITHUB_RUN_ID"
+            git push --quiet --force origin "HEAD:refs/heads/$branch"
+            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: notes.md
+          if-no-files-found: error
+
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.version.outputs.sha }}
+
+  github-release:
+    name: Main, tag and GitHub release
+    needs: [version, ci]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Moving main, creating the tag, the release and uploading its file needs write access.
+      contents: write
+    steps:
+      # The commit passed CI, so main moves to it. The compare status tells
+      # whether the commit is ahead of main (a fast-forward), already on main
+      # (identical or behind), or not on top of main, because main changed
+      # during the run (diverged), which stops the release before the tag.
+      - name: Move main to the commit of the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.version.outputs.sha }}
+          BRANCH: ${{ needs.version.outputs.branch }}
+        run: |
+          status=$(gh api "repos/$GH_REPO/compare/main...$SHA" --jq .status)
+          case "$status" in
+            ahead)
+              gh api --method PATCH "repos/$GH_REPO/git/refs/heads/main" -f sha="$SHA" -F force=false > /dev/null ;;
+            identical | behind) ;;
+            *)
+              echo "::error::main changed during the release; start the release again."
+              exit 1 ;;
+          esac
+          if [ -n "$BRANCH" ] && gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" > /dev/null 2>&1; then
+            gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH"
+          fi
+
+      - name: Download the VSIX of the CI job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vsix
+
+      - name: Download the notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notes
+
+      - name: Check the VSIX
+        env:
+          VSIX: ${{ needs.version.outputs.vsix }}
+        run: |
+          if [ ! -f "$VSIX" ]; then
+            echo "::error::The CI job built no $VSIX."
+            exit 1
+          fi
+
+      # A re-run keeps a tag that names the commit of the release.
+      - name: Create the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+        run: |
+          # gh writes the body of an error response, for example 404, to the output, so the exit status decides.
+          if existing=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq .object.sha 2> /dev/null); then
+            if [ "$existing" != "$SHA" ]; then
+              echo "::error::The tag $TAG names $existing, not the commit $SHA of the release."
+              exit 1
+            fi
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" > /dev/null
+          fi
+
+      # The GitHub CLI of the runner creates the release as a draft, uploads
+      # the VSIX and publishes the release after the upload. A release that
+      # exists keeps its notes, and a VSIX that it holds stays unchanged.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VSIX: ${{ needs.version.outputs.vsix }}
+        run: |
+          if gh release view "$TAG" --json assets --jq '.assets[].name' > assets.txt; then
+            if grep -Fqx "$VSIX" assets.txt; then
+              echo "The release $TAG keeps its file $VSIX."
+            else
+              gh release upload "$TAG" "$VSIX"
+            fi
+          else
+            gh release create "$TAG" "$VSIX" --title "$TAG" --notes-file notes.md --verify-tag
+          fi
+
+  # After CI, also when a job failed, so that the temporary branch never stays. A re-run of the failed jobs runs this
+  # job again, after the branch is gone.
+  dry-run:
+    name: Dry run, delete the temporary branch
+    needs: [version, ci]
+    if: ${{ always() && inputs.dry_run && needs.version.outputs.branch != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Deletes the temporary branch of the version commit.
+      contents: write
+    steps:
+      - name: Delete the temporary branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ needs.version.outputs.branch }}
+        run: |
+          if gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" > /dev/null 2>&1; then
+            gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$BRANCH"
+          fi
+
+  publish:
+    name: Publish to the Visual Studio Marketplace
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    # The rules of the environment decide which runs may publish, and its name
+    # is part of the subject of the federated credential.
+    environment: marketplace
+    permissions:
+      contents: read
+      # azure/login exchanges the OpenID Connect token of this job.
+      id-token: write
+    steps:
+      - name: Check out the source of the release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      - name: Download the VSIX of the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VSIX: ${{ needs.version.outputs.vsix }}
+        run: gh release download "$TAG" --pattern "$VSIX"
+
+      - name: Sign in to Microsoft Entra ID
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          # An app registration publishes without an Azure subscription.
+          allow-no-subscriptions: true
+
+      - name: Publish the VSIX package
+        env:
+          # vsce requests the token of the signed-in Azure CLI for this tenant.
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          VSIX: ${{ needs.version.outputs.vsix }}
+        run: npx vsce publish --azure-credential --packagePath "$VSIX" --skip-duplicate

@@ -1,0 +1,27 @@
+nimblescape Devspaces 2: third-party notices
+
+This extension contains material from the project below. Its license applies to that material only.
+The rest of the extension is under the MIT License in the file LICENSE
+(LICENSE.txt in the installed extension).
+
+Codicons (the icons of Visual Studio Code)
+https://github.com/microsoft/vscode-codicons
+Copyright (c) Microsoft Corporation.
+License: Creative Commons Attribution 4.0 International (CC BY 4.0),
+https://creativecommons.org/licenses/by/4.0/legalcode
+
+Where the codicons are used, and what was changed:
+- resources/icon.svg (the icon of Devspaces in the activity bar): the codicon "open-in-window",
+  not changed.
+- resources/icon.png (the icon of the extension, for example on the Marketplace): the codicon
+  "open-in-window" in white on a blue square with round corners, 256 x 256 pixels. Changed: color,
+  size and background.
+- resources/icons/devspace-icons.woff (the icons of the rows of the view): shapes of the codicons "vm",
+  "vm-connect", "vm-running", "vm-pending" and "vm-outline". Changed: scripts/build-icon-font.py
+  combines, scales, moves and cuts these shapes. It also adds two shapes of its own: a filled screen,
+  and the exclamation mark of the warning sign. The folder scripts/icons of the repository shows each
+  result.
+
+The licensor offers the material as-is, without any warranty (section 5 of the license).
+The license gives no right to use the names, logos or trademarks of Microsoft. Microsoft is not
+affiliated with nimblescape and does not endorse this extension.

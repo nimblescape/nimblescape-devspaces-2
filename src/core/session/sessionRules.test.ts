@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// The session helpers of src/core/session.
+import { describe, expect, it } from 'vitest';
+import { isProcessAlive, keepFlagsOf, keptWhenClosed, stopAfterSeconds } from './sessionRules';
+
+describe('sessionRules', () => {
+  it('stopAfterSeconds clamps to one minute..one day and gives 10 minutes for a value that is no number', () => {
+    expect(stopAfterSeconds(10)).toBe(600);
+    expect(stopAfterSeconds(1.5)).toBe(90);
+    expect(stopAfterSeconds(0)).toBe(60);
+    expect(stopAfterSeconds(5000)).toBe(86_400);
+    expect(stopAfterSeconds(undefined)).toBe(600);
+    expect(stopAfterSeconds(Number.NaN)).toBe(600);
+  });
+
+  it('keptWhenClosed follows Keep Running, Close and Keep Running, stopOnClose and a respected shutdownAction none', () => {
+    const settings = { stopOnClose: true, respectShutdownActionNone: false };
+    expect(keptWhenClosed(keepFlagsOf({}), settings)).toBe(false);
+    expect(keptWhenClosed(keepFlagsOf({ keepRunning: true }), settings)).toBe(true);
+    expect(keptWhenClosed(keepFlagsOf({ keepRunningOnce: true }), settings)).toBe(true);
+    expect(keptWhenClosed(keepFlagsOf({ shutdownActionNone: true }), settings)).toBe(false);
+    expect(keptWhenClosed(keepFlagsOf({ shutdownActionNone: true }), { ...settings, respectShutdownActionNone: true })).toBe(true);
+    expect(keptWhenClosed(keepFlagsOf({}), { ...settings, stopOnClose: false })).toBe(true);
+    // Anything but an explicit false keeps the default (stop).
+    expect(keptWhenClosed(keepFlagsOf({}), {})).toBe(false);
+  });
+
+  // A flag or setting that is not set is never a keep.
+  it('keepFlagsOf of an entry without flags is all false; respectShutdownActionNone unset does not respect it', () => {
+    expect(keepFlagsOf({})).toEqual({ keepRunning: false, shutdownActionNone: false });
+    expect(keptWhenClosed({ keepRunning: false, shutdownActionNone: true }, { stopOnClose: true })).toBe(false);
+    expect(keptWhenClosed({ keepRunning: false, shutdownActionNone: true }, { stopOnClose: true, respectShutdownActionNone: undefined })).toBe(false);
+  });
+
+  it('isProcessAlive: this process lives, invalid IDs do not', () => {
+    expect(isProcessAlive(process.pid)).toBe(true);
+    expect(isProcessAlive(0)).toBe(false);
+    expect(isProcessAlive(-1)).toBe(false);
+    expect(isProcessAlive(1.5)).toBe(false);
+    expect(isProcessAlive(0x80000000)).toBe(false);
+  });
+});

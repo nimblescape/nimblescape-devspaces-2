@@ -1,0 +1,1000 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// The port `DockerEngine` of the flows in the worker (src/core/worker/dockerEngine.ts) over the Docker Engine API
+// (engineApi.ts). One request per call, no `docker` process; `exec` runs over a hijacked connection, so the standard
+// input of a script (its secret) never becomes an argument.
+import { publicInfo, toContainerInfo, toLabels } from '../core/docker/dockerObjects';
+import {
+  EngineError,
+  type DockerEngine,
+  type EngineAttachedOptions,
+  type EngineAttachedRun,
+  type EngineAttachedSpec,
+  type EngineContainer,
+  type EngineContainerSummary,
+  type EngineExecOptions,
+  type EngineExecResult,
+  type EngineFilters,
+  type EngineImage,
+  type EngineObjectKind,
+  type EnginePullLogin,
+  MAX_IMAGE_FILE_BYTES,
+  type MonitorCreated,
+  type MonitorRunSpec,
+} from '../core/worker/dockerEngine';
+import { abortError, isAbortError, type StartedProcess } from '../core/ports';
+import { errorMessage } from '../core/errors';
+import { readableStderr } from '../core/loader/pipeLoader';
+import * as crypto from 'crypto';
+import { hasTagOrDigest, parseEngineIdentity, StreamRedactor } from '../core/helperChannel/protocol';
+import { StringDecoder } from 'string_decoder';
+import { firstTarFile, maxTarFileArchiveBytes } from '../core/docker/tarFile';
+import {
+  MAX_ENGINE_LIST_ANSWER_CHARACTERS,
+  engineApi,
+  engineErrorMessage,
+  engineHijack,
+  type EngineAnswer,
+  type EngineApi,
+  type EngineHijackRequest,
+  type EngineStream,
+} from './engineApi';
+
+/**
+ * The container of an inspect answer, read as the pipeline reads `docker inspect` (toContainerInfo of dockerObjects.ts:
+ * one reading for both), with the exit code and the restarts.
+ */
+function containerOf(value: unknown): EngineContainer | undefined {
+  const inspected = toContainerInfo(value);
+  if (inspected === undefined) return undefined;
+  const raw = value as { State?: { ExitCode?: unknown }; RestartCount?: unknown };
+  const container: EngineContainer = publicInfo(inspected);
+  if (typeof raw.State?.ExitCode === 'number') container.exitCode = raw.State.ExitCode;
+  if (typeof raw.RestartCount === 'number') container.restartCount = raw.RestartCount;
+  if (inspected.created !== '') container.created = inspected.created;
+  return container;
+}
+
+/** The Engine API answer as JSON, or undefined when it cannot be read. */
+function json(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The hijacked start of an exec (engineHijack). */
+export type EngineHijack = (request: EngineHijackRequest) => Promise<EngineStream>;
+
+/** The path of an inspect of each kind. */
+const INSPECT_PATHS: Record<EngineObjectKind, (reference: string) => string> = {
+  container: (reference) => `/containers/${encodeURIComponent(reference)}/json`,
+  image: (reference) => `/images/${encodeURIComponent(reference)}/json`,
+  volume: (reference) => `/volumes/${encodeURIComponent(reference)}`,
+  network: (reference) => `/networks/${encodeURIComponent(reference)}`,
+};
+
+/** The query of the filters of a list request. */
+function filtersQuery(filters: EngineFilters): string {
+  return `filters=${encodeURIComponent(JSON.stringify(filters))}`;
+}
+
+/**
+ * The value of the header X-Registry-Auth: the credentials as JSON in URL-safe Base64 **with** its padding, as the
+ * Docker CLI sends them (Go's base64.URLEncoding). The engine decodes it strictly and ignores a header it cannot
+ * decode, so Node's `base64url` (without `=`) would make it pull anonymously in 2 of 3 cases. `identitytoken`: an
+ * identity token of `docker login` in place of a user and password.
+ */
+export function registryAuthHeader(credentials: { username: string; password: string; serveraddress: string } | { identitytoken: string; serveraddress: string }): string {
+  return Buffer.from(JSON.stringify(credentials), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+interface PullMessage {
+  status?: unknown;
+  id?: unknown;
+  progressDetail?: { current?: unknown };
+  error?: unknown;
+  errorDetail?: { message?: unknown };
+}
+
+/**
+ * The line of `docker pull` for one message of the engine's progress stream, or undefined for the progress bars of a
+ * layer (`Downloading`, `Extracting` with a current size), which `docker pull` without a terminal does not print either.
+ */
+export function pullLine(message: PullMessage): string | undefined {
+  if (typeof message.status !== 'string') return undefined;
+  if (message.progressDetail !== undefined && typeof message.progressDetail === 'object' && message.progressDetail !== null && message.progressDetail.current !== undefined) {
+    return undefined;
+  }
+  return typeof message.id === 'string' && message.id !== '' ? `${message.id}: ${message.status}` : message.status;
+}
+
+/** The time of the engine (seconds since 1970) as RFC 3339. */
+function isoOf(seconds: unknown): string {
+  return typeof seconds === 'number' && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : '';
+}
+
+function texts(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
+/**
+ * The name of a container in the list of the engine (`Names`, each with a leading `/`): its own name, not an alias of a
+ * legacy `--link` (`/<other>/<alias>`, which the engine may sort first), as `docker ps` shows it; the first one when
+ * all have a further `/`; '' when the list gives none.
+ */
+export function containerName(names: readonly string[]): string {
+  const plain = names.map((name) => name.replace(/^\//, ''));
+  return plain.find((name) => !name.includes('/')) ?? plain[0] ?? '';
+}
+
+/**
+ * The port over the Engine API of the worker's engine. `secretOf` gives the value of a secret that the operation holds
+ * (OperationContext.secrets), for the standard input of an exec (EngineExecOptions.secretInputName) and the login of a
+ * pull; the port of an operation is built with its own secrets.
+ */
+export function dockerEngine(
+  api: EngineApi = engineApi(),
+  hijack: EngineHijack = engineHijack(),
+  secretOf: (name: string) => string | undefined = () => undefined,
+  // Every secret of the operation, masked in the output of an exec.
+  secrets: () => Iterable<string> = () => [],
+): DockerEngine {
+  const fail = (answer: { status: number; body: string }): never => {
+    throw new EngineError(engineErrorMessage({ ...answer, truncated: false }), answer.status);
+  };
+  const inspect = async (kind: EngineObjectKind, reference: string, signal?: AbortSignal): Promise<unknown> => {
+    const answer = await api({ method: 'GET', path: INSPECT_PATHS[kind](reference), signal });
+    if (answer.status === 404) return undefined;
+    if (answer.status !== 200) fail(answer);
+    const value = json(answer.body);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new EngineError(`The engine answered the inspect of the ${kind} ${reference} with an invalid value.`, answer.status);
+    return value;
+  };
+  // `maxCharacters`, the bound of the answer of a list of every container or image (MAX_ENGINE_LIST_ANSWER_CHARACTERS);
+  // the engineApi's default for every other request.
+  const list = async (path: string, signal?: AbortSignal, maxCharacters?: number): Promise<unknown> => {
+    const answer = await api({ method: 'GET', path, signal, ...(maxCharacters !== undefined ? { maxCharacters } : {}) });
+    if (answer.status !== 200) fail(answer);
+    if (answer.truncated) throw new EngineError(`The engine answered ${path.split('?')[0]} with more than can be read.`, answer.status);
+    const value = json(answer.body);
+    if (value === undefined) throw new EngineError(`The engine answered ${path.split('?')[0]} with an invalid value.`, answer.status);
+    return value;
+  };
+  /**
+   * The read of the regular file at the absolute path `filePath` (`name`: its base name, fileBase) of the container
+   * `container` through the archive endpoint (containerFile, imageFile): its bytes; undefined when it is no regular
+   * file or is larger than `maxBytes` (the answer is bounded to the archive of such a file, so a longer one is
+   * truncated); `notFound` of a 404. Rejects with an EngineError for any other status.
+   */
+  const archiveFile = async <M>(container: string, filePath: string, name: string, maxBytes: number, signal: AbortSignal | undefined, notFound: (answer: EngineAnswer) => M): Promise<Buffer | M | undefined> => {
+    // Latin-1: one character per byte, so that the offsets of the tar archive stay byte offsets.
+    const answer = await api({
+      method: 'GET',
+      path: `/containers/${encodeURIComponent(container)}/archive?path=${encodeURIComponent(filePath)}`,
+      signal,
+      latin1: true,
+      maxCharacters: maxTarFileArchiveBytes(maxBytes),
+    });
+    if (answer.status === 404) return notFound(answer);
+    if (answer.status !== 200) fail(answer);
+    // More than the answer holds: more than the bound of the file.
+    if (answer.truncated) return undefined;
+    return firstTarFile(Buffer.from(answer.body, 'latin1'), { name, maxBytes });
+  };
+  const containerIds = async (filters: EngineFilters, signal?: AbortSignal): Promise<string[]> => {
+    const value = await list(`/containers/json?all=true&${filtersQuery(filters)}`, signal);
+    if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the containers with an invalid value.', 200);
+    return value.map((entry) => (entry as { Id?: unknown })?.Id).filter((id): id is string => typeof id === 'string' && id !== '');
+  };
+  return {
+    container: async (reference, signal) => {
+      const value = await inspect('container', reference, signal);
+      if (value === undefined) return undefined;
+      const container = containerOf(value);
+      if (container === undefined) throw new EngineError('The engine answered the inspect of a container with an invalid value.', 200);
+      return container;
+    },
+    containers: async (label, signal) => {
+      const found: EngineContainer[] = [];
+      for (const id of await containerIds({ label: [label] }, signal)) {
+        const value = await inspect('container', id, signal);
+        // Removed since the list.
+        if (value === undefined) continue;
+        const container = containerOf(value);
+        if (container !== undefined) found.push(container);
+      }
+      return found;
+    },
+    // The list of the engine as it is, without an inspect (`docker ps -a --filter label=…` sends `all=1`), within the
+    // bound of a list. An entry without an ID is left out; its state, first name and labels are read as the list gives
+    // them ('' and none when it gives none).
+    containerSummaries: async (label, signal) => {
+      const value = await list(`/containers/json?all=1&${filtersQuery({ label: [label] })}`, signal, MAX_ENGINE_LIST_ANSWER_CHARACTERS);
+      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the containers with an invalid value.', 200);
+      const summaries: EngineContainerSummary[] = [];
+      for (const entry of value as Record<string, unknown>[]) {
+        if (typeof entry !== 'object' || entry === null || typeof entry.Id !== 'string' || entry.Id === '') continue;
+        summaries.push({
+          id: entry.Id,
+          name: containerName(texts(entry.Names)),
+          state: typeof entry.State === 'string' ? entry.State : '',
+          labels: toLabels(entry.Labels),
+        });
+      }
+      return summaries;
+    },
+    exec: (container, command, options = {}) => execInContainer(api, hijack, secretOf, secrets, container, command, options),
+    stop: async (container, timeoutSeconds, signal) => {
+      const query = timeoutSeconds === undefined ? '' : `?t=${timeoutSeconds}`;
+      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/stop${query}`, signal });
+      // 204: stopped; 304: it did not run.
+      if (answer.status !== 204 && answer.status !== 304) fail(answer);
+    },
+    start: async (container, signal) => {
+      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/start`, signal });
+      // 204: started; 304: it runs already.
+      if (answer.status !== 204 && answer.status !== 304) fail(answer);
+    },
+    updateRestartPolicy: async (container, policy, signal) => {
+      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/update`, json: { RestartPolicy: { Name: policy } }, signal });
+      // 200 with the warnings of the engine, which change nothing here.
+      if (answer.status !== 200) fail(answer);
+    },
+    version: async (signal) => {
+      const value = (await list('/version', signal)) as { ApiVersion?: unknown; Version?: unknown };
+      return { apiVersion: typeof value?.ApiVersion === 'string' ? value.ApiVersion : '', version: typeof value?.Version === 'string' ? value.Version : '' };
+    },
+    // The identity of the probe, checked as the extension checks it (parseEngineIdentity).
+    identity: async (signal) => {
+      const value = (await list('/info', signal)) as { ID?: unknown; DockerRootDir?: unknown } | null;
+      const identity = parseEngineIdentity({ id: value?.ID, rootDir: value?.DockerRootDir });
+      if (identity === undefined) throw new EngineError('The engine answered /info without its ID and root folder.', 200);
+      return identity;
+    },
+    // The prune of the sweep; `ContainersDeleted` is null when nothing was removed.
+    pruneContainers: async (filters, signal) => {
+      const answer = await api({ method: 'POST', path: `/containers/prune?${filtersQuery(filters)}`, signal });
+      if (answer.status !== 200) fail(answer);
+      if (answer.truncated) throw new EngineError('The engine answered the prune of the containers with more than can be read.', answer.status);
+      const deleted = (json(answer.body) as { ContainersDeleted?: unknown } | undefined)?.ContainersDeleted;
+      if (deleted !== null && !Array.isArray(deleted)) throw new EngineError('The engine answered the prune of the containers with an invalid value.', answer.status);
+      return texts(deleted).filter((id) => id !== '');
+    },
+    inspect,
+    containerIds,
+    images: async (filters, signal) => {
+      // Within the bound of a list (the Monitor lists every image).
+      const value = await list(`/images/json?${filtersQuery(filters)}`, signal, MAX_ENGINE_LIST_ANSWER_CHARACTERS);
+      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the images with an invalid value.', 200);
+      const images: EngineImage[] = [];
+      for (const entry of value as Record<string, unknown>[]) {
+        if (typeof entry?.Id !== 'string' || entry.Id === '') continue;
+        images.push({
+          id: entry.Id,
+          // The engine names a dangling image `<none>:<none>` in older versions.
+          repoTags: texts(entry.RepoTags).filter((tag) => tag !== '<none>:<none>'),
+          repoDigests: texts(entry.RepoDigests).filter((digest) => digest !== '<none>@<none>'),
+          labels: toLabels(entry.Labels),
+          created: isoOf(entry.Created),
+        });
+      }
+      return images;
+    },
+    volumeNames: async (filters, signal) => {
+      const value = (await list(`/volumes?${filtersQuery(filters)}`, signal)) as { Volumes?: unknown };
+      if (value?.Volumes !== null && !Array.isArray(value?.Volumes)) throw new EngineError('The engine answered the list of the volumes with an invalid value.', 200);
+      return (value.Volumes ?? []).map((entry: unknown) => (entry as { Name?: unknown })?.Name).filter((name: unknown): name is string => typeof name === 'string' && name !== '');
+    },
+    networkNames: async (filters, signal) => {
+      const value = await list(`/networks?${filtersQuery(filters)}`, signal);
+      if (!Array.isArray(value)) throw new EngineError('The engine answered the list of the networks with an invalid value.', 200);
+      return [...new Set(value.map((entry) => (entry as { Name?: unknown })?.Name).filter((name): name is string => typeof name === 'string' && name !== ''))];
+    },
+    removeContainer: async (container, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true`, signal });
+      if (answer.status !== 204 && answer.status !== 404) fail(answer);
+    },
+    renameContainer: async (container, name, signal) => {
+      const answer = await api({ method: 'POST', path: `/containers/${encodeURIComponent(container)}/rename?name=${encodeURIComponent(name)}`, signal });
+      if (answer.status !== 204) fail(answer);
+    },
+    removeImage: async (reference, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/images/${encodeURIComponent(reference)}`, signal });
+      if (answer.status === 200) return 'removed';
+      if (answer.status === 404) return 'missing';
+      // In use by a container, or the parent of another image.
+      if (answer.status === 409) return 'inUse';
+      return fail(answer);
+    },
+    tagImage: async (image, reference, signal) => {
+      const at = reference.lastIndexOf(':');
+      if (at <= 0 || reference.includes('/') || reference.includes('@')) throw new Error(`The reference ${JSON.stringify(reference)} is not a local repository:tag.`);
+      const query = `repo=${encodeURIComponent(reference.slice(0, at))}&tag=${encodeURIComponent(reference.slice(at + 1))}`;
+      const answer = await api({ method: 'POST', path: `/images/${encodeURIComponent(image)}/tag?${query}`, signal });
+      if (answer.status !== 201 && answer.status !== 200) fail(answer);
+    },
+    createVolume: async (name, labels, signal) => {
+      const answer = await api({ method: 'POST', path: '/volumes/create', json: { Name: name, Labels: labels }, signal });
+      if (answer.status !== 201 && answer.status !== 200) fail(answer);
+    },
+    removeVolume: async (name, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/volumes/${encodeURIComponent(name)}`, signal });
+      if (answer.status !== 204 && answer.status !== 404) fail(answer);
+    },
+    removeNetwork: async (name, signal) => {
+      const answer = await api({ method: 'DELETE', path: `/networks/${encodeURIComponent(name)}`, signal });
+      if (answer.status !== 204 && answer.status !== 404) fail(answer);
+    },
+    pull: (reference, options = {}) => pullImage(api, secretOf, reference, options),
+    labelImage: async (image, labels, signal) => {
+      const inspected = (await inspect('image', image, signal)) as { Config?: Record<string, unknown> } | undefined;
+      if (inspected === undefined) throw new EngineError(`The image ${image} does not exist.`, 404);
+      const config = { ...(inspected.Config ?? {}) };
+      config.Labels = { ...toLabels(config.Labels), ...labels };
+      // Created only to be committed: never started, and removed again; its command is never run.
+      if (signal?.aborted) throw abortError();
+      // Without the signal, so that a cancel never leaves it behind created but unknown. A commit of an image without a
+      // command gives it this container's `Cmd ['true']` (the engine merges the container's command into an empty one);
+      // the images of a devspace have one, or Dev Containers sets it. On the classic image store the commit is a
+      // child of the previous image, which is then kept. No label of ours on it; the commit would copy it into the
+      // image. A name of its own (the commit does not copy it), by which it is removed also when its create did not
+      // answer within its time limit.
+      const name = `devspaces-label-${crypto.randomBytes(6).toString('hex')}`;
+      const removeByName = () =>
+        api({ method: 'DELETE', path: `/containers/${name}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      let created: EngineAnswer;
+      try {
+        created = await api({ method: 'POST', path: `/containers/create?name=${name}`, json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal: limit });
+      } catch (error) {
+        // The engine may have created it although the answer failed; the name is ours, so it goes in every case. A
+        // create that the engine ends only after this removal stays behind, never started, findable by the
+        // `devspaces-label-` name.
+        await removeByName();
+        if (!limit.aborted) throw error;
+        throw new EngineError(`The engine did not answer the create of a container for the labels of ${image} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+      }
+      if (created.status !== 201) fail(created);
+      const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+      if (typeof container !== 'string' || container === '') {
+        await removeByName();
+        throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+      }
+      try {
+        const [repository, tag] = splitTag(image);
+        // The body is the configuration of the new image: the one of the image with the labels, not the container's.
+        const committed = await api({
+          method: 'POST',
+          path: `/commit?container=${encodeURIComponent(container)}&repo=${encodeURIComponent(repository)}&tag=${encodeURIComponent(tag)}&pause=false`,
+          json: config,
+          signal,
+        });
+        if (committed.status !== 201) fail(committed);
+        const id = (json(committed.body) as { Id?: unknown } | undefined)?.Id;
+        if (typeof id !== 'string' || id === '') throw new EngineError('The engine answered the commit with an invalid value.', committed.status);
+        return id;
+      } finally {
+        // With its anonymous volumes (`VOLUME` of the image), as `docker run --rm`. Within a time limit of its own,
+        // never the cancel signal.
+        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      }
+    },
+    imageFile: async (image, filePath, signal) => {
+      // The read of the label container of labelImage, without a commit: created from the image (never started; its
+      // command is never run), the file read through the archive endpoint, and removed in every case.
+      const base = fileBase(filePath);
+      if (signal?.aborted) throw abortError();
+      // As labelImage: a name of its own, by which it is removed also when its create did not answer within its time
+      // limit, and the create without the signal of the operation, so that a cancel never leaves it created but unknown.
+      const name = `devspaces-read-${crypto.randomBytes(6).toString('hex')}`;
+      const removeByName = () =>
+        api({ method: 'DELETE', path: `/containers/${name}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+      let created: EngineAnswer;
+      try {
+        created = await api({ method: 'POST', path: `/containers/create?name=${name}`, json: { Image: image, Cmd: ['true'], Entrypoint: [], Labels: {} }, signal: limit });
+      } catch (error) {
+        await removeByName();
+        if (!limit.aborted) throw error;
+        throw new EngineError(`The engine did not answer the create of a container for the read of ${filePath} of ${image} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+      }
+      if (created.status !== 201) fail(created);
+      const container = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+      if (typeof container !== 'string' || container === '') {
+        await removeByName();
+        throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+      }
+      try {
+        if (signal?.aborted) throw abortError();
+        // A 404: the path does not exist in the image.
+        const content = await archiveFile(container, filePath, base, MAX_IMAGE_FILE_BYTES, signal, () => undefined);
+        return content === undefined ? undefined : content.toString('utf8');
+      } finally {
+        // With its anonymous volumes (`VOLUME` of the image), within a time limit of its own, never the cancel signal.
+        await api({ method: 'DELETE', path: `/containers/${encodeURIComponent(container)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
+      }
+    },
+    // Only the engine's own message of a missing container or file is `missing`; a 404 of something on the way is no
+    // evidence.
+    containerFile: async (container, filePath, maxBytes, signal) =>
+      archiveFile(container, filePath, fileBase(filePath), maxBytes, signal, (answer) => (isMissingContainerFile(engineErrorMessage({ ...answer, truncated: false })) ? ('missing' as const) : fail(answer))),
+    systemTime: async (signal) => {
+      const value = (await list('/info', signal)) as { SystemTime?: unknown };
+      if (typeof value?.SystemTime !== 'string') throw new EngineError('The engine answered /info without its time.', 200);
+      return value.SystemTime;
+    },
+    // The proxy of the daemon; a field that is no string or empty is none.
+    proxy: async (signal) => {
+      const value = (await list('/info', signal)) as { HttpProxy?: unknown; HttpsProxy?: unknown; NoProxy?: unknown } | null;
+      const field = (text: unknown) => (typeof text === 'string' && text.trim() !== '' ? text.trim() : undefined);
+      const httpProxy = field(value?.HttpProxy);
+      const httpsProxy = field(value?.HttpsProxy);
+      const noProxy = field(value?.NoProxy);
+      return { ...(httpProxy ? { httpProxy } : {}), ...(httpsProxy ? { httpsProxy } : {}), ...(noProxy ? { noProxy } : {}) };
+    },
+    // The platform of the shared VS Code server comes from it.
+    architecture: async (signal) => {
+      const value = (await list('/info', signal)) as { Architecture?: unknown } | null;
+      if (typeof value?.Architecture !== 'string' || value.Architecture === '') throw new EngineError('The engine answered /info without its architecture.', 200);
+      return value.Architecture;
+    },
+    // The server versions that running dev containers run, for the cleanup of the store. Read up to
+    // MAX_ENGINE_LIST_ANSWER_CHARACTERS (a container with a large process table would otherwise block every removal
+    // while it runs); an answer cut at that bound is still a failure.
+    processes: async (container, signal) => {
+      const answer = await api({ method: 'GET', path: `/containers/${encodeURIComponent(container)}/top`, signal, maxCharacters: MAX_ENGINE_LIST_ANSWER_CHARACTERS });
+      if (answer.status === 404 || answer.status === 409) return undefined;
+      if (answer.status !== 200) fail(answer);
+      if (answer.truncated) throw new EngineError('The engine answered the processes of a container with more than can be read.', answer.status);
+      const value = json(answer.body) as { Processes?: unknown } | undefined;
+      const rows = value?.Processes;
+      // An empty list may come as null.
+      if (rows === null) return [];
+      if (!Array.isArray(rows) || !rows.every((row) => Array.isArray(row) && row.every((field) => typeof field === 'string'))) {
+        throw new EngineError('The engine answered the processes of a container with an invalid value.', answer.status);
+      }
+      return rows as string[][];
+    },
+    createAttached: (spec, options) => createAttached(api, hijack, spec, options),
+    runAttached: (spec, options) => runAttached(api, hijack, spec, options),
+  };
+}
+
+/** The base name of the absolute path of a file (the name of its entry in an archive); throws for any other path. */
+function fileBase(filePath: string): string {
+  const base = filePath.slice(filePath.lastIndexOf('/') + 1);
+  if (!filePath.startsWith('/') || base === '' || base === '.' || base === '..') throw new Error(`The path ${JSON.stringify(filePath)} is no absolute path of a file.`);
+  return base;
+}
+
+/**
+ * The engine's message of a 404 of the archive endpoint (DockerEngine.containerFile) for a container that does not exist
+ * (`No such container: <name>`; Podman's ends with `no such container`) or a path that does not exist in it (`Could not
+ * find the file <path> in container <name>` of newer engines, `lstat <path>: no such file or directory` of older ones,
+ * `stat <path>: no such file or directory` as Podman words it).
+ * Each alternative is tied to the start or the end of the message, so a message that only quotes an inner error (a
+ * failed mount: `…: no such file or directory`) is no evidence.
+ */
+export const MISSING_CONTAINER_FILE = /^No such container: |no such container$|^Could not find the file \S+ in container |^l?stat \S+: no such file or directory$/i;
+
+/** Whether the 404 message `message` of the archive endpoint matches MISSING_CONTAINER_FILE, without the white space and the one period that may end it. */
+export function isMissingContainerFile(message: string): boolean {
+  return MISSING_CONTAINER_FILE.test(message.trim().replace(/\.$/, ''));
+}
+
+/**
+ * The time limit of the create and of the removal of a container of labelImage, and of the create and the removal of
+ * the container of imageFile.
+ */
+export const RUN_CLEANUP_TIMEOUT_MS = 60_000;
+
+/** `repository:tag` of a reference with a tag (`registry:5000/name:1` → `registry:5000/name`, `1`); `latest` without one. */
+function splitTag(reference: string): [string, string] {
+  const slash = reference.lastIndexOf('/');
+  const colon = reference.lastIndexOf(':');
+  return colon > slash ? [reference.slice(0, colon), reference.slice(colon + 1)] : [reference, 'latest'];
+}
+
+/** `POST /images/create?fromImage=<reference>`, the login only in its header; the lines of `docker pull` to `onLine`. */
+async function pullImage(
+  api: EngineApi,
+  secretOf: (name: string) => string | undefined,
+  reference: string,
+  options: { login?: EnginePullLogin; onLine?: (line: string) => void; signal?: AbortSignal },
+): Promise<void> {
+  // Never a pull of every tag of a repository (`fromImage` without a tag).
+  if (!hasTagOrDigest(reference)) throw new EngineError(`The pull of ${reference} needs a tag or a digest.`, 0);
+  const headers: Record<string, string> = {};
+  const login = options.login;
+  if (login !== undefined) {
+    const password = secretOf(login.secretName);
+    if (password === undefined) throw new EngineError(`The operation holds no secret ${login.secretName} for the pull of ${reference}.`, 0);
+    headers['X-Registry-Auth'] = registryAuthHeader(
+      login.identityToken === true ? { identitytoken: password, serveraddress: login.serveraddress } : { username: login.username ?? '', password, serveraddress: login.serveraddress },
+    );
+  }
+  let pending = '';
+  // The start of the answer, for the message of an error answer (its body is one JSON object, not a stream).
+  let head = '';
+  let failure: string | undefined;
+  const handleLine = (line: string) => {
+    if (line.trim() === '') return;
+    let message: PullMessage;
+    try {
+      message = JSON.parse(line) as PullMessage;
+    } catch {
+      options.onLine?.(line);
+      return;
+    }
+    if (typeof message !== 'object' || message === null) return;
+    if (message.error !== undefined || message.errorDetail !== undefined) {
+      failure ??= typeof message.errorDetail?.message === 'string' ? message.errorDetail.message : String(message.error);
+      return;
+    }
+    const text = pullLine(message);
+    if (text !== undefined) options.onLine?.(text);
+  };
+  const answer = await api({
+    method: 'POST',
+    path: `/images/create?fromImage=${encodeURIComponent(reference)}`,
+    headers,
+    signal: options.signal,
+    onChunk: (chunk) => {
+      if (head.length < 2_000) head += chunk.slice(0, 2_000 - head.length);
+      pending += chunk;
+      let newline = pending.indexOf('\n');
+      while (newline >= 0) {
+        handleLine(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        newline = pending.indexOf('\n');
+      }
+    },
+  });
+  handleLine(pending);
+  if (answer.status !== 200) throw new EngineError(failure ?? engineErrorMessage({ ...answer, body: head }), answer.status);
+  if (failure !== undefined) throw new EngineError(failure, answer.status);
+}
+
+/** The most text of each stream of an exec that the result keeps (onOutput still gets all of it). */
+export const MAX_EXEC_OUTPUT_CHARACTERS = 1024 * 1024;
+
+/**
+ * The output of an exec by stream, decoded across frames, each bounded. Masked as it comes, with every secret of the
+ * operation (`secrets`, the secret of the input among them), before anything of it is kept or handed to `onOutput`; the
+ * masker holds back a tail that could start a secret, so neither the cut nor a frame boundary leaves a part of one.
+ */
+function execOutput(onOutput: EngineExecOptions['onOutput'], secrets: () => Iterable<string>) {
+  const stream = (name: 'stdout' | 'stderr') => {
+    const state = { decoder: new StringDecoder('utf8'), text: '', masker: undefined as unknown as StreamRedactor };
+    state.masker = new StreamRedactor(secrets, (masked) => {
+      if (state.text.length < MAX_EXEC_OUTPUT_CHARACTERS) state.text += masked.slice(0, MAX_EXEC_OUTPUT_CHARACTERS - state.text.length);
+      onOutput?.(name, masked);
+    });
+    return state;
+  };
+  const streams = { stdout: stream('stdout'), stderr: stream('stderr') };
+  return {
+    frame: (kind: 1 | 2, data: Buffer) => {
+      const state = streams[kind === 2 ? 'stderr' : 'stdout'];
+      state.masker.push(state.decoder.write(data));
+    },
+    result: () => {
+      for (const state of [streams.stdout, streams.stderr]) {
+        state.masker.push(state.decoder.end());
+        state.masker.flush();
+      }
+      return { stdout: streams.stdout.text, stderr: streams.stderr.text };
+    },
+  };
+}
+
+/**
+ * One process in a running container. The exec is created, then started over a hijacked connection: its standard input
+ * carries `input` (or the secret that `secretInputName` names), and its output comes back framed by stream. `timeoutMs`
+ * covers every request of the exec and ends it (`timedOut`); the signal ends it with an AbortError. The time limit
+ * covers the create and the inspect too; a process that still runs when its output ended is a failure, never an exit
+ * code; a secret that the operation does not hold is a failure, never an empty input.
+ */
+async function execInContainer(
+  api: EngineApi,
+  hijack: EngineHijack,
+  secretOf: (name: string) => string | undefined,
+  secrets: () => Iterable<string>,
+  container: string,
+  command: readonly string[],
+  options: EngineExecOptions,
+): Promise<EngineExecResult> {
+  if (options.signal?.aborted) throw abortError();
+  let input = options.input;
+  if (options.secretInputName !== undefined) {
+    input = secretOf(options.secretInputName);
+    if (input === undefined) throw new EngineError(`The operation holds no secret ${options.secretInputName} for the process in the container.`, 0);
+  }
+  const ended = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, ended.signal]) : ended.signal;
+  let timedOut = false;
+  const timer =
+    options.timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          ended.abort();
+        }, options.timeoutMs);
+  const secretInput = options.secretInputName !== undefined ? input : undefined;
+  const output = execOutput(options.onOutput, () => (secretInput === undefined ? secrets() : [secretInput, ...secrets()]));
+  try {
+    const created = await api({
+      method: 'POST',
+      path: `/containers/${encodeURIComponent(container)}/exec`,
+      signal,
+      json: {
+        AttachStdin: input !== undefined,
+        AttachStdout: true,
+        AttachStderr: true,
+        Tty: false,
+        Cmd: [...command],
+        ...(options.user !== undefined ? { User: options.user } : {}),
+        ...(options.workdir !== undefined ? { WorkingDir: options.workdir } : {}),
+      },
+    });
+    if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
+    const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+    if (typeof id !== 'string' || id === '') throw new EngineError('The engine answered the create of an exec with an invalid value.', created.status);
+    const stream = await hijack({ path: `/exec/${encodeURIComponent(id)}/start`, json: { Detach: false, Tty: false }, signal, onFrame: output.frame });
+    try {
+      if (input !== undefined) stream.write(input);
+      stream.end();
+      await stream.ended;
+    } finally {
+      stream.destroy();
+    }
+    const inspected = await api({ method: 'GET', path: `/exec/${encodeURIComponent(id)}/json`, signal });
+    if (inspected.status !== 200) throw new EngineError(engineErrorMessage({ ...inspected, truncated: false }), inspected.status);
+    const state = json(inspected.body) as { ExitCode?: unknown; Running?: unknown } | undefined;
+    if (state?.Running !== false) throw new EngineError('The output of the process in the container ended, but the process did not.', inspected.status);
+    return { exitCode: typeof state.ExitCode === 'number' ? state.ExitCode : null, ...output.result(), timedOut: false };
+  } catch (error) {
+    if (timedOut) return { exitCode: null, ...output.result(), timedOut: true };
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * What `docker run -i` sets in a create for an open, attached input (no terminal), shared by the attached create of the
+ * Monitor and the attached run of the batch helper.
+ */
+const ATTACHED_INPUT = { AttachStdin: true, AttachStdout: true, AttachStderr: true, OpenStdin: true, StdinOnce: true, Tty: false } as const;
+
+/** The ID of a container in the answer of its create, or undefined when the answer has none. */
+function createdId(created: EngineAnswer): string | undefined {
+  const id = (json(created.body) as { Id?: unknown } | undefined)?.Id;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
+/** Whether the engine started the container (204), or found it running already (304). */
+function isStarted(answer: EngineAnswer): boolean {
+  return answer.status === 204 || answer.status === 304;
+}
+
+/**
+ * Shared by createAttached and runAttached: the attach to the standard input, output and error output of the created
+ * container `id` over a hijacked connection, `beforeStart`, then its start, as `docker run -i` does it (attached before
+ * the start, so that no output is lost). Answers the connection and the answer of the start, which the caller checks
+ * (and then ends the connection); a start that fails ends the connection before it throws.
+ */
+async function attachAndStart(
+  api: EngineApi,
+  hijack: EngineHijack,
+  id: string,
+  signal: AbortSignal | undefined,
+  onFrame: EngineHijackRequest['onFrame'],
+  beforeStart: () => void = () => {},
+): Promise<{ stream: EngineStream; started: EngineAnswer }> {
+  const stream = await hijack({ path: `/containers/${encodeURIComponent(id)}/attach?stream=1&stdin=1&stdout=1&stderr=1`, signal, onFrame });
+  try {
+    beforeStart();
+    const started = await api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/start`, signal });
+    return { stream, started };
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+}
+
+/** The time from the SIGTERM to the SIGKILL of the kill of an attached run, when it is not given (as `docker stop`). */
+export const ATTACHED_STOP_SECONDS = 10;
+/** How long the end of an attached run waits for the rest of its output after the engine reported its end. */
+export const ATTACHED_DRAIN_MS = 2_000;
+/** How long the end of an attached run waits for the answer of its wait after its kill removed it. */
+export const ATTACHED_KILL_WAIT_MS = 10_000;
+
+/**
+ * DockerEngine.runAttached: `docker run --rm -i` of the batch helper over the API, without a `docker run` process in
+ * the worker. The create maps each option of that `docker run` (see EngineAttachedSpec), and sets what the CLI sets for
+ * `--rm -i`: AutoRemove, an open input that the engine closes when the attached connection closes it (StdinOnce), and
+ * the default network. It is sent without the signal and within RUN_CLEANUP_TIMEOUT_MS (as labelImage), so that a
+ * cancel never leaves a container created but unknown. Then the attach, the wait for its removal (registered before the
+ * start, as the CLI does for `--rm`, so that its exit code is read although the engine removes it), and the start. What
+ * fails after the create answered removes the container by its ID.
+ */
+async function runAttached(api: EngineApi, hijack: EngineHijack, spec: EngineAttachedSpec, options: EngineAttachedOptions = {}): Promise<EngineAttachedRun> {
+  const signal = options.signal;
+  if (signal?.aborted) throw abortError();
+  const stopSeconds = options.stopSeconds ?? ATTACHED_STOP_SECONDS;
+  // As the removal of `--rm`: with its anonymous volumes; within a time limit of its own, never the cancel signal.
+  const remove = (id: string) =>
+    api({ method: 'DELETE', path: `/containers/${encodeURIComponent(id)}?force=true&v=true`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS) }).then(
+      () => undefined,
+      () => undefined,
+    );
+  const limit = AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS);
+  let created: EngineAnswer;
+  try {
+    created = await api({
+      method: 'POST',
+      path: `/containers/create?name=${encodeURIComponent(spec.name)}`,
+      signal: limit,
+      json: {
+        Image: spec.image,
+        Cmd: [...spec.command],
+        Labels: { ...spec.labels },
+        ...ATTACHED_INPUT,
+        HostConfig: {
+          AutoRemove: true,
+          NetworkMode: 'default',
+          LogConfig: { Type: 'none', Config: {} },
+          SecurityOpt: [...spec.securityOpt],
+          Mounts: spec.mounts.map((mount) => ({ Type: mount.type, Source: mount.source, Target: mount.target })),
+          Tmpfs: { ...spec.tmpfs },
+        },
+      },
+    });
+  } catch (error) {
+    if (!limit.aborted) throw error;
+    throw new EngineError(`The engine did not answer the create of the container ${spec.name} within ${RUN_CLEANUP_TIMEOUT_MS / 1000} s.`, 0);
+  }
+  if (created.status !== 201) throw new EngineError(engineErrorMessage({ ...created, truncated: false }), created.status);
+  const id = createdId(created);
+  if (id === undefined) throw new EngineError('The engine answered the create of a container with an invalid value.', created.status);
+
+  // The output by stream, decoded across frames; what comes before a listener is there is kept for it (bounded).
+  const decoders = { 1: new StringDecoder('utf8'), 2: new StringDecoder('utf8') };
+  const listeners: Record<1 | 2, ((text: string) => void) | undefined> = { 1: undefined, 2: undefined };
+  const early: Record<1 | 2, string> = { 1: '', 2: '' };
+  const deliver = (kind: 1 | 2, text: string) => {
+    if (text === '') return;
+    const listener = listeners[kind];
+    if (listener !== undefined) listener(text);
+    else if (early[kind].length < MAX_EXEC_OUTPUT_CHARACTERS) early[kind] += text.slice(0, MAX_EXEC_OUTPUT_CHARACTERS - early[kind].length);
+  };
+  const listen = (kind: 1 | 2, listener: (text: string) => void) => {
+    listeners[kind] = listener;
+    const text = early[kind];
+    early[kind] = '';
+    if (text !== '') listener(text);
+  };
+  // The wait ends only with the run (never with the cancel signal), so that `exited` follows a kill too.
+  const waitEnded = new AbortController();
+  let waited: Promise<EngineAnswer> | undefined;
+  let stream: EngineStream | undefined;
+  try {
+    if (signal?.aborted) throw abortError();
+    const attached = await attachAndStart(
+      api,
+      hijack,
+      id,
+      signal,
+      (kind, data) => deliver(kind, decoders[kind].write(data)),
+      () => {
+        waited = api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/wait?condition=removed`, signal: waitEnded.signal });
+        // Read by `exited`; a failure before must not be an unhandled rejection.
+        waited.catch(() => undefined);
+      },
+    );
+    stream = attached.stream;
+    if (!isStarted(attached.started)) throw new EngineError(engineErrorMessage({ ...attached.started, truncated: false }), attached.started.status);
+  } catch (error) {
+    stream?.destroy();
+    waitEnded.abort();
+    // Created, but never started (or refused): AutoRemove does not apply; removed here.
+    await remove(id);
+    throw error;
+  }
+  const connection = stream;
+  let done = false;
+  let inputEnded = false;
+  let killed: Promise<void> | undefined;
+  const kill = () => {
+    killed ??= (async () => {
+      // As `docker stop -t`, then the removal of `--rm` (AutoRemove removes it after the stop already; a missing one is fine).
+      await api({ method: 'POST', path: `/containers/${encodeURIComponent(id)}/stop?t=${stopSeconds}`, signal: AbortSignal.timeout(RUN_CLEANUP_TIMEOUT_MS + stopSeconds * 1000) }).catch(
+        () => undefined,
+      );
+      await remove(id);
+      // The wait answers with the removal; one that does not answer is ended (the exit code is then unknown).
+      const timer = setTimeout(() => waitEnded.abort(), ATTACHED_KILL_WAIT_MS);
+      timer.unref?.();
+    })();
+  };
+  // A connection that broke (not by its end) leaves the helper without its input and output: it is ended.
+  connection.ended.catch(() => (done ? undefined : kill()));
+  const exited = (async (): Promise<{ exitCode: number | null; error?: Error }> => {
+    let result: { exitCode: number | null; error?: Error };
+    try {
+      const answer = await waited!;
+      const value = json(answer.body) as { StatusCode?: unknown } | undefined;
+      if (answer.status === 200 && typeof value?.StatusCode === 'number') result = { exitCode: value.StatusCode };
+      else result = { exitCode: null, error: new Error(answer.status === 200 ? 'The engine answered the wait of the container with an invalid value.' : engineErrorMessage({ ...answer, truncated: false })) };
+    } catch (error) {
+      result = { exitCode: null, error: isAbortError(error) ? new Error('The end of the container could not be read.') : error instanceof Error ? error : new Error(String(error)) };
+    }
+    // The rest of its output, then the connection ends. A paused output is read again first, so its end (often why the
+    // process ended) is not lost and its end does not wait out ATTACHED_DRAIN_MS.
+    connection.resume?.();
+    let drained: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([connection.ended.catch(() => undefined), new Promise<void>((resolve) => (drained = setTimeout(resolve, ATTACHED_DRAIN_MS)))]);
+    clearTimeout(drained);
+    done = true;
+    connection.destroy();
+    deliver(1, decoders[1].end());
+    deliver(2, decoders[2].end());
+    signal?.removeEventListener('abort', kill);
+    return result;
+  })();
+  const process: StartedProcess = {
+    write: (text) => {
+      if (done || inputEnded) return false;
+      try {
+        connection.write(text);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    end: () => {
+      if (done || inputEnded) return;
+      inputEnded = true;
+      try {
+        // The engine closes the input of the container (StdinOnce); the output goes on.
+        connection.end();
+      } catch {
+        // A connection that ended already.
+      }
+    },
+    kill,
+    onStdout: (listener) => listen(1, listener),
+    onStderr: (listener) => listen(2, listener),
+    exited,
+  };
+  if (signal?.aborted) kill();
+  else signal?.addEventListener('abort', kill, { once: true });
+  return { id, process, pause: () => connection.pause?.(), resume: () => connection.resume?.() };
+}
+
+/** The characters of the end of the error output of an attached create that are kept (for the log). */
+const ATTACHED_STDERR_TAIL_LENGTH = 4_000;
+/** The engine's refusal of a create whose name is in use. */
+const NAME_CONFLICT = /\bConflict\. The container name\b.*\bis already in use\b/;
+
+/**
+ * The attached create of the Monitor over the API, for its pipe loading (DockerEngine.createAttached): the
+ * create with an open input (OpenStdin, StdinOnce, as `docker run -i`), the attach (stdin, stdout, stderr), the start,
+ * the input line, then the wait for `readyText` on the output (its end kept across frames), the end of the output (the
+ * container ended), the time limit, or the cancel. The input is closed and the connection ended in every case; the
+ * container goes on alone after its ready line.
+ */
+async function createAttached(
+  api: EngineApi,
+  hijack: EngineHijack,
+  spec: MonitorRunSpec,
+  options: { input: string; readyText: string; timeoutMs: number; signal?: AbortSignal },
+): Promise<MonitorCreated> {
+  if (options.signal?.aborted) throw abortError();
+  const ended = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, ended.signal]) : ended.signal;
+  let timedOut = false;
+  const timer = setTimeout(() => ((timedOut = true), ended.abort()), options.timeoutMs);
+  let stream: EngineStream | undefined;
+  let stdout = '';
+  let stderr = '';
+  const decoders = { 1: new StringDecoder('utf8'), 2: new StringDecoder('utf8') };
+  let onReady: () => void = () => {};
+  const ready = new Promise<void>((resolve) => (onReady = resolve));
+  const outcome = (error: unknown): MonitorCreated => {
+    if (timedOut) return { kind: 'timeout' };
+    if (options.signal?.aborted || isAbortError(error)) return { kind: 'aborted' };
+    return { kind: 'exited', detail: errorMessage(error), conflict: false };
+  };
+  try {
+    let created: EngineAnswer;
+    try {
+      created = await api({
+        method: 'POST',
+        path: `/containers/create?name=${encodeURIComponent(spec.name)}`,
+        signal,
+        json: {
+          Image: spec.image,
+          Cmd: [...spec.command],
+          Labels: spec.labels,
+          Env: Object.entries(spec.env).map(([key, value]) => `${key}=${value}`),
+          ...ATTACHED_INPUT,
+          HostConfig: {
+            RestartPolicy: { Name: spec.restartPolicy },
+            NetworkMode: spec.network === 'none' ? 'none' : 'default',
+            CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges'],
+            LogConfig: { Type: spec.log.driver, Config: { 'max-size': spec.log.maxSize, 'max-file': spec.log.maxFile } },
+            Binds: [`${spec.mounts.socket}:/var/run/docker.sock`, `${spec.mounts.volume}:${spec.mounts.volumeTarget}`],
+            // The shared VS Code server store read-write, with `nocopy` as the worker mounts it (Docker never fills an
+            // empty store with the content of the image at the target).
+            ...(spec.mounts.store !== undefined
+              ? { Mounts: [{ Type: 'volume', Source: spec.mounts.store.volume, Target: spec.mounts.store.target, ReadOnly: false, VolumeOptions: { NoCopy: true } }] }
+              : {}),
+          },
+        },
+      });
+    } catch (error) {
+      // The request was sent: the container may exist; the caller removes it by its labels.
+      return outcome(error);
+    }
+    if (created.status !== 201) {
+      const detail = engineErrorMessage({ ...created, truncated: false });
+      return { kind: 'exited', detail, conflict: created.status === 409 && NAME_CONFLICT.test(detail) };
+    }
+    const id = createdId(created);
+    if (id === undefined) return { kind: 'exited', detail: 'The engine answered the create of a container with an invalid value.', conflict: false };
+    try {
+      // A container of a tag runs only from the pinned image; the tag may have moved between its tag and this create
+      // (another window). Checked before the start.
+      if (spec.imageId !== undefined) {
+        const inspected = await api({ method: 'GET', path: `/containers/${encodeURIComponent(id)}/json`, signal });
+        if (inspected.status !== 200) return { kind: 'exited', detail: engineErrorMessage({ ...inspected, truncated: false }), conflict: false };
+        const image = (json(inspected.body) as { Image?: unknown } | undefined)?.Image;
+        if (image !== spec.imageId) {
+          return { kind: 'exited', detail: `the container was created from the image ${typeof image === 'string' ? image : 'that cannot be read'}, not from ${spec.imageId}`, conflict: false };
+        }
+      }
+      const attached = await attachAndStart(api, hijack, id, signal, (kind, data) => {
+        const text = decoders[kind].write(data);
+        if (kind === 2) {
+          stderr = (stderr + text).slice(-ATTACHED_STDERR_TAIL_LENGTH);
+          return;
+        }
+        // Only the tail is kept: enough for the ready line across frames.
+        stdout = (stdout + text).slice(-8_192);
+        if (stdout.includes(options.readyText)) onReady();
+      });
+      stream = attached.stream;
+      if (!isStarted(attached.started)) return { kind: 'exited', detail: engineErrorMessage({ ...attached.started, truncated: false }), conflict: false };
+      stream.write(options.input);
+      const result = await Promise.race([
+        ready.then((): MonitorCreated => ({ kind: 'ready' })),
+        stream.ended.then(
+          (): MonitorCreated => ({ kind: 'exited', detail: readableStderr(stderr, ATTACHED_STDERR_TAIL_LENGTH) || 'the container ended before it reported its start', conflict: false }),
+          (error: unknown) => outcome(error),
+        ),
+        new Promise<MonitorCreated>((resolve) => signal.addEventListener('abort', () => resolve(outcome(undefined)), { once: true })),
+      ]);
+      return result;
+    } catch (error) {
+      return outcome(error);
+    }
+  } finally {
+    clearTimeout(timer);
+    if (stream !== undefined) {
+      try {
+        // The input ends (the loader read its line); the container goes on alone.
+        stream.end();
+      } catch {
+        // A connection that ended already.
+      }
+      stream.destroy();
+    }
+  }
+}

@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Mutation probe: reconcileInWorker with parameters that cannot be sent.
+import { describe, expect, it } from 'vitest';
+import { RECONCILE_FLOW_TIMEOUT_MS } from './operationBase';
+import { createHarness } from './devspaceService.testkit';
+
+describe('reconcileInWorker: parameters and timeout', () => {
+  it('fails, and sends nothing, when the window of the operation does not fit the parameters', async () => {
+    const calls: unknown[] = [];
+    const h = createHarness({ owner: { windowId: 'window-1', pid: 0 }, flow: async (...args) => (calls.push(args), { added: 1 }) });
+    await expect(h.operations.reconcileInWorker({ passive: true })).rejects.toThrow('cannot be sent to the worker');
+    expect(calls).toEqual([]);
+  });
+
+  it('waits at most two minutes for the worker', () => {
+    expect(RECONCILE_FLOW_TIMEOUT_MS).toBe(2 * 60_000);
+  });
+});

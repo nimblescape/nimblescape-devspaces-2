@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Switcher: Quick Pick with the recent devspaces and the entry "Open repository…".
+import * as vscode from 'vscode';
+import type { Devspace, RepositoryInfo } from '../core/types';
+import { recentDevspaces, repositoriesForPicker, stateIcon, type OwnerGroup } from './treeModel';
+
+// User-visible texts that messages.ts lacks; to be moved there.
+export const SwitcherTexts = {
+  title: 'Switch Devspace',
+  placeholder: 'Select a devspace to open in this window',
+  newWindowPlaceholder: 'Select a devspace to open in a new window',
+  recentDevspaces: 'Recent devspaces',
+  openRepository: 'Open repository…',
+  repositoryPlaceholder: 'Search a repository to open in this window',
+  newWindowRepositoryPlaceholder: 'Search a repository to open in a new window',
+  archived: 'archived',
+  fork: 'fork',
+} as const;
+
+export type SwitcherChoice =
+  | { kind: 'devspace'; devspaceId: string }
+  | { kind: 'repository'; repository: RepositoryInfo };
+
+interface ChoiceItem extends vscode.QuickPickItem {
+  choice?: { kind: 'devspace'; devspaceId: string } | { kind: 'openRepository' };
+}
+
+interface RepositoryItem extends vscode.QuickPickItem {
+  repository: RepositoryInfo;
+}
+
+/**
+ * First list: the recent devspaces with their state (most recently used first), then "Open repository…", which
+ * shows all repositories with a text search. Without devspaces, the repository list opens at once.
+ * The caller opens the result in the current window, or with `newWindow` in a new window (the texts say which).
+ */
+export async function showSwitcher(input: {
+  groups: readonly OwnerGroup[];
+  devspaces: readonly Devspace[];
+  repositories: readonly RepositoryInfo[];
+  newWindow?: boolean;
+}): Promise<SwitcherChoice | undefined> {
+  const newWindow = input.newWindow === true;
+  const recent = recentDevspaces(input.groups, input.devspaces);
+  if (recent.length === 0) return openRepository(input.repositories, newWindow);
+
+  const items: ChoiceItem[] = [
+    { label: SwitcherTexts.recentDevspaces, kind: vscode.QuickPickItemKind.Separator },
+    ...recent.map((entry): ChoiceItem => ({
+      label: entry.state ? `$(${stateIcon(entry.state).id}) ${entry.name}` : entry.name,
+      description: entry.description,
+      choice: { kind: 'devspace', devspaceId: entry.devspaceId },
+    })),
+    { label: '', kind: vscode.QuickPickItemKind.Separator },
+    { label: `$(repo) ${SwitcherTexts.openRepository}`, alwaysShow: true, choice: { kind: 'openRepository' } },
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    title: SwitcherTexts.title,
+    placeHolder: newWindow ? SwitcherTexts.newWindowPlaceholder : SwitcherTexts.placeholder,
+    matchOnDescription: true,
+  });
+  const choice = picked?.choice;
+  if (!choice) return undefined;
+  if (choice.kind === 'devspace') return choice;
+  return openRepository(input.repositories, newWindow);
+}
+
+/**
+ * Quick Pick with all repositories and a text search on the name and owner. `title` null: no title (a command that
+ * does not open the repository, for example Show on GitHub).
+ */
+export async function pickRepository(
+  repositories: readonly RepositoryInfo[],
+  placeholder: string = SwitcherTexts.repositoryPlaceholder,
+  title: string | null = SwitcherTexts.openRepository,
+): Promise<RepositoryInfo | undefined> {
+  const items = repositoriesForPicker(repositories).map(
+    (repository): RepositoryItem => ({
+      label: repository.nameWithOwner,
+      description: [
+        repository.defaultBranch ?? undefined,
+        repository.isArchived ? SwitcherTexts.archived : undefined,
+        repository.isFork ? SwitcherTexts.fork : undefined,
+      ]
+        .filter((text): text is string => text !== undefined && text !== '')
+        .join(' · '),
+      repository,
+    }),
+  );
+  const picked = await vscode.window.showQuickPick(items, {
+    title: title ?? undefined,
+    placeHolder: placeholder,
+    matchOnDescription: true,
+  });
+  return picked?.repository;
+}
+
+async function openRepository(repositories: readonly RepositoryInfo[], newWindow: boolean): Promise<SwitcherChoice | undefined> {
+  const repository = await pickRepository(
+    repositories,
+    newWindow ? SwitcherTexts.newWindowRepositoryPlaceholder : SwitcherTexts.repositoryPlaceholder,
+  );
+  return repository ? { kind: 'repository', repository } : undefined;
+}

@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// Arguments and results of the Dev Container CLI in the workspace helper. Pure functions.
+import { CommandError } from '../errors';
+import type { DevcontainerConfig, DevcontainerResult } from '../types';
+import { ATTACHED_SHUTDOWN_ACTION, devContainersSettings, SKIP_POST_ATTACH_ARG } from '../devContainers';
+import {
+  COMPOSE_CLEARED_LABELS,
+  CONTAINER_VERSION_LABEL,
+  configPathLabel,
+  isConfigPathLabelValue,
+  containerHostname,
+  HELPER_CACHE_FOLDER,
+  HOST_ACCESS_UNRESTRICTED_LABEL,
+  TOKEN_TMPFS,
+  WORKSPACES_ROOT,
+  vscodeStoreMount,
+} from '../names';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
+import {
+  loopbackAppPorts,
+  overrideRunArgs,
+  runArgsDecideHostname,
+  type HostAccessChecks,
+} from '../policy';
+import { isRecord } from '../valueChecks';
+
+/**
+ * Arguments of `devcontainer read-configuration`. With `merged` (default), the result also has `mergedConfiguration`:
+ * the configuration merged with the metadata of the base image and of the Features (or of the existing container),
+ * which the host access policy checks. Without a container, the CLI reads the base image and the Features for it (from
+ * the registries, if they are not local).
+ */
+export function readConfigurationArgs(p: {
+  workspaceFolder: string;
+  configPath: string;
+  idLabel: string;
+  merged?: boolean;
+  /** `--override-config` (Docker Compose: composeConfigOverride, which names our model). */
+  overrideConfigPath?: string;
+}): string[] {
+  const args = ['read-configuration', '--workspace-folder', p.workspaceFolder, '--config', p.configPath, '--id-label', p.idLabel];
+  if (p.overrideConfigPath !== undefined) args.push('--override-config', p.overrideConfigPath);
+  if (p.merged !== false) args.push('--include-merged-configuration');
+  return args;
+}
+
+/**
+ * Arguments of `devcontainer build`. `build` has no `--override-config` (CLI 0.89.0, devContainersSpecCLI.js, the
+ * handler of `build`: `configFile:v,overrideConfigFile:J` with `J=void 0`), so a Docker Compose configuration is built
+ * with `--config` naming our copy of the configuration (composeConfigOverride) in the helper.
+ */
+export function buildArgs(p: { workspaceFolder: string; configPath: string; imageName: string; frozenLockfile?: boolean }): string[] {
+  return [
+    'build',
+    '--workspace-folder',
+    p.workspaceFolder,
+    '--config',
+    p.configPath,
+    '--image-name',
+    p.imageName,
+    '--user-data-folder',
+    HELPER_CACHE_FOLDER,
+    // A prepare never writes the lockfile of the repository (CLI 0.89.0, `--frozen-lockfile`: "Ensure lockfile exists
+    // and remains unchanged; fail otherwise"). WRITE_AND_RUN_SCRIPT replaces it with `--no-lockfile` when the
+    // repository has no lockfile.
+    ...(p.frozenLockfile === true ? [FROZEN_LOCKFILE_ARG] : []),
+  ];
+}
+
+/** The option of `devcontainer build` that keeps the lockfile of the repository as it is (buildArgs). */
+export const FROZEN_LOCKFILE_ARG = '--frozen-lockfile';
+
+/**
+ * Argument of `devcontainer up`: `up` runs no lifecycle command (CLI 0.89.0: `postCreateEnabled: !skipPostCreate`, and
+ * `lifecycleHook.enabled && await runLifecycleHooks(…)`: no onCreateCommand, updateContentCommand, postCreateCommand,
+ * postStartCommand, postAttachCommand, no marker). They run afterwards with `devcontainer run-user-commands`
+ * (runUserCommandsArgs), once the token is in the container.
+ */
+export const SKIP_POST_CREATE_ARG = '--skip-post-create';
+
+/**
+ * Arguments of `devcontainer up` with the override configuration (it replaces the repository configuration; everything
+ * else comes from the label devcontainer.metadata of the devspace image). `--update-remote-user-uid-default never`:
+ * the "local" user of the CLI is root in the helper, so a UID update is meaningless, and it would build an additional
+ * image `<name>-uid` at each container creation. The files of the volume get their owner through the ownership fix
+ * instead (the script `ownershipFix` of the script registry). SKIP_POST_CREATE_ARG: the lifecycle commands run with
+ * run-user-commands after the token was written.
+ */
+export function upArgs(p: {
+  workspaceFolder: string;
+  overrideConfigPath: string;
+  idLabel: string;
+  removeExistingContainer: boolean;
+}): string[] {
+  const args = [
+    'up',
+    '--workspace-folder',
+    p.workspaceFolder,
+    '--override-config',
+    p.overrideConfigPath,
+    '--id-label',
+    p.idLabel,
+    '--user-data-folder',
+    HELPER_CACHE_FOLDER,
+    '--update-remote-user-uid-default',
+    'never',
+    SKIP_POST_CREATE_ARG,
+    SKIP_POST_ATTACH_ARG,
+  ];
+  if (p.removeExistingContainer) args.push('--remove-existing-container');
+  return args;
+}
+
+/**
+ * Arguments of `devcontainer run-user-commands`: the lifecycle commands that `up` skipped (SKIP_POST_CREATE_ARG), with
+ * the same workspace folder, override configuration, and id label as `up`, so the CLI reads the same configuration
+ * (merged with the label devcontainer.metadata of the container) and resolves `${devcontainerId}` the same way.
+ * `--container-id`: the container of the result of `up` (with Docker Compose, the containers of the other services
+ * carry the id label too). CLI 0.89.0 runs onCreateCommand, updateContentCommand, postCreateCommand (each once per
+ * container: a marker with the creation time in ~/.devcontainer of the remote user), and postStartCommand (once per
+ * start: a marker with the start time), and stops at the first that fails. SKIP_POST_ATTACH_ARG: postAttachCommand
+ * stays with the Dev Containers extension, as for `up`. It has no option of the UID update (always `never`).
+ */
+export function runUserCommandsArgs(p: { workspaceFolder: string; overrideConfigPath: string; idLabel: string; containerId: string }): string[] {
+  return [
+    'run-user-commands',
+    '--workspace-folder',
+    p.workspaceFolder,
+    '--override-config',
+    p.overrideConfigPath,
+    '--id-label',
+    p.idLabel,
+    '--container-id',
+    p.containerId,
+    '--user-data-folder',
+    HELPER_CACHE_FOLDER,
+    SKIP_POST_ATTACH_ARG,
+  ];
+}
+
+/** The result object if `line` is the JSON result of `build` or `up`, otherwise undefined. */
+export function tryParseDevcontainerResult(line: string): DevcontainerResult | undefined {
+  const text = line.trim();
+  if (!text.startsWith('{') || !text.endsWith('}')) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || (value.outcome !== 'success' && value.outcome !== 'error')) return undefined;
+  return value as unknown as DevcontainerResult;
+}
+
+/**
+ * The JSON result on the last line of standard output of `devcontainer build` and `devcontainer up`: the last non-empty
+ * line that parses as JSON with an `outcome` field. Throws if there is none.
+ */
+export function parseDevcontainerResult(stdout: string): DevcontainerResult {
+  const lines = stdout.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() === '') continue;
+    const result = tryParseDevcontainerResult(lines[i]);
+    if (result) return result;
+  }
+  throw new Error(`The Dev Container CLI returned no result: ${JSON.stringify(stdout.trim().slice(-300))}`);
+}
+
+// `[<name> of ]<command> from <origin> failed.`: <name> is a key of the object form of the command, <origin> is
+// `devcontainer.json` or `Feature '<id>'`.
+const LIFECYCLE_FAILURE =
+  /^(?:.+ of )?(?:onCreateCommand|updateContentCommand|postCreateCommand|postStartCommand|postAttachCommand) from .+ failed\.$/;
+
+/**
+ * Whether the result of `devcontainer up` (or of `run-user-commands`, whose result WorkspaceHelper.runUserCommands
+ * completes with the container ID) reports a failed lifecycle command of a container that exists. Assumption: when a
+ * lifecycle command exits with a code other than 0, CLI 0.89.0 skips the further commands, ends `up` with exit code 1
+ * and the result `{ outcome: 'error', containerId, description: '… from … failed.' }`, and leaves the container
+ * running. initializeCommand runs before the container starts, so it is not one of them.
+ */
+export function isLifecycleCommandFailure(
+  result: DevcontainerResult | undefined,
+): result is DevcontainerResult & { containerId: string; description: string } {
+  return (
+    result?.outcome === 'error' &&
+    typeof result.containerId === 'string' &&
+    result.containerId.trim() !== '' &&
+    typeof result.description === 'string' &&
+    LIFECYCLE_FAILURE.test(result.description)
+  );
+}
+
+/**
+ * A `devcontainer build` or `up` that failed. `result` is the JSON result of the CLI, if it printed one.
+ * The message names the message of the CLI result when there is one.
+ */
+export class DevcontainerCommandError extends CommandError {
+  constructor(
+    command: string,
+    exitCode: number | null,
+    stdout: string,
+    stderr: string,
+    readonly result?: DevcontainerResult,
+  ) {
+    super(command, exitCode, stdout, stderr);
+    this.name = 'DevcontainerCommandError';
+    if (result?.outcome === 'error' && (result.message || result.description)) {
+      const text = [result.message, result.description].filter(Boolean).join(' ');
+      this.message = `${command} failed with exit code ${exitCode}: ${text}`;
+    }
+  }
+}
+
+/**
+ * Override configuration for `up`: only image, workspaceMount, workspaceFolder, runArgs (the repository values as the
+ * host access policy checks them, overrideRunArgs: without any --name and with 127.0.0.1 for published ports without an
+ * address; plus `--label nimblescape.devspaces.container-version=<n>`, the labels `com.docker.compose.project` and
+ * `com.docker.compose.service` with empty values (COMPOSE_CLEARED_LABELS), and `--name <container name>`, and
+ * `--hostname <repository name>` (containerHostname) unless the runArgs decide the host name themselves,
+ * runArgsDecideHostname, then `--tmpfs TOKEN_TMPFS`, the folder of the token in memory, and last, with
+ * `vscodeStoreVolume`, the read-only `--mount` of the shared VS Code server store), appPort (if set, on 127.0.0.1),
+ * containerEnv, remoteEnv, and the settings of the Dev Containers extension in customizations (container-only Git), and
+ * shutdownAction 'none' (ATTACHED_SHUTDOWN_ACTION, ../devContainers.ts). `hostAccessChecks` `off` (the switch of the
+ * repository, ../policy/hostAccessChecks.ts): the published ports of runArgs and appPort keep the address that the
+ * configuration gives them (appPort as the configuration writes it), and runArgs get
+ * `--label nimblescape.devspaces.host-access=unrestricted`, so that the container is created again once the checks are
+ * on. `initializeCommand` is never passed: the host access policy refuses a configuration with one.
+ */
+export function buildOverrideConfig(p: {
+  devspaceImage: string;
+  volumeName: string;
+  repositoryName: string;
+  containerName: string;
+  runArgs?: string[];
+  appPort?: DevcontainerConfig['appPort'];
+  hostAccessChecks?: HostAccessChecks;
+  /** The configuration path of the devspace, as the label nimblescape.devspaces.config-path. */
+  configPath?: string;
+  /**
+   * The volume of the shared VS Code server store, mounted read-only at VSCODE_STORE_TARGET (vscodeStoreMount), last;
+   * without it, no store.
+   */
+  vscodeStoreVolume?: string;
+}): Record<string, unknown> {
+  const checksOn = p.hostAccessChecks !== 'off';
+  const labels = checksOn ? ['--label', CONTAINER_VERSION_LABEL] : ['--label', CONTAINER_VERSION_LABEL, '--label', HOST_ACCESS_UNRESTRICTED_LABEL];
+  // Only a configuration path that reconcileFromVolumes takes; without the label, it takes the default configuration.
+  if (p.configPath !== undefined && isConfigPathLabelValue(p.configPath)) labels.push('--label', configPathLabel(p.configPath));
+  // The labels of Docker Compose empty, whatever the image inherited.
+  for (const label of COMPOSE_CLEARED_LABELS) labels.push('--label', label);
+  const repositoryRunArgs = overrideRunArgs(p.runArgs, checksOn);
+  // Without it, Docker names the host after the container ID, and the shell prompt shows that ID.
+  const hostname = runArgsDecideHostname(repositoryRunArgs) ? [] : ['--hostname', containerHostname(p.repositoryName)];
+  // The tmpfs of the token (TOKEN_FOLDER), after the runArgs of the repository; the checks of the override
+  // configuration accept exactly this entry (runArgsFindings), a configuration may not mount there
+  // (configFolderTarget). The read-only mount of the shared VS Code server store, after the tmpfs; the checks of the
+  // override configuration accept exactly this entry (runArgsFindings), a configuration may not name the volume
+  // (foreignVolumeName) or mount at or below its target (configFolderTarget).
+  const store = p.vscodeStoreVolume !== undefined ? ['--mount', vscodeStoreMount(p.vscodeStoreVolume)] : [];
+  const runArgs = [...repositoryRunArgs, ...labels, '--name', p.containerName, ...hostname, '--tmpfs', TOKEN_TMPFS, ...store];
+  const override: Record<string, unknown> = {
+    image: p.devspaceImage,
+    workspaceMount: `source=${p.volumeName},target=${WORKSPACES_ROOT},type=volume`,
+    workspaceFolder: `${WORKSPACES_ROOT}/${p.repositoryName}`,
+    runArgs,
+  };
+  const appPort = checksOn ? loopbackAppPorts(p.appPort) : p.appPort;
+  if (appPort !== undefined && appPort !== null) override.appPort = appPort;
+  // Merged over the containerEnv, remoteEnv, and settings of the image metadata; these values win. The settings only add
+  // to the customizations of the image metadata (its extensions and other settings stay).
+  override.containerEnv = containerEnvironment();
+  override.remoteEnv = remoteEnvironment();
+  override.customizations = { vscode: { settings: devContainersSettings() } };
+  override.shutdownAction = ATTACHED_SHUTDOWN_ACTION;
+  return override;
+}
+
+/**
+ * The configuration of a Docker Compose configuration for `read-configuration` (`--override-config`) and `build`
+ * (`--config`, buildArgs): the repository configuration as written (`raw`, parsed devcontainer.json; the CLI resolves
+ * its variables as usual), with `dockerComposeFile` naming only our model (an absolute path: the CLI resolves the paths
+ * against the folder of `--config`, CLI 0.89.0 function `sg`), and without `initializeCommand`, which the host access
+ * policy refuses anyway (it would run in the helper, which has the Docker socket).
+ */
+export function composeConfigOverride(raw: Readonly<Record<string, unknown>>, modelPath: string): Record<string, unknown> {
+  const config: Record<string, unknown> = { ...raw, dockerComposeFile: [modelPath] };
+  delete config.initializeCommand;
+  return config;
+}
+
+/**
+ * Override configuration of `devcontainer up` for a Docker Compose configuration (the counterpart of buildOverrideConfig):
+ * `dockerComposeFile` names only our model (composeUpModel, an absolute path), `service`, `runServices` (when the
+ * repository names them), `workspaceFolder`, and, as in buildOverrideConfig, containerEnv, remoteEnv, the settings of
+ * the Dev Containers extension, and shutdownAction 'none'. No image, runArgs, appPort, or workspaceMount: the CLI
+ * ignores them for Compose (CLI 0.89.0: `if("dockerComposeFile"in t)return{workspaceFolder:pp(t),workspaceMount:void 0,…}`;
+ * runArgs and appPort are read only for a single container); the model carries the image, the name, the labels, the
+ * ports, and the workspace volume. The CLI writes containerEnv as `environment` of the dev service into its last compose
+ * file, so these values win. `initializeCommand` is never passed.
+ */
+export function buildComposeOverrideConfig(p: {
+  modelPath: string;
+  service: string;
+  runServices?: readonly string[];
+  repositoryName: string;
+}): Record<string, unknown> {
+  const override: Record<string, unknown> = {
+    dockerComposeFile: [p.modelPath],
+    service: p.service,
+  };
+  if (p.runServices !== undefined) override.runServices = [...p.runServices];
+  override.workspaceFolder = `${WORKSPACES_ROOT}/${p.repositoryName}`;
+  override.containerEnv = containerEnvironment();
+  override.remoteEnv = remoteEnvironment();
+  override.customizations = { vscode: { settings: devContainersSettings() } };
+  override.shutdownAction = ATTACHED_SHUTDOWN_ACTION;
+  return override;
+}

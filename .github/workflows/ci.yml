@@ -1,0 +1,542 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
+# Test the extension and build its package for every push to main and every
+# pull request, on the pinned Node.js 24 release (.node-version); VS Code 1.125
+# (engines.vscode) and later run extensions on Node.js 24 too. The job "test"
+# installs the locked development tools, checks the types, runs the unit tests,
+# and packages the VSIX with vsce. The helper container runs its scripts as root
+# on the files of other users, and the tests of that behavior need root (chown
+# to other users, mknod, mount --bind), so the job "test as root" runs the unit
+# tests again as root; the job "test" runs them as a user without root, as some
+# tests need. The job "every test ran" fails when a test is skipped in both
+# runs, so no test stops running unseen. The job "docker" runs the integration
+# tests against the Docker Engine of the runner, in three groups of test files
+# side by side, each on a runner of its own. The job "vscode" runs the
+# tests in a real VS Code (stable) with the Dev Containers extension on Linux,
+# Windows and macOS, against the packaged VSIX and on Linux also against the
+# development build. The job "vscode attach" starts VS Code in the windows of
+# containers on the Docker Engine of the runner, through the real Dev
+# Containers extension, the job "vscode attach remote" in the window of a
+# devspace on a Docker Engine over SSH, and the job "vscode update" in the
+# window of a devspace before and after the update from the last released
+# version. The VSIX of the job "test" stays a
+# workflow artifact for inspection. This workflow publishes nothing: the
+# release workflow calls it for the commit of a version and publishes the VSIX
+# of that call. A change of this file changes the release process: its pull
+# request needs a dry run (rule 4). The workflow "VS Code versions" calls it
+# once per week with another VS Code version for the VS Code jobs; such a call
+# runs only the job "test", for the VSIX, and the VS Code jobs.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The release workflow calls this workflow for the commit of a version,
+  # because its push of that commit starts no workflow.
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to test and package; empty for the commit of the event.
+        type: string
+        required: false
+        default: ''
+      vscode-version:
+        description: The VS Code version of the VS Code jobs, "insiders" or a version such as 1.125.0; empty for stable. When set, only the job "test" (for the VSIX) and the VS Code jobs run.
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  # Checkout needs repository reads; the checks get no write scope.
+  contents: read
+
+env:
+  # The two calls of the workflow "VS Code versions" in one workflow run keep their artifacts apart. Empty for every
+  # other run, so the release workflow finds the artifact "vsix".
+  ARTIFACT_SUFFIX: ${{ inputs.vscode-version && format('-vscode-{0}', inputs.vscode-version) || '' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      - name: Check the types
+        run: npm run typecheck
+
+      # The reporters default and github-actions are those of vitest on GitHub; json keeps the results for the job
+      # "every test ran".
+      - name: Run the unit tests
+        run: npm test -- --reporter=default --reporter=github-actions --reporter=json --outputFile.json=test-results/user.json
+
+      - name: Keep the test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-user${{ env.ARTIFACT_SUFFIX }}
+          path: test-results/user.json
+          if-no-files-found: error
+
+      - name: Build the VSIX package
+        run: npm run package
+
+      - name: Keep the VSIX package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vsix${{ env.ARTIFACT_SUFFIX }}
+          path: '*.vsix'
+          if-no-files-found: error
+
+  test-root:
+    name: test as root
+    if: ${{ !inputs.vscode-version }}
+    # The runner itself, not a container: a container refuses mount --bind, which some tests need.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      # sudo -E keeps GITHUB_ACTIONS and GITHUB_STEP_SUMMARY for the reporter github-actions; env PATH keeps the
+      # pinned Node release, which the secure_path of sudo would replace.
+      - name: Run the unit tests as root
+        run: sudo -E env "PATH=$PATH" npx vitest run --reporter=default --reporter=github-actions --reporter=json --outputFile.json=test-results/root.json
+
+      - name: Keep the test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-root
+          path: test-results/root.json
+          if-no-files-found: error
+
+  every-test-ran:
+    name: every test ran
+    needs: [test, test-root]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download the test results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: test-results-*
+          merge-multiple: true
+
+      # A test that ran in neither run is skipped in both: the run as root skips
+      # the tests that need a user without root, the other run those that need root.
+      - name: Check that each test ran as root or as a user without root
+        run: |
+          node - <<'JS'
+          const fs = require("node:fs");
+          const skipped = (file) => {
+            const report = JSON.parse(fs.readFileSync(file, "utf8"));
+            const names = new Set();
+            for (const result of report.testResults) {
+              const name = result.name.replace(`${process.env.GITHUB_WORKSPACE}/`, "");
+              for (const test of result.assertionResults) {
+                if (test.status !== "passed" && test.status !== "failed") names.add(`${name} > ${test.fullName}`);
+              }
+            }
+            console.log(`${file}: ${report.numTotalTests} tests, ${names.size} not run`);
+            return names;
+          };
+          const root = skipped("root.json");
+          const neither = [...skipped("user.json")].filter((name) => root.has(name));
+          for (const name of neither) console.log(`::error::Not run as root nor as a user without root: ${name}`);
+          if (neither.length > 0) process.exit(1);
+          JS
+
+  docker:
+    # Docker Engine is preinstalled on the runner. The tests build the helper image and run the Dev Container CLI of
+    # the pinned version (devDependency @devcontainers/cli) against it. The test files run one at a time on an engine,
+    # so three groups of files run side by side, each on its own runner and engine. vitest.docker.config.mts names the
+    # files of each group (DEVSPACE_TEST_GROUP); the group "other" runs every file that the others do not name.
+    name: docker (${{ matrix.group }})
+    if: ${{ !inputs.vscode-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Every group reports its failures, also when another group failed.
+      fail-fast: false
+      matrix:
+        group: [monitor, pipeline, other]
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools
+        run: npm ci
+
+      - name: Run the integration tests against Docker
+        env:
+          DEVSPACE_TEST_GROUP: ${{ matrix.group }}
+          DEVSPACE_TEST_GROUP_COUNT: ${{ strategy.job-total }}
+        run: npm run test:docker
+
+  vscode:
+    # The tests in a real VS Code (.vscode-test.mjs) on the three systems of the users: against the VSIX of the job
+    # "test", as users install it, and on Linux also against the development build (npm run test:vscode). The job
+    # waits for the job "test" and its VSIX, so it does not run when a unit test fails. The Linux runner has no
+    # display, so xvfb-run gives VS Code a virtual one; xvfb is preinstalled on ubuntu-latest.
+    name: vscode (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      # .vscode-test.mjs downloads this VS Code version; empty (also for every event but a call) gives stable.
+      VSCODE_TEST_VERSION: ${{ inputs.vscode-version }}
+    strategy:
+      # Every system reports its failures, also when another system failed.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      - name: Run the tests in VS Code against the development build
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:vscode
+
+      # The VSIX of the job "test", which the release publishes: the tests run against the file that users get, also in a
+      # folder that VS Code does not trust (Restricted Mode, the configuration "untrusted" of .vscode-test.mjs).
+      - name: Download the VSIX of the job "test"
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vsix${{ env.ARTIFACT_SUFFIX }}
+
+      - name: Run the tests in VS Code against the VSIX
+        shell: bash
+        run: ${{ runner.os == 'Linux' && 'xvfb-run -a ' || '' }}npm run test:vscode:vsix
+
+      # Fails when a program of the test VS Code of the two steps above, other than a `docker exec` of Dev Containers and
+      # its `ssh`, still runs 10 s after VS Code quit (Linux, from /proc; scripts/leftoverPrograms.mjs).
+      - name: Check that the test VS Code left no program of the extension running
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: node scripts/leftoverPrograms.mjs
+
+  vscode-attach:
+    # The attach tests (.vscode-test.mjs, label attach): VS Code starts in the window of a container on the Docker
+    # Engine of the runner, through the real Dev Containers extension. test/vscode/attach/prepare.ts prepares the engine
+    # and the test VS Code. The first start opens a container that is no devspace, the second a devspace that the window
+    # restores from its volume labels, the third the same devspace again with the user data folder of the second (a
+    # restart of VS Code), the fourth the same window under another GitHub account, and the fifth the same window when
+    # the start of its stopped container takes several minutes. The sixth starts with a local folder and starts a
+    # second VS Code, with the extension installed from its VSIX, in the window of the devspace, whose container the
+    # tests stop and then remove. The runner gets a Git configuration and an SSH agent, so that the tests see which of
+    # them reach the containers. The extension creates its objects with the names of a real installation, which is why
+    # these tests run only on CI.
+    name: vscode attach
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # .vscode-test.mjs, test/vscode/attach/prepare.ts and scripts/install-attach-extensions.mjs download the VS Code
+      # version of VSCODE_TEST_VERSION; empty (also for every event but a call) gives stable. @vscode/test-electron
+      # downloads VS Code again when a newer build or release has come out, into a folder without the changes of
+      # prepare.ts (seen in PR #22: the preparation ran on 1.141.1, the tests on 1.141.2, and the extension's GitHub
+      # sign-in asked a question). So the job uses the commit of the newest Insiders build, or the newest stable release
+      # (as @vscode/test-electron resolves stable), at its start. @vscode/test-electron takes a stable version only with a
+      # patch number of one digit; with more digits, stable stays unpinned. This step writes the version for the later
+      # steps.
+      - name: Choose the VS Code version
+        env:
+          VERSION: ${{ inputs.vscode-version }}
+        run: |
+          if [ "$VERSION" = insiders ]; then
+            VERSION=$(curl -fsS --retry 3 https://update.code.visualstudio.com/api/update/linux-x64/insider/latest | jq -er .version)
+            [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::The newest VS Code Insiders build has no commit: $VERSION"; exit 1; }
+          elif [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsS --retry 3 'https://update.code.visualstudio.com/api/releases/stable?released=true' | jq -er '.[0]')
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]$ ]]; then
+              echo "::warning::The newest stable VS Code $VERSION is not pinned: @vscode/test-electron takes a stable version only with a patch number of one digit."
+              VERSION=
+            fi
+          fi
+          echo "VS Code ${VERSION:-stable}"
+          echo "VSCODE_TEST_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      - name: Prepare the Docker engine and the test VS Code
+        run: npm run test:vscode:attach:prepare
+
+      - name: Give the runner a Git configuration and an SSH agent with a key
+        run: |
+          git config --global devspacestest.marker devspaces-runner-git-configuration
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/devspaces-test-key"
+          eval "$(ssh-agent -s)"
+          ssh-add "$RUNNER_TEMP/devspaces-test-key"
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+
+      - name: Run the tests in the window of a container that is no devspace
+        env:
+          DEVSPACE_TEST_ATTACH: plain
+        run: xvfb-run -a npm run test:vscode:attach
+
+      - name: Run the tests in the window of a restored devspace
+        if: ${{ !cancelled() }}
+        env:
+          DEVSPACE_TEST_ATTACH: devspace
+        run: xvfb-run -a npm run test:vscode:attach
+
+      # The Dev Containers extension stops no container when its window closes (shutdownAction none of the override);
+      # only the Monitor does, after its waiting time.
+      - name: Check that the devspace still runs after VS Code quit
+        run: |
+          name=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.containerName")
+          test "$(docker inspect -f '{{.State.Running}}' "$name")" = true
+
+      - name: Run the tests in the window of the devspace after a restart of VS Code
+        env:
+          DEVSPACE_TEST_ATTACH: reattach
+        run: xvfb-run -a npm run test:vscode:attach
+
+      - name: Run the tests in the window of the devspace under another GitHub account
+        env:
+          DEVSPACE_TEST_ATTACH: account
+        run: xvfb-run -a npm run test:vscode:attach
+
+      - name: Check that the devspace of the owner still runs
+        run: |
+          name=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.containerName")
+          test "$(docker inspect -f '{{.State.Running}}' "$name")" = true
+
+      # The open pipeline of the next run starts the container, and its postStartCommand waits several minutes once
+      # (test/vscode/attach/prepare.ts). The file of postAttachCommand starts empty, so that the run counts its attaches.
+      - name: Stop the devspace, with a long postStartCommand at its next start
+        run: |
+          name=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.containerName")
+          user=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.user")
+          mark=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.longStartMark")
+          docker exec -u "$user" "$name" sh -c 'touch "$1" && rm -f /tmp/attach-count' sh "$mark"
+          docker stop "$name"
+
+      - name: Run the tests in the window of the devspace with an open pipeline of several minutes
+        env:
+          DEVSPACE_TEST_ATTACH: longopen
+        run: xvfb-run -a npm run test:vscode:attach
+
+      # The second VS Code of the next run loads the extension as users install it (scripts/install-attach-extensions.mjs).
+      - name: Install the extension and the test sign-in provider into the test VS Code from VSIX files
+        run: node scripts/install-attach-extensions.mjs
+
+      - name: Run the tests in the window of the devspace whose container stops
+        env:
+          DEVSPACE_TEST_ATTACH: stopped
+        run: xvfb-run -a npm run test:vscode:attach
+
+      - name: Show the Docker objects
+        if: ${{ failure() }}
+        run: |
+          docker ps -a
+          docker volume ls
+          docker images
+
+  vscode-attach-remote:
+    # The attach test of a devspace on the Docker engine of another computer, reached over SSH.
+    # test/vscode/attach/prepare.ts (DEVSPACE_TEST_ATTACH_PREPARE=remote) starts that computer as a container of the
+    # runner with its own Docker engine and an SSH server, adds it to the SSH config of the runner, puts the devspace without container on
+    # its engine, and makes its Docker context the current one, as "Use a Remote Docker Host…" does. The engine of the
+    # runner gets a container with the name of the devspace container, which the window must not use. A job of its
+    # own, so that the engine of the runner has no objects of the other attach tests.
+    name: vscode attach remote
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # As in the job "vscode attach".
+      - name: Choose the VS Code version
+        env:
+          VERSION: ${{ inputs.vscode-version }}
+        run: |
+          if [ "$VERSION" = insiders ]; then
+            VERSION=$(curl -fsS --retry 3 https://update.code.visualstudio.com/api/update/linux-x64/insider/latest | jq -er .version)
+            [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::The newest VS Code Insiders build has no commit: $VERSION"; exit 1; }
+          elif [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsS --retry 3 'https://update.code.visualstudio.com/api/releases/stable?released=true' | jq -er '.[0]')
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]$ ]]; then
+              echo "::warning::The newest stable VS Code $VERSION is not pinned: @vscode/test-electron takes a stable version only with a patch number of one digit."
+              VERSION=
+            fi
+          fi
+          echo "VS Code ${VERSION:-stable}"
+          echo "VSCODE_TEST_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      - name: Prepare a Docker engine over SSH and the test VS Code
+        env:
+          DEVSPACE_TEST_ATTACH_PREPARE: remote
+        run: npm run test:vscode:attach:prepare
+
+      - name: Run the tests in the window of a devspace on the Docker engine over SSH
+        env:
+          DEVSPACE_TEST_ATTACH: remote
+        run: xvfb-run -a npm run test:vscode:attach
+
+      # Each command runs also when one before failed (for example the engine of the other computer did not start), and
+      # none waits longer than a minute for an engine that does not answer.
+      - name: Show the Docker objects of both engines
+        if: ${{ failure() }}
+        run: |
+          set +e
+          docker --context default logs --tail 200 attach-test-remote-host
+          docker context ls
+          for context in default devspaces-test-remote; do
+            echo "===== $context"
+            timeout 60 docker --context "$context" ps -a
+            timeout 60 docker --context "$context" volume ls
+            timeout 60 docker --context "$context" images
+          done
+          true
+
+  vscode-update:
+    # The update from the last released version (.vscode-test.mjs, label attach, kinds previous and updated).
+    # test/vscode/attach/prepare.ts (DEVSPACE_TEST_ATTACH_PREPARE=update) installs that version into the test VS Code
+    # from the VSIX of the latest GitHub release (the file that the release workflow publishes to the Marketplace), and
+    # puts the devspace without container on the Docker engine of the runner. The first start runs the released version in
+    # the window of the devspace; then the VSIX of this commit is installed over it, and the second start, with the same
+    # user data folder, runs the new version in the same window. A job of its own, so that the engine of the runner has
+    # no objects of the other attach tests.
+    name: vscode update
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # As in the job "vscode attach".
+      - name: Choose the VS Code version
+        env:
+          VERSION: ${{ inputs.vscode-version }}
+        run: |
+          if [ "$VERSION" = insiders ]; then
+            VERSION=$(curl -fsS --retry 3 https://update.code.visualstudio.com/api/update/linux-x64/insider/latest | jq -er .version)
+            [[ "$VERSION" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::The newest VS Code Insiders build has no commit: $VERSION"; exit 1; }
+          elif [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsS --retry 3 'https://update.code.visualstudio.com/api/releases/stable?released=true' | jq -er '.[0]')
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]$ ]]; then
+              echo "::warning::The newest stable VS Code $VERSION is not pinned: @vscode/test-electron takes a stable version only with a patch number of one digit."
+              VERSION=
+            fi
+          fi
+          echo "VS Code ${VERSION:-stable}"
+          echo "VSCODE_TEST_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install the locked development tools without install scripts
+        run: npm ci --ignore-scripts
+
+      # The token only raises the rate limit of the GitHub API for the read of the latest release.
+      - name: Prepare the Docker engine and the test VS Code with the last released version of the extension
+        env:
+          DEVSPACE_TEST_ATTACH_PREPARE: update
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run test:vscode:attach:prepare
+
+      - name: Run the tests in the window of the devspace with the last released version
+        env:
+          DEVSPACE_TEST_ATTACH: previous
+        run: xvfb-run -a npm run test:vscode:attach
+
+      - name: Check that the devspace still runs after VS Code quit
+        run: |
+          name=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.containerName")
+          test "$(docker inspect --type container -f '{{.State.Running}}' "$name")" = true
+
+      # Over the released version, as an update replaces it (prepare.ts fails when the release is newer than this commit).
+      - name: Install the VSIX of this commit into the test VS Code
+        run: node scripts/install-attach-extensions.mjs
+
+      - name: Run the tests in the window of the devspace after the update
+        env:
+          DEVSPACE_TEST_ATTACH: updated
+        run: xvfb-run -a npm run test:vscode:attach
+
+      - name: Check that the devspace still runs after VS Code quit again
+        run: |
+          name=$(node -p "require('./out/test/vscode/attach/seed.json').devspace.containerName")
+          test "$(docker inspect --type container -f '{{.State.Running}}' "$name")" = true
+
+      - name: Show the Docker objects
+        if: ${{ failure() }}
+        run: |
+          docker ps -a
+          docker volume ls
+          docker images

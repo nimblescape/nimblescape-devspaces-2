@@ -1,0 +1,76 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Opens an Extension Development Host window with the extension from dist/ (task "open extension development
+      // host") and attaches to its extension host over 127.0.0.1. Why not the usual "extensionHost" configuration: in
+      // VS Code 1.139.0 its attach fails when localhost resolves to ::1 first (microsoft/vscode-js-debug#2420); this
+      // variant works with every VS Code version. "restart" attaches again after the window reloads (for example when
+      // it connects to a container).
+      "name": "Run Extension",
+      "type": "node",
+      "request": "attach",
+      "address": "127.0.0.1",
+      "port": 9339,
+      "restart": true,
+      "timeout": 30000,
+      "continueOnAttach": true,
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "open extension development host"
+    },
+    {
+      // Opens an Extension Development Host window with the extension from dist/, without a debugger (task "open
+      // extension development host (no debugger)"): no breakpoints, but also nothing of the Node inspector in the
+      // extension host. This session only runs the task and ends at once; the window stays open. Logs: Developer: Open
+      // Logs Folder in that window.
+      "name": "Run Extension (no debugger)",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["-e", "0"],
+      "console": "internalConsole",
+      "preLaunchTask": "open extension development host (no debugger)"
+    },
+    {
+      // The same in a VS Code profile of your choice (it asks for the name; the Dev Containers extension must be
+      // installed in that profile).
+      "name": "Run Extension (profile)",
+      "type": "node",
+      "request": "attach",
+      "address": "127.0.0.1",
+      "port": 9339,
+      "restart": true,
+      "timeout": 30000,
+      "continueOnAttach": true,
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "open extension development host (profile)"
+    },
+    {
+      // Runs the unit tests of the file open in the editor.
+      "name": "Debug Unit Tests (current file)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/vitest/vitest.mjs",
+      "args": ["run", "${relativeFile}"],
+      "autoAttachChildProcesses": true,
+      "smartStep": true,
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    },
+    {
+      // Runs the Docker integration tests of the file open in the editor (test/docker/*.test.ts) against the running
+      // Docker engine.
+      "name": "Debug Docker Tests (current file)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/vitest/vitest.mjs",
+      "args": ["run", "--config", "vitest.docker.config.mts", "${relativeFile}"],
+      "autoAttachChildProcesses": true,
+      "smartStep": true,
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**", "**/node_modules/**"]
+    }
+  ]
+}

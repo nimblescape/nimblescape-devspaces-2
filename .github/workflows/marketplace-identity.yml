@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
+# Print the ID under which the Marketplace knows the app registration that
+# publishes the extension. The one-time setup of CONTRIBUTING.md adds this ID
+# as a member of the publisher nimblescape. The job signs in like the publish
+# job of the release workflow, reads the profile of the identity with the
+# request that the Microsoft publishing guide documents and changes nothing.
+
+name: Marketplace identity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    name: Print the Marketplace member ID
+    runs-on: ubuntu-latest
+    # The same environment as the publish job, so that the same federated credential applies.
+    environment: marketplace
+    permissions:
+      # azure/login exchanges the OpenID Connect token of this job.
+      id-token: write
+    steps:
+      - name: Sign in to Microsoft Entra ID
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Print the profile ID of the identity
+        run: |
+          id=$(az rest --method get --url https://app.vssps.visualstudio.com/_apis/profile/profiles/me \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 --query id --output tsv)
+          echo "Marketplace member ID: $id"
+          echo "Add the ID \`$id\` to the Marketplace publisher nimblescape as a member with the role Contributor." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
+# Rule 4 of CONTRIBUTING.md, "Release rules": a change of the release process
+# is tested with a dry run before it reaches main. On a pull request that
+# changes release.yml, ci.yml or scripts/release-checks.mjs, the job fails
+# until a successful dry run of the workflow "Release" on the branch of the
+# pull request had these files as they are at the head of the pull request.
+# After the dry run, re-run the job. On every other pull request, the job
+# passes.
+# Do not make the job a required check of main: the release moves main to its
+# version commit, which has no result of this job. The version job of the
+# release checks the same rule again. The job only reads; it is a workflow of
+# its own, so that the workflows that call ci.yml need no more permissions.
+
+name: Release dry run
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  # The files of the pull request.
+  pull-requests: read
+  # The runs of the workflow "Release".
+  actions: read
+
+jobs:
+  dry-run:
+    name: release dry run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the pinned Node release
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Check that a dry run tested the changes of the release process
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: node scripts/release-checks.mjs dry-run

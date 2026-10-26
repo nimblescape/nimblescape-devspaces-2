@@ -1,0 +1,2245 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import { describe, expect, it } from 'vitest';
+import { devContainersSettings } from '../devContainers';
+import { MAX_DOCKERFILE_LENGTH } from '../imageCheck/dockerfile';
+import {
+  CONTAINER_CONFIG_UNKNOWN_LABEL,
+  CONTAINER_VERSION_LABEL,
+  EXTENSION_LABEL_KEYS,
+  HELPER_CACHE_VOLUME,
+  LABEL_DEVSPACE_ID,
+  LABEL_OWNER_ID,
+  LABEL_PREFIX,
+  LABEL_REPOSITORY,
+  TOKEN_TMPFS,
+  composeProjectName,
+  isDevspaceResourceName,
+  newDevspaceId,
+  resourceName,
+} from '../names';
+import { helperCliVariables, mayBeSetInHelper, substituteCliVariables, unresolvedCliVariables } from './cliVariables';
+import { containerEnvironment, remoteEnvironment } from './containerGit';
+import { runAnalysisJob } from './configurationAnalysis';
+import { buildOverrideConfig } from './devcontainerCli';
+import {
+  GITHUB_CLI_ACCOUNT_REASON,
+  MAX_LISTED_ITEMS,
+  MAX_STOP_TIMEOUT_SECONDS,
+  foreignNetworkItem,
+  hostAccessClassification,
+  hostAccessProblems,
+  hostAccessReport,
+  imageLabelItems,
+  devspaceImageClass,
+  devspaceImageIds,
+  devspaceImageNames,
+  hasUnknownDevspace,
+  imageNamedBy,
+  isOtherDevspaceImageName,
+  imageReferenceFinding,
+  otherAccountImageItems,
+  volumeOwners,
+  resolveNetworkReference,
+  resolvedByImageId,
+  imageIdResolvedReferences,
+  isHelperPath,
+  isValidImageReference,
+  isLoopbackAddress,
+  isOwnVolume,
+  isSameOwnerAdditionalVolume,
+  localImageRepository,
+  loopbackAppPorts,
+  loopbackRunArgs,
+  mountedVolumeNames,
+  overrideRunArgs,
+  removedRunArgs,
+  runArgsNetworks,
+  runArgsProblems,
+  splitPortAddress,
+  volumeFlagTarget,
+  volumeLabelOwner,
+  volumeNameItems,
+  withLoopbackAddress,
+  withoutNameArgs,
+  type HostAccessInput,
+  type HostAccessReport,
+} from '../policy';
+
+const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+// One name per devspace (resourceName); the project, the volume, and the container share it.
+const OWN = resourceName('acme/api', ID);
+/** The name of a devspace of another repository and ID. */
+const OTHER = resourceName('acme/web', '11111111-2222-4333-8444-555555555555');
+
+/** Problems of a repository configuration alone. */
+function configProblems(config: Record<string, unknown>): string[] {
+  return hostAccessProblems({ config, ownVolume: OWN });
+}
+
+describe('host access policy: mounts', () => {
+  it.each<[string, unknown, string[]]>([
+    ['a named volume', 'source=cache,target=/cache,type=volume', []],
+    ['a named volume without type', 'source=cache,target=/cache', []],
+    ['an anonymous volume', 'target=/cache,type=volume', []],
+    ['a tmpfs', 'type=tmpfs,target=/tmp/x', []],
+    ['the own workspace volume', `source=${OWN},target=/other,type=volume`, []],
+    ['a volume with ${devcontainerId} (not resolved before the first up)', 'source=${devcontainerId}-history,target=/h,type=volume', []],
+    ['a bind mount', 'source=/Users/x/.ssh,target=/root/.ssh,type=bind', ['bind mount /Users/x/.ssh']],
+    ['a bind mount with src and upper case type', 'type=BIND,src=/Users/x,dst=/x', ['bind mount /Users/x']],
+    ['a path without type', 'source=/var/run/docker.sock,target=/var/run/docker.sock', ['bind mount /var/run/docker.sock']],
+    ['a relative path without type', 'source=./data,target=/data', ['bind mount ./data']],
+    ['a home path without type', 'source=~/x,target=/x', ['bind mount ~/x']],
+    ['a Windows path without type', 'source=C:\\Users\\x,target=/x', ['bind mount C:\\Users\\x']],
+    ['a path as the source of a volume', 'source=/Users/x,target=/x,type=volume', ['bind mount /Users/x']],
+    ['a quoted source with a comma', 'type=bind,"source=/Users/a,b",target=/x', ['bind mount /Users/a,b']],
+    ['a volume of another devspace', `source=${OTHER},target=/x,type=volume`, [`volume ${OTHER} of another devspace`]],
+    // Volumes of the repository whose name starts with `devspaces-`, for example `${localWorkspaceFolderBasename}-node_modules`
+    // of a repository devspaces-tools: not named like the workspace volume of a devspace.
+    ['a volume of the repository that starts with devspaces-', 'source=devspaces-tools-node_modules,target=/x,type=volume', []],
+    ['an object volume of the repository that starts with devspaces-', { type: 'volume', source: 'devspaces-home', target: '/h' }, []],
+    ['the cache volume of the workspace helper', 'source=devspaces-worker-cache,target=/x,type=volume', ['volume devspaces-worker-cache of the workspace helper']],
+    // The Dev Containers extension keeps VS Code Server for its dev containers in `vscode`, and clones repositories into
+    // volumes named with a hash.
+    ['the cache volume of the Dev Containers extension', 'source=vscode,target=/vscode,type=volume', ['volume vscode of the Dev Containers extension']],
+    ['the cache volume of the Dev Containers extension as an object', { type: 'volume', source: 'vscode', target: '/v' }, ['volume vscode of the Dev Containers extension']],
+    // A name that ends in a hash is decided by the volume, when it exists (see "volumes named like a clone volume").
+    ['a name like a clone volume of the Dev Containers extension (SHA-256) that does not exist', `source=api-${'5e'.repeat(32)},target=/x,type=volume`, []],
+    ['a name like a clone volume of the Dev Containers extension (MD5) that does not exist', `source=vsc-api-${'0f'.repeat(16)},target=/x`, []],
+    ['the proposed name of a named clone volume of the Dev Containers extension', 'source=vsc-remote-containers,target=/x,type=volume', ['volume vsc-remote-containers of the Dev Containers extension']],
+    ['volumes whose names only look similar', 'source=vscode-extensions,target=/x,type=volume', []],
+    ['a hash of another length (SHA-1)', `source=api-${'a'.repeat(40)},target=/x,type=volume`, []],
+    ['a hash in upper case', `source=api-${'A'.repeat(32)},target=/x,type=volume`, []],
+    // An anonymous volume of another container, named by Docker (older Docker versions do not label it).
+    ['a volume named like an anonymous volume', `source=${'ab'.repeat(32)},target=/x,type=volume`, [`volume ${'ab'.repeat(32)} of another container`]],
+    ['a volume with driver options (a folder of the computer)', 'type=volume,source=v,target=/x,volume-opt=type=none,volume-opt=device=/Users/x', ['volume options of the mount v']],
+    ['a volume with a driver', 'type=volume,source=v,target=/x,volume-driver=local', ['volume options of the mount v']],
+    // Labels on a volume that the mount creates: the labels by which the extension restores devspaces after a lost registry.
+    ['a volume with labels', 'type=volume,source=myvol,target=/x,volume-label=nimblescape.devspaces.id=x,volume-label=nimblescape.devspaces.owner-id=2', ['volume options of the mount myvol']],
+    ['a volume with a label in upper case', 'type=volume,source=v,target=/x,Volume-Label=a=b', ['volume options of the mount v']],
+    ['the documented volume options without access to the computer', 'type=volume,source=v,target=/x,volume-nocopy,volume-subpath=sub', []],
+    ['an object whose target adds a volume label', { type: 'volume', source: 'v', target: '/x,volume-label=nimblescape.devspaces.id=x' }, ['volume options of the mount v']],
+    ['an object with volume labels', { source: 'v', target: '/x', type: 'volume', volumeLabels: { a: 'b' } }, ['volume options of the mount v']],
+    ['a named pipe', 'type=npipe,source=\\\\.\\pipe\\docker_engine,target=/p', ['mount of the type npipe']],
+    ['an object bind mount (a Feature: docker-outside-of-docker)', { source: '/var/run/docker.sock', target: '/var/run/docker-host.sock', type: 'bind' }, ['bind mount /var/run/docker.sock']],
+    ['an object volume (a Feature: docker-in-docker)', { source: 'dind-var-lib-docker-x', target: '/var/lib/docker', type: 'volume' }, []],
+    ['an object without type and a path', { source: '/Users/x', target: '/x' }, ['bind mount /Users/x']],
+    ['an object with volume options', { source: 'v', target: '/x', type: 'volume', volumeOptions: {} }, ['volume options of the mount v']],
+    ['an invalid entry', 42, ['mount of the type unknown']],
+    // The CLI gives Docker an object as `type=…,src=…,dst=…` without quotes: a comma in a value adds fields.
+    ['an object whose target adds a bind mount', { type: 'volume', source: 'v', target: '/x,type=bind,src=/' }, ['bind mount /']],
+    ['an object whose source adds a bind mount', { type: 'volume', source: 'v,type=bind,source=.', target: '/x' }, ['bind mount .']],
+    // Docker reads only the first line: the fields after a line break would be checked, but not used.
+    ['a line break', 'type=bind,source=/,target=/host\n,type=volume,source=v', ['mount "type=bind,source=/,target=/host\\n,type=volume,source=v"']],
+    ['a quote inside a field (Docker refuses it)', 'type=volume,source=v"x,type=bind', ['mount "type=volume,source=v\\"x,type=bind"']],
+    ['a quoted field with an escaped quote', 'type=volume,"source=a""b",target=/x', []],
+  ])('%s', (_name, mount, expected) => {
+    expect(configProblems({ mounts: [mount] })).toEqual(expected);
+  });
+});
+
+describe('host access policy: runArgs', () => {
+  it.each<[string, string[], string[]]>([
+    ['the network, also host', ['--network', 'host', '--net=bridge', '--network=corp'], []],
+    [
+      'the network of another container',
+      ['--network', `container:${OTHER}`, '--net=container:db'],
+      [`network of another container (container:${OTHER})`, 'network of another container (container:db)'],
+    ],
+    ['--mount with a line break', ['--mount', 'type=bind,src=/,dst=/host\n,type=volume,src=v'], ['mount "type=bind,src=/,dst=/host\\n,type=volume,src=v"']],
+    ['DNS and hosts', ['--add-host', 'host.docker.internal:host-gateway', '--dns=1.1.1.1', '--dns-search', 'corp', '--dns-option=ndots:1'], []],
+    [
+      'each known DNS, memory, and health check flag, with its value next or after =',
+      [
+        '--dns', '1.1.1.1', '--dns=8.8.8.8', '--dns-option', 'ndots:2', '--dns-option=timeout:1', '--dns-opt', 'rotate', '--dns-opt=attempts:2',
+        '--dns-search', 'corp', '--dns-search=example.com',
+        '--memory', '4g', '--memory=2g', '--memory-reservation', '1g', '--memory-reservation=512m', '--memory-swap', '5g', '--memory-swap=-1',
+        '--memory-swappiness', '10', '--memory-swappiness=0',
+        '--health-cmd', 'true', '--health-cmd=true', '--health-interval', '30s', '--health-interval=10s', '--health-retries', '3', '--health-retries=5',
+        '--health-start-period', '5s', '--health-start-period=1s', '--health-start-interval', '1s', '--health-start-interval=2s',
+        '--health-timeout', '2s', '--health-timeout=3s', '--no-healthcheck',
+      ],
+      [],
+    ],
+    // An unknown flag that starts like a known one does not take the next argument as its value: `--privileged` is seen.
+    ['an unknown flag that starts like --dns', ['--dns-foo', '--privileged'], ['--dns-foo', 'privileged mode']],
+    ['unknown flags that start like --memory and --health-', ['--memory-foo', '-v', '/:/host', '--health-foo=1', '--healthcheck'], ['--memory-foo', 'bind mount /', '--health-foo', '--healthcheck']],
+    ['a value of a known flag that looks like a flag stays its value', ['--dns-search', '--privileged'], []],
+    ['init, labels, hostname, name', ['--init', '--label', 'a=b', '-l', 'c=d', '--hostname', 'h', '-h', 'h2', '--name', 'x'], []],
+    ['environment variables', ['--env', 'A=1', '-e', 'B=2', '-eC=3', '-e=D=4', '--env-file', '/workspaces/api/.env'], []],
+    ['limits', ['--shm-size=1g', '--ulimit', 'nofile=1024', '--memory', '4g', '-m', '2g', '--memory-swap=5g', '--cpus', '2'], []],
+    ['user and working folder', ['--user', 'node', '-u', '1000', '--workdir', '/w', '-w', '/x'], []],
+    ['SYS_PTRACE and seccomp=unconfined', ['--cap-add=SYS_PTRACE', '--cap-add', 'CAP_SYS_PTRACE', '--security-opt', 'seccomp=unconfined', '--security-opt=seccomp:unconfined'], []],
+    ['ports on localhost or without address', ['-p', '127.0.0.1:8080:80', '--publish=8081:81', '-p3000', '-p', '[::1]:9000:90', '-p', ':7000:70'], []],
+    ['a named volume', ['-v', 'cache:/cache', '--volume=other:/o:ro', '-v', '/anonymous', '--mount', 'type=tmpfs,target=/t'], []],
+    ['privileged mode', ['--privileged'], ['privileged mode']],
+    ['privileged mode with a value', ['--privileged=true'], ['privileged mode']],
+    ['a bind mount with -v', ['-v', '/Users/x/project:/src'], ['bind mount /Users/x/project']],
+    ['a bind mount with --volume=', ['--volume=/var/run/docker.sock:/var/run/docker.sock'], ['bind mount /var/run/docker.sock']],
+    ['a bind mount with -v and a relative path', ['-v', './data:/data'], ['bind mount ./data']],
+    ['a bind mount with a Windows path', ['-v', 'C:\\data:/data'], ['bind mount C:\\data']],
+    ['a volume of another devspace with -v', ['-v', `${OTHER}:/x`], [`volume ${OTHER} of another devspace`]],
+    ['--mount with type=bind', ['--mount', 'type=bind,source=/etc,target=/host-etc'], ['bind mount /etc']],
+    ['--mount= with a volume of the helper', ['--mount=type=volume,source=devspaces-worker-cache,target=/c'], ['volume devspaces-worker-cache of the workspace helper']],
+    ['devices and GPUs', ['--device', '/dev/fuse', '--device-cgroup-rule=c 1:* rwm', '--gpus', 'all'], ['--device=/dev/fuse', '--device-cgroup-rule=c 1:* rwm', '--gpus=all']],
+    ['namespaces of the computer', ['--pid=host', '--ipc', 'host', '--uts=host', '--userns=host', '--cgroupns=host'], ['--pid=host', '--ipc=host', '--uts=host', '--userns=host', '--cgroupns=host']],
+    ['another namespace mode is not known to be safe', ['--ipc=private'], ['--ipc=private']],
+    ['volumes of another container', ['--volumes-from', 'other'], ['--volumes-from=other']],
+    ['other capabilities', ['--cap-add', 'NET_ADMIN', '--cap-add=ALL'], ['capability NET_ADMIN', 'capability ALL']],
+    ['other security options', ['--security-opt', 'apparmor=unconfined', '--security-opt=label=disable'], ['security option apparmor=unconfined', 'security option label=disable']],
+    ['a port on all addresses', ['-p', '0.0.0.0:8080:80'], ['published port 0.0.0.0:8080:80']],
+    ['a port on a LAN address', ['--publish=192.168.1.5:8080:80'], ['published port 192.168.1.5:8080:80']],
+    ['a port on all IPv6 addresses', ['-p', '[::]:8080:80'], ['published port [::]:8080:80']],
+    // Docker's long syntax has no address: Docker publishes it on all addresses, also with 127.0.0.1:: in front of it.
+    ['a port in the long syntax', ['-p', 'published=8080,target=80'], ['published port published=8080,target=80']],
+    ['a port in the long syntax after an unknown key', ['-p', 'x=y,published=8080,target=80'], ['published port x=y,published=8080,target=80']],
+    ['a port in the long syntax with --publish=', ['--publish=published=9090,target=90'], ['published port published=9090,target=90']],
+    ['a port in the long syntax attached to -p', ['-ppublished=8080,target=80'], ['published port published=8080,target=80']],
+    ['-v with a volume named like an anonymous volume', ['-v', `${'cd'.repeat(32)}:/x`], [`volume ${'cd'.repeat(32)} of another container`]],
+    ['--mount with volume labels', ['--mount', 'type=volume,source=myvol,target=/x,volume-label=nimblescape.devspaces.repository=acme/api'], ['volume options of the mount myvol']],
+    ['a port in the long syntax behind 127.0.0.1', ['-p', '127.0.0.1::published=8080,target=80'], ['published port 127.0.0.1::published=8080,target=80']],
+    ['all ports', ['-P'], ['publishing all ports (-P)']],
+    ['all ports, long form', ['--publish-all'], ['publishing all ports (--publish-all)']],
+    ['the platform (as in build.options)', ['--platform', 'linux/amd64', '--init', '--platform=linux/arm64'], []],
+    ['a tmpfs (as a mount of the type tmpfs)', ['--tmpfs', '/tmp', '--tmpfs=/run:rw,size=64m'], []],
+    ['volumes of the repository that start with devspaces-', ['-v', 'devspaces-cache:/x', '--mount=type=volume,source=devspaces-db-data,target=/d', '--mount', 'type=volume,src=devspaces-cache,dst=/c'], []],
+    ['the network of another container in upper case', ['--network=CONTAINER:db'], ['network of another container (CONTAINER:db)']],
+    // Docker reads `name=…` as the long form of --network: CSV, keys and values in lower case, the last `name` wins.
+    [
+      'the network of another container in the long form',
+      ['--network', 'name=container:db', '--network=NAME=container:web', '--net', 'alias=x,name=CONTAINER:api', '--network', '"name=container:q"', '--network', 'name=bridge,name=container:last'],
+      [
+        'network of another container (name=container:db)',
+        'network of another container (NAME=container:web)',
+        'network of another container (alias=x,name=CONTAINER:api)',
+        'network of another container ("name=container:q")',
+        'network of another container (name=bridge,name=container:last)',
+      ],
+    ],
+    ['other networks in the long form', ['--network', 'name=corp,alias=api', '--network=name=host', '--network', 'name=bridge,driver-opt=com.docker.network.endpoint.ifname=eth1'], []],
+    ['a long form that Docker reads otherwise (only its first line)', ['--network', 'name=bridge\nname=container:db'], ['network "name=bridge\\nname=container:db"']],
+    ['flags that only take rights away', ['--cap-drop', 'ALL', '--cap-drop=NET_RAW', '--read-only', '--read-only=true', '--security-opt', 'no-new-privileges'], []],
+    [
+      'no-new-privileges in each spelling that Docker reads',
+      ['--security-opt=no-new-privileges:true', '--security-opt', 'no-new-privileges=true', '--security-opt', 'no-new-privileges=false', '--security-opt=no-new-privileges:1'],
+      [],
+    ],
+    ['security options that give more rights', ['--security-opt', 'no-new-privileges=maybe', '--security-opt=systempaths=unconfined', '--security-opt', 'seccomp=/p.json'], ['security option no-new-privileges=maybe', 'security option systempaths=unconfined', 'security option seccomp=/p.json']],
+    [
+      'limits of processes, CPUs, block I/O, and storage',
+      ['--pids-limit', '100', '--cpu-shares', '512', '-c', '256', '--cpu-period=100000', '--cpu-quota', '50000', '--cpu-rt-period', '1000000', '--cpu-rt-runtime=950000', '--cpuset-cpus', '0-1', '--cpuset-mems=0', '--blkio-weight', '300', '--storage-opt', 'size=20G', '--isolation=default'],
+      [],
+    ],
+    ['an OOM score of 0 or more', ['--oom-score-adj', '500', '--oom-score-adj=0', '--oom-score-adj', '1000'], []],
+    ['a negative OOM score (other processes of the computer end first)', ['--oom-score-adj', '-500', '--oom-score-adj=-0x3e8'], ['--oom-score-adj=-500', '--oom-score-adj=-0x3e8']],
+    ['groups of the user inside the container', ['--group-add', 'docker', '--group-add=1001'], []],
+    [
+      'the health check',
+      ['--health-cmd', 'curl -f http://localhost || exit 1', '--health-interval=30s', '--health-retries', '3', '--health-start-period', '5s', '--health-start-interval=1s', '--health-timeout', '2s', '--no-healthcheck'],
+      [],
+    ],
+    ['addresses and names in a network, and exposed ports', ['--ip', '172.30.100.104', '--ip6=2001:db8::33', '--network-alias', 'api', '--net-alias=web', '--expose', '3000', '--expose=8000-8010'], []],
+    ['kernel settings of the namespaces of the container', ['--sysctl', 'net.ipv4.ip_unprivileged_port_start=0', '--sysctl=kernel.shmmax=1000000'], []],
+    ['the stop of the container', ['--stop-signal', 'SIGINT', '--stop-timeout', String(MAX_STOP_TIMEOUT_SECONDS), '--stop-timeout=0'], []],
+    [
+      'a stop that can take longer than the Monitor waits',
+      ['--stop-timeout', String(MAX_STOP_TIMEOUT_SECONDS + 1), '--stop-timeout=-1', '--stop-timeout', '0x10'],
+      [`--stop-timeout=${MAX_STOP_TIMEOUT_SECONDS + 1}`, '--stop-timeout=-1', '--stop-timeout=0x10'],
+    ],
+    ['a restart after a failure', ['--restart', 'no', '--restart=on-failure', '--restart', 'on-failure:3'], []],
+    ['a start together with Docker', ['--restart', 'always', '--restart=unless-stopped'], ['--restart=always', '--restart=unless-stopped']],
+    [
+      'logs in files of the container, or none',
+      ['--log-driver', 'json-file', '--log-driver=local', '--log-driver', 'none', '--log-opt', 'max-size=10m', '--log-opt=max-file=3', '--log-opt', 'compress=true', '--log-opt', 'tag={{.Name}}', '--log-opt', 'mode=non-blocking'],
+      [],
+    ],
+    ['log drivers that reach the computer or credentials of Docker', ['--log-driver', 'syslog', '--log-driver=journald', '--log-driver', 'awslogs'], ['--log-driver=syslog', '--log-driver=journald', '--log-driver=awslogs']],
+    ['log options of other drivers', ['--log-opt', 'syslog-address=unix:///var/run/docker.sock', '--log-opt=awslogs-group=x'], ['--log-opt=syslog-address=unix:///var/run/docker.sock', '--log-opt=awslogs-group=x']],
+    ['other storage options', ['--storage-opt', 'dm.basesize=20G'], ['--storage-opt=dm.basesize=20G']],
+    ['flags without effect (the CLI sets its own)', ['--entrypoint', '/bin/bash', '--attach', 'STDOUT', '-a', 'STDERR', '-aSTDIN'], []],
+    [
+      'flags that are removed before up',
+      ['--rm', '-i', '-t', '-it', '-ti', '--interactive', '--tty', '-d', '--detach', '-dit', '--rm=false', '--tty=true', '-i=false'],
+      [],
+    ],
+    ['an environment file of the workspace volume', ['--env-file', '/workspaces/api/.env', '--env-file=/workspaces/.devspace+/env', '--env-file', '//workspaces/./api/.env'], []],
+    [
+      'an environment file outside the workspace volume (docker run reads it in the workspace helper)',
+      ['--env-file', '/devspace-cache/x', '--env-file=/Users/x/.env', '--env-file', '.env', '--env-file', '/workspaces/api/../../devspace-cache/x', '--env-file', '/workspaces', '--env-file', '/workspacesx/a'],
+      ['--env-file=/devspace-cache/x', '--env-file=/Users/x/.env', '--env-file=.env', '--env-file=/workspaces/api/../../devspace-cache/x', '--env-file=/workspaces', '--env-file=/workspacesx/a'],
+    ],
+    [
+      'devices, runtimes, volume drivers, cgroups, and the Docker socket',
+      ['--device-read-bps', '/dev/sda:1mb', '--device-write-iops=/dev/sda:10', '--blkio-weight-device', '/dev/sda:200', '--runtime', 'nvidia', '--volume-driver=local', '--use-api-socket', '--cgroup-parent', '/system.slice', '--oom-kill-disable', '--link', 'db'],
+      ['--device-read-bps=/dev/sda:1mb', '--device-write-iops=/dev/sda:10', '--blkio-weight-device=/dev/sda:200', '--runtime=nvidia', '--volume-driver=local', 'the Docker socket (--use-api-socket)', '--cgroup-parent=/system.slice', '--oom-kill-disable', '--link=db'],
+    ],
+    ['a group of short flags with -P', ['-Pi'], ['publishing all ports (-P)']],
+    ['the cache volume of the Dev Containers extension', ['-v', 'vscode:/vscode', '--mount=type=volume,src=vscode,dst=/v'], ['volume vscode of the Dev Containers extension']],
+    [
+      'labels of Devspaces and of the Dev Container CLI',
+      ['--label', 'nimblescape.devspaces.id=x', '-l', 'nimblescape.devspaces.owner-id=1', '--label=devcontainer.metadata=[]', '-ldevcontainer.local_folder=/Users/x', '--label', ' NIMBLESCAPE.DEVSPACES.container-config=unknown', '--label', 'nimblescape.devspaces.container-version=2', '-l', 'nimblescape.devspaces.worker-run'],
+      ['label nimblescape.devspaces.id', 'label nimblescape.devspaces.owner-id', 'label devcontainer.metadata', 'label devcontainer.local_folder', 'label NIMBLESCAPE.DEVSPACES.container-config', 'label nimblescape.devspaces.container-version', 'label nimblescape.devspaces.worker-run'],
+    ],
+    ['the labels that the override configuration adds itself', ['--label', CONTAINER_VERSION_LABEL, '-l', CONTAINER_CONFIG_UNKNOWN_LABEL], []],
+    ['other labels', ['--label', 'devspacex=1', '-l', 'devcontainer=1', '--label', 'com.example.devspace.x=1', '--label', 'devspace', '--label', 'devspaces-test.run=1'], []],
+    // Labels of another tool with the prefix devspace. are not the extension's (its labels have the prefix
+    // nimblescape.devspaces.).
+    ['labels of another tool with the prefix devspace.', ['--label', 'devspace.fingerprint=x', '-l', 'devspace.inputs', '--label=devspace.environment-id=x', '-ldevspace.compose-service=db'], []],
+    [
+      'variables of container-only Git (the value of runArgs would win)',
+      ['-e', 'GIT_CONFIG_GLOBAL=/tmp/x', '--env', 'GIT_CONFIG_COUNT=0', '-eGIT_CONFIG_PARAMETERS=', '-e=DOCKER_CONFIG=/tmp/docker', '--env=GIT_CONFIG_KEY_0=x', '--env', 'GIT_SSH_COMMAND=ssh', '-e', 'GIT_CONFIG_SYSTEM=/x'],
+      [
+        'variable GIT_CONFIG_GLOBAL in runArgs',
+        'variable GIT_CONFIG_COUNT in runArgs',
+        'variable GIT_CONFIG_PARAMETERS in runArgs',
+        'variable DOCKER_CONFIG in runArgs',
+        'variable GIT_CONFIG_KEY_0 in runArgs',
+        'variable GIT_SSH_COMMAND in runArgs',
+        'variable GIT_CONFIG_SYSTEM in runArgs',
+      ],
+    ],
+    // Without a value, Docker takes the value of the workspace helper, or removes the variable of the extension.
+    ['a variable of container-only Git without a value', ['-e', 'DOCKER_CONFIG', '--env', 'GIT_CONFIG_GLOBAL'], ['variable DOCKER_CONFIG in runArgs', 'variable GIT_CONFIG_GLOBAL in runArgs']],
+    ['other variables', ['-e', 'GIT_AUTHOR_NAME=x', '--env', 'BROWSER=x', '-e', 'GIT_CONFIGURATION=x', '-e', 'SSH_AUTH_SOCKET=x'], []],
+    // Variables of the Dev Containers extension and GnuPG: the extension leaves them to their owners and does not set them.
+    ['variables that the extension does not set', ['-e', 'SSH_AUTH_SOCK=/home/me/agent.sock', '--env=REMOTE_CONTAINERS_IPC=/tmp/ipc', '-e', 'GNUPGHOME=/x'], []],
+    ['flags that stay unknown', ['--mac-address', '02:42:ac:11:00:02', '--label-file=/workspaces/api/labels', '--cidfile', '/tmp/id', '--annotation', 'a=b', '--kernel-memory', '1g'], ['--mac-address', '--label-file', '--cidfile', '--annotation', '--kernel-memory']],
+    // Docker would take the next argument of the extension (its --label) as the value.
+    ['a flag without its value at the end', ['--init', '-e'], ['-e without a value']],
+    ['a flag with a check without its value at the end', ['--network'], ['--network without a value']],
+    ['--name without its value at the end (removed)', ['--init', '--name'], []],
+    ['an unknown flag with =', ['--pull=always'], ['--pull']],
+    ['an unknown boolean flag', ['--sig-proxy'], ['--sig-proxy']],
+    ['a group of short flags with a flag that is not known', ['-itq'], ['-itq']],
+    ['a group of short flags with a flag that takes a value', ['-itp8080:80'], ['-itp8080:80']],
+    ['a stray argument', ['host'], ['argument host']],
+    ['each item once', ['--privileged', '--privileged', '-v', '/a:/a', '-v', '/a:/b'], ['privileged mode', 'bind mount /a']],
+  ])('%s', (_name, runArgs, expected) => {
+    expect(runArgsProblems(runArgs, OWN)).toEqual(expected);
+    expect(configProblems({ runArgs })).toEqual(expected);
+  });
+
+  // Each label of the extension, and any later one with its prefix.
+  it.each([...EXTENSION_LABEL_KEYS, `${LABEL_PREFIX}future`])('refuses the label %s of the extension in runArgs, with or without a value', (key) => {
+    expect(runArgsProblems(['--label', `${key}=x`, '-l', key, '--label', 'devspace.fingerprint=f'], OWN)).toEqual([`label ${key}`]);
+  });
+
+  it('never takes the value of a flag for a flag', () => {
+    expect(runArgsProblems(['-e', '--privileged', '--label', '-v'], OWN)).toEqual([]);
+  });
+
+  it('refuses entries that are no text, which the list for Docker would not have', () => {
+    for (const runArgs of [['--label', 1, '--label', '--privileged'], ['-e', 5, '-e', '--privileged']]) {
+      // Without the number, `--label --label --privileged` would give Docker the flag --privileged.
+      expect(hostAccessReport({ config: { runArgs }, ownVolume: OWN })).toEqual({
+        hostAccess: ['privileged mode'],
+        unsupported: [`argument ${runArgs[1]}`],
+      });
+    }
+  });
+});
+
+describe('host access policy: settings that need access to the computer, and settings that are not supported', () => {
+  const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN });
+
+  it('reports unknown flags, options, and arguments as not supported, not as access to the computer', () => {
+    expect(report({ runArgs: ['--pull=always', '--sig-proxy', '-itq', 'host'] })).toEqual({
+      hostAccess: [],
+      unsupported: ['--pull', '--sig-proxy', '-itq', 'argument host'],
+    });
+    expect(report({ build: { options: ['--progress=plain'] } })).toEqual({ hostAccess: [], unsupported: ['build option --progress'] });
+  });
+
+  it('reports values of known flags that Devspaces does not support as not supported', () => {
+    expect(
+      report({ runArgs: ['--restart=always', '--stop-timeout', '600', '--log-opt', 'syslog-address=udp://x', '--storage-opt', 'dm.basesize=20G', '--init', '-e'] }),
+    ).toEqual({
+      hostAccess: [],
+      unsupported: ['--restart=always', '--stop-timeout=600', '--log-opt=syslog-address=udp://x', '--storage-opt=dm.basesize=20G', '-e without a value'],
+    });
+    expect(report({ runArgs: ['--log-driver=syslog', '--oom-score-adj=-1', '--env-file', '/etc/passwd'] })).toEqual({
+      hostAccess: ['--log-driver=syslog', '--oom-score-adj=-1', '--env-file=/etc/passwd'],
+      unsupported: [],
+    });
+  });
+
+  it('reports labels of Devspaces as not supported, and variables, volumes, and the port host as access to the computer', () => {
+    const config = {
+      runArgs: ['--label', 'nimblescape.devspaces.id=x', '-e', 'GIT_CONFIG_GLOBAL=/x', '-v', 'vscode:/v'],
+      containerEnv: { DOCKER_CONFIG: '/a' },
+      customizations: { vscode: { settings: { 'remote.localPortHost': 'allInterfaces' } } },
+    };
+    expect(report(config)).toEqual({
+      hostAccess: [
+        'setting remote.localPortHost "allInterfaces"',
+        'variable GIT_CONFIG_GLOBAL in runArgs',
+        'volume vscode of the Dev Containers extension',
+        'variable DOCKER_CONFIG in containerEnv',
+      ],
+      unsupported: ['label nimblescape.devspaces.id'],
+    });
+  });
+
+  it('keeps the settings that a rule refuses in the list of access to the computer', () => {
+    expect(report({ runArgs: ['--privileged', '--restart=always'] })).toEqual({ hostAccess: ['privileged mode'], unsupported: ['--restart=always'] });
+    expect(
+      report({ runArgs: ['-v', '/Users/x:/x', '-P', '--gpus', 'all'], build: { options: ['--secret', 'id=a'] }, initializeCommand: 'x' }),
+    ).toEqual({
+      // The secret `id=a` without a source is the file `a` (a relative path).
+      hostAccess: ['initializeCommand', 'bind mount /Users/x', 'publishing all ports (-P)', '--gpus=all', 'build option --secret', 'build option --secret id=a (a relative path)'],
+      unsupported: [],
+    });
+  });
+
+  it('has the same items as hostAccessProblems, in the same order', () => {
+    const config = { runArgs: ['--rm', '--privileged', '--restart=always', '-v', '/a:/a'], mounts: ['type=bind,source=/b,target=/b'] };
+    const { hostAccess, unsupported } = report(config);
+    const items = hostAccessProblems({ config, ownVolume: OWN });
+    expect([...hostAccess, ...unsupported].sort()).toEqual([...items].sort());
+    expect(items.filter((item) => hostAccess.includes(item))).toEqual(hostAccess);
+    expect(items.filter((item) => unsupported.includes(item))).toEqual(unsupported);
+  });
+});
+
+describe('host access policy: the runArgs that Docker gets', () => {
+  const name = (runArgs: readonly string[]) => withoutNameArgs(runArgs);
+
+  it('removes --name as Docker reads it, and keeps a --name that is the value of another flag', () => {
+    expect(name(['--name', 'x', '--init'])).toEqual(['--init']);
+    expect(name(['--name=x', '--init'])).toEqual(['--init']);
+    expect(name(['--init', '--name'])).toEqual(['--init']);
+    expect(name(['--name', '--privileged', '--init'])).toEqual(['--init']);
+    expect(name(['-e', 'A=--name', '--init'])).toEqual(['-e', 'A=--name', '--init']);
+    expect(name(['-e', '--name', '--init'])).toEqual(['-e', '--name', '--init']);
+    expect(name(['--label', '--name', '--init', '--label', '--privileged'])).toEqual(['--label', '--name', '--init', '--label', '--privileged']);
+  });
+
+  /** The repository part of the runArgs of the override configuration: without the label, the name, and the host name it adds. */
+  function dockerRunArgs(runArgs: string[]): string[] {
+    const all = buildOverrideConfig({ devspaceImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs })
+      .runArgs as string[];
+    // The host name is left out where the repository decides it (runArgsDecideHostname).
+    // The tmpfs of the token comes last.
+    const added = all.at(-4) === '--hostname' ? ['--hostname', 'api'] : [];
+    // The override configuration also sets the labels of Docker Compose empty.
+    const tail = [
+      '--label',
+      'nimblescape.devspaces.container-version=1',
+      '--label',
+      'com.docker.compose.project=',
+      '--label',
+      'com.docker.compose.service=',
+      '--name',
+      OWN,
+      ...added,
+      '--tmpfs',
+      '/run/devspace:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+    ];
+    expect(all.slice(-tail.length)).toEqual(tail);
+    return all.slice(0, -tail.length);
+  }
+
+  const CASES: string[][] = [
+    // `--name` as the value of an allowed flag: removed word by word, the arguments after it would shift by one.
+    ['--label', '--name', '--init', '--label', '--privileged'],
+    ['-e', '--name', '--init', '-e', '--privileged'],
+    ['-e', '--name', '--init', '-e', '--volume=/:/host'],
+    ['--label', '--name', '--init', '--label', '--pid=host'],
+    ['--label', '--name', '--init', '--label', '-v/Users/hs:/host'],
+    ['--label', '--name', '--init', '--label', '--mount=type=bind,source=/Users,target=/host'],
+    ['--hostname', '--name', 'x', '--privileged'],
+    ['--name', 'x', '--privileged'],
+    ['--name=x', '-v', '/Users/hs:/host'],
+    ['--name', '--init', '-p', '8080:80'],
+    ['--cap-add=SYS_PTRACE', '--name', 'mine', '--network', 'host', '-p', '3000'],
+    ['--init', '--name'],
+    ['-e', '--name'],
+  ];
+
+  it.each(CASES.map((runArgs) => [runArgs.join(' '), runArgs]))('checks what Docker gets: %s', (_name, runArgs) => {
+    const passed = dockerRunArgs(runArgs);
+    expect(passed).toEqual(overrideRunArgs(runArgs));
+    // A configuration that the policy allows gives Docker nothing that the policy refuses.
+    const allowed = hostAccessProblems({ config: { runArgs }, ownVolume: OWN }).length === 0;
+    if (allowed) expect(runArgsProblems(passed, OWN)).toEqual([]);
+  });
+
+  it.each(CASES.slice(0, 6).map((runArgs) => [runArgs.join(' '), runArgs]))('passes %s as it is: --name is a value there', (_name, runArgs) => {
+    expect(dockerRunArgs(runArgs)).toEqual(runArgs);
+    expect(hostAccessProblems({ config: { runArgs }, ownVolume: OWN })).toEqual([]);
+  });
+
+  it('lets no --name, --privileged, or bind mount through as a flag that the policy read as a value', () => {
+    expect(hostAccessProblems({ config: { runArgs: ['--label', '--name', '--init', '--label', '--privileged'] }, ownVolume: OWN })).toEqual([]);
+    expect(dockerRunArgs(['--label', '--name', '--init', '--label', '--privileged'])).toEqual(['--label', '--name', '--init', '--label', '--privileged']);
+    expect(hostAccessProblems({ config: { runArgs: ['--hostname', '--name', 'x', '--privileged'] }, ownVolume: OWN })).toEqual(['argument x', 'privileged mode']);
+  });
+});
+
+describe('host access policy: flags that are removed before up (--rm, -i, -t, -d, --name)', () => {
+  const LIFE_CYCLE = expect.stringContaining('--rm would delete it at each stop');
+  const TERMINAL = expect.stringContaining('without a terminal');
+  const DETACH = expect.stringContaining('stays attached');
+  const NAME = expect.stringContaining('name of the devspace');
+
+  it.each<[string, string[], Array<{ arg: string; reason: unknown }>, string[]]>([
+    ['--rm', ['--rm', '--init'], [{ arg: '--rm', reason: LIFE_CYCLE }], ['--init']],
+    ['--rm with a value', ['--rm=false', '--rm=true'], [{ arg: '--rm=false', reason: LIFE_CYCLE }, { arg: '--rm=true', reason: LIFE_CYCLE }], []],
+    ['-i and -t', ['-i', '-t', '--init'], [{ arg: '-i', reason: TERMINAL }, { arg: '-t', reason: TERMINAL }], ['--init']],
+    ['-it and -ti', ['-it', '--cap-drop', 'ALL', '-ti'], [{ arg: '-it', reason: TERMINAL }, { arg: '-ti', reason: TERMINAL }], ['--cap-drop', 'ALL']],
+    ['the long forms', ['--interactive', '--tty=true', '-i=false'], [{ arg: '--interactive', reason: TERMINAL }, { arg: '--tty=true', reason: TERMINAL }, { arg: '-i=false', reason: TERMINAL }], []],
+    ['-d', ['-d', '--detach'], [{ arg: '-d', reason: DETACH }, { arg: '--detach', reason: DETACH }], []],
+    ['-dit, with both reasons', ['-dit'], [{ arg: '-dit', reason: expect.stringMatching(/stays attached.*; .*without a terminal/) }], []],
+    ['--name with its value', ['--name', 'mine', '--rm', '-p', '3000'], [{ arg: '--name mine', reason: NAME }, { arg: '--rm', reason: LIFE_CYCLE }], ['-p', '127.0.0.1::3000']],
+    ['flags that are values of other flags stay', ['--label', '--rm', '-e', '-it', '--hostname', '-d'], [], ['--label', '--rm', '-e', '-it', '--hostname', '-d']],
+    ['--rm before a flag whose value looks like a mount', ['--rm', '--label', '-v/Users:/host'], [{ arg: '--rm', reason: LIFE_CYCLE }], ['--label', '-v/Users:/host']],
+    ['a group with -P stays (the policy refuses it)', ['-Pi'], [], ['-Pi']],
+    ['nothing to remove', ['--init', '--platform', 'linux/amd64'], [], ['--init', '--platform', 'linux/amd64']],
+  ])('%s', (_name, runArgs, removed, passed) => {
+    expect(removedRunArgs(runArgs)).toEqual(removed);
+    expect(overrideRunArgs(runArgs)).toEqual(passed);
+    // What Docker gets passes the policy whenever the configuration does.
+    if (runArgsProblems(runArgs, OWN).length === 0) expect(runArgsProblems(passed, OWN)).toEqual([]);
+  });
+
+  it('removes them from the runArgs of the override configuration, and keeps the rest in order', () => {
+    const override = buildOverrideConfig({
+      devspaceImage: 'i:1',
+      volumeName: OWN,
+      repositoryName: 'api',
+      containerName: OWN,
+      runArgs: ['--platform', 'linux/amd64', '--rm', '-it', '--cap-drop', 'ALL', '-d', '--label', '--rm'],
+    });
+    // With the labels of Docker Compose set empty.
+    expect(override.runArgs).toEqual([
+      '--platform',
+      'linux/amd64',
+      '--cap-drop',
+      'ALL',
+      '--label',
+      '--rm',
+      '--label',
+      // The tmpfs of the token comes at the end; the check accepts it.
+      'nimblescape.devspaces.container-version=1',
+      '--label',
+      'com.docker.compose.project=',
+      '--label',
+      'com.docker.compose.service=',
+      '--name',
+      OWN,
+      '--hostname',
+      'api',
+      '--tmpfs',
+      '/run/devspace:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+    ]);
+    expect(hostAccessProblems({ config: { runArgs: override.runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual([]);
+  });
+});
+
+describe('host access policy: the runArgs check cannot be bypassed', () => {
+  /** The report of a repository configuration, and the runArgs that Docker gets for it (without the extension's own). */
+  function check(runArgs: unknown[]): { report: HostAccessReport; passed: string[] } {
+    const report = hostAccessReport({ config: { runArgs }, ownVolume: OWN });
+    return { report, passed: overrideRunArgs(runArgs) };
+  }
+
+  const NONE: HostAccessReport = { hostAccess: [], unsupported: [] };
+
+  it.each<[string, unknown[], HostAccessReport]>([
+    // --name as the value of another flag: removed word by word, the next entries would shift and become flags.
+    ['--name as a label before a bind mount', ['--label', '--name', '--init', '--label', '-v/Users:/host'], NONE],
+    ['--name as a label before --privileged', ['--label', '--name', '--init', '--label', '--privileged'], NONE],
+    ['--name as a label before a port on all addresses', ['--label', '--name', '--init', '--label', '-p0.0.0.0:80:80'], NONE],
+    ['--rm as a label before a bind mount', ['--label', '--rm', '--init', '--label', '-v/Users:/host'], NONE],
+    ['-it as a value before --privileged', ['-e', '-it', '--init', '-e', '--privileged'], NONE],
+    // An entry that is no text: dropped from the list, the next entries would shift and become flags.
+    ['a number before a bind mount', ['--label', 3, '--label', '-v/Users:/host'], { hostAccess: ['bind mount /Users'], unsupported: ['argument 3'] }],
+    ['a number before --privileged', ['--label', 3, '--label', '--privileged'], { hostAccess: ['privileged mode'], unsupported: ['argument 3'] }],
+    ['a number before a port on all addresses', ['--label', 3, '--label', '-p0.0.0.0:80:80'], { hostAccess: ['published port 0.0.0.0:80:80'], unsupported: ['argument 3'] }],
+    ['true before a bind mount', ['-e', true, '-e', '--volume=/:/host'], { hostAccess: ['bind mount /'], unsupported: ['argument true'] }],
+    ['null and an object', ['--init', null, { a: 1 }], { hostAccess: [], unsupported: ['argument null', 'argument {"a":1}'] }],
+    // Removed flags whose value is the next entry: the value goes with them.
+    ['--name that takes --rm as its value, before a bind mount', ['--name', '--rm', '-v/Users:/host'], { hostAccess: ['bind mount /Users'], unsupported: [] }],
+    ['--rm and --name before a label', ['--rm', '--name', '--label', '-v/Users:/host'], { hostAccess: ['bind mount /Users'], unsupported: [] }],
+  ])('%s', (_name, runArgs, expected) => {
+    const { report, passed } = check(runArgs);
+    expect(report).toEqual(expected);
+    // A configuration that passes gives Docker the same list: the flags that look removable are values there.
+    if (expected.hostAccess.length === 0 && expected.unsupported.length === 0) {
+      expect(passed).toEqual(runArgs);
+      expect(runArgsProblems(passed, OWN)).toEqual([]);
+    }
+  });
+});
+
+describe('host access policy: build options', () => {
+  it.each<[string, string[], string[]]>([
+    ['allowed options', ['--network=host', '--add-host', 'x:1.2.3.4', '--build-arg', 'A=1', '--target', 'dev', '--label', 'a=b', '--platform=linux/amd64', '--pull', '--no-cache'], []],
+    ['a build context of an image or a URL', ['--build-context', 'base=docker-image://alpine:3', '--build-context=src=https://github.com/a/b.git'], []],
+    ['secrets', ['--secret', 'id=npm,src=/Users/x/.npmrc'], ['build option --secret']],
+    ['the SSH agent', ['--ssh=default'], ['build option --ssh']],
+    ['entitlements', ['--allow', 'network.host'], ['build option --allow']],
+    ['a build context of a folder', ['--build-context', 'src=/Users/x/src'], ['build option --build-context=src=/Users/x/src']],
+    // Only the exact lower-case prefixes are an image or a URL for Buildx.
+    ['a build context of HTTPS:// (a path for Buildx)', ['--build-context', 'src=HTTPS://example.com/x'], ['build option --build-context=src=HTTPS://example.com/x']],
+    ['a build context of DOCKER-IMAGE:// (a path for Buildx)', ['--build-context', 'src=DOCKER-IMAGE://alpine'], ['build option --build-context=src=DOCKER-IMAGE://alpine']],
+    ['a build context of an OCI layout (a folder)', ['--build-context=x=oci-layout:///Users/x'], ['build option --build-context=x=oci-layout:///Users/x']],
+    // `-o out` writes to a relative path.
+    ['an output', ['--output', 'type=local,dest=/Users/x', '-o', 'out'], ['build option --output', 'build option -o', 'build option -o out (a relative path)']],
+    ['an unknown option', ['--progress=plain'], ['build option --progress']],
+  ])('%s', (_name, options, expected) => {
+    // The build options are checked through the configuration.
+    expect(configProblems({ build: { dockerfile: 'Dockerfile', options } })).toEqual(expected);
+  });
+});
+
+describe('host access policy: properties of the configuration, the merged configuration, and the image metadata', () => {
+  it.each<[string, Record<string, unknown>, string[]]>([
+    ['nothing special', { image: 'node:24', forwardPorts: [3000], portsAttributes: { 3000: { label: 'web' } }, containerEnv: { BROWSER: 'x' } }, []],
+    ['privileged mode (docker-in-docker)', { privileged: true }, ['privileged mode']],
+    ['privileged false', { privileged: false }, []],
+    // The Dev Container CLI adds --privileged for any true-like value, and reads a single value in place of a list.
+    ['privileged as another true-like value', { privileged: 1 }, ['privileged mode']],
+    ['a capability as a single value', { capAdd: 'SYS_ADMIN' }, ['capability SYS_ADMIN']],
+    ['a security option as a single value', { securityOpt: 'apparmor=unconfined' }, ['security option apparmor=unconfined']],
+    ['a mount as a single value', { mounts: 'type=bind,source=/,target=/host' }, ['bind mount /']],
+    ['a mount object in place of a list', { mounts: { type: 'bind', source: '/Users/x', target: '/x' } }, ['bind mount /Users/x']],
+    ['SYS_PTRACE', { capAdd: ['SYS_PTRACE'] }, []],
+    ['another capability', { capAdd: ['SYS_PTRACE', 'NET_ADMIN'] }, ['capability NET_ADMIN']],
+    ['seccomp=unconfined', { securityOpt: ['seccomp=unconfined'] }, []],
+    ['no-new-privileges', { securityOpt: ['no-new-privileges', 'no-new-privileges:true'] }, []],
+    ['another security option', { securityOpt: ['apparmor=unconfined'] }, ['security option apparmor=unconfined']],
+    ['a GPU', { hostRequirements: { gpu: true } }, ['GPU access (hostRequirements.gpu)']],
+    ['an optional GPU', { hostRequirements: { gpu: 'optional' } }, ['GPU access (hostRequirements.gpu)']],
+    ['no GPU', { hostRequirements: { gpu: false, cpus: 4 } }, []],
+    ['initializeCommand as a string', { initializeCommand: 'docker login' }, ['initializeCommand']],
+    ['initializeCommand as an array', { initializeCommand: ['sh', '-c', 'x'] }, ['initializeCommand']],
+    ['initializeCommand as an object', { initializeCommand: { a: 'x' } }, ['initializeCommand']],
+    ['an empty initializeCommand', { initializeCommand: '' }, []],
+    ['appPort numbers (the CLI publishes them on 127.0.0.1)', { appPort: [3000, 8080] }, []],
+    ['appPort without address', { appPort: '8080:80' }, []],
+    ['appPort on 127.0.0.1', { appPort: ['127.0.0.1:8080:80'] }, []],
+    ['appPort on all addresses', { appPort: ['0.0.0.0:8080:80', 3000] }, ['published port 0.0.0.0:8080:80']],
+    ['appPort in the long syntax of docker run', { appPort: ['published=8080,target=80'] }, ['published port published=8080,target=80']],
+    [
+      'variables of container-only Git in containerEnv and remoteEnv',
+      { containerEnv: { GIT_CONFIG_GLOBAL: '/x', FOO: 'bar' }, remoteEnv: { GIT_SSH_COMMAND: 'ssh', GIT_CONFIG_PARAMETERS: "'a=b'", PATH: '${containerEnv:PATH}:/x' } },
+      ['variable GIT_CONFIG_GLOBAL in containerEnv', 'variable GIT_SSH_COMMAND in remoteEnv', 'variable GIT_CONFIG_PARAMETERS in remoteEnv'],
+    ],
+    ['other variables', { containerEnv: { NODE_ENV: 'development', GIT_AUTHOR_NAME: 'x' }, remoteEnv: { PATH: '/x', DOCKER_HOST: 'tcp://x' } }, []],
+    ['variables of the Dev Containers extension and GnuPG', { containerEnv: { GNUPGHOME: '/g' }, remoteEnv: { SSH_AUTH_SOCK: '/a', REMOTE_CONTAINERS_IPC: '' } }, []],
+    // The window applies the settings of the container: VS Code would forward the ports on all addresses of the computer.
+    ['VS Code forwards ports on all addresses', { customizations: { vscode: { settings: { 'remote.localPortHost': 'allInterfaces' } } } }, ['setting remote.localPortHost "allInterfaces"']],
+    ['the same with a nested key', { customizations: { vscode: { settings: { remote: { localPortHost: 'allInterfaces' } } } } }, ['setting remote.localPortHost "allInterfaces"']],
+    ['an unknown value (VS Code uses all addresses for it)', { customizations: { vscode: { settings: { 'remote.localPortHost': '0.0.0.0' } } } }, ['setting remote.localPortHost "0.0.0.0"']],
+    ['VS Code forwards ports on localhost', { customizations: { vscode: { settings: { 'remote.localPortHost': 'localhost', 'editor.tabSize': 2 } } } }, []],
+    ['other settings and customizations', { customizations: { vscode: { settings: { 'remote.autoForwardPorts': true }, extensions: ['a.b'] }, codespaces: {} } }, []],
+  ])('%s', (_name, config, expected) => {
+    expect(configProblems(config)).toEqual(expected);
+  });
+
+  it('checks the variables in the repository configuration and the image metadata, not in the merged configuration', () => {
+    // The merged configuration of a container that the extension created holds the values of its override configuration,
+    // also those of an older container setup (here GIT_CONFIG_PARAMETERS, GNUPGHOME, an empty SSH_AUTH_SOCK), whose
+    // containers the pipeline creates again after this check.
+    const olderSetup = { ...containerEnvironment(), GIT_CONFIG_PARAMETERS: "'credential.helper='", GNUPGHOME: '/workspaces/.devspace+/gnupg' };
+    const merged = { containerEnv: olderSetup, remoteEnv: { ...remoteEnvironment(), ...olderSetup, SSH_AUTH_SOCK: '' } };
+    expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
+    // A Feature or the base image: the values that the extension does not set itself would reach Git.
+    const metadata = [{ id: 'feature', containerEnv: { GIT_CONFIG_PARAMETERS: "'credential.helper=store'", GNUPGHOME: '/g' } }, { remoteEnv: { DOCKER_CONFIG: '/d', SSH_AUTH_SOCK: '/a' } }];
+    expect(hostAccessProblems({ metadata, ownVolume: OWN })).toEqual(['variable GIT_CONFIG_PARAMETERS in containerEnv', 'variable DOCKER_CONFIG in remoteEnv']);
+  });
+
+  it('checks remote.localPortHost in every entry of the merged configuration and the image metadata', () => {
+    const merged = { customizations: { vscode: [{ settings: { 'editor.tabSize': 2 } }, { settings: { 'remote.localPortHost': 'allInterfaces' } }] } };
+    expect(hostAccessProblems({ merged, ownVolume: OWN })).toEqual(['setting remote.localPortHost "allInterfaces"']);
+    const metadata = [{ id: 'feature', customizations: { vscode: { settings: { remote: { localPortHost: 'allInterfaces' } } } } }];
+    expect(hostAccessProblems({ metadata, ownVolume: OWN })).toEqual(['setting remote.localPortHost "allInterfaces"']);
+  });
+
+  it('passes the override configuration itself: its labels, variables, and settings', () => {
+    for (const runArgs of [['--init', '-p', '3000'], ['--label', CONTAINER_CONFIG_UNKNOWN_LABEL]]) {
+      const override = buildOverrideConfig({ devspaceImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs });
+      expect(override.customizations).toEqual({ vscode: { settings: devContainersSettings() } });
+      // The final check says that `config` is the override configuration (its labels of Docker Compose with empty
+      // values).
+      expect(hostAccessReport({ config: { runArgs: override.runArgs }, merged: override, ownVolume: OWN, overrideConfiguration: true })).toEqual({
+        hostAccess: [],
+        unsupported: [],
+      });
+    }
+  });
+
+  it('allows the empty labels of Docker Compose only as the override configuration adds them', () => {
+    const runArgs = ['--init', '--label', 'com.docker.compose.project=', '--label', 'com.docker.compose.service='];
+    // The repository may not write them, nor any other value of a label of Docker Compose.
+    expect(hostAccessReport({ config: { runArgs }, ownVolume: OWN }).unsupported).toEqual(['label com.docker.compose.project', 'label com.docker.compose.service']);
+    expect(hostAccessReport({ config: { runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual({ hostAccess: [], unsupported: [] });
+    // The merged configuration of an existing container holds the override configuration.
+    expect(hostAccessReport({ config: {}, merged: { runArgs }, ownVolume: OWN })).toEqual({ hostAccess: [], unsupported: [] });
+    // Exactly these: another value, or another label of Docker Compose, stays refused also in the override configuration.
+    const other = ['--label', 'com.docker.compose.project=shop', '--label', 'com.docker.compose.oneoff=', '-l', 'com.docker.compose.project= '];
+    expect(hostAccessReport({ config: { runArgs: other }, ownVolume: OWN, overrideConfiguration: true }).unsupported).toEqual([
+      'label com.docker.compose.project',
+      'label com.docker.compose.oneoff',
+    ]);
+    const override = buildOverrideConfig({ devspaceImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: [] });
+    expect(override.runArgs).toEqual(expect.arrayContaining(['com.docker.compose.project=', 'com.docker.compose.service=']));
+  });
+
+  it('checks the merged configuration (Features and the base image) and the image metadata too', () => {
+    const merged = {
+      privileged: true,
+      mounts: [{ source: '/var/run/docker.sock', target: '/var/run/docker-host.sock', type: 'bind' }],
+      runArgs: ['--gpus', 'all'],
+    };
+    expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([
+      'bind mount /var/run/docker.sock',
+      'privileged mode',
+      '--gpus=all',
+    ]);
+    const metadata = [
+      { id: 'ghcr.io/devcontainers/features/docker-outside-of-docker:1', mounts: [{ source: '/var/run/docker.sock', target: '/var/run/docker-host.sock', type: 'bind' }] },
+      { id: 'ghcr.io/devcontainers/features/docker-in-docker:2', privileged: true, capAdd: ['NET_ADMIN'] },
+      'not an entry',
+      { remoteUser: 'node', securityOpt: ['seccomp=unconfined'] },
+    ];
+    expect(hostAccessProblems({ metadata, ownVolume: OWN })).toEqual([
+      'bind mount /var/run/docker.sock',
+      'privileged mode',
+      'capability NET_ADMIN',
+    ]);
+    // The label of a base image or a Feature, as the CLI reads it (single values, any true-like `privileged`).
+    expect(hostAccessProblems({ metadata: [{ privileged: 'true', capAdd: 'SYS_ADMIN', mounts: 'type=bind,src=/,dst=/h' }], ownVolume: OWN })).toEqual([
+      'bind mount /',
+      'privileged mode',
+      'capability SYS_ADMIN',
+    ]);
+    // runArgs, appPort, and build options are not part of the image metadata: only the configurations name them.
+    expect(hostAccessProblems({ metadata: [{ runArgs: ['--privileged'], appPort: '0.0.0.0:1:1' }], ownVolume: OWN })).toEqual([]);
+  });
+
+  it('names each problem once, also when the configuration and the merged configuration both have it', () => {
+    const config = { mounts: ['source=/Users/x,target=/x,type=bind'], runArgs: ['--privileged'] };
+    const merged = { ...config, privileged: true };
+    expect(hostAccessProblems({ config, merged, ownVolume: OWN })).toEqual(['bind mount /Users/x', 'privileged mode']);
+  });
+});
+
+describe('volumes of other devspaces', () => {
+  it.each(['acme/api', 'Acme/My.Repo_Name', 'a/b', 'devspace/x', `${'a'.repeat(40)}/${'b'.repeat(40)}`, 'o/name-with--dashes---'])(
+    'recognizes the workspace volume of a devspace of %s',
+    (repository) => {
+      for (let i = 0; i < 20; i++) expect(isDevspaceResourceName(resourceName(repository, newDevspaceId()))).toBe(true);
+    },
+  );
+
+  // A name with a short ID (devspaces-acme-api-3f2a9c1e) is no name of a devspace.
+  it.each(['devspaces-tools-node_modules', 'devspaces-cache', HELPER_CACHE_VOLUME, 'devspaces-acme-api', 'cache-3f2a9c1e', 'devspaces-acme-api-3f2a9c1', 'devspaces-acme-api-3f2a9c1ez', 'devspaces-acme-api-3f2a9c1e', 'cache-tidy-berners'])(
+    'does not take %s for one',
+    (volume) => {
+      expect(isDevspaceResourceName(volume)).toBe(false);
+    },
+  );
+
+  it('refuses the workspace volume of another devspace, also a shortened long name, and the volume of the helper', () => {
+    const long = resourceName(`${'a'.repeat(40)}/${'b'.repeat(40)}`, '0a1b2c3d-0000-4000-8000-000000000000');
+    expect(long).toHaveLength(63);
+    expect(configProblems({ mounts: [`source=${long},target=/x,type=volume`] })).toEqual([`volume ${long} of another devspace`]);
+    expect(configProblems({ runArgs: ['-v', `${OTHER}:/x`, '-v', `${HELPER_CACHE_VOLUME}:/c`] })).toEqual([
+      `volume ${OTHER} of another devspace`,
+      `volume ${HELPER_CACHE_VOLUME} of the workspace helper`,
+    ]);
+    // The own volume is allowed, also for a repository whose name starts with devspaces-.
+    const own = resourceName('acme/devspace-tools', newDevspaceId());
+    expect(hostAccessProblems({ config: { mounts: [`source=${own},target=/o,type=volume`, 'source=devspaces-tools-node_modules,target=/n,type=volume'] }, ownVolume: own })).toEqual([]);
+  });
+});
+
+describe('volumes of devspaces of other accounts', () => {
+  const FOREIGN = ['shared-cache', 'api-node_modules'];
+
+  it.each<[string, Record<string, unknown>, string[]]>([
+    ['a mount', { mounts: ['source=shared-cache,target=/c,type=volume'] }, ['volume shared-cache of another devspace']],
+    ['a mount object', { mounts: [{ type: 'volume', source: 'api-node_modules', target: '/n' }] }, ['volume api-node_modules of another devspace']],
+    [
+      '-v and --mount of runArgs',
+      { runArgs: ['-v', 'shared-cache:/c', '--mount', 'type=volume,source=api-node_modules,target=/n'] },
+      ['volume shared-cache of another devspace', 'volume api-node_modules of another devspace'],
+    ],
+    ['volumes of no other account', { mounts: ['source=own-cache,target=/c,type=volume'], runArgs: ['-v', 'other:/o', '-v', '/anonymous'] }, []],
+  ])('%s', (_name, config, expected) => {
+    expect(hostAccessProblems({ config, ownVolume: OWN, foreignVolumes: FOREIGN })).toEqual(expected);
+    // Without devspaces of other accounts, the same volumes are allowed.
+    expect(hostAccessProblems({ config, ownVolume: OWN })).toEqual([]);
+  });
+
+  it('checks the image metadata and the runArgs as Docker gets them too', () => {
+    const metadata = [{ id: 'feature', mounts: [{ type: 'volume', source: 'shared-cache', target: '/c' }] }];
+    expect(hostAccessProblems({ metadata, ownVolume: OWN, foreignVolumes: FOREIGN })).toEqual(['volume shared-cache of another devspace']);
+    expect(runArgsProblems(['-v', 'shared-cache:/c'], OWN, FOREIGN)).toEqual(['volume shared-cache of another devspace']);
+    expect(runArgsProblems(['-v', 'shared-cache:/c'], OWN)).toEqual([]);
+  });
+
+  it('allows the own workspace volume, also when the registry names it for another account', () => {
+    expect(hostAccessProblems({ config: { mounts: [`source=${OWN},target=/o,type=volume`] }, ownVolume: OWN, foreignVolumes: [OWN] })).toEqual([]);
+  });
+});
+
+describe('volumes named like a clone volume of the Dev Containers extension (a name that ends in a hash)', () => {
+  const SHA = `api-${'5e'.repeat(32)}`;
+  const MD5 = `vsc-api-${'0f'.repeat(16)}`;
+  const DEVSPACE = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+  const OWN_LABELS = { 'nimblescape.devspaces.id': DEVSPACE.id, 'nimblescape.devspaces.owner-id': '1001', 'nimblescape.devspaces.repository': 'acme/api', 'nimblescape.devspaces.volume': 'additional' };
+
+  it.each<[string, Record<string, Record<string, string>>, string[]]>([
+    ['they do not exist yet (the pipeline creates them with its labels)', {}, []],
+    ['they exist without labels (older versions of the Dev Containers extension)', { [SHA]: {}, [MD5]: {} }, [`volume ${SHA} of another program`, `volume ${MD5} of another program`]],
+    ['they exist with the labels of the Dev Containers extension', { [SHA]: { 'vsch.local.repository': 'x' }, [MD5]: { 'dev.container.volume': 'true' } }, [`volume ${SHA} of the Dev Containers extension`, `volume ${MD5} of the Dev Containers extension`]],
+    ['they exist with other labels', { [SHA]: { 'com.example': 'x' } }, [`volume ${SHA} of another program`]],
+    ['they are the own volumes of the devspace', { [SHA]: OWN_LABELS, [MD5]: OWN_LABELS }, []],
+  ])('%s', (_name, volumeLabels, expected) => {
+    const config = { mounts: [`source=${SHA},target=/s,type=volume`], runArgs: ['-v', `${MD5}:/m`] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels, devspace: DEVSPACE })).toEqual(expected);
+  });
+});
+
+describe('volumes with the labels of Devspaces', () => {
+  const DEVSPACE = { id: 'e0000001-0000-4000-8000-000000000001', ownerId: '1001' };
+  const FORMER = 'e0000009-0000-4000-8000-000000000009';
+  const labels = (id: string, owner?: string, kind: string | null = 'additional'): Record<string, string> => ({
+    'nimblescape.devspaces.id': id,
+    'nimblescape.devspaces.repository': 'acme/api',
+    ...(owner === undefined ? {} : { 'nimblescape.devspaces.owner-id': owner }),
+    ...(kind === null ? {} : { 'nimblescape.devspaces.volume': kind }),
+  });
+
+  it.each<[string, Record<string, string>, { id: string; ownerId: string }, string[]]>([
+    ['its own volume', labels(DEVSPACE.id, '1001'), DEVSPACE, []],
+    ['its own ID without an owner label (made by hand)', labels(DEVSPACE.id), DEVSPACE, ['volume data of another devspace']],
+    ['its own ID with the owner label of another account', labels(DEVSPACE.id, '2002'), DEVSPACE, ['volume data of another devspace']],
+    // The devspaces of one account share an additional volume, as the docs promise (for example web-node_modules of
+    // a fork and its upstream repository): the other devspace may still exist.
+    ['a volume of another devspace in the registry, also of the same owner', labels(FORMER, '1001'), DEVSPACE, []],
+    ['a volume that the Delete of a devspace of the same owner kept', labels(FORMER, '1001'), DEVSPACE, []],
+    ['a volume of another devspace of another owner', labels(FORMER, '2002'), DEVSPACE, ['volume data of another devspace']],
+    ['a volume of another devspace without an owner label', labels(FORMER), DEVSPACE, ['volume data of another devspace']],
+    ['a volume of another devspace of the same owner without nimblescape.devspaces.volume (a workspace volume)', labels(FORMER, '1001', null), DEVSPACE, ['volume data of another devspace']],
+    ['a volume of another devspace of the same owner of another kind', labels(FORMER, '1001', 'workspace'), DEVSPACE, ['volume data of another devspace']],
+  ])('%s', (_name, volumeLabels, devspace, expected) => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: volumeLabels }, devspace })).toEqual(expected);
+  });
+
+  it('refuses an additional volume of the same owner that a devspace of another account records', () => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(
+      hostAccessProblems({ config, ownVolume: OWN, foreignVolumes: ['data'], volumeLabels: { data: labels(FORMER, '1001') }, devspace: DEVSPACE }),
+    ).toEqual(['volume data of another devspace']);
+  });
+
+  it('refuses every volume with nimblescape.devspaces.id when the devspace is not known', () => {
+    const config = { mounts: ['source=data,target=/data,type=volume'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: labels(DEVSPACE.id, '1001') } })).toEqual(['volume data of another devspace']);
+  });
+
+  it.each<[string, Record<string, string>, string, boolean]>([
+    ['the ID and the owner', { 'nimblescape.devspaces.id': 'a', 'nimblescape.devspaces.owner-id': '1' }, '1', true],
+    ['the ID without an owner label', { 'nimblescape.devspaces.id': 'a' }, '1', false],
+    ['another owner', { 'nimblescape.devspaces.id': 'a', 'nimblescape.devspaces.owner-id': '2' }, '1', false],
+    ['another ID', { 'nimblescape.devspaces.id': 'b', 'nimblescape.devspaces.owner-id': '1' }, '1', false],
+    ['no labels', {}, '1', false],
+    ['labels of another program', { 'com.docker.compose.project': 'a' }, '1', false],
+  ])('isOwnVolume: %s', (_name, volumeLabels, ownerId, expected) => {
+    expect(isOwnVolume(volumeLabels, 'a', ownerId)).toBe(expected);
+  });
+
+  it.each<[string, Record<string, string>, string, boolean]>([
+    ['an additional volume of the owner', labels(FORMER, '1001'), '1001', true],
+    ['an additional volume of another owner', labels(FORMER, '2002'), '1001', false],
+    ['an additional volume without an owner label', labels(FORMER), '1001', false],
+    ['a workspace volume of the owner (no nimblescape.devspaces.volume)', labels(FORMER, '1001', null), '1001', false],
+    ['a volume of the owner of another kind', labels(FORMER, '1001', 'workspace'), '1001', false],
+    ['the owner and kind labels without a devspace ID', { 'nimblescape.devspaces.owner-id': '1001', 'nimblescape.devspaces.volume': 'additional' }, '1001', false],
+    ['no labels', {}, '1001', false],
+  ])('isSameOwnerAdditionalVolume: %s', (_name, volumeLabels, ownerId, expected) => {
+    expect(isSameOwnerAdditionalVolume(volumeLabels, ownerId)).toBe(expected);
+  });
+});
+
+describe('volumes of other programs, by their labels', () => {
+  it.each<[string, Record<string, string>, string[]]>([
+    ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop', 'com.docker.compose.volume': 'db' }, ['volume data of the Docker Compose project shop']],
+    ['a volume of Docker Compose without a project', { 'com.docker.compose.volume': 'db' }, ['volume data of Docker Compose']],
+    ['a clone of the Dev Containers extension', { 'vsch.local.repository': 'https://github.com/a/b.git', 'vsch.local.repository.unique': 'false' }, ['volume data of the Dev Containers extension']],
+    ['a volume of a template of the Dev Containers extension', { 'dev.container.volume': 'true' }, ['volume data of the Dev Containers extension']],
+    ['an anonymous volume of another container', { 'com.docker.volume.anonymous': '' }, ['volume data of another container']],
+    ['the workspace volume of another devspace', { 'nimblescape.devspaces.id': 'x', 'nimblescape.devspaces.owner-id': '1' }, ['volume data of another devspace']],
+    ['a volume without labels (as the mounts of a configuration create it)', {}, []],
+    ['a volume with other labels', { 'com.example.purpose': 'cache' }, []],
+  ])('%s', (_name, labels, expected) => {
+    const config = { mounts: ['source=data,target=/data,type=volume'], runArgs: ['-v', 'data:/d', '--mount', 'type=volume,src=data,dst=/m'] };
+    expect(hostAccessProblems({ config, ownVolume: OWN, volumeLabels: { data: labels } })).toEqual(expected);
+    // Without the labels (a volume that does not exist yet), the name alone decides.
+    expect(hostAccessProblems({ config, ownVolume: OWN })).toEqual([]);
+  });
+
+  it('names the named volumes of the mounts once, for the labels', () => {
+    const config = {
+      mounts: [
+        'source=cache,target=/c,type=volume',
+        'type=bind,source=/Users/x,target=/x',
+        'target=/anonymous,type=volume',
+        { source: 'history', target: '/h', type: 'volume' },
+        'source=${devcontainerId}-x,target=/y,type=volume',
+        `source=${OWN},target=/o,type=volume`,
+        'type=tmpfs,target=/t',
+      ],
+      runArgs: ['-v', 'data:/data', '-v', '/anon', '-v', './rel:/r', '--mount', 'type=volume,source=more,target=/m', '--label', '-v', '--volume=cache:/c2'],
+    };
+    const merged = { mounts: [{ source: 'feature-vol', target: '/f', type: 'volume' }] };
+    const metadata = [{ mounts: 'source=image-vol,target=/i' }];
+    expect(mountedVolumeNames({ config, merged, metadata, ownVolume: OWN })).toEqual(['cache', 'history', 'feature-vol', 'image-vol', 'data', 'more']);
+    expect(mountedVolumeNames({ config: { runArgs: ['--init'] }, ownVolume: OWN })).toEqual([]);
+    // The forms of mounts, -v, and --mount: named and anonymous volumes, bind mounts, and a repeated volume.
+    expect(
+      mountedVolumeNames({
+        config: {
+          mounts: [
+            'source=api-node_modules,target=/workspaces/api/node_modules,type=volume',
+            'src=pgdata,dst=/var/lib/postgresql/data',
+            { source: 'cache', target: '/cache', type: 'volume' },
+            { source: '/Users/x', target: '/x', type: 'bind' },
+            'source=/tmp,target=/tmp,type=bind',
+            'type=volume,target=/anonymous',
+            { source: 'cache', target: '/cache2', type: 'volume' },
+          ],
+          runArgs: ['-v', 'history:/commandhistory', '--mount', 'type=volume,source=db,target=/db', '-v', './x:/x'],
+        },
+        ownVolume: OWN,
+      }),
+    ).toEqual(['api-node_modules', 'pgdata', 'cache', 'history', 'db']);
+    // Sources with an unresolved variable (read-configuration before the container exists) are skipped.
+    expect(
+      mountedVolumeNames({
+        config: {
+          mounts: [
+            'source=${devcontainerId}-history,target=/commandhistory,type=volume',
+            { source: '${localEnv:VOLUME}', target: '/v', type: 'volume' },
+            'source=1r60kajr11nn-history,target=/commandhistory,type=volume',
+          ],
+          runArgs: ['-v', '${devcontainerId}-cache:/cache'],
+        },
+        ownVolume: OWN,
+      }),
+    ).toEqual(['1r60kajr11nn-history']);
+    expect(mountedVolumeNames({ config: { image: 'x' }, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('volumeLabelOwner and volumeNameItems (for the Docker Compose policy, composeAccess.ts)', () => {
+  it.each<[string, Record<string, string>, string | undefined]>([
+    ['a volume of a Docker Compose project', { 'com.docker.compose.project': 'shop' }, 'the Docker Compose project shop'],
+    // The volumes of the Compose project of a devspace carry both: the devspace label decides.
+    ['a volume of a devspace that Docker Compose labeled too', { 'com.docker.compose.project': OTHER, 'nimblescape.devspaces.id': 'x' }, 'another devspace'],
+    ['a volume of a devspace', { 'nimblescape.devspaces.id': 'x' }, 'another devspace'],
+    ['no labels', {}, undefined],
+  ])('volumeLabelOwner: %s', (_name, labels, expected) => {
+    expect(volumeLabelOwner(labels)).toBe(expected);
+  });
+
+  it('volumeNameItems applies the rules of the named volumes of mounts', () => {
+    const devspace = { id: 'e1', ownerId: '1' };
+    expect(volumeNameItems(OWN, { ownVolume: OWN })).toEqual([]);
+    expect(volumeNameItems('cache', { ownVolume: OWN })).toEqual([]);
+    expect(volumeNameItems('devspaces-worker-cache', { ownVolume: OWN })).toEqual(['volume devspaces-worker-cache of the workspace helper']);
+    expect(volumeNameItems('cache', { ownVolume: OWN, foreignVolumes: ['cache'] })).toEqual(['volume cache of another devspace']);
+    const own = { 'nimblescape.devspaces.id': 'e1', 'nimblescape.devspaces.owner-id': '1', 'nimblescape.devspaces.volume': 'compose' };
+    expect(volumeNameItems('data', { ownVolume: OWN, devspace, volumeLabels: { data: own } })).toEqual([]);
+    const other = { ...own, 'nimblescape.devspaces.id': 'e2' };
+    expect(volumeNameItems('data', { ownVolume: OWN, devspace, volumeLabels: { data: other } })).toEqual(['volume data of another devspace']);
+  });
+});
+
+describe('ports on localhost', () => {
+  it.each<[string, string | undefined, string]>([
+    ['80', undefined, '80'],
+    ['8080:80', undefined, '8080:80'],
+    ['127.0.0.1:8080:80', '127.0.0.1', '8080:80'],
+    ['127.0.0.1::80', '127.0.0.1', ':80'],
+    [':8080:80', '', '8080:80'],
+    ['[::1]:8080:80', '[::1]', '8080:80'],
+    ['::1:8080:80', '::1', '8080:80'],
+  ])('splits %s', (spec, address, ports) => {
+    expect(splitPortAddress(spec)).toEqual({ address, ports });
+  });
+
+  it.each<[string, boolean]>([
+    ['127.0.0.1', true],
+    ['127.1.2.3', true],
+    ['::1', true],
+    ['[::1]', true],
+    ['0:0:0:0:0:0:0:1', true],
+    ['0.0.0.0', false],
+    ['192.168.1.5', false],
+    ['::', false],
+    ['localhost', false],
+  ])('%s is a loopback address: %s', (address, expected) => {
+    expect(isLoopbackAddress(address)).toBe(expected);
+  });
+
+  it.each<[string, string]>([
+    ['8080:80', '127.0.0.1:8080:80'],
+    ['80', '127.0.0.1::80'],
+    ['80/udp', '127.0.0.1::80/udp'],
+    ['8000-8010:8000-8010', '127.0.0.1:8000-8010:8000-8010'],
+    [':8080:80', '127.0.0.1:8080:80'],
+    ['127.0.0.1:8080:80', '127.0.0.1:8080:80'],
+    ['[::1]:8080:80', '[::1]:8080:80'],
+    // The long syntax is refused by the policy; a prefix would only hide it from the final check.
+    ['published=8080,target=80', 'published=8080,target=80'],
+  ])('publishes %s as %s', (spec, expected) => {
+    expect(withLoopbackAddress(spec)).toBe(expected);
+  });
+
+  it('binds appPort to 127.0.0.1', () => {
+    expect(loopbackAppPorts(3000)).toEqual(['127.0.0.1:3000:3000']);
+    expect(loopbackAppPorts('8080:80')).toEqual(['127.0.0.1:8080:80']);
+    expect(loopbackAppPorts([3000, '8080:80', '127.0.0.1:9000:90'])).toEqual([
+      '127.0.0.1:3000:3000',
+      '127.0.0.1:8080:80',
+      '127.0.0.1:9000:90',
+    ]);
+    expect(loopbackAppPorts(undefined)).toBeUndefined();
+    expect(loopbackAppPorts([])).toBeUndefined();
+  });
+
+  it('adds 127.0.0.1 to the published ports of runArgs, in each form, and changes nothing else', () => {
+    expect(
+      loopbackRunArgs(['-p', '8080:80', '--publish', '3000', '-p9000:90', '-p=7000:70', '--publish=6000:60', '-e', '-p', '--label', 'x=1']),
+    ).toEqual(['-p', '127.0.0.1:8080:80', '--publish', '127.0.0.1::3000', '-p127.0.0.1:9000:90', '-p127.0.0.1:7000:70', '--publish=127.0.0.1:6000:60', '-e', '-p', '--label', 'x=1']);
+    expect(loopbackRunArgs(['-p', '127.0.0.1:8080:80', '--network', 'host'])).toEqual(['-p', '127.0.0.1:8080:80', '--network', 'host']);
+  });
+
+  it('keeps --network host as it is (Docker ignores -p there)', () => {
+    expect(loopbackRunArgs(['--network', 'host', '-p', '3000:3000'])).toEqual(['--network', 'host', '-p', '127.0.0.1:3000:3000']);
+    expect(hostAccessProblems({ config: { runArgs: ['--network', 'host', '-p', '3000:3000'] }, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('GH_CONFIG_DIR, the sign-in of the GitHub CLI of the owner account', () => {
+  it.each<[string, Record<string, unknown>, string[]]>([
+    ['in containerEnv', { containerEnv: { GH_CONFIG_DIR: '/home/node/.config/gh' } }, ['variable GH_CONFIG_DIR in containerEnv']],
+    ['in remoteEnv', { remoteEnv: { gh_config_dir: '/tmp/gh' } }, ['variable gh_config_dir in remoteEnv']],
+    ['in runArgs with -e', { runArgs: ['-e', 'GH_CONFIG_DIR=/tmp/gh'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['in runArgs with --env=', { runArgs: ['--env=GH_CONFIG_DIR=/x'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['in runArgs with -e and the value attached', { runArgs: ['-eGH_CONFIG_DIR=/y'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    // Without a value, Docker removes the variable of the override configuration.
+    ['in runArgs without a value', { runArgs: ['--env', 'GH_CONFIG_DIR'] }, ['variable GH_CONFIG_DIR in runArgs']],
+    ['other variables of the GitHub CLI', { containerEnv: { GH_PAGER: 'cat' }, runArgs: ['-e', 'GH_NO_UPDATE_NOTIFIER=1'] }, []],
+  ])('%s', (_name, config, expected) => {
+    expect(configProblems(config)).toEqual(expected);
+  });
+
+  it('refuses it in the image metadata, and accepts the value of the override configuration in the merged configuration', () => {
+    expect(hostAccessProblems({ metadata: [{ id: 'feature', containerEnv: { GH_CONFIG_DIR: '/g' } }], ownVolume: OWN })).toEqual([
+      'variable GH_CONFIG_DIR in containerEnv',
+    ]);
+    const merged = { containerEnv: containerEnvironment(), remoteEnv: remoteEnvironment() };
+    // The folder of the GitHub CLI is in the tmpfs of the token.
+    expect(merged.containerEnv.GH_CONFIG_DIR).toBe('/run/devspace/gh');
+    expect(hostAccessProblems({ config: {}, merged, ownVolume: OWN })).toEqual([]);
+  });
+});
+
+describe('variables of the account of the GitHub CLI', () => {
+  const NAMES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST'];
+  const REASON = 'the GitHub CLI would use it instead of the sign-in of the account that owns the devspace';
+  const FORMS: Array<[form: string, runArgs: (name: string) => string[]]> = [
+    ['-e NAME=value', (name) => ['-e', `${name}=x`]],
+    ['-e NAME', (name) => ['-e', name]],
+    ['--env NAME=value', (name) => ['--env', `${name}=x`]],
+    ['--env NAME', (name) => ['--env', name]],
+    ['--env=NAME=value', (name) => [`--env=${name}=x`]],
+    ['--env=NAME', (name) => [`--env=${name}`]],
+    ['-eNAME=value', (name) => [`-e${name}=x`]],
+    ['-eNAME', (name) => [`-e${name}`]],
+  ];
+
+  it.each(NAMES.flatMap((name) => FORMS.map(([form, runArgs]) => [name, form, runArgs(name)] as const)))(
+    '%s in runArgs as %s',
+    (name, _form, runArgs) => {
+      expect(configProblems({ runArgs: [...runArgs] })).toEqual([`variable ${name} in runArgs (${REASON})`]);
+    },
+  );
+
+  it.each(NAMES.flatMap((name) => ['containerEnv', 'remoteEnv'].map((property) => [name, property] as const)))(
+    '%s in %s of the repository configuration',
+    (name, property) => {
+      expect(configProblems({ [property]: { [name]: 'ghp_x' } })).toEqual([`variable ${name} in ${property} (${REASON})`]);
+    },
+  );
+
+  it.each(NAMES.flatMap((name) => ['containerEnv', 'remoteEnv'].map((property) => [name, property] as const)))(
+    '%s in %s of an entry of the image metadata',
+    (name, property) => {
+      const metadata = [{ id: 'base' }, { id: 'feature', [property]: { [name]: 'x' } }];
+      expect(hostAccessProblems({ metadata, ownVolume: OWN })).toEqual([`variable ${name} in ${property} (${REASON})`]);
+    },
+  );
+
+  it('compares without case and surrounding spaces, and allows other variables of the GitHub CLI', () => {
+    expect(configProblems({ containerEnv: { ' gh_token ': 'x' }, runArgs: ['-e', 'github_token'] })).toEqual([
+      `variable github_token in runArgs (${REASON})`,
+      `variable gh_token in containerEnv (${REASON})`,
+    ]);
+    expect(configProblems({ containerEnv: { GH_PAGER: 'cat', GITHUB_TOKEN_FILE: '/x' }, runArgs: ['-e', 'GH_NO_UPDATE_NOTIFIER=1'] })).toEqual([]);
+  });
+
+  it('is a refusal of access, not an unsupported option', () => {
+    expect(hostAccessReport({ config: { containerEnv: { GH_TOKEN: 'x' } }, ownVolume: OWN })).toEqual({
+      hostAccess: [`variable GH_TOKEN in containerEnv (${REASON})`],
+      unsupported: [],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The paths of the workspace helper, image references, networks, and the Dockerfile of a single container.
+
+describe('isHelperPath', () => {
+  const REPO = '/workspaces/api';
+  it.each([
+    ['/', true],
+    ['/devspace-cache', true],
+    ['/devspace-cache/docker-compose', true],
+    ['/workspaces', true],
+    ['/workspaces/.devspace+', true],
+    ['/workspaces/.devspace+/github-token', true],
+    ['/workspaces/other', true],
+    ['/workspaces/api-other', true],
+    ['/var/run/docker.sock', true],
+    ['/var/run', true],
+    ['/var', true],
+    ['/workspaces/api/../.devspace+', true],
+    // The folders of the kernel, whose links lead anywhere.
+    ['/proc/self/root/devspace-cache', true],
+    ['/proc', true],
+    ['/sys/fs/cgroup', true],
+    ['/dev/fd/3', true],
+    // The folders of the batch helper with the Docker socket and the token, also by /var/run, and the folder that
+    // contains them; not a folder that only starts with their names.
+    ['/run/devspace-docker', true],
+    ['/run/devspace-docker/docker.sock', true],
+    ['/run/devspace-secrets', true],
+    ['/run/devspace-secrets/github-token', true],
+    ['/var/run/devspace-docker/docker.sock', true],
+    ['/var/run/devspace-secrets', true],
+    ['/run', true],
+    // A `..` segment, which the helper resolves after the links
+    // of its image (/var/run → /run, /var/lock → /run/lock, /usr/lib/ssl/certs → /etc/ssl/certs), not as the text says.
+    ['/var/run/../devspace-cache', true],
+    ['/var/lock/../devspace-secrets', true],
+    ['/usr/lib/ssl/certs/../../../run/devspace-secrets', true],
+    ['/opt/tools/../other', true],
+    ['/opt/..tools', false],
+    ['/run/devspace-dockerx', false],
+    ['/run/devspace', false],
+    ['/device', false],
+    ['/workspaces/api', false],
+    ['/workspaces/api/.devcontainer', false],
+    ['/opt/tools', false],
+    ['/tmp/devspace-override/context', false],
+    ['/etc', false],
+  ])('%s → %s', (file, expected) => {
+    expect(isHelperPath(file, REPO)).toBe(expected);
+  });
+});
+
+describe('imageReferenceFinding and localImageRepository', () => {
+  it.each([
+    [`${OTHER}:2`, OTHER],
+    [`docker.io/${OTHER}:2`, OTHER],
+    [`docker.io/library/${OTHER}`, OTHER],
+    [`index.docker.io/library/${OTHER}:2`, OTHER],
+    [`registry-1.docker.io/${OTHER}-db@sha256:` + 'a'.repeat(64), `${OTHER}-db`],
+    ['ghcr.io/acme/devspaces-tools:1', 'ghcr.io/acme/devspaces-tools'],
+    ['localhost:5000/devspaces-x', 'localhost:5000/devspaces-x'],
+    ['postgres:16', 'postgres'],
+  ])('%s → %s', (reference, repository) => {
+    expect(localImageRepository(reference)).toBe(repository);
+  });
+
+  it.each([
+    // A name is not refused by its form; the pipeline refuses an image of the devspaces of another account by its ID
+    // (otherAccountImageItems).
+    [`${OTHER}:2`, undefined],
+    ['Docker.io/Library/devspaces-1', undefined],
+    [`sha256:${'d'.repeat(64)}`, { item: `image sha256:${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
+    ['d'.repeat(64), { item: `image ${'d'.repeat(64)} (an image ID; name the image)`, class: 'unsupported' }],
+    // 12 hexadecimal characters may be a name; the pipeline asks Docker (resolvedByImageId).
+    ['dddddddddddd', undefined],
+    ['ghcr.io/acme/devspaces-tools:1', undefined],
+    ['postgres:16', undefined],
+  ])('%s', (reference, expected) => {
+    expect(imageReferenceFinding(reference)).toEqual(expected);
+  });
+});
+
+describe('otherAccountImageItems', () => {
+  // Images are named after resourceName.
+  const MINE_ID = '22222222-2222-4222-8222-222222222222';
+  const THEIR_ID = '11111111-2222-4333-8444-555555555555';
+  const UNKNOWN_ID = '33333333-3333-4333-8333-333333333333';
+  /** A devspace of the account (1001). */
+  const MINE = resourceName('acme/api', MINE_ID);
+  /** A devspace of another account (2002): OTHER. */
+  const THEIRS_NAME = resourceName('acme/web', THEIR_ID);
+  /** A devspace that no registry entry or volume knows. */
+  const UNKNOWN = resourceName('acme/db', UNKNOWN_ID);
+  const OWNERS = {
+    byName: new Map([
+      [MINE, '1001'],
+      [THEIRS_NAME, '2002'],
+    ]),
+    byId: new Map([
+      [MINE_ID, '1001'],
+      [THEIR_ID, '2002'],
+    ]),
+  };
+  const THEIRS = { id: `sha256:${'a'.repeat(64)}`, repoTags: [`${THEIRS_NAME}:2`], repoDigests: [] };
+  const COPY = { id: THEIRS.id, repoTags: ['mine:1'], repoDigests: [] };
+  const OURS = { id: `sha256:${'b'.repeat(64)}`, repoTags: [`${MINE}:1`], repoDigests: [] };
+  const named = (reference: string, what = 'image') => [{ reference, what }];
+
+  it('gives the image of a reference by its name, also written with the registry of Docker Hub, never by an ID prefix', () => {
+    expect(imageNamedBy(`${THEIRS_NAME}:2`, [OURS, THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy(`docker.io/library/${THEIRS_NAME}:2`, [THEIRS])).toBe(THEIRS);
+    expect(imageNamedBy('aaaaaaaa', [THEIRS])).toBeUndefined();
+    expect(imageNamedBy('Not A Reference', [THEIRS])).toBeUndefined();
+  });
+
+  it.each<[string, string[]]>([
+    [`${THEIRS_NAME}:2`, [THEIRS_NAME]],
+    [`${THEIRS_NAME}-db:latest`, [THEIRS_NAME]],
+    [`${THEIRS_NAME}-my-worker`, [THEIRS_NAME]],
+    [`docker.io/library/${THEIRS_NAME}:2`, [THEIRS_NAME]],
+    [`index.docker.io/${THEIRS_NAME}-app`, [THEIRS_NAME]],
+    [`registry-1.docker.io/${THEIRS_NAME}-db@sha256:${'a'.repeat(64)}`, [THEIRS_NAME]],
+    [`ghcr.io/acme/${THEIRS_NAME}:1`, []],
+    ['devspaces-tools:1', []],
+    ['devspaces-tools-node:1', []],
+    // A name with a short ID is no name of a devspace.
+    ['devspaces-11111111:2', []],
+    ['postgres:16', []],
+  ])('gives the names of the devspaces that %s may be an image of: %j', (reference, expected) => {
+    expect(devspaceImageNames(reference)).toEqual(expected);
+  });
+
+  it('gives every start of the repository that is named like a devspace, for a service whose name has a -', () => {
+    // A service `x-happy-turing` of the project THEIRS_NAME: both starts have the shape of a name of a devspace.
+    expect(devspaceImageNames(`${THEIRS_NAME}-x-happy-turing:1`)).toEqual([THEIRS_NAME, `${THEIRS_NAME}-x-happy-turing`]);
+  });
+
+  it('reads a name in upper case (not a valid reference) in lower case', () => {
+    expect(devspaceImageNames(`${THEIRS_NAME.toUpperCase()}:2`)).toEqual([THEIRS_NAME]);
+    expect(devspaceImageNames(`docker.io/library/${THEIRS_NAME.toUpperCase()}-DB`)).toEqual([THEIRS_NAME]);
+  });
+
+  // An image of a Docker Hub user whose name has the shape `<name of a devspace>-…` is no devspace image (its
+  // repository has a `/`): no names, and not refused.
+  it('gives no names for an image of a Docker Hub user named like a devspace, and does not refuse it', () => {
+    expect(devspaceImageNames(`${THEIRS_NAME}-web/tool:1`)).toEqual([]);
+    expect(devspaceImageNames(`docker.io/${THEIRS_NAME}/tool:1`)).toEqual([]);
+    const ids = devspaceImageIds([], OWNERS, '1001');
+    expect(isOtherDevspaceImageName(`${THEIRS_NAME}-web/tool:1`, ids)).toBe(false);
+    expect(hasUnknownDevspace([], [`${UNKNOWN}-web/tool:1`], OWNERS)).toBe(false);
+  });
+
+  it.each<[string, string[], 'none' | 'own' | 'other']>([
+    ['no names', [], 'none'],
+    ['a devspace of the account', [MINE], 'own'],
+    ['a devspace of another account', [THEIRS_NAME], 'other'],
+    ['a devspace of no known owner', [UNKNOWN], 'other'],
+    ['a name of no devspace next to one of the account', [MINE, `${MINE}-x-happy-turing`], 'own'],
+    ['a devspace of another account next to one of the account', [MINE, THEIRS_NAME], 'other'],
+  ])('devspaceImageClass: %s', (_name, names, expected) => {
+    expect(devspaceImageClass(names, new Set([MINE]), new Set([THEIRS_NAME]))).toBe(expected);
+  });
+
+  const IMAGES = [
+    // By the names (no label).
+    { id: 'sha256:A', tags: [`${THEIRS_NAME}:2`, `${THEIRS_NAME}:3`] },
+    { id: 'sha256:B', tags: [`${MINE}-db:latest`] },
+    { id: 'sha256:C', tags: [`${UNKNOWN}:1`] },
+    { id: 'sha256:D', tags: ['devspaces-tools:1'] },
+    // By the label nimblescape.devspaces.id.
+    { id: 'sha256:E', tags: ['mine:1'], devspaceId: MINE_ID },
+    { id: 'sha256:F', tags: [`${MINE}:9`], devspaceId: THEIR_ID },
+    { id: 'sha256:G', tags: ['x:1'], devspaceId: '44444444-4444-4444-8444-444444444444' },
+    { id: 'sha256:H', tags: [`${THEIRS_NAME}:5`], devspaceId: MINE_ID },
+  ];
+
+  it('devspaceImageIds: the label decides, an unknown ID counts as another account, a name of another account overrides an own label', () => {
+    expect(devspaceImageIds(IMAGES, OWNERS, '1001')).toEqual({
+      own: new Set(['sha256:b', 'sha256:e']),
+      others: new Set(['sha256:a', 'sha256:c', 'sha256:f', 'sha256:g', 'sha256:h']),
+      ownNames: new Set([MINE]),
+      otherNames: new Set([THEIRS_NAME]),
+    });
+    // For the other account: F has its label, but a name of a devspace of 1001 (now another account) overrides it.
+    expect(devspaceImageIds(IMAGES, OWNERS, '2002')).toMatchObject({
+      own: new Set(['sha256:a']),
+      others: new Set(['sha256:b', 'sha256:c', 'sha256:e', 'sha256:f', 'sha256:g', 'sha256:h']),
+    });
+  });
+
+  it('hasUnknownDevspace (replaces unknownDevspaceShortIds): an image or reference of a devspace that no owner knows', () => {
+    expect(hasUnknownDevspace(IMAGES, [], OWNERS)).toBe(true);
+    // Only of the images that the references found.
+    expect(hasUnknownDevspace(IMAGES, [], OWNERS, new Set(['sha256:a', 'sha256:b', 'sha256:d', 'sha256:e', 'sha256:f', 'sha256:h']))).toBe(false);
+    expect(hasUnknownDevspace(IMAGES, [], OWNERS, new Set(['sha256:c']))).toBe(true);
+    expect(hasUnknownDevspace(IMAGES, [], OWNERS, new Set(['sha256:g']))).toBe(true);
+    // A known label decides, whatever the names.
+    expect(hasUnknownDevspace([{ id: 'sha256:I', tags: [`${UNKNOWN}:1`], devspaceId: MINE_ID }], [], OWNERS)).toBe(false);
+    // The references of a configuration without a local image.
+    expect(hasUnknownDevspace([], [`${UNKNOWN}:1`], OWNERS)).toBe(true);
+    expect(hasUnknownDevspace([], [`${THEIRS_NAME}:1`, `${MINE}-db`, 'postgres:16', 'devspaces-tools:1'], OWNERS)).toBe(false);
+    expect(hasUnknownDevspace([], [], OWNERS)).toBe(false);
+  });
+
+  it('refuses a name of a devspace image without a local image unless the devspace is the account\'s', () => {
+    const ids = devspaceImageIds([], OWNERS, '1001');
+    expect(ids.ownNames).toEqual(new Set([MINE]));
+    expect(ids.otherNames).toEqual(new Set([THEIRS_NAME]));
+    expect(isOtherDevspaceImageName(`${THEIRS_NAME}:4`, ids)).toBe(true);
+    expect(isOtherDevspaceImageName(`docker.io/library/${THEIRS_NAME}-db`, ids)).toBe(true);
+    expect(isOtherDevspaceImageName(`${UNKNOWN}:4`, ids)).toBe(true);
+    expect(isOtherDevspaceImageName(`${MINE}:4`, ids)).toBe(false);
+    expect(isOtherDevspaceImageName(`${MINE}-x-happy-turing`, ids)).toBe(false);
+    expect(isOtherDevspaceImageName('devspaces-tools:1', ids)).toBe(false);
+    expect(isOtherDevspaceImageName('postgres:16', ids)).toBe(false);
+    // Without the names, every devspace counts as of no known owner.
+    expect(isOtherDevspaceImageName(`${MINE}:4`, { own: new Set(), others: new Set() })).toBe(true);
+    const missing = new Set([`${THEIRS_NAME}:4`, `${MINE}:4`]);
+    expect(otherAccountImageItems(named(`${THEIRS_NAME}:4`), [], ids, missing)).toEqual([`image ${THEIRS_NAME}:4 (an image of a devspace of another GitHub account)`]);
+    expect(otherAccountImageItems(named(`${MINE}:4`), [], ids, missing)).toEqual([]);
+    // A reference that Docker could not inspect (not in `missing`) is not decided by its name.
+    expect(otherAccountImageItems(named(`${THEIRS_NAME}:4`), [], ids, new Set())).toEqual([]);
+  });
+
+  it('names the owner of each devspace by the labels of its volumes, by name and by ID, none when they differ', () => {
+    const volume = (id: string, repository?: string, owner?: string) => ({
+      labels: {
+        'nimblescape.devspaces.id': id,
+        ...(repository ? { 'nimblescape.devspaces.repository': repository } : {}),
+        ...(owner ? { 'nimblescape.devspaces.owner-id': owner } : {}),
+      },
+    });
+    const ID1 = '11111111-0000-4000-8000-000000000001';
+    const ID2 = '22222222-0000-4000-8000-000000000002';
+    const ID3 = '33333333-0000-4000-8000-000000000003';
+    const ID4 = '44444444-0000-4000-8000-000000000004';
+    const ID5 = '55555555-0000-4000-8000-000000000005';
+    expect(
+      volumeOwners([
+        volume(ID1, 'acme/api', '1001'),
+        volume(ID1, 'acme/api', '1001'),
+        // Conflicting owners: left out by name and by ID.
+        volume(ID2, 'acme/web', '1001'),
+        volume(ID2, 'acme/web', '2002'),
+        volume(ID2, 'acme/web', '1001'),
+        // No owner.
+        volume(ID3, 'acme/db'),
+        // No repository, or one that is no repository: by ID only.
+        volume(ID4, undefined, '2002'),
+        volume(ID5, 'noslash', '2002'),
+        { labels: {} },
+      ]),
+    ).toEqual({
+      byName: new Map([[resourceName('acme/api', ID1), '1001']]),
+      byId: new Map([
+        [ID1, '1001'],
+        [ID4, '2002'],
+        [ID5, '2002'],
+      ]),
+    });
+    // The name is in lower case.
+    expect(volumeOwners([volume(ID1, 'Acme/API', '1001')]).byName).toEqual(new Map([[resourceName('acme/api', ID1), '1001']]));
+  });
+
+  // A volume with the ID label but no owner label (made by hand, or an older one) says nothing about the owner of the
+  // ID: the owner that another volume names stays, in either order.
+  it('keeps the owner of an ID by ID when another volume of the ID carries no owner label', () => {
+    const ID = '11111111-0000-4000-8000-000000000001';
+    const withOwner = { labels: { [LABEL_DEVSPACE_ID]: ID, [LABEL_OWNER_ID]: '1001', [LABEL_REPOSITORY]: 'acme/api' } };
+    const withoutOwner = { labels: { [LABEL_DEVSPACE_ID]: ID } };
+    expect(volumeOwners([withOwner, withoutOwner]).byId.get(ID)).toBe('1001');
+    expect(volumeOwners([withoutOwner, withOwner]).byId.get(ID)).toBe('1001');
+    expect(volumeOwners([withoutOwner]).byId.has(ID)).toBe(false);
+  });
+
+  it.each<[string, readonly { id: string; repoTags: string[]; repoDigests: string[] }[], { own: string[]; others: string[] }, string[]]>([
+    ['an image of another account', [THEIRS], { own: [], others: [THEIRS.id] }, [`image ${THEIRS_NAME}:2 (an image of a devspace of another GitHub account)`]],
+    ['an image of another account that is also the account\'s own (the same build)', [THEIRS], { own: [THEIRS.id], others: [THEIRS.id] }, []],
+    // The image of the account is named by the reference.
+    ['an image of the account', [{ ...OURS, repoTags: [`${THEIRS_NAME}:2`] }], { own: [OURS.id], others: [THEIRS.id] }, []],
+    ['no image of a devspace', [{ id: 'sha256:c', repoTags: [`${THEIRS_NAME}:2`], repoDigests: [] }], { own: [], others: [THEIRS.id] }, []],
+    // The name of an image of a devspace of no known owner that is not there is refused by its name
+    // (isOtherDevspaceImageName).
+    ['a missing image', [], { own: [], others: [THEIRS.id] }, [`image ${THEIRS_NAME}:2 (an image of a devspace of another GitHub account)`]],
+  ])('%s', (_name, images, ids, expected) => {
+    const missing = new Set(images.length === 0 ? [`${THEIRS_NAME}:2`] : []);
+    expect(otherAccountImageItems(named(`${THEIRS_NAME}:2`), images, { own: new Set(ids.own), others: new Set(ids.others) }, missing)).toEqual(expected);
+  });
+
+  it('refuses a copy under another name by its ID, with the name of the setting', () => {
+    expect(otherAccountImageItems(named('mine:1', 'service db: image'), [COPY], { own: new Set(), others: new Set([THEIRS.id]) }, new Set())).toEqual([
+      'service db: image mine:1 (an image of a devspace of another GitHub account)',
+    ]);
+  });
+});
+
+describe('foreignNetworkItem and runArgsNetworks', () => {
+  const ID = 'e0000001-0000-4000-8000-000000000001';
+  // foreignNetworkItem takes the own project (resourceName).
+  const OWN_PROJECT = composeProjectName('acme/api', ID);
+  it.each([
+    ['named like the project of another devspace', `${OTHER}_default`, undefined, true],
+    ['named like the own project', `${OWN_PROJECT}_default`, undefined, false],
+    ['labelled for another devspace', 'backend', { labels: { 'com.docker.compose.project': OTHER }, devspaces: [] }, true],
+    ['labelled for the own project', 'backend', { labels: { 'com.docker.compose.project': OWN_PROJECT }, devspaces: [ID] }, false],
+    // The project label is compared without regard to case, as the name.
+    ['labelled for the own project in upper case', 'backend', { labels: { 'com.docker.compose.project': OWN_PROJECT.toUpperCase() }, devspaces: [] }, false],
+    ['labelled for another devspace in upper case', 'backend', { labels: { 'com.docker.compose.project': OTHER.toUpperCase() }, devspaces: [] }, true],
+    ['labelled for a project of another program', 'backend', { labels: { 'com.docker.compose.project': 'shop' }, devspaces: [] }, false],
+    ['labelled for a project of a repository named devspaces-…', 'backend', { labels: { 'com.docker.compose.project': 'devspaces-tools' }, devspaces: [] }, false],
+    ['with a container of another devspace', 'shared', { labels: {}, devspaces: [ID, 'e0000002-0000-4000-8000-000000000002'] }, true],
+    ['without anything of another devspace', 'shared', { labels: {}, devspaces: [] }, false],
+  ])('%s', (_name, network, state, foreign) => {
+    expect(foreignNetworkItem(network, state, ID, OWN_PROJECT) !== undefined).toBe(foreign);
+  });
+
+  it('takes every devspace name for another one without the own project', () => {
+    expect(foreignNetworkItem(`${OWN_PROJECT}_default`, undefined, ID)).toBe(`network ${OWN_PROJECT}_default of another devspace`);
+    expect(foreignNetworkItem(`${OWN_PROJECT.toUpperCase()}_default`, undefined, ID, OWN_PROJECT)).toBeUndefined();
+  });
+
+  it('names the networks of runArgs, not the modes of Docker', () => {
+    expect(runArgsNetworks(['--network', 'host', '--net=backend', '--network', 'name=shared,alias=x', '--network', 'container:x', '-e', 'A=--network'])).toEqual([
+      'backend',
+      'shared',
+    ]);
+    expect(runArgsNetworks(undefined)).toEqual([]);
+  });
+});
+
+describe('the Dockerfile of a single container', () => {
+  it('refuses a configured Dockerfile that could not be read as protected; the update check has no FROM images of it', () => {
+    // Refused as protected, whatever the switch says: the CLI would read the file that a link out of the repository
+    // points to as the Dockerfile. The pipeline passes dockerfileUnreadable (resolvedDockerfile).
+    const config = { build: { dockerfile: '${localEnv:X}/Dockerfile' } };
+    for (const checksOn of [true, false]) {
+      const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN, dockerfileUnreadable: '${localEnv:X}/Dockerfile' }, checksOn, config });
+      expect(analysis.report).toEqual({ hostAccess: ['Dockerfile ${localEnv:X}/Dockerfile (the Dockerfile is a link out of the repository or could not be read)'], unsupported: [] });
+      expect(analysis.references.images).toEqual([]);
+    }
+    // Without dockerfileUnreadable (the Dockerfile was read, or the configuration names none): nothing is refused.
+    expect(runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn: true, config }).report).toEqual({ hostAccess: [], unsupported: [] });
+  });
+
+  const HELPER = { configFolder: '/workspaces/api/.devcontainer', repositoryFolder: '/workspaces/api' };
+
+  it('refuses a Dockerfile that is a link out of the repository (to the token or the cache volume), also with the checks off', () => {
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    const item = 'Dockerfile Dockerfile (the Dockerfile is a link out of the repository or could not be read)';
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileUnreadable: 'Dockerfile' }, checksOn)).toEqual({ hostAccess: [item], unsupported: [] });
+    }
+    expect(hostAccessClassification({ config, ownVolume: OWN, ...HELPER, dockerfileUnreadable: 'Dockerfile' })).toEqual([{ item, class: 'protected' }]);
+    // A path of the workspace helper as written is named once, as such.
+    const cache = { build: { dockerfile: '/devspace-cache/x' } };
+    expect(hostAccessReport({ config: cache, ownVolume: OWN, ...HELPER, dockerfileUnreadable: '/devspace-cache/x' }, false)).toEqual({
+      hostAccess: ['Dockerfile /devspace-cache/x (a folder of the workspace helper)'],
+      unsupported: [],
+    });
+  });
+
+  it('refuses a Dockerfile of MAX_DOCKERFILE_LENGTH + 1 characters as not supported, and allows a normal one', () => {
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    const item = `the Dockerfile (longer than ${MAX_DOCKERFILE_LENGTH} characters; the Dockerfile is too large)`;
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileLength: MAX_DOCKERFILE_LENGTH + 1 }, checksOn)).toEqual({ hostAccess: [], unsupported: [item] });
+      expect(hostAccessReport({ config, ownVolume: OWN, ...HELPER, dockerfileLength: MAX_DOCKERFILE_LENGTH }, checksOn)).toEqual({ hostAccess: [], unsupported: [] });
+    }
+  });
+});
+
+describe('the images that the Dockerfile of a single container names', () => {
+  it('allows the images of other devspaces in FROM, COPY --from, RUN --mount, and the syntax directive, whatever the switch says', () => {
+    const dockerfileText = [
+      `# syntax=docker.io/library/${OTHER}:9`,
+      'FROM alpine AS base',
+      `FROM ${OTHER}\${TARGETVARIANT}`,
+      'COPY --from=base /a /a',
+      `COPY --from=${OTHER}:1 /b /b`,
+      `RUN --mount=type=cache,from=${OTHER},target=/c true`,
+      'COPY --from=$IMAGE /d /d',
+    ].join('\n');
+    const config = { build: { dockerfile: 'Dockerfile' } };
+    for (const checksOn of [true, false]) {
+      const analysis = runAnalysisJob({ kind: 'single', input: { config, ownVolume: OWN }, checksOn, config, dockerfileText });
+      expect(analysis.report).toEqual({ hostAccess: [], unsupported: [] });
+      expect(analysis.imageReferences).toEqual([]);
+      // The update check reads the FROM images it can resolve.
+      expect(analysis.references.images).toEqual(['alpine']);
+    }
+  });
+});
+
+describe('resolvedByImageId', () => {
+  const digest = `sha256:${'e'.repeat(64)}`;
+  it.each<[string, string, string[], string[], boolean]>([
+    ['a name of the image', 'postgres:16', ['postgres:16'], [], false],
+    ['Docker Hub written in full', 'docker.io/library/postgres', ['postgres:latest'], [], false],
+    ['the short form of a full name', 'postgres', ['docker.io/library/postgres:latest'], [], false],
+    ['an ID prefix', 'a1b2c3d4', ['postgres:16'], [], true],
+    ['a short ID prefix', 'a1b', ['postgres:16'], [], true],
+    ['an image that is named like hexadecimal characters', 'a1b2c3d4', ['a1b2c3d4:latest'], [], false],
+    ['another tag of the same repository', 'postgres:15', ['postgres:16'], [], true],
+    ['a digest of the image', `postgres@${digest}`, [], [`postgres@${digest}`], false],
+    ['a tag and a digest of the image', `postgres:16@${digest}`, [], [`docker.io/library/postgres@${digest}`], false],
+    ['a digest that the image does not have', `postgres@${digest}`, ['postgres:16'], [], true],
+    ['a dangling image', 'a1b2c3d4', [], [], true],
+    ['no image name', 'Not/Valid:', [], [], false],
+  ])('%s', (_name, reference, tags, digests, expected) => {
+    expect(resolvedByImageId(reference, tags, digests)).toBe(expected);
+  });
+});
+
+describe('resolveNetworkReference', () => {
+  const networks = [
+    { name: 'backend', id: 'aaaa1111' },
+    { name: 'aaaa', id: 'bbbb2222' },
+    { name: 'front', id: 'aaaa3333' },
+  ];
+  it('resolves as Docker does: full ID, name, then a unique ID prefix', () => {
+    expect(resolveNetworkReference('bbbb2222', networks)?.name).toBe('aaaa');
+    expect(resolveNetworkReference('backend', networks)?.name).toBe('backend');
+    expect(resolveNetworkReference('aaaa', networks)?.name).toBe('aaaa');
+    expect(resolveNetworkReference('aaaa3', networks)?.name).toBe('front');
+    expect(resolveNetworkReference('aaa', networks)).toBeUndefined();
+    expect(resolveNetworkReference('', networks)).toBeUndefined();
+    expect(resolveNetworkReference('zzzz', networks)).toBeUndefined();
+  });
+});
+
+describe('foreignNetworkItem with a network that a reference resolves to', () => {
+  const ID = '3f2a9c1e-0000-4000-8000-000000000000';
+  it('checks the name of the network that a reference resolves to', () => {
+    // The own project is passed (resourceName).
+    const project = composeProjectName('acme/api', ID);
+    expect(foreignNetworkItem('f00dbabe', { name: `${OTHER}_default`, labels: {}, devspaces: [] }, ID, project)).toBe('network f00dbabe of another devspace');
+    expect(foreignNetworkItem('f00dbabe', { name: `${project}_default`, labels: {}, devspaces: [] }, ID, project)).toBeUndefined();
+  });
+
+  it('allows a container of a devspace of the same owner, and no other', () => {
+    const other = '11111111-0000-4000-8000-000000000000';
+    expect(foreignNetworkItem('devnet', { labels: {}, devspaces: [other], sameOwnerDevspaces: [other] }, ID)).toBeUndefined();
+    expect(foreignNetworkItem('devnet', { labels: {}, devspaces: [other, 'x'], sameOwnerDevspaces: [other] }, ID)).toBe('network devnet of another devspace');
+    expect(foreignNetworkItem('devnet', { labels: {}, devspaces: [other] }, ID)).toBe('network devnet of another devspace');
+    // The project network of another devspace stays refused, also of the same owner.
+    expect(foreignNetworkItem(`${OTHER}_default`, { labels: {}, devspaces: [other], sameOwnerDevspaces: [other] }, ID)).toBe(
+      `network ${OTHER}_default of another devspace`,
+    );
+    expect(foreignNetworkItem('backend', { labels: { 'com.docker.compose.project': OTHER }, devspaces: [other], sameOwnerDevspaces: [other] }, ID)).toBe(
+      'network backend of another devspace',
+    );
+  });
+});
+
+describe('imageLabelItems', () => {
+  it('allows the labels of another tool with the prefix devspace.', () => {
+    expect(imageLabelItems(`${OWN}:2`, { 'devspace.fingerprint': 'f', 'devspace.inputs': 'i', 'devcontainer.metadata': '[]' })).toEqual([]);
+    expect(imageLabelItems('x', { 'devspace.environment-id': 'e', 'devspace.compose-service': 'db' })).toEqual([]);
+  });
+
+  it.each([...EXTENSION_LABEL_KEYS, `${LABEL_PREFIX}future`])('names the label %s of the extension, in any case', (key) => {
+    expect(imageLabelItems('x', { [key]: 'v', 'devspace.fingerprint': 'f' })).toEqual([`label ${key} of the image x`]);
+    expect(imageLabelItems('x', { [` ${key.toUpperCase()}`]: 'v' })).toEqual([`label ${key.toUpperCase()} of the image x`]);
+  });
+
+  it('names the labels by which the extension and the CLI find containers, except devcontainer.metadata', () => {
+    // The label com.docker.compose.project of an image is not refused.
+    expect(
+      imageLabelItems(`${OWN}:2`, {
+        'devcontainer.metadata': '[]',
+        'org.opencontainers.image.title': 'x',
+        'nimblescape.devspaces.compose-service': 'x',
+        'devcontainer.local_folder': '/x',
+        'com.docker.compose.project': OTHER,
+      }),
+    ).toEqual([`label nimblescape.devspaces.compose-service of the image ${OWN}:2`, `label devcontainer.local_folder of the image ${OWN}:2`]);
+  });
+
+  describe('the labels that the extension gives the images of the devspace', () => {
+    // The build record only on the devspace image (devspaceImage).
+    const OWN_ENV = { id: '3f2a9c1e-0000-4000-8000-000000000000', repository: 'acme/api', ownerId: '1001', devspaceImage: true };
+    const LABELS = {
+      'nimblescape.devspaces.id': OWN_ENV.id,
+      'nimblescape.devspaces.repository': OWN_ENV.repository,
+      'nimblescape.devspaces.owner-id': OWN_ENV.ownerId,
+      'nimblescape.devspaces.build-record': '{"buildNumber":1}',
+    };
+
+    it('allows them with the values of the own devspace, the build record with any value', () => {
+      expect(imageLabelItems(`${OWN}:2`, LABELS, OWN_ENV)).toEqual([]);
+      expect(imageLabelItems(`${OWN}:2`, { ...LABELS, 'nimblescape.devspaces.build-record': 'anything' }, OWN_ENV)).toEqual([]);
+      expect(imageLabelItems(`${OWN}-db`, { 'nimblescape.devspaces.id': OWN_ENV.id }, OWN_ENV)).toEqual([]);
+    });
+
+    it('refuses the build record on any image but the devspace image', () => {
+      const service = { ...OWN_ENV, devspaceImage: false };
+      expect(imageLabelItems('base:1', { 'nimblescape.devspaces.build-record': '{"forged":true}' }, service)).toEqual(['label nimblescape.devspaces.build-record of the image base:1']);
+      expect(imageLabelItems('base:1', { 'nimblescape.devspaces.id': OWN_ENV.id }, service)).toEqual([]);
+    });
+
+    it('allows the label of a prepared image only empty and only on the devspace image', () => {
+      expect(imageLabelItems(`${OWN}:2`, { ...LABELS, 'nimblescape.devspaces.prepared': '' }, OWN_ENV)).toEqual([]);
+      expect(imageLabelItems(`${OWN}:2`, { ...LABELS, 'nimblescape.devspaces.prepared': '{"key":{}}' }, OWN_ENV)).toEqual([`label nimblescape.devspaces.prepared of the image ${OWN}:2`]);
+      expect(imageLabelItems('base:1', { 'nimblescape.devspaces.prepared': '' }, { ...OWN_ENV, devspaceImage: false })).toEqual(['label nimblescape.devspaces.prepared of the image base:1']);
+      expect(imageLabelItems('base:1', { 'nimblescape.devspaces.prepared': '' })).toEqual(['label nimblescape.devspaces.prepared of the image base:1']);
+    });
+
+    it.each<[string, Record<string, string>]>([
+      ['another devspace ID', { 'nimblescape.devspaces.id': '11111111-2222-4333-8444-555555555555' }],
+      ['another repository', { 'nimblescape.devspaces.repository': 'acme/web' }],
+      ['another owner', { 'nimblescape.devspaces.owner-id': '2002' }],
+    ])('refuses them with %s', (_name, changed) => {
+      const key = Object.keys(changed)[0];
+      expect(imageLabelItems('x', { ...LABELS, ...changed }, OWN_ENV)).toEqual([`label ${key} of the image x`]);
+    });
+
+    it('refuses them without the own devspace', () => {
+      expect(imageLabelItems('x', LABELS)).toEqual([
+        'label nimblescape.devspaces.id of the image x',
+        'label nimblescape.devspaces.repository of the image x',
+        'label nimblescape.devspaces.owner-id of the image x',
+        'label nimblescape.devspaces.build-record of the image x',
+      ]);
+    });
+
+    it('still refuses the other labels of the extension, also with the values of the own devspace', () => {
+      expect(
+        imageLabelItems('x', { ...LABELS, 'nimblescape.devspaces.compose-service': 'db', 'nimblescape.devspaces.volume': OWN_ENV.id, 'nimblescape.devspaces.host-access': 'unrestricted' }, OWN_ENV),
+      ).toEqual(['label nimblescape.devspaces.compose-service of the image x', 'label nimblescape.devspaces.volume of the image x', 'label nimblescape.devspaces.host-access of the image x']);
+    });
+  });
+
+  it('allows the labels of Docker Compose of any project', () => {
+    // An image that Compose built for another project (inherited through FROM) is usable; a
+    // single container gets the labels empty in its override configuration, and Compose sets its own on its containers.
+    const built = { 'com.docker.compose.project': OWN, 'com.docker.compose.service': 'app', 'com.docker.compose.version': '2.40.3' };
+    expect(imageLabelItems(`${OWN}-app`, built)).toEqual([]);
+    expect(imageLabelItems('x', { 'com.docker.compose.service': 'app', 'com.docker.compose.project': 'shop' })).toEqual([]);
+    expect(imageLabelItems('x', { 'nimblescape.devspaces.host-access': 'unrestricted', 'com.docker.compose.project': 'shop' })).toEqual([
+      'label nimblescape.devspaces.host-access of the image x',
+    ]);
+  });
+});
+
+describe('the time of the check', () => {
+  it('removes the duplicates of 20000 items in linear time', () => {
+    const mounts = Array.from({ length: 20_000 }, (_, i) => `type=bind,source=/etc/x${i},target=/x${i}`);
+    const start = performance.now();
+    const report = hostAccessReport({ config: { mounts }, ownVolume: OWN });
+    expect(performance.now() - start).toBeLessThan(600);
+    // The report names at most MAX_LISTED_ITEMS and counts the rest; every one of the
+    // 20000 items is still found, each once (hostAccessClassification is not capped).
+    expect(report.hostAccess).toHaveLength(MAX_LISTED_ITEMS + 1);
+    expect(report.hostAccess[MAX_LISTED_ITEMS]).toBe(`and ${20_000 - MAX_LISTED_ITEMS} more`);
+    expect(hostAccessClassification({ config: { mounts }, ownVolume: OWN })).toHaveLength(20_000);
+    expect(report.unsupported).toEqual([]);
+  });
+});
+
+describe('--restart is not passed to Docker', () => {
+  const RESTART = expect.stringContaining('would start the container again when Docker starts');
+
+  it.each<[string, string[], Array<{ arg: string; reason: unknown }>, string[]]>([
+    ['--restart on-failure', ['--restart', 'on-failure', '--init'], [{ arg: '--restart on-failure', reason: RESTART }], ['--init']],
+    ['--restart=on-failure:3', ['--restart=on-failure:3'], [{ arg: '--restart=on-failure:3', reason: RESTART }], []],
+    ['--restart no', ['--init', '--restart', 'no'], [{ arg: '--restart no', reason: RESTART }], ['--init']],
+    ['a --restart that is the value of another flag stays', ['--label', '--restart=on-failure'], [], ['--label', '--restart=on-failure']],
+  ])('removes %s from the runArgs that Docker gets, and names it for the log', (_name, runArgs, removed, passed) => {
+    // Docker would start a container with on-failure again when the Docker daemon starts.
+    expect(removedRunArgs(runArgs)).toEqual(removed);
+    expect(overrideRunArgs(runArgs)).toEqual(passed);
+    expect(runArgsProblems(runArgs, OWN)).toEqual([]);
+    expect(runArgsProblems(passed, OWN)).toEqual([]);
+  });
+
+  it('still refuses the values that start the container together with Docker, and a --restart without a value', () => {
+    expect(runArgsProblems(['--restart', 'always', '--restart=unless-stopped'], OWN)).toEqual(['--restart=always', '--restart=unless-stopped']);
+    expect(runArgsProblems(['--init', '--restart'], OWN)).toEqual(['--restart without a value']);
+  });
+
+  it('removes it from the override configuration', () => {
+    const override = buildOverrideConfig({ devspaceImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: ['--restart=on-failure:5', '--init'] });
+    expect((override.runArgs as string[]).some((arg) => arg.startsWith('--restart'))).toBe(false);
+    expect(override.runArgs).toContain('--init');
+  });
+});
+
+describe('imageIdResolvedReferences', () => {
+  const ID = `sha256:a1b2c3${'0'.repeat(58)}`;
+  const PG = { id: `sha256:${'e'.repeat(64)}`, repoTags: ['postgres:16'], repoDigests: [`postgres@sha256:${'f'.repeat(64)}`] };
+
+  it('takes the name first, then a prefix of the ID or a digest that is the ID, as Docker resolves them', () => {
+    const found = [PG, { id: ID, repoTags: [`${OTHER}-db:latest`], repoDigests: [] }];
+    expect(
+      imageIdResolvedReferences(
+        ['postgres:16', `postgres@sha256:${'f'.repeat(64)}`, 'a1b2c3', 'sha256:a1b2c3', `other@${ID}`, 'missing:1', 'eeee', 'fff'],
+        found,
+      ),
+    ).toEqual(['a1b2c3', 'sha256:a1b2c3', `other@${ID}`, 'eeee']);
+    // A hexadecimal name that is a tag of an image is its name.
+    expect(imageIdResolvedReferences(['a1b2c3'], [{ id: ID, repoTags: ['a1b2c3:latest'], repoDigests: [] }])).toEqual([]);
+    expect(imageIdResolvedReferences(['a1b2c3'], [])).toEqual([]);
+  });
+});
+
+describe('isValidImageReference: the digest rules of go-digest and the length of the normalized name', () => {
+  it('accepts the digests of sha256, sha384, and sha512 in lowercase hex of their length', () => {
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(64)}`)).toBe(true);
+    expect(isValidImageReference(`alpine@sha384:${'b'.repeat(96)}`)).toBe(true);
+    expect(isValidImageReference(`alpine:3@sha512:${'0'.repeat(128)}`)).toBe(true);
+    expect(isValidImageReference(`ghcr.io/o/r@sha256:${'f'.repeat(64)}`)).toBe(true);
+  });
+
+  it('refuses another algorithm, another length, or uppercase hex', () => {
+    // The grammar alone accepts them, and Docker's answer would count as transient (an internal error at every open).
+    expect(isValidImageReference(`alpine@sha256:${'A'.repeat(64)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(63)}A`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(40)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256:${'a'.repeat(65)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha384:${'a'.repeat(64)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha512:${'a'.repeat(96)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha1:${'a'.repeat(40)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@md5:${'a'.repeat(32)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@SHA256:${'a'.repeat(64)}`)).toBe(false);
+    expect(isValidImageReference(`alpine@sha256+b64:${'a'.repeat(64)}`)).toBe(false);
+  });
+
+  it('applies the bound of 255 characters to the normalized name (docker.io/library/<name> on Docker Hub)', () => {
+    // docker.io/library/ has 18 characters: 237 characters of name are 255 in all.
+    expect(isValidImageReference('a'.repeat(237))).toBe(true);
+    expect(isValidImageReference(`${'a'.repeat(237)}:tag`)).toBe(true);
+    // The grammar alone bounds the name as written and accepts 238 characters.
+    expect(isValidImageReference('a'.repeat(238))).toBe(false);
+    expect(isValidImageReference(`${'a'.repeat(238)}:1@sha256:${'a'.repeat(64)}`)).toBe(false);
+    // docker.io/<path>, without library/, for a path of two components; index.docker.io becomes docker.io.
+    expect(isValidImageReference(`o/${'a'.repeat(243)}`)).toBe(true);
+    expect(isValidImageReference(`o/${'a'.repeat(244)}`)).toBe(false);
+    expect(isValidImageReference(`index.docker.io/o/${'a'.repeat(200)}`)).toBe(true);
+    expect(isValidImageReference(`index.docker.io/${'a'.repeat(237)}`)).toBe(true);
+    expect(isValidImageReference(`index.docker.io/${'a'.repeat(238)}`)).toBe(false);
+    expect(isValidImageReference(`docker.io/${'a'.repeat(238)}`)).toBe(false);
+    // Another registry: the name as written.
+    expect(isValidImageReference(`ghcr.io/${'a'.repeat(247)}`)).toBe(true);
+    expect(isValidImageReference(`ghcr.io/${'a'.repeat(248)}`)).toBe(false);
+  });
+
+  it('still accepts the references of real configurations', () => {
+    for (const reference of [
+      'localhost:5000/foo/bar:v1',
+      '[::1]:5000/foo',
+      'Registry.Example.com:443/a__b/c-d--e:TAG_1.x',
+      'mcr.microsoft.com/devcontainers/typescript-node:1-20-bookworm',
+      'postgres:16',
+    ]) {
+      expect([reference, isValidImageReference(reference)]).toEqual([reference, true]);
+    }
+  });
+});
+
+describe('no mount of a single container into the extension\'s internal folder', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN });
+  const U = (...items: string[]) => ({ hostAccess: [], unsupported: items });
+
+  it('refuses the `mounts` forms (text and object) at or below /workspaces/.devspace+', () => {
+    expect(report({ mounts: ['source=cache,target=/workspaces/.devspace+/pg,type=volume'] })).toEqual(U(`mount at /workspaces/.devspace+/pg (${INTERNAL})`));
+    expect(report({ mounts: ['type=tmpfs,dst=/workspaces//.devspace+/'] })).toEqual(U(`mount at /workspaces/.devspace+ (${INTERNAL})`));
+    expect(report({ mounts: [{ source: 'cache', target: '/workspaces/api/../.devspace+/x', type: 'volume' }] })).toEqual(U(`mount at /workspaces/.devspace+/x (${INTERNAL})`));
+    expect(report({ mounts: ['type=volume,src=cache,destination=/workspaces/.devspace+/gh'] })).toEqual(U(`mount at /workspaces/.devspace+/gh (${INTERNAL})`));
+  });
+
+  it('refuses -v, --mount, and --tmpfs of runArgs there', () => {
+    expect(report({ runArgs: ['-v', 'cache:/workspaces/.devspace+/pg'] })).toEqual(U(`mount at /workspaces/.devspace+/pg (${INTERNAL})`));
+    expect(report({ runArgs: ['--volume=/workspaces/.devspace+/anonymous'] })).toEqual(U(`mount at /workspaces/.devspace+/anonymous (${INTERNAL})`));
+    expect(report({ runArgs: ['-v', 'cache:/workspaces/.devspace+:ro'] })).toEqual(U(`mount at /workspaces/.devspace+ (${INTERNAL})`));
+    expect(report({ runArgs: ['--mount', 'type=volume,source=cache,target=/workspaces/.devspace+/x'] })).toEqual(U(`mount at /workspaces/.devspace+/x (${INTERNAL})`));
+    expect(report({ runArgs: ['--tmpfs', '/workspaces/.devspace+:size=1m'] })).toEqual(U(`mount at /workspaces/.devspace+ (${INTERNAL})`));
+    expect(report({ runArgs: ['--tmpfs=/workspaces/.devspace+/docker'] })).toEqual(U(`mount at /workspaces/.devspace+/docker (${INTERNAL})`));
+  });
+
+  it('allows other paths of /workspaces outside the repository, and a folder that only starts like it', () => {
+    expect(report({ mounts: ['source=cache,target=/workspaces/.cache,type=volume', 'source=cache2,target=/workspaces/.devspace+x,type=volume'] })).toEqual({ hostAccess: [], unsupported: [] });
+    expect(report({ runArgs: ['-v', 'cache:/workspaces/.cache', '--tmpfs', '/workspaces/.devspace+x', '--mount', 'type=tmpfs,target=/workspaces/.devspace'] })).toEqual({ hostAccess: [], unsupported: [] });
+  });
+});
+
+describe('volumeFlagTarget', () => {
+  it.each([
+    ['cache:/data', '/data'],
+    ['cache:/data:ro', '/data'],
+    ['/data', '/data'],
+    ['/data:ro', '/data'],
+    ['C:\\x:/data:rw', '/data'],
+    ['/host:/data', '/data'],
+  ])('%s → %s', (spec, target) => {
+    expect(volumeFlagTarget(spec)).toBe(target);
+  });
+});
+
+// Dev Container CLI 0.89.0 substitutes the variables of every entry of the image metadata (and of the
+// configuration and the override configuration) at `up`, before it passes the mounts to `docker run`. The policy checks
+// the resolved values (./cliVariables.ts), in the image metadata, the configuration, and the merged configuration.
+describe('host access policy: variables of the Dev Container CLI in mounts', () => {
+  const variables = helperCliVariables('acme/api');
+  const FOREIGN = `volume ${OTHER} of another devspace`;
+  const HELPER_CACHE = `volume ${HELPER_CACHE_VOLUME} of the workspace helper`;
+  type Where = 'metadata' | 'config' | 'merged';
+  const input = (where: Where, mounts: unknown[], withVariables = true): HostAccessInput => {
+    const base = { ownVolume: OWN, ...(withVariables ? { variables } : {}) };
+    if (where === 'metadata') return { ...base, metadata: [{ id: 'base' }, { mounts }] };
+    // The configuration and the merged configuration are the output of read-configuration, which the
+    // CLI has substituted once already, and the checks read them as they are. Here they are substituted once with the
+    // variables of the pipeline (the variables of the helper process whose values are not known stay, as if
+    // read-configuration had left them).
+    return { ...base, [where]: { mounts: substituteCliVariables(mounts, base.variables ?? { mayBeSet: mayBeSetInHelper }) } };
+  };
+
+  describe.each<Where>(['metadata', 'config', 'merged'])('in the %s', (where) => {
+    it.each<[string, unknown, string]>([
+      ['a default of an unset ${localEnv:…} that names a volume of another devspace', `source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`, FOREIGN],
+      ['a default of an unset ${env:…} that names the cache volume of the helper', 'source=${env:NOPE:devspaces-worker-cache},target=/c,type=volume', HELPER_CACHE],
+      ['the object form', { source: `\${localEnv:NOPE:${OTHER}}`, target: '/x', type: 'volume' }, FOREIGN],
+      ['the object form of the helper cache', { type: 'volume', source: '${env:NOPE:devspaces-worker-cache}', target: '/c' }, HELPER_CACHE],
+      ['a name of another devspace built from the basename (repository api)', 'source=devspaces-${localWorkspaceFolderBasename}-tidy-berners,target=/x,type=volume', 'volume devspaces-api-tidy-berners of another devspace'],
+      ['a default without a type', `src=\${localEnv:NOPE:${OTHER}},dst=/x`, FOREIGN],
+    ])('refuses %s, with the checks on and off', (_name, mount, item) => {
+      for (const checksOn of [true, false]) {
+        expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({ hostAccess: [item], unsupported: [] });
+      }
+    });
+
+    it.each<[string, unknown, string, string?]>([
+      ['a variable of the helper process in a volume name', 'source=${localEnv:HOSTNAME},target=/x,type=volume', '${localEnv:HOSTNAME}'],
+      // HOME is known in the helper (/root), so TERM, which may be set.
+      ['a variable of the helper process with a default', `source=\${env:TERM:${OTHER}},target=/x,type=volume`, `\${env:TERM:${OTHER}}`],
+      ['a variable of the helper process in a target', 'source=cache,target=${localEnv:PATH},type=volume', '${localEnv:PATH}'],
+      ['a variable of the helper process in the object form', { source: '${localEnv:HOSTNAME}', target: '/x', type: 'volume' }, '${localEnv:HOSTNAME}'],
+      ['a variable of the helper process without a type', 'source=${localEnv:HOSTNAME},target=/x', '${localEnv:HOSTNAME}'],
+      ['${containerEnv:…}, which the CLI leaves for a new container', 'source=${containerEnv:VOLUME},target=/x,type=volume', '${containerEnv:VOLUME}'],
+      [
+        'a variable left by a default (named in the resolved text)',
+        `source=\${localEnv:NOPE:$}{localEnv:NOPE:${OTHER}},target=/x,type=volume`,
+        `\${localEnv:NOPE:${OTHER}}`,
+        `source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`,
+      ],
+      ['${env} without a name (the CLI stops)', 'source=${env},target=/x,type=volume', '${env}'],
+      // HOME is known in the helper (/root), so PWD, which may be set.
+      ['a tmpfs with a variable of the helper process', 'type=tmpfs,target=${localEnv:PWD}/t', '${localEnv:PWD}'],
+    ])('does not support %s, with the checks on and off', (_name, mount, variable, resolved) => {
+      // An object is named by the --mount text that the CLI makes of it.
+      const text = resolved ?? (typeof mount === 'string' ? mount : 'type=volume,src=${localEnv:HOSTNAME},dst=/x');
+      if (where === 'metadata' && resolved !== undefined) {
+        // In the label, the leftovers are decided on the raw string, which has none here. The CLI
+        // substitutes the label once at `up`, so Docker gets the resolved text as it is: a volume named
+        // `${localEnv:NOPE:devspaces-other-abcdef12}`, not the volume of another devspace (Docker refuses the `$`).
+        for (const checksOn of [true, false]) expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({ hostAccess: [], unsupported: [] });
+        return;
+      }
+      for (const checksOn of [true, false]) {
+        expect(hostAccessReport(input(where, [mount]), checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [`mount ${JSON.stringify(text)} uses ${variable}, which cannot be checked`],
+        });
+      }
+    });
+
+    it('refuses a bind mount that a default adds to a volume mount (a comma in the default)', () => {
+      const mount = 'type=volume,source=v,target=/x${localEnv:NOPE:,type=bind,source=/}';
+      expect(hostAccessProblems(input(where, [mount]))).toEqual(['bind mount /']);
+    });
+
+    it('refuses the workspace folder variables without the variables of the pipeline (fail closed)', () => {
+      const mount = 'source=${localWorkspaceFolderBasename}-node_modules,target=/n,type=volume';
+      expect(hostAccessReport(input(where, [mount], false), false).unsupported).toEqual([
+        `mount ${JSON.stringify(mount)} uses \${localWorkspaceFolderBasename}, which cannot be checked`,
+      ]);
+    });
+
+    it('keeps the common patterns working, with the checks on', () => {
+      const mounts = [
+        'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume',
+        { source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' },
+        'source=${devcontainerId}-bashhistory,target=/commandhistory,type=volume',
+        'source=${localWorkspaceFolderBasename}-bashhistory,target=/commandhistory,type=volume',
+        'source=projectname-bashhistory,target=/commandhistory,type=volume',
+        'type=tmpfs,target=${containerWorkspaceFolder}/tmp',
+      ];
+      expect(hostAccessProblems(input(where, mounts))).toEqual([]);
+      // The names that Docker gets; a name with ${devcontainerId} gets its name only at `up`.
+      expect(mountedVolumeNames(input(where, mounts))).toEqual(['api-node_modules', 'api-bashhistory', 'projectname-bashhistory']);
+    });
+
+    it('keeps the bind mounts of ${localEnv:HOME} as access to the computer: allowed with the checks off', () => {
+      const mounts = ['source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached', { source: '${localEnv:HOME}/.aws', target: '/a', type: 'bind' }];
+      // HOME is /root in the helper.
+      expect(hostAccessProblems(input(where, mounts))).toEqual(['bind mount /root/.ssh', 'bind mount /root/.aws']);
+      expect(hostAccessProblems(input(where, mounts), false)).toEqual([]);
+      // A path without a type is a bind mount too.
+      expect(hostAccessProblems(input(where, ['source=${localEnv:HOME}/.m2,target=/m2']), false)).toEqual([]);
+    });
+
+    it('names the resolved volumes, for the labels and for the check of existing volumes', () => {
+      const mounts = [`source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`, { source: '${env:NOPE:shared}', target: '/s', type: 'volume' }];
+      expect(mountedVolumeNames(input(where, mounts))).toEqual([OTHER, 'shared']);
+      // An existing volume of another program, by the resolved name.
+      const labelled = { ...input(where, [mounts[1]]), volumeLabels: { shared: { 'com.docker.compose.project': 'db' } } };
+      expect(hostAccessProblems(labelled)).toEqual(['volume shared of the Docker Compose project db']);
+      // A volume of a devspace of another account (registry), by the resolved name.
+      expect(hostAccessProblems({ ...input(where, [mounts[1]]), foreignVolumes: ['shared'] }, false)).toEqual(['volume shared of another devspace']);
+    });
+  });
+
+  it.each<[string, string[], string[]]>([
+    ['--mount with a default', ['--mount', `source=\${localEnv:NOPE:${OTHER}},target=/x,type=volume`], [FOREIGN]],
+    ['-v with a default', ['-v', '${env:NOPE:devspaces-worker-cache}:/c'], [HELPER_CACHE]],
+    ['--volume= with the basename', ['--volume=devspaces-${localWorkspaceFolderBasename}-tidy-berners:/x'], ['volume devspaces-api-tidy-berners of another devspace']],
+  ])('refuses %s in runArgs, with the checks on and off', (_name, raw, items) => {
+    // The runArgs as read-configuration returns them (substituted once).
+    const runArgs = substituteCliVariables(raw, variables);
+    for (const checksOn of [true, false]) {
+      expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs } }, checksOn)).toEqual(items);
+      expect(hostAccessProblems({ ownVolume: OWN, variables, merged: { runArgs } }, checksOn)).toEqual(items);
+    }
+  });
+
+  it('does not support a variable of the helper process in a volume of runArgs, and keeps bind mounts as access to the computer', () => {
+    // A variable left in the runArgs of read-configuration is resolved again at `up`, so any
+    // such entry is not supported, also in a bind mount (named as an entry of runArgs).
+    const runArgs = ['-v', '${localEnv:HOSTNAME}:/c', '--mount', 'type=volume,src=${env:PATH},dst=/p', '-v', '${localEnv:HOME}/.ssh:/s'];
+    expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, false)).toEqual({
+      hostAccess: [],
+      unsupported: [
+        'runArgs "${localEnv:HOSTNAME}:/c" uses ${localEnv:HOSTNAME}, which cannot be checked',
+        'runArgs "type=volume,src=${env:PATH},dst=/p" uses ${env:PATH}, which cannot be checked',
+        'runArgs "${localEnv:HOME}/.ssh:/s" uses ${localEnv:HOME}, which cannot be checked',
+      ],
+    });
+    const leftBind = 'runArgs "type=bind,src=${localEnv:HOME}/.ssh,dst=/s" uses ${localEnv:HOME}, which cannot be checked';
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } })).toEqual([leftBind]);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=${localEnv:HOME}/.ssh,dst=/s'] } }, false)).toEqual([leftBind]);
+    // As read-configuration returns it, the bind mount is access to the computer.
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=/root/.ssh,dst=/s'] } })).toEqual(['bind mount /root/.ssh']);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs: ['--mount', 'type=bind,src=/root/.ssh,dst=/s'] } }, false)).toEqual([]);
+    expect(runArgsProblems(['--mount', `source=\${localEnv:NOPE:${OTHER}},target=/x`], OWN)).toEqual([
+      `runArgs "source=\${localEnv:NOPE:${OTHER}},target=/x" uses \${localEnv:NOPE:${OTHER}}, which cannot be checked`,
+    ]);
+    expect(runArgsProblems(['--mount', `source=${OTHER},target=/x`], OWN)).toEqual([FOREIGN]);
+  });
+
+  it('checks the other properties of the metadata as the CLI resolves them', () => {
+    const metadata = [{ capAdd: ['${localEnv:NOPE:SYS_ADMIN}'], customizations: { vscode: { settings: { 'remote.localPortHost': '${localEnv:NOPE:allInterfaces}' } } } }];
+    expect(hostAccessProblems({ ownVolume: OWN, variables, metadata })).toEqual(['capability SYS_ADMIN', 'setting remote.localPortHost "allInterfaces"']);
+  });
+
+  it('keeps the own workspace volume and names built from the basename that are not named like a devspace', () => {
+    const own = helperCliVariables(`acme/${OWN}`);
+    expect(hostAccessProblems({ ownVolume: OWN, variables: own, metadata: [{ mounts: ['source=${localWorkspaceFolderBasename},target=/o,type=volume'] }] })).toEqual([]);
+    expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts: ['source=devspaces-${localWorkspaceFolderBasename}-cache,target=/c,type=volume'] }] })).toEqual([]);
+  });
+});
+
+// Docker passes a `containerEnv` key `GH_TOKEN=x` as `GH_TOKEN=x=<value>`, which sets GH_TOKEN.
+describe('host access policy: names of variables', () => {
+  const REASON = `(${GITHUB_CLI_ACCOUNT_REASON})`;
+  it.each<[string, Record<string, unknown>, HostAccessReport]>([
+    ['GH_TOKEN=x in containerEnv', { containerEnv: { 'GH_TOKEN=x': 'value' } }, { hostAccess: [`variable GH_TOKEN in containerEnv ${REASON}`], unsupported: [] }],
+    ['GITHUB_TOKEN= in remoteEnv', { remoteEnv: { 'GITHUB_TOKEN=': 'value' } }, { hostAccess: [`variable GITHUB_TOKEN in remoteEnv ${REASON}`], unsupported: [] }],
+    [' GH_HOST in containerEnv', { containerEnv: { ' GH_HOST': 'evil.example' } }, { hostAccess: [`variable GH_HOST in containerEnv ${REASON}`], unsupported: [] }],
+    ['a Git variable before =', { containerEnv: { 'GIT_CONFIG_GLOBAL=/x': 'y' } }, { hostAccess: ['variable GIT_CONFIG_GLOBAL in containerEnv'], unsupported: [] }],
+    [
+      'a name with a line break',
+      { containerEnv: { 'FOO\nGH_TOKEN': 'value' } },
+      { hostAccess: [], unsupported: ['variable "FOO\\nGH_TOKEN" in containerEnv (a name with a space or a control character)'] },
+    ],
+    ['a name with a space', { remoteEnv: { 'A B': 'value' } }, { hostAccess: [], unsupported: ['variable "A B" in remoteEnv (a name with a space or a control character)'] }],
+    ['a name with a tab', { containerEnv: { 'A\tB': 'value' } }, { hostAccess: [], unsupported: ['variable "A\\tB" in containerEnv (a name with a space or a control character)'] }],
+    ['a name with a control character', { containerEnv: { 'A\u0001': 'value' } }, { hostAccess: [], unsupported: ['variable "A\\u0001" in containerEnv (a name with a space or a control character)'] }],
+    ['an ordinary name with = in the value', { containerEnv: { FOO: 'a=b c' } }, { hostAccess: [], unsupported: [] }],
+  ])('%s, with the checks on and off, in the configuration and the image metadata', (_name, env, expected) => {
+    for (const checksOn of [true, false]) {
+      expect(hostAccessReport({ ownVolume: OWN, config: env }, checksOn)).toEqual(expected);
+      expect(hostAccessReport({ ownVolume: OWN, metadata: [env] }, checksOn)).toEqual(expected);
+    }
+  });
+
+  it.each<[string, string[], HostAccessReport]>([
+    ['GH_TOKEN=x=y', ['-e', 'GH_TOKEN=x=y'], { hostAccess: [`variable GH_TOKEN in runArgs ${REASON}`], unsupported: [] }],
+    ['a name with a line break', ['--env', 'FOO\nGH_TOKEN=x'], { hostAccess: [], unsupported: ['variable "FOO\\nGH_TOKEN=x" in runArgs (a name with a space or a control character)'] }],
+    ['a name with a space', ['-e', 'A B=1'], { hostAccess: [], unsupported: ['variable "A B=1" in runArgs (a name with a space or a control character)'] }],
+    ['a space in the value only', ['-e', 'A=b c'], { hostAccess: [], unsupported: [] }],
+  ])('runArgs: %s, with the checks on and off', (_name, runArgs, expected) => {
+    for (const checksOn of [true, false]) expect(hostAccessReport({ ownVolume: OWN, config: { runArgs } }, checksOn)).toEqual(expected);
+  });
+});
+
+// Dev Container CLI 0.89.0 substitutes the runArgs and the appPort of the override configuration a second time at
+// `up` (read-configuration substituted them once already), and it substitutes the image metadata at `up`.
+describe('host access policy: what the Dev Container CLI substitutes again at up', () => {
+  const variables = helperCliVariables('acme/api');
+  const FOREIGN_NAME = OTHER;
+  // The process of the CLI in the helper: `docker run -i` without `-t` (no TERM), no OLDPWD, `_`, or proxy variables.
+  const HELPER_PROCESS = { HOME: '/root', PATH: '/usr/local/bin:/usr/bin:/bin', HOSTNAME: '0123456789ab', NODE_VERSION: '24.1.0', YARN_VERSION: '1.22.22' };
+  /** What read-configuration returns: the configuration substituted once by the CLI in the helper. */
+  const readConfiguration = <T>(raw: T): T =>
+    substituteCliVariables(raw, { localWorkspaceFolder: '/workspaces/api', containerWorkspaceFolder: '/workspaces/api', env: HELPER_PROCESS });
+  const leftover = (kind: string, text: string, left: string): string => `${kind} ${JSON.stringify(text)} uses ${left}, which cannot be checked`;
+  const both = (check: (checksOn: boolean) => void): void => {
+    for (const checksOn of [true, false]) check(checksOn);
+  };
+
+  describe('a type that a variable of the helper process adds to a bind mount', () => {
+    it.each<[string, unknown, string, string]>([
+      [
+        'the label, a string',
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${localEnv:TERM:type=volume}`,
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${localEnv:TERM:type=volume}`,
+        '${localEnv:TERM:type=volume}',
+      ],
+      [
+        'the label, the object form',
+        { type: 'bind', source: FOREIGN_NAME, target: '/y,${localEnv:TERM:type=volume}' },
+        `type=bind,src=${FOREIGN_NAME},dst=/y,\${localEnv:TERM:type=volume}`,
+        '${localEnv:TERM:type=volume}',
+      ],
+      [
+        'the label, OLDPWD',
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${env:OLDPWD:type=volume}`,
+        `type=bind,source=${FOREIGN_NAME},target=/y,\${env:OLDPWD:type=volume}`,
+        '${env:OLDPWD:type=volume}',
+      ],
+      [
+        'the label, a path in the default of a volume source',
+        `type=volume,source=\${env:TERM:${FOREIGN_NAME}}\${env:TERM::/}`,
+        `type=volume,source=\${env:TERM:${FOREIGN_NAME}}\${env:TERM::/}`,
+        `\${env:TERM:${FOREIGN_NAME}}, \${env:TERM::/}`,
+      ],
+    ])('refuses %s, with the checks on and off', (_name, mount, text, left) => {
+      both((checksOn) => {
+        expect(hostAccessReport({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }] }, checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [leftover('mount', text, left)],
+        });
+      });
+    });
+
+    it.each<[string, string]>([
+      ['TERM', `type=bind,source=${FOREIGN_NAME},target=/y,$\${env:NOPE:{}env:TERM:type=volume}`],
+      ['OLDPWD', `type=bind,source=${FOREIGN_NAME},target=/y,$\${env:NOPE:{}env:OLDPWD:type=volume}`],
+      ['a path in the default of a volume source', `type=volume,source=$\${env:NOPE:{}env:TERM:${FOREIGN_NAME}}$\${env:NOPE:{}env:TERM::/}`],
+    ])('refuses a --mount of runArgs that the second substitution makes a volume (%s), with the checks on and off', (_name, raw) => {
+      const runArgs = readConfiguration(['--mount', raw]);
+      expect(runArgs[1]).toContain('${env:');
+      both((checksOn) => {
+        for (const where of ['config', 'merged'] as const) {
+          const report = hostAccessReport({ ownVolume: OWN, variables, [where]: { runArgs } }, checksOn);
+          expect(report.unsupported).toContain(leftover('runArgs', runArgs[1], unresolvedCliVariables(runArgs[1]).join(', ')));
+        }
+      });
+    });
+  });
+
+  describe('a name of -e, --env, or --label that the second substitution makes', () => {
+    it.each<[string, string[]]>([
+      ['-e GH_TOKEN', ['-e', '$${env:NOPE:{}env:TERM:GH_TOKEN}=attacker']],
+      ['the joined -e form', ['-e$${env:NOPE:{}env:TERM:GH_TOKEN}=attacker']],
+      ['--env=', ['--env=$${env:NOPE:{}env:TERM:GITHUB_TOKEN}=attacker']],
+      ['--label of Devspaces', ['--label', '$${env:NOPE:{}env:TERM:nimblescape.devspaces.container-version}=999']],
+    ])('refuses %s, with the checks on and off', (_name, raw) => {
+      const runArgs = readConfiguration(raw);
+      const entry = runArgs[runArgs.length - 1];
+      both((checksOn) => {
+        expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [leftover('runArgs', entry, unresolvedCliVariables(entry).join(', '))],
+        });
+      });
+    });
+  });
+
+  describe('a published port or a removed flag that the second substitution makes', () => {
+    it.each<[string, Record<string, unknown>, string, string]>([
+      ['-p', { runArgs: ['-p', '${localEnv:A:$}{localEnv:B:8080}'] }, 'runArgs', '${localEnv:B:8080}'],
+      ['--publish=', { runArgs: ['--publish=${localEnv:A:$}{localEnv:B:8080}'] }, 'runArgs', '--publish=${localEnv:B:8080}'],
+      ['appPort', { appPort: '${localEnv:A:$}{localEnv:B:9090}' }, 'appPort', '${localEnv:B:9090}'],
+      ['appPort, a list', { appPort: [3000, '${localEnv:A:$}{localEnv:B:9090}'] }, 'appPort', '${localEnv:B:9090}'],
+      ['--rm', { runArgs: ['${localEnv:A:$}{localEnv:B:--rm}'] }, 'runArgs', '${localEnv:B:--rm}'],
+      ['--user', { runArgs: ['--user', '${localEnv:A:$}{localEnv:B:0}'] }, 'runArgs', '${localEnv:B:0}'],
+    ])('refuses %s, with the checks on and off', (_name, raw, kind, entry) => {
+      const config = readConfiguration(raw);
+      both((checksOn) => {
+        expect(hostAccessReport({ ownVolume: OWN, variables, config }, checksOn)).toEqual({
+          hostAccess: [],
+          unsupported: [leftover(kind, entry, entry.replace(/^--publish=/, ''))],
+        });
+      });
+    });
+
+    it('refuses the values of the override configuration too (the final check before up)', () => {
+      const config = readConfiguration({ runArgs: ['-p', '${localEnv:A:$}{localEnv:B:8080}'], appPort: '${localEnv:A:$}{localEnv:B:9090}' });
+      const override = buildOverrideConfig({ devspaceImage: 'img', volumeName: OWN, repositoryName: 'api', containerName: 'c', runArgs: config.runArgs as string[], appPort: config.appPort });
+      expect(override.appPort).toEqual(['${localEnv:B:9090}']);
+      expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs: override.runArgs, appPort: override.appPort } }).unsupported).toEqual([
+        leftover('runArgs', '${localEnv:B:8080}', '${localEnv:B:8080}'),
+        leftover('appPort', '${localEnv:B:9090}', '${localEnv:B:9090}'),
+      ]);
+    });
+  });
+
+  describe('the double substitution: variables without a value in the helper', () => {
+    it.each<[string, string[]]>([
+      ['--mount of another devspace', ['--mount', `type=volume,source=$\${env:NOPE:{}env:NOPE2:${FOREIGN_NAME}},target=/y`]],
+      ['-v of another devspace', ['-v', `$\${env:NOPE:{}env:NOPE2:${FOREIGN_NAME}}:/y`]],
+      ['-v of the helper cache', ['-v', `$\${env:NOPE:{}env:NOPE2:${HELPER_CACHE_VOLUME}}:/y`]],
+      ['-e GH_TOKEN', ['-e', '$${env:NOPE:{}env:NOPE2:GH_TOKEN}=x']],
+      ['--label', ['--label', '$${env:NOPE:{}env:NOPE2:nimblescape.devspaces.id}=x']],
+    ])('refuses %s, with the checks on and off', (_name, raw) => {
+      const runArgs = readConfiguration(raw);
+      const entry = runArgs[runArgs.length - 1];
+      expect(entry).toContain('${env:NOPE2:');
+      both((checksOn) => {
+        for (const where of ['config', 'merged'] as const) {
+          const report = hostAccessReport({ ownVolume: OWN, variables, [where]: { runArgs } }, checksOn);
+          expect(report.unsupported).toContain(leftover('runArgs', entry, unresolvedCliVariables(entry).join(', ')));
+        }
+        expect(runArgsProblems(runArgs, OWN)).toContain(leftover('runArgs', entry, unresolvedCliVariables(entry).join(', ')));
+      });
+    });
+
+    it('allows ${devcontainerId} and ordinary values in runArgs', () => {
+      const runArgs = readConfiguration(['--init', '-e', 'FOO=bar', '--label', 'x=${devcontainerId}', '-v', 'cache-${devcontainerId}:/c', '-p', '8080:80', '--cap-add', 'SYS_PTRACE']);
+      both((checksOn) => expect(hostAccessProblems({ ownVolume: OWN, variables, config: { runArgs, appPort: [3000, '8081:81'] } }, checksOn)).toEqual([]));
+    });
+  });
+
+  describe('the other readers of runArgs see what Docker gets', () => {
+    it('a --user, --hostname, or --network that the second substitution makes is refused before runArgsUser, runArgsDecideHostname, and imageRemoteUser read it', () => {
+      for (const raw of [['--user', '${localEnv:A:$}{localEnv:B:0}'], ['--hostname', '${localEnv:A:$}{localEnv:B:x}'], ['--network', '${localEnv:A:$}{localEnv:B:host}']]) {
+        const runArgs = readConfiguration(raw);
+        both((checksOn) => expect(hostAccessReport({ ownVolume: OWN, variables, config: { runArgs } }, checksOn).unsupported).toEqual([leftover('runArgs', runArgs[1], runArgs[1])]));
+      }
+    });
+  });
+
+  describe('${localEnv:HOME} of the helper (/root)', () => {
+    it.each<[string, unknown]>([
+      ['a volume target', 'source=m2-${devcontainerId},target=${localEnv:HOME}/.m2,type=volume'],
+      ['a volume target, object form', { type: 'volume', source: 'm2-${devcontainerId}', target: '${localEnv:HOME}/.m2' }],
+      ['a tmpfs target', 'type=tmpfs,target=${localEnv:HOME}/.cache'],
+    ])('allows %s in the label, with the checks on and off', (_name, mount) => {
+      both((checksOn) => expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }] }, checksOn)).toEqual([]));
+    });
+
+    it('keeps the bind mounts of ${localEnv:HOME}/.ssh: /root/.ssh, allowed with the checks off', () => {
+      const mounts = ['source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached'];
+      expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts }] })).toEqual(['bind mount /root/.ssh']);
+      expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts }] }, false)).toEqual([]);
+      // In the configuration, read-configuration has resolved it already.
+      expect(hostAccessProblems({ ownVolume: OWN, variables, config: readConfiguration({ mounts }) }, false)).toEqual([]);
+    });
+  });
+
+  describe('long texts', () => {
+    it('refuses a label of 300 KB of "${" quickly', () => {
+      const metadata = [{ customizations: { x: '${'.repeat(150_000) } }];
+      const start = Date.now();
+      both((checksOn) => {
+        const report = hostAccessReport({ ownVolume: OWN, variables, metadata }, checksOn);
+        expect(report.unsupported).toEqual(['a text longer than 256 KB in the image metadata']);
+      });
+      mountedVolumeNames({ ownVolume: OWN, variables, metadata });
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+  });
+
+  describe('the object form in the message', () => {
+    it('shows the text that the CLI passes to docker run', () => {
+      const mount = { source: '${localEnv:HOSTNAME}', target: '/x', type: 'volume' };
+      expect(hostAccessReport({ ownVolume: OWN, variables, metadata: [{ mounts: [mount] }] }).unsupported).toEqual([
+        leftover('mount', 'type=volume,src=${localEnv:HOSTNAME},dst=/x', '${localEnv:HOSTNAME}'),
+      ]);
+    });
+  });
+
+  it('keeps the common patterns working', () => {
+    const mounts = [
+      'source=${localWorkspaceFolderBasename}-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume',
+      { source: 'dind-var-lib-docker-${devcontainerId}', target: '/var/lib/docker', type: 'volume' },
+      'source=${devcontainerId}-bashhistory,target=/commandhistory,type=volume',
+      'source=projectname-bashhistory,target=/commandhistory,type=volume',
+    ];
+    const runArgs = ['--init', '-e', 'FOO=bar', '--memory', '4g'];
+    both((checksOn) => {
+      expect(hostAccessProblems({ ownVolume: OWN, variables, metadata: [{ mounts }] }, checksOn)).toEqual([]);
+      expect(hostAccessProblems({ ownVolume: OWN, variables, config: readConfiguration({ mounts, runArgs }) }, checksOn)).toEqual([]);
+    });
+    expect(mountedVolumeNames({ ownVolume: OWN, variables, config: readConfiguration({ mounts }) })).toEqual(['api-node_modules', 'projectname-bashhistory']);
+  });
+});
+
+describe('no mount of a configuration at or below /run/devspace, the tmpfs of the token', () => {
+  const INTERNAL = "mounts into the extension's internal folder are not supported";
+  const U = (...items: string[]) => ({ hostAccess: [], unsupported: items });
+  const NONE = { hostAccess: [], unsupported: [] };
+
+  it.each([true, false])('refuses `mounts`, -v, --mount, and --tmpfs there, also the tmpfs of the override as the repository writes it (checks on: %s)', (checksOn) => {
+    const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN }, checksOn);
+    expect(report({ mounts: ['source=cache,target=/run/devspace,type=volume'] })).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+    expect(report({ mounts: ['type=tmpfs,dst=/run//devspace/gh/'] })).toEqual(U(`mount at /run/devspace/gh (${INTERNAL})`));
+    expect(report({ mounts: [{ source: 'cache', target: '/run/x/../devspace', type: 'volume' }] })).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+    expect(report({ runArgs: ['-v', 'cache:/run/devspace'] })).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+    expect(report({ runArgs: ['--volume=/run/devspace/gh'] })).toEqual(U(`mount at /run/devspace/gh (${INTERNAL})`));
+    expect(report({ runArgs: ['--mount', 'type=volume,source=cache,target=/run/devspace/github-token'] })).toEqual(U(`mount at /run/devspace/github-token (${INTERNAL})`));
+    expect(report({ runArgs: ['--tmpfs', '/run/devspace:size=1m'] })).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+    // Exactly the tmpfs of the override configuration: the repository may not add it (only the override does).
+    expect(report({ runArgs: ['--tmpfs', TOKEN_TMPFS] })).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+    expect(report({ runArgs: [`--tmpfs=${TOKEN_TMPFS}`] })).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+  });
+
+  it('allows /run itself (a tmpfs of the image or of systemd lies below ours) and a folder that only starts like it', () => {
+    const report = (config: Record<string, unknown>) => hostAccessReport({ config, ownVolume: OWN });
+    expect(report({ runArgs: ['--tmpfs', '/run', '--tmpfs', '/run/devspacex', '--mount', 'type=tmpfs,target=/run/devspace-other'] })).toEqual(NONE);
+    expect(report({ mounts: ['source=cache,target=/run/lock,type=volume'] })).toEqual(NONE);
+  });
+
+  it('accepts the tmpfs of the override configuration only in the override and the merged configuration, exactly as written', () => {
+    const override = buildOverrideConfig({ devspaceImage: 'i:1', volumeName: OWN, repositoryName: 'api', containerName: OWN, runArgs: [] });
+    expect((override.runArgs as string[]).slice(-2)).toEqual(['--tmpfs', TOKEN_TMPFS]);
+    expect(hostAccessReport({ config: { runArgs: override.runArgs }, ownVolume: OWN, overrideConfiguration: true })).toEqual(NONE);
+    expect(hostAccessReport({ config: {}, merged: { runArgs: override.runArgs }, ownVolume: OWN })).toEqual(NONE);
+    // Another text at the folder stays refused there too, also with the checks off.
+    for (const checksOn of [true, false]) {
+      const other = hostAccessReport({ config: { runArgs: ['--tmpfs', '/run/devspace:mode=0777'] }, ownVolume: OWN, overrideConfiguration: true }, checksOn);
+      expect(other).toEqual(U(`mount at /run/devspace (${INTERNAL})`));
+    }
+    expect(hostAccessReport({ config: {}, merged: { runArgs: ['-v', 'cache:/run/devspace/gh'] }, ownVolume: OWN })).toEqual(U(`mount at /run/devspace/gh (${INTERNAL})`));
+  });
+});

@@ -1,0 +1,577 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { UserFacingError } from '../errors';
+import { Messages, dockerHostReason } from '../messages';
+import type { RunOptions, RunResult } from '../ports';
+import { RemoteDockerState } from '../storage/remoteDockerState';
+import { namePair } from '../namePairs';
+import { ownContextDescription, remoteContextNames } from './dockerHost';
+import { UNREADABLE_DOCKER_TARGET } from './dockerTargets';
+import {
+  ENGINE_INFO_FORMAT,
+  SSH_CHECK_CACHE_MS,
+  SshLoginCache,
+  checkCurrentEngine,
+  checkSshLogin,
+  chooseLocalContext,
+  dockerVariableOverride,
+  ensureDockerHostReachable,
+  ensureRemoteContext,
+  findRemoteContext,
+  isOwnContext,
+  listContextInfos,
+  localContextChoice,
+  remoteContextChoice,
+  noPromptEnv,
+  parseEngineInfo,
+  readRootlessSocket,
+  startDockerFor,
+  testRemoteDockerHost,
+  useContext,
+  useRemoteContext,
+  type ContextInfo,
+  type RemoteDockerCli,
+} from './remoteDocker';
+
+const ok = (stdout: string): RunResult => ({ exitCode: 0, stdout, stderr: '', timedOut: false });
+const fail = (stderr: string, exitCode = 1): RunResult => ({ exitCode, stdout: '', stderr, timedOut: false });
+const info = (rootless = false) =>
+  ok(`${JSON.stringify({ version: '28.1.0', securityOptions: ['name=seccomp,profile=builtin', ...(rootless ? ['name=rootless'] : [])] })}\n`);
+const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+/** The ssh check before the Docker calls: `ssh … -- <host> true`. */
+const isSshCheck = (args: readonly string[]): boolean => args[args.length - 1] === 'true';
+/** A runner whose ssh check succeeds and whose other ssh call prints `runtimeDir`. */
+function sshRunner(runtimeDir = '/run/user/1000', check: RunResult = ok('')) {
+  return { run: vi.fn(async (_file: string, args: readonly string[], _options?: RunOptions) => (isSshCheck(args) ? check : ok(runtimeDir))) };
+}
+const sshDeps = (runner = sshRunner()) => ({ runner, sshPath: '/usr/bin/ssh', env: { PATH: '/usr/bin' } });
+
+type Call = { args: readonly string[]; options?: RunOptions };
+
+function fakeDocker(answer: (args: readonly string[]) => RunResult | Promise<RunResult>): RemoteDockerCli & { calls: Call[] } {
+  const calls: Call[] = [];
+  return {
+    calls,
+    isInstalled: () => true,
+    processEnv: () => ({ PATH: '/usr/bin', DOCKER_CONTEXT: 'desktop-linux', SSH_AUTH_SOCK: '/tmp/agent.sock', SSH_ASKPASS_REQUIRE: 'force' }),
+    run: async (args, options) => {
+      calls.push({ args, options });
+      return answer(args);
+    },
+  };
+}
+
+let dir: string;
+let state: RemoteDockerState;
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-remote-'));
+  state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
+  vi.clearAllMocks();
+});
+
+afterEach(() => {
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe('parseEngineInfo', () => {
+  it('reads the version and a rootless engine', () => {
+    expect(parseEngineInfo(info(true).stdout)).toEqual({ version: '28.1.0', rootless: true });
+    expect(parseEngineInfo(info(false).stdout)).toEqual({ version: '28.1.0', rootless: false });
+  });
+
+  it('needs a server version', () => {
+    expect(parseEngineInfo('{"version":"","securityOptions":null}')).toBeUndefined();
+    expect(parseEngineInfo('garbage')).toBeUndefined();
+  });
+});
+
+describe('testRemoteDockerHost (the test before the switch)', () => {
+  it('runs docker -H ssh://<host> info without questions, and without the context of VS Code', async () => {
+    const docker = fakeDocker(() => info());
+    await expect(testRemoteDockerHost(docker, 'me@box:2222', sshDeps())).resolves.toEqual({ ok: true, version: '28.1.0', rootless: false });
+    expect(docker.calls).toHaveLength(1);
+    const [{ args, options }] = docker.calls;
+    expect(args).toEqual(['-H', 'ssh://me@box:2222', 'info', '--format', ENGINE_INFO_FORMAT]);
+    expect(options?.timeoutMs).toBe(45_000);
+    expect(options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+    expect(options?.env).not.toHaveProperty('DOCKER_CONTEXT');
+    expect(options?.env).not.toHaveProperty('DOCKER_HOST');
+    // The SSH agent of the user stays as it is.
+    expect(options?.env?.SSH_AUTH_SOCK).toBe('/tmp/agent.sock');
+  });
+
+  it.each([
+    ['Permission denied (publickey).', 'login'],
+    ['Host key verification failed.', 'hostKey'],
+    ['ssh: Could not resolve hostname box: Name or service not known', 'unreachable'],
+    ['bash: docker: command not found', 'dockerMissing'],
+    ['Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?', 'dockerNotRunning'],
+  ])('maps %s to %s', async (stderr, problem) => {
+    const docker = fakeDocker(() => fail(`error during connect: ${stderr}`));
+    await expect(testRemoteDockerHost(docker, 'box', sshDeps())).resolves.toMatchObject({ ok: false, problem });
+  });
+
+  it('counts a time-out as unreachable', async () => {
+    const docker = fakeDocker(() => ({ exitCode: null, stdout: '', stderr: '', timedOut: true }));
+    await expect(testRemoteDockerHost(docker, 'box', sshDeps(), { timeoutMs: 1000 })).resolves.toEqual({
+      ok: false,
+      problem: 'unreachable',
+      detail: 'docker info did not answer within 1 seconds.',
+    });
+  });
+
+  it('noPromptEnv replaces every spelling of SSH_ASKPASS_REQUIRE', () => {
+    expect(noPromptEnv({ ssh_askpass_require: 'force', A: '1' })).toEqual({ A: '1', SSH_ASKPASS_REQUIRE: 'never' });
+  });
+});
+
+describe('the ssh check before the Docker calls', () => {
+  it('runs ssh with BatchMode, a connection time limit, no terminal, the host after --, and the command true', async () => {
+    const runner = sshRunner();
+    await expect(checkSshLogin('me@box:2222', { runner, sshPath: '/usr/bin/ssh', env: { PATH: '/usr/bin', SSH_ASKPASS_REQUIRE: 'force' } })).resolves.toEqual({ ok: true });
+    const [file, args, options] = runner.run.mock.calls[0];
+    expect(file).toBe('/usr/bin/ssh');
+    expect(args).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', 'true']);
+    expect(options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+    expect(options?.timeoutMs).toBe(30_000);
+    await checkSshLogin('me@[2001:db8::1]:22', { runner, sshPath: '/usr/bin/ssh', env: {} });
+    expect(runner.run.mock.calls[1][1]).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-p', '22', '-l', 'me', '--', '2001:db8::1', 'true']);
+  });
+
+  it.each([
+    ['Host key verification failed.', 'hostKey'],
+    ['me@box: Permission denied (publickey,password).', 'login'],
+    ['ssh: Could not resolve hostname box: Name or service not known', 'unreachable'],
+    ['ssh: connect to host box port 22: Connection timed out', 'unreachable'],
+    ['Connection closed by 192.0.2.10 port 22', 'closedBeforeLogin'],
+  ])('names the reason of %s: %s', async (stderr, problem) => {
+    const runner = sshRunner('', { exitCode: 255, stdout: '', stderr, timedOut: false });
+    await expect(checkSshLogin('box', { runner, sshPath: '/usr/bin/ssh', env: {} })).resolves.toEqual({ ok: false, problem, detail: stderr });
+  });
+
+  it('counts a time-out as unreachable, and fails without ssh', async () => {
+    const runner = sshRunner('', { exitCode: null, stdout: '', stderr: '', timedOut: true });
+    await expect(checkSshLogin('box', { runner, sshPath: '/usr/bin/ssh', env: {} })).resolves.toMatchObject({ ok: false, problem: 'unreachable' });
+    await expect(checkSshLogin('box', { runner, sshPath: undefined, env: {} })).resolves.toMatchObject({ ok: false, problem: 'sshMissing' });
+  });
+
+  it('leaves a host that is no SSH alias or address to the Docker CLI', async () => {
+    const runner = sshRunner();
+    await expect(checkSshLogin('me@box/path', { runner, sshPath: '/usr/bin/ssh', env: {} })).resolves.toEqual({ ok: true, skipped: 'notAnSshTarget' });
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('keeps a success for a minute per host, never a failure', async () => {
+    let now = 1_000_000;
+    const sshLogins = new SshLoginCache({ now: () => now });
+    const runner = sshRunner();
+    const deps = { runner, sshPath: '/usr/bin/ssh', env: {}, sshLogins };
+    await checkSshLogin('box', deps);
+    await checkSshLogin('box', deps);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    await checkSshLogin('other', deps);
+    expect(runner.run).toHaveBeenCalledTimes(2);
+    now += SSH_CHECK_CACHE_MS;
+    await checkSshLogin('box', deps);
+    expect(runner.run).toHaveBeenCalledTimes(3);
+    // A failure is not kept, and ends a kept success.
+    runner.run.mockImplementation(async () => fail('Permission denied (publickey).', 255));
+    await expect(checkSshLogin('box', deps, { useCache: false })).resolves.toMatchObject({ ok: false, problem: 'login' });
+    await expect(checkSshLogin('box', deps)).resolves.toMatchObject({ ok: false, problem: 'login' });
+    expect(runner.run).toHaveBeenCalledTimes(5);
+  });
+
+  it('runs before docker -H ssh://… info of the test, always connects, and stops at its failure', async () => {
+    const sshLogins = new SshLoginCache();
+    sshLogins.remember('box');
+    const docker = fakeDocker(() => info());
+    const failing = sshRunner('', fail('Host key verification failed.', 255));
+    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(failing), sshLogins })).resolves.toEqual({
+      ok: false,
+      problem: 'hostKey',
+      detail: 'Host key verification failed.',
+    });
+    expect(failing.run).toHaveBeenCalledTimes(1);
+    expect(docker.calls).toEqual([]);
+  });
+
+  it('runs before docker info of each operation (a success of the last minute counts), and stops at its failure', async () => {
+    const target = { kind: 'remote' as const, host: 'me@box:2222', endpoint: 'ssh://me@box:2222', context: remoteContextNames('me@box:2222')[0] };
+    const docker = fakeDocker(() => info());
+    const runner = sshRunner();
+    const sshLogins = new SshLoginCache();
+    const deps = { docker, runner, state, logger, sshPath: '/usr/bin/ssh', env: {}, sshLogins };
+    await ensureDockerHostReachable(target, deps);
+    await ensureDockerHostReachable(target, deps);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(docker.calls).toHaveLength(2);
+    sshLogins.forget('me@box:2222');
+    runner.run.mockImplementation(async () => fail('Host key verification failed.', 255));
+    await expect(ensureDockerHostReachable(target, deps)).rejects.toMatchObject({
+      code: 'dockerHostUnreachable',
+      message: Messages.dockerHostUnreachable('me@box:2222', dockerHostReason('hostKey', 'me@box:2222')),
+    });
+    expect(docker.calls).toHaveLength(2);
+  });
+});
+
+describe('readRootlessSocket', () => {
+  it('asks ssh with BatchMode for XDG_RUNTIME_DIR; the host after --', async () => {
+    const runner = { run: vi.fn(async (_file: string, _args: readonly string[], _options?: RunOptions) => ok('/run/user/1001')) };
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'me@box:2222', { PATH: '/usr/bin' })).resolves.toEqual({
+      ok: true,
+      socket: '/run/user/1001/docker.sock',
+    });
+    const [file, args, options] = runner.run.mock.calls[0];
+    expect(file).toBe('/usr/bin/ssh');
+    expect(args).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', 'printf %s "$XDG_RUNTIME_DIR"']);
+    expect(options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+  });
+
+  it('fails without ssh, for an unusable host, and without XDG_RUNTIME_DIR', async () => {
+    const runner = { run: vi.fn(async () => ok('')) };
+    await expect(readRootlessSocket(runner, undefined, 'box', {})).resolves.toMatchObject({ ok: false, problem: 'sshMissing' });
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'box/path', {})).resolves.toMatchObject({ ok: false, problem: 'unknown' });
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'box', {})).resolves.toMatchObject({ ok: false, problem: 'unknown' });
+    expect(runner.run).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ensureDockerHostReachable (the Docker start of a remote host)', () => {
+  // The context is named after the SSH host.
+  const target = { kind: 'remote' as const, host: 'box', endpoint: 'ssh://box', context: 'box' };
+
+  it('asks docker info through the current context; a rootful engine has no recorded socket', async () => {
+    await state.setRootlessSocket('box', '/run/user/1000/docker.sock');
+    const docker = fakeDocker(() => info(false));
+    const runner = sshRunner();
+    await ensureDockerHostReachable(target, { docker, runner, state, logger, sshPath: '/usr/bin/ssh', env: {} });
+    expect(docker.calls.map((call) => call.args)).toEqual([['info', '--format', ENGINE_INFO_FORMAT]]);
+    // Only the ssh check runs; no read of a socket.
+    expect(runner.run.mock.calls.map((call) => call[1])).toEqual([['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '--', 'box', 'true']]);
+    expect(await state.rootlessSocket('box')).toBeUndefined();
+  });
+
+  it('records the socket of a rootless engine once', async () => {
+    const docker = fakeDocker(() => info(true));
+    const runner = sshRunner('/run/user/1000');
+    const deps = { docker, runner, state, logger, sshPath: '/usr/bin/ssh', env: {} };
+    await ensureDockerHostReachable(target, deps);
+    await ensureDockerHostReachable(target, deps);
+    // The ssh checks are not counted here.
+    expect(runner.run.mock.calls.filter((call) => !isSshCheck(call[1]))).toHaveLength(1);
+    expect(await state.rootlessSocket('box')).toBe('/run/user/1000/docker.sock');
+  });
+
+  it('throws dockerHostUnreachable with the plain reason', async () => {
+    const docker = fakeDocker(() => fail('me@box: Permission denied (publickey).'));
+    // With ssh (without it, the ssh check reports sshMissing).
+    const error = await ensureDockerHostReachable(target, { docker, runner: sshRunner(), state, logger, sshPath: '/usr/bin/ssh', env: {} }).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(UserFacingError);
+    expect((error as UserFacingError).code).toBe('dockerHostUnreachable');
+    expect((error as UserFacingError).message).toBe(Messages.dockerHostUnreachable('box', dockerHostReason('login', 'box')));
+    expect((error as UserFacingError).detail).toContain('Permission denied');
+  });
+
+  it('checkCurrentEngine passes the signal and never adds -H', async () => {
+    const docker = fakeDocker(() => info());
+    const signal = new AbortController().signal;
+    await checkCurrentEngine(docker, { signal });
+    expect(docker.calls[0].options?.signal).toBe(signal);
+    expect(docker.calls[0].args).not.toContain('-H');
+  });
+});
+
+describe('startDockerFor (remote mode skips the Docker Desktop start)', () => {
+  it('starts the local Docker as before', async () => {
+    const startLocal = vi.fn(async () => {});
+    const docker = fakeDocker(() => info());
+    await startDockerFor({ kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock' }, startLocal, {
+      docker,
+      runner: { run: vi.fn() },
+      state,
+      logger,
+      sshPath: undefined,
+      env: {},
+    });
+    expect(startLocal).toHaveBeenCalledTimes(1);
+    expect(docker.calls).toEqual([]);
+  });
+
+  it('only checks a remote host: no Docker Desktop start, no desktop command', async () => {
+    const startLocal = vi.fn(async () => {});
+    const docker = fakeDocker(() => fail('ssh: connect to host box port 22: Connection refused'));
+    const runner = sshRunner();
+    await expect(
+      startDockerFor({ kind: 'remote', host: 'box', endpoint: 'ssh://box' }, startLocal, { docker, runner, state, logger, sshPath: '/usr/bin/ssh', env: {} }),
+    ).rejects.toMatchObject({ code: 'dockerHostUnreachable', message: Messages.dockerHostUnreachable('box', dockerHostReason('unreachable', 'box')) });
+    expect(startLocal).not.toHaveBeenCalled();
+    // The ssh check ran; nothing else.
+    expect(runner.run.mock.calls.every((call) => isSshCheck(call[1]))).toBe(true);
+    expect(docker.calls.flatMap((call) => call.args)).not.toContain('desktop');
+  });
+
+  it('refuses an endpoint that is neither local nor SSH', async () => {
+    const startLocal = vi.fn(async () => {});
+    const docker = fakeDocker(() => info());
+    await expect(
+      startDockerFor({ kind: 'unsupported', host: 'tcp://box:2376', endpoint: 'tcp://box:2376' }, startLocal, {
+        docker,
+        runner: { run: vi.fn() },
+        state,
+        logger,
+        sshPath: undefined,
+        env: {},
+      }),
+    ).rejects.toMatchObject({ code: 'dockerEndpointUnsupported', message: Messages.dockerEndpointUnsupported('tcp://box:2376') });
+    expect(startLocal).not.toHaveBeenCalled();
+    expect(docker.calls).toEqual([]);
+  });
+
+  // Docker Desktop is not started for a Docker that is not known.
+  it('refuses a current context that could not be read, with its own message', async () => {
+    const startLocal = vi.fn(async () => {});
+    const docker = fakeDocker(() => info());
+    await expect(
+      startDockerFor(UNREADABLE_DOCKER_TARGET, startLocal, { docker, runner: { run: vi.fn() }, state, logger, sshPath: undefined, env: {} }),
+    ).rejects.toMatchObject({ code: 'dockerEndpointUnsupported', message: Messages.dockerContextUnreadable });
+    expect(startLocal).not.toHaveBeenCalled();
+    expect(docker.calls).toEqual([]);
+  });
+});
+
+/** The output of `docker context ls --format '{{json .}}'` for `contexts`. */
+function contextLs(contexts: readonly ContextInfo[]): RunResult {
+  return ok(
+    contexts
+      .map((context) => `${JSON.stringify({ Name: context.name, Description: context.description, DockerEndpoint: context.endpoint, Current: false })}\n`)
+      .join(''),
+  );
+}
+const LS_ARGS = ['context', 'ls', '--format', '{{json .}}'];
+const local = (name: string, endpoint = 'unix:///var/run/docker.sock'): ContextInfo => ({ name, description: '', endpoint });
+const own = (name: string, host: string): ContextInfo => ({ name, description: ownContextDescription(host), endpoint: `ssh://${host}` });
+
+// The context of a host is named after its SSH alias or host name (remoteContextNames), with the pair of the host only
+// on a clash; ours are recognised by their description.
+describe('the Docker context commands', () => {
+  it('lists the name, the description and the endpoint of every context', async () => {
+    const docker = fakeDocker(() =>
+      ok(
+        [
+          JSON.stringify({ Name: 'default', Description: 'Current DOCKER_HOST based configuration', DockerEndpoint: 'unix:///var/run/docker.sock', Current: true }),
+          '',
+          JSON.stringify({ Name: 'htldvm', Description: ownContextDescription('htldvm'), DockerEndpoint: 'ssh://htldvm' }),
+          JSON.stringify({ Name: 'bare' }),
+          JSON.stringify({ Name: '' }),
+          'null',
+        ].join('\n'),
+      ),
+    );
+    await expect(listContextInfos(docker)).resolves.toEqual([
+      { name: 'default', description: 'Current DOCKER_HOST based configuration', endpoint: 'unix:///var/run/docker.sock' },
+      { name: 'htldvm', description: ownContextDescription('htldvm'), endpoint: 'ssh://htldvm' },
+      { name: 'bare', description: '', endpoint: '' },
+    ]);
+    expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS]);
+  });
+
+  it('refuses a line of `docker context ls` that is not JSON', async () => {
+    const docker = fakeDocker(() => ok('default\n'));
+    await expect(listContextInfos(docker)).rejects.toThrow('printed a line that is not JSON: default');
+  });
+
+  it('creates the context of the host, named after the host, and uses it, without DOCKER_CONTEXT in their environment', async () => {
+    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default'), local('desktop-linux')]) : ok('')));
+    await expect(useRemoteContext(docker, 'me@box')).resolves.toBe('box');
+    // A context per host.
+    expect(docker.calls.map((call) => call.args)).toEqual([
+      LS_ARGS,
+      ['context', 'create', 'box', '--description', 'Devspaces: remote Docker host me@box', '--docker', 'host=ssh://me@box'],
+      ['context', 'use', 'box'],
+    ]);
+    for (const call of docker.calls) expect(call.options?.env).not.toHaveProperty('DOCKER_CONTEXT');
+  });
+
+  it('takes the alias as the name as it is', async () => {
+    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default')]) : ok('')));
+    await expect(ensureRemoteContext(docker, 'htldvm')).resolves.toBe('htldvm');
+    expect(docker.calls[1].args).toEqual(['context', 'create', 'htldvm', '--description', ownContextDescription('htldvm'), '--docker', 'host=ssh://htldvm']);
+  });
+
+  it('takes the name with the pair of the host when a context with the name points elsewhere', async () => {
+    const docker = fakeDocker((args) =>
+      args[1] === 'ls' ? contextLs([local('default'), { name: 'box', description: 'mine', endpoint: 'ssh://me@box' }]) : ok(''),
+    );
+    const pair = `box-${namePair('other@box:2222')}`;
+    await expect(ensureRemoteContext(docker, 'other@box:2222')).resolves.toBe(pair);
+    expect(docker.calls.map((call) => call.args)).toEqual([
+      LS_ARGS,
+      ['context', 'create', pair, '--description', ownContextDescription('other@box:2222'), '--docker', 'host=ssh://other@box:2222'],
+    ]);
+  });
+
+  it("never changes a context that points to the host, ours or the user's; it only uses it", async () => {
+    // No `docker context update`: an operation of another window that runs on the context keeps its host.
+    for (const existing of [own('other', 'other'), { name: 'other', description: 'my own', endpoint: 'ssh://other' }]) {
+      const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default'), existing]) : ok('')));
+      await expect(useRemoteContext(docker, 'other')).resolves.toBe('other');
+      expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS, ['context', 'use', 'other']]);
+    }
+  });
+
+  it('reuses the context with the pair when the name points elsewhere and the pair points to the host', async () => {
+    const [name, pair] = remoteContextNames('me@box');
+    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([{ name, description: '', endpoint: 'ssh://box' }, own(pair, 'me@box')]) : ok('')));
+    await expect(ensureRemoteContext(docker, 'me@box')).resolves.toBe(pair);
+    await expect(findRemoteContext(docker, 'me@box')).resolves.toBe(pair);
+    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'ls']);
+  });
+
+  it('refuses when both names point elsewhere, and changes nothing', async () => {
+    const [name, pair] = remoteContextNames('other');
+    const docker = fakeDocker((args) =>
+      args[1] === 'ls' ? contextLs([{ name, description: '', endpoint: 'ssh://elsewhere' }, own(pair, 'elsewhere')]) : ok(''),
+    );
+    await expect(ensureRemoteContext(docker, 'other')).rejects.toThrow(`The Docker contexts ${name} and ${pair} exist and point elsewhere than ssh://other`);
+    await expect(useRemoteContext(docker, 'other')).rejects.toThrow('docker context rm <name>');
+    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'ls']);
+  });
+
+  it('throws when creating the context fails', async () => {
+    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([]) : fail('permission denied')));
+    await expect(ensureRemoteContext(docker, 'box')).rejects.toThrow('docker context create box');
+  });
+
+  it('takes the context that another window created meanwhile when its own create fails', async () => {
+    let lists = 0;
+    const docker = fakeDocker((args) => {
+      if (args[1] === 'ls') return contextLs(lists++ === 0 ? [] : [own('box', 'box')]);
+      return fail('context "box" already exists');
+    });
+    await expect(ensureRemoteContext(docker, 'box')).resolves.toBe('box');
+    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
+  });
+
+  // When the list after the failed create fails too, the error of the create is thrown (it says why), not the one of
+  // the list.
+  it('throws the error of the create when the list after it fails too', async () => {
+    let lists = 0;
+    const docker = fakeDocker((args) => {
+      if (args[1] === 'ls') return lists++ === 0 ? contextLs([]) : fail('Cannot connect to the Docker daemon');
+      return fail('permission denied');
+    });
+    const thrown = await ensureRemoteContext(docker, 'box').catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('docker context create box');
+    expect((thrown as Error).message).toContain('permission denied');
+    expect((thrown as Error).message).not.toContain('Cannot connect to the Docker daemon');
+    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
+  });
+
+  it('chooses among the contexts by remoteContextChoice', () => {
+    const [name, pair] = remoteContextNames('me@box');
+    expect(remoteContextChoice('me@box', [])).toEqual({ free: name });
+    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://me@box' }])).toEqual({ existing: name });
+    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://box' }])).toEqual({ free: pair });
+    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://box' }, own(pair, 'me@box')])).toEqual({ existing: pair });
+    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://box' }, own(pair, 'x')])).toEqual({});
+    // An existing context of the host wins over a free name before it.
+    expect(remoteContextChoice('me@box', [own(pair, 'me@box')])).toEqual({ existing: pair });
+  });
+
+  it('finds no context of a host that has none', async () => {
+    const docker = fakeDocker(() => contextLs([local('default'), { name: 'box', description: '', endpoint: 'ssh://elsewhere' }]));
+    await expect(findRemoteContext(docker, 'box')).resolves.toBeUndefined();
+    expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS]);
+  });
+
+  it('knows its own contexts by their description, whatever their name', async () => {
+    const docker = fakeDocker(() =>
+      contextLs([local('default'), own('htldvm', 'htldvm'), { name: 'mybox', description: 'mine', endpoint: 'ssh://mybox' }]),
+    );
+    await expect(isOwnContext(docker, 'htldvm')).resolves.toBe(true);
+    await expect(isOwnContext(docker, 'mybox')).resolves.toBe(false);
+    await expect(isOwnContext(docker, 'default')).resolves.toBe(false);
+    await expect(isOwnContext(docker, 'gone')).resolves.toBe(false);
+  });
+
+  it('throws when a command fails', async () => {
+    const docker = fakeDocker(() => fail('context "x" does not exist'));
+    await expect(useContext(docker, 'x')).rejects.toThrow('docker context use x failed: context "x" does not exist');
+    await expect(listContextInfos(docker)).rejects.toThrow('docker context ls');
+  });
+
+  it('goes back to the remembered context, else default; never to one of ours', () => {
+    expect(localContextChoice('desktop-linux', [local('default'), local('desktop-linux'), own('box', 'box')])).toBe('desktop-linux');
+    expect(localContextChoice('gone', [local('default')])).toBe('default');
+    expect(localContextChoice(undefined, [local('default'), local('desktop-linux')])).toBe('default');
+    // A context named `devspaces-remote` without the description of Devspaces is not one of ours; like any context of
+    // the user it is remembered.
+    expect(localContextChoice('devspaces-remote', [local('default'), local('devspaces-remote')])).toBe('devspaces-remote');
+    // Never a context of ours: ours by the description, whatever the name.
+    expect(localContextChoice('box', [local('default'), own('box', 'box')])).toBe('default');
+    expect(localContextChoice('anything', [local('default'), own('anything', 'me@box')])).toBe('default');
+    expect(localContextChoice('box', [local('default'), { name: 'box', description: 'mine', endpoint: 'ssh://box' }])).toBe('box');
+  });
+
+  it('goes back to a remembered context only when it points to the local Docker', async () => {
+    const endpoints: Record<string, string> = {
+      default: 'unix:///var/run/docker.sock',
+      'desktop-linux': 'unix:///home/me/.docker/desktop/docker.sock',
+      mybox: 'ssh://me@mybox',
+      tcpbox: 'tcp://10.0.0.5:2375',
+      loop: 'tcp://127.0.0.1:2375',
+    };
+    const docker = fakeDocker((args) => {
+      if (args[1] === 'ls') return contextLs(Object.entries(endpoints).map(([name, endpoint]) => local(name, endpoint)));
+      if (args[1] === 'inspect') return ok(JSON.stringify({ Name: args[2], Endpoints: { docker: { Host: endpoints[args[2]] } } }));
+      return fail('unexpected');
+    });
+    await expect(chooseLocalContext(docker, 'desktop-linux')).resolves.toBe('desktop-linux');
+    await expect(chooseLocalContext(docker, 'loop')).resolves.toBe('loop');
+    await expect(chooseLocalContext(docker, 'mybox')).resolves.toBe('default');
+    await expect(chooseLocalContext(docker, 'tcpbox')).resolves.toBe('default');
+    await expect(chooseLocalContext(docker, undefined)).resolves.toBe('default');
+    const unreadable = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default'), local('x')]) : fail('no')));
+    await expect(chooseLocalContext(unreadable, 'x')).resolves.toBe('default');
+  });
+
+  it('names DOCKER_HOST or DOCKER_CONTEXT set for VS Code', () => {
+    expect(dockerVariableOverride({}, 'linux')).toBeUndefined();
+    expect(dockerVariableOverride({ DOCKER_HOST: 'unix:///x' }, 'linux')).toBe('DOCKER_HOST');
+    expect(dockerVariableOverride({ DOCKER_CONTEXT: 'x' }, 'linux')).toBe('DOCKER_CONTEXT');
+    expect(dockerVariableOverride({ docker_host: 'x' }, 'win32')).toBe('DOCKER_HOST');
+    expect(dockerVariableOverride({ DOCKER_HOST: ' ' }, 'linux')).toBeUndefined();
+  });
+});
+
+describe('RemoteDockerState', () => {
+  it('remembers the previous context and the rootless sockets per host', async () => {
+    expect(await state.read()).toEqual({});
+    await state.setPreviousContext('desktop-linux');
+    await state.setRootlessSocket('box', '/run/user/1000/docker.sock');
+    await state.setRootlessSocket('__proto__', '/run/user/1/docker.sock');
+    expect(await state.previousContext()).toBe('desktop-linux');
+    expect(await state.rootlessSocket('box')).toBe('/run/user/1000/docker.sock');
+    expect(await state.rootlessSocket('__proto__')).toBe('/run/user/1/docker.sock');
+    expect(await state.rootlessSocket('other')).toBeUndefined();
+    await state.setRootlessSocket('box', undefined);
+    await state.setPreviousContext(undefined);
+    expect(await state.read()).toEqual({ hosts: [{ host: '__proto__', rootlessSocket: '/run/user/1/docker.sock' }] });
+  });
+
+  it('ignores invalid content', async () => {
+    fs.writeFileSync(state.file, JSON.stringify({ previousContext: 3, hosts: [{ host: 'a', rootlessSocket: 'relative' }, 'x', { host: '' }] }));
+    expect(await state.read()).toEqual({ hosts: [{ host: 'a' }] });
+  });
+});

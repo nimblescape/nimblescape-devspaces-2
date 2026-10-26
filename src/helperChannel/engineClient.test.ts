@@ -1,0 +1,1092 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// The port `DockerEngine` over the Engine API, against a real HTTP server on a Unix socket (as the engine answers: JSON
+// for the requests, a hijacked connection with framed output for an exec).
+import * as fs from 'fs';
+import * as http from 'http';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EngineError, isMissing, MAX_IMAGE_FILE_BYTES, type DockerEngine } from '../core/worker/dockerEngine';
+import { MIN_SECRET_LENGTH, SECRET_TOKEN } from '../core/helperChannel/protocol';
+import { scriptCommand } from '../core/worker/containerScripts';
+import { maxTarFileArchiveBytes } from '../core/docker/tarFile';
+import { engineApi, engineHijack, MAX_ENGINE_FRAME_BYTES, type EngineAnswer, type EngineApi, type EngineRequest } from './engineApi';
+import { dockerEngine, MAX_EXEC_OUTPUT_CHARACTERS } from './engineClient';
+
+interface Call {
+  method: string;
+  url: string;
+  body: string;
+}
+
+/** A frame of the engine: the stream, three zero bytes, the length, the data. */
+function frame(stream: 1 | 2, text: string): Buffer {
+  const data = Buffer.from(text, 'utf8');
+  const header = Buffer.alloc(8);
+  header[0] = stream;
+  header.writeUInt32BE(data.length, 4);
+  return Buffer.concat([header, data]);
+}
+
+/**
+ * A tar archive of one entry, as the archive endpoint of the engine answers it: a ustar header (with its checksum), the
+ * data padded to blocks, and the two empty blocks of the end.
+ */
+function tarOf(name: string, data: Buffer, typeflag = '0'): Buffer {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 'utf8');
+  header.write('0000644\0', 100, 'latin1');
+  header.write('0000000\0', 108, 'latin1');
+  header.write('0000000\0', 116, 'latin1');
+  header.write(`${data.length.toString(8).padStart(11, '0')}\0`, 124, 'latin1');
+  header.write('00000000000\0', 136, 'latin1');
+  header.write(typeflag, 156, 'latin1');
+  header.write('ustar\x0000', 257, 'latin1');
+  header.write('        ', 148, 'latin1');
+  let sum = 0;
+  for (const byte of header) sum += byte;
+  header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'latin1');
+  const padding = Buffer.alloc((512 - (data.length % 512)) % 512);
+  return Buffer.concat([header, data, padding, Buffer.alloc(1024)]);
+}
+
+const INSPECT = {
+  Id: 'c0ffee'.repeat(10) + 'c0ff',
+  Name: '/devspaces-acme-api-brave-noether',
+  Created: '2026-10-03T19:00:00.000Z',
+  RestartCount: 2,
+  State: { Status: 'running', Running: true, Paused: false, ExitCode: 0 },
+  Config: { Labels: { 'nimblescape.devspaces.id': 'e1' }, Image: 'devspaces-acme-api-brave-noether:1' },
+  Image: 'sha256:' + 'a'.repeat(64),
+  Mounts: [
+    { Type: 'volume', Name: 'devspaces-acme-api-brave-noether' },
+    // Only the mounts of the type volume, whatever else has a name.
+    { Type: 'bind', Name: 'not-a-volume', Source: '/tmp' },
+    { Type: 'tmpfs', Name: 'not-a-volume-either' },
+  ],
+};
+
+describe('the port of the engine over the Engine API', () => {
+  const servers: http.Server[] = [];
+  const sockets: net.Socket[] = [];
+  // Every folder of a test, not only the last one.
+  const folders: string[] = [];
+  let folder: string | undefined;
+
+  afterEach(async () => {
+    // The hijacked connections stay open until the test ends them.
+    for (const socket of sockets.splice(0)) socket.destroy();
+    for (const server of servers.splice(0)) await new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const each of folders.splice(0)) fs.rmSync(each, { recursive: true, force: true });
+    folder = undefined;
+  });
+
+  /** An engine whose requests `answer` serves; an exec is served over a hijacked connection by `exec`. */
+  async function serve(
+    answer: (call: Call) => { status: number; json?: unknown; body?: string; raw?: Buffer } | undefined,
+    exec?: (socket: net.Socket, input: Buffer) => void,
+    more: {
+      /** Written in the same write as the answer 101. */
+      withUpgrade?: Buffer;
+      /** Called at once after the upgrade, before the input ended. */
+      onUpgrade?: (socket: net.Socket) => void;
+      /** The status of an exec start that the engine does not upgrade. */
+      refuse?: { status: number; json: unknown };
+      secrets?: Record<string, string>;
+      /** The values to mask, when not those of `secrets`. */
+      masked?: string[];
+    } = {},
+  ): Promise<{ engine: DockerEngine; calls: Call[] }> {
+    folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-engine-'));
+    folders.push(folder);
+    const socketPath = path.join(folder, 'docker.sock');
+    const calls: Call[] = [];
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')));
+      req.on('end', () => {
+        const call = { method: req.method ?? '', url: req.url ?? '', body };
+        calls.push(call);
+        const given = answer(call);
+        // No answer: the engine hangs.
+        if (given === undefined) return;
+        res.writeHead(given.status, { 'Content-Type': 'application/json' });
+        // `raw`, a binary answer (the tar archive of the archive endpoint).
+        res.end(given.raw ?? (given.json !== undefined ? JSON.stringify(given.json) : (given.body ?? '')));
+      });
+    });
+    // The hijacked start of an exec: the engine answers 101 and the connection carries the streams.
+    server.on('upgrade', (req, socket: net.Socket, head: Buffer) => {
+      sockets.push(socket);
+      // As the engine does: the body of the request comes before the stream, so it is not input of the process.
+      const length = Number(req.headers['content-length'] ?? 0);
+      calls.push({ method: 'POST', url: req.url ?? '', body: head.subarray(0, length).toString('utf8') });
+      if (more.refuse !== undefined) {
+        const body = JSON.stringify(more.refuse.json);
+        socket.end(`HTTP/1.1 ${more.refuse.status} Refused\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+        return;
+      }
+      const upgrade = Buffer.from('HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n');
+      socket.write(more.withUpgrade === undefined ? upgrade : Buffer.concat([upgrade, more.withUpgrade]));
+      more.onUpgrade?.(socket);
+      let input = head.subarray(length);
+      socket.on('data', (chunk: Buffer) => (input = Buffer.concat([input, chunk])));
+      socket.on('end', () => exec?.(socket, input));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    const secrets = more.secrets ?? {};
+    // Every secret of the operation is masked in the output of an exec (OperationContext.maskedValues).
+    return { engine: dockerEngine(engineApi(socketPath), engineHijack(socketPath), (name) => secrets[name], () => more.masked ?? Object.values(secrets)), calls };
+  }
+
+  it('reads a container with its state, labels, image and volumes; a missing one is undefined', async () => {
+    const { engine, calls } = await serve((call) => (call.url.includes('missing') ? { status: 404, json: { message: 'No such container' } } : { status: 200, json: INSPECT }));
+    expect(await engine.container('devspaces-acme-api-brave-noether')).toEqual({
+      id: INSPECT.Id,
+      name: 'devspaces-acme-api-brave-noether',
+      state: 'running',
+      rawState: 'running',
+      exitCode: 0,
+      restartCount: 2,
+      labels: { 'nimblescape.devspaces.id': 'e1' },
+      image: 'devspaces-acme-api-brave-noether:1',
+      imageId: INSPECT.Image,
+      volumes: ['devspaces-acme-api-brave-noether'],
+      created: '2026-10-03T19:00:00.000Z',
+    });
+    expect(calls[0]).toMatchObject({ method: 'GET', url: '/containers/devspaces-acme-api-brave-noether/json' });
+    expect(await engine.container('missing')).toBeUndefined();
+  });
+
+  it('a paused container counts as running, a stopped one as stopped', async () => {
+    const { engine } = await serve((call) => ({
+      status: 200,
+      json: call.url.includes('paused')
+        ? { ...INSPECT, State: { Status: 'paused', Running: false, Paused: true } }
+        : { ...INSPECT, State: { Status: 'exited', Running: false, Paused: false, ExitCode: 137 } },
+    }));
+    expect(await engine.container('paused')).toMatchObject({ state: 'running', rawState: 'paused' });
+    expect(await engine.container('other')).toMatchObject({ state: 'stopped', rawState: 'exited', exitCode: 137 });
+  });
+
+  it('lists the containers of a label and inspects each one; one that is gone is left out', async () => {
+    const { engine, calls } = await serve((call) =>
+      call.url.startsWith('/containers/json')
+        ? { status: 200, json: [{ Id: 'a'.repeat(64) }, { Id: 'b'.repeat(64) }, { noId: true }] }
+        : call.url.includes('b'.repeat(64))
+          ? { status: 404, json: { message: 'No such container' } }
+          : { status: 200, json: INSPECT },
+    );
+    const found = await engine.containers('nimblescape.devspaces.id=e1');
+    expect(found).toHaveLength(1);
+    expect(found[0].id).toBe(INSPECT.Id);
+    expect(decodeURIComponent(calls[0].url)).toBe('/containers/json?all=true&filters={"label":["nimblescape.devspaces.id=e1"]}');
+  });
+
+  it('runs a process in a container: its output by stream, its exit code, and its input on the connection', async () => {
+    const { engine, calls } = await serve(
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 3, Running: false } }),
+      (socket, input) => {
+        socket.write(frame(1, `in:${input.toString('utf8')}`));
+        socket.write(frame(2, 'a warning'));
+        socket.end();
+      },
+    );
+    const output: string[] = [];
+    const result = await engine.exec('c1', ['sh', '-c', 'cat'], { user: 'root', workdir: '/w', input: 'hello', onOutput: (stream, text) => output.push(`${stream}:${text}`) });
+    expect(result).toEqual({ exitCode: 3, stdout: 'in:hello', stderr: 'a warning', timedOut: false });
+    expect(output).toEqual(['stdout:in:hello', 'stderr:a warning']);
+    expect(JSON.parse(calls[0].body)).toEqual({ AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: false, Cmd: ['sh', '-c', 'cat'], User: 'root', WorkingDir: '/w' });
+    expect(calls.map((call) => call.url)).toEqual(['/containers/c1/exec', '/exec/exec-1/start', '/exec/exec-1/json']);
+  });
+
+  it('ends a process at its time limit and reports what it wrote until then', async () => {
+    const { engine } = await serve(
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0, Running: false } }),
+      (socket) => {
+        socket.write(frame(1, 'started'));
+        // Never ends: the time limit of the call must end it.
+      },
+    );
+    const result = await engine.exec('c1', ['sleep', '60'], { timeoutMs: 50 });
+    expect(result).toMatchObject({ exitCode: null, timedOut: true, stdout: 'started' });
+  });
+
+  it('stops and starts a container; 304 (nothing to do) is no failure', async () => {
+    const { engine, calls } = await serve((call) => ({ status: call.url.includes('stop') ? 204 : 304 }));
+    await engine.stop('c1', 20);
+    await engine.start('c1');
+    // Without a time, the container's own stop time (no query).
+    await engine.stop('c1');
+    expect(calls.map((call) => call.url)).toEqual(['/containers/c1/stop?t=20', '/containers/c1/start', '/containers/c1/stop']);
+    // A stop of a container that does not run, and a missing one.
+    const nothing = await serve(() => ({ status: 304 }));
+    await nothing.engine.stop('c1', 20);
+    const missing = await serve(() => ({ status: 404, json: { message: 'No such container' } }));
+    for (const call of [missing.engine.stop('c1', 20), missing.engine.start('c1')]) {
+      const thrown = await call.catch((error: unknown) => error);
+      expect(isMissing(thrown)).toBe(true);
+    }
+  });
+
+  it('changes the restart policy of a container; any other answer than 200 is an EngineError', async () => {
+    const { engine, calls } = await serve((call) => (call.url.startsWith('/containers/c1/') ? { status: 200, json: { Warnings: [] } } : { status: 404, json: { message: 'No such container: gone' } }));
+    await engine.updateRestartPolicy('c1', 'no');
+    expect(calls).toEqual([{ method: 'POST', url: '/containers/c1/update', body: JSON.stringify({ RestartPolicy: { Name: 'no' } }) }]);
+    const thrown = await engine.updateRestartPolicy('gone', 'no').catch((error: unknown) => error);
+    expect(isMissing(thrown)).toBe(true);
+    expect(thrown).toMatchObject({ message: 'No such container: gone' });
+  });
+
+  it('throws an EngineError with the message of the engine and its status', async () => {
+    const { engine } = await serve(() => ({ status: 500, json: { message: 'the daemon is busy' } }));
+    for (const call of [engine.container('c1'), engine.containers('label'), engine.stop('c1', 10), engine.start('c1'), engine.exec('c1', ['true'])]) {
+      const thrown = await call.catch((error: unknown) => error);
+      expect(thrown).toBeInstanceOf(EngineError);
+      expect(thrown).toMatchObject({ message: 'the daemon is busy', status: 500 });
+    }
+  });
+
+  it('throws when the engine answers an inspect or an exec create with something it cannot read', async () => {
+    const empty = await serve(() => ({ status: 200, body: 'not json' }));
+    await expect(empty.engine.container('c1')).rejects.toBeInstanceOf(EngineError);
+    const noId = await serve((call) => (call.url.endsWith('/exec') ? { status: 201, json: {} } : { status: 200, json: [] }));
+    await expect(noId.engine.exec('c1', ['true'])).rejects.toThrow(/invalid value/);
+  });
+
+  it('a cancel ends the call with an AbortError', async () => {
+    const { engine } = await serve(
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0, Running: false } }),
+      () => {
+        // Never answers.
+      },
+    );
+    const controller = new AbortController();
+    const running = engine.exec('c1', ['sleep', '60'], { signal: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    await expect(running).rejects.toMatchObject({ name: 'AbortError' });
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(engine.container('c1', aborted.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  /** An engine whose exec create and inspect succeed (exit code 0, ended), with the exec served by `exec`. */
+  const execAnswers = (inspect: unknown = { ExitCode: 0, Running: false }) => (call: Call) =>
+    call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 200, json: inspect };
+
+  it('hands on the output that came with the answer 101', async () => {
+    const output: string[] = [];
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(), { withUpgrade: Buffer.concat([frame(1, 'early'), frame(2, 'warning')]) });
+    const result = await engine.exec('c1', ['true'], { onOutput: (stream, text) => output.push(`${stream}:${text}`) });
+    expect(result).toEqual({ exitCode: 0, stdout: 'early', stderr: 'warning', timedOut: false });
+    expect(output).toEqual(['stdout:early', 'stderr:warning']);
+  });
+
+  it('puts together frames that come in pieces, and characters split between frames', async () => {
+    const whole = Buffer.concat([frame(1, 'hello world'), frame(2, 'e'), frame(1, '!')]);
+    const euro = Buffer.from('€', 'utf8');
+    const { engine } = await serve(execAnswers(), (socket) => {
+      // The header in two pieces, then the data byte by byte, then a character split between two frames.
+      const pieces = [whole.subarray(0, 3), whole.subarray(3, 8), ...[...whole.subarray(8)].map((byte) => Buffer.from([byte]))];
+      for (const piece of pieces) socket.write(piece);
+      const first = Buffer.alloc(8 + 2);
+      first[0] = 1;
+      first.writeUInt32BE(2, 4);
+      euro.copy(first, 8, 0, 2);
+      const second = Buffer.alloc(8 + 1);
+      second[0] = 1;
+      second.writeUInt32BE(1, 4);
+      euro.copy(second, 8, 2, 3);
+      socket.write(first);
+      socket.end(second);
+    });
+    const output: string[] = [];
+    const result = await engine.exec('c1', ['true'], { onOutput: (stream, text) => output.push(`${stream}:${text}`) });
+    expect(result).toMatchObject({ stdout: 'hello world!€', stderr: 'e' });
+    expect(output.join('')).not.toContain('\uFFFD');
+  });
+
+  it('fails when the output is not framed, a frame is too long, or the output ends in the middle of a frame', async () => {
+    const half = frame(1, 'hello').subarray(0, 10);
+    const tooLong = Buffer.alloc(8);
+    tooLong[0] = 1;
+    tooLong.writeUInt32BE(MAX_ENGINE_FRAME_BYTES + 1, 4);
+    for (const [written, message] of [
+      [Buffer.from('plain terminal output'), 'not framed'],
+      [tooLong, `a frame of ${MAX_ENGINE_FRAME_BYTES + 1} bytes`],
+      [half, 'in the middle of a frame'],
+    ] as const) {
+      const { engine } = await serve(execAnswers(), (socket) => socket.end(written));
+      await expect(engine.exec('c1', ['true'])).rejects.toThrow(message);
+    }
+  });
+
+  it('fails when the connection breaks, never as a clean end', async () => {
+    const { engine, calls } = await serve(execAnswers(), undefined, {
+      onUpgrade: (socket) => {
+        // A Unix socket cannot be reset: the engine goes away in the middle of a frame.
+        socket.write(Buffer.concat([frame(1, 'started'), frame(1, 'more').subarray(0, 9)]));
+        setTimeout(() => socket.destroy(), 10);
+      },
+    });
+    await expect(engine.exec('c1', ['true'])).rejects.toThrow();
+    // The inspect is never asked after a broken connection.
+    expect(calls.some((call) => call.url.endsWith('/json') && call.url.startsWith('/exec/'))).toBe(false);
+  });
+
+  it('fails when the process still runs after its output ended, and when the inspect fails', async () => {
+    const running = await serve(execAnswers({ ExitCode: 0, Running: true }), (socket) => socket.end());
+    await expect(running.engine.exec('c1', ['true'])).rejects.toThrow('the process did not');
+    const failing = await serve(
+      (call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : { status: 500, json: { message: 'the daemon is busy' } }),
+      (socket) => socket.end(),
+    );
+    await expect(failing.engine.exec('c1', ['true'])).rejects.toMatchObject({ name: 'EngineError', status: 500, message: 'the daemon is busy' });
+    const noCode = await serve(execAnswers({ Running: false }), (socket) => socket.end());
+    expect(await noCode.engine.exec('c1', ['true'])).toMatchObject({ exitCode: null, timedOut: false });
+  });
+
+  it('refuses an exec start that the engine does not upgrade, with its message and status', async () => {
+    for (const status of [409, 200]) {
+      const { engine } = await serve(execAnswers(), undefined, { refuse: { status, json: { message: 'the container is paused' } } });
+      const thrown = await engine.exec('c1', ['true']).catch((error: unknown) => error);
+      expect(thrown).toBeInstanceOf(EngineError);
+      expect(thrown).toMatchObject({ message: 'the container is paused', status });
+    }
+  });
+
+  it('gives the secret that the operation holds as the standard input, never in a request', async () => {
+    const { engine, calls } = await serve(
+      execAnswers(),
+      (socket, input) => {
+        // The output of an exec masks every secret, so the engine answers whether the input was the secret (an echo of
+        // the input would show only the mask).
+        socket.end(frame(1, `in:${input.toString('utf8') === 'ghp_value'}`));
+      },
+      { secrets: { [SECRET_TOKEN]: 'ghp_value' } },
+    );
+    const result = await engine.exec('c1', scriptCommand('tokenWrite', ['dev', 'octocat']), { user: 'root', secretInputName: SECRET_TOKEN });
+    expect(result.stdout).toBe('in:true');
+    expect(JSON.parse(calls[0].body)).toMatchObject({ AttachStdin: true });
+    expect(JSON.stringify(calls)).not.toContain('ghp_value');
+    // A secret that the operation does not hold is a failure, never an empty input.
+    const none = await serve(execAnswers(), (socket) => socket.end());
+    await expect(none.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).rejects.toThrow(`holds no secret ${SECRET_TOKEN}`);
+    expect(none.calls).toEqual([]);
+  });
+
+  it('ends at its time limit also when the operation gives its cancel signal', async () => {
+    const { engine } = await serve(execAnswers(), () => {
+      // Never ends.
+    });
+    const started = Date.now();
+    const result = await engine.exec('c1', ['sleep', '60'], { signal: new AbortController().signal, timeoutMs: 50 });
+    expect(result).toMatchObject({ exitCode: null, timedOut: true });
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('the time limit covers the create of the exec and its inspect', async () => {
+    const hangingCreate = await serve(() => undefined);
+    expect(await hangingCreate.engine.exec('c1', ['true'], { timeoutMs: 50 })).toMatchObject({ timedOut: true, exitCode: null });
+    const hangingInspect = await serve((call) => (call.url.endsWith('/exec') ? { status: 201, json: { Id: 'exec-1' } } : undefined), (socket) => socket.end(frame(1, 'done')));
+    expect(await hangingInspect.engine.exec('c1', ['true'], { timeoutMs: 200 })).toMatchObject({ timedOut: true, exitCode: null, stdout: 'done' });
+  });
+
+  it('keeps at most MAX_EXEC_OUTPUT_CHARACTERS of a stream, and hands all of it to onOutput', async () => {
+    const big = 'x'.repeat(MAX_EXEC_OUTPUT_CHARACTERS + 10);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(frame(1, big)));
+    let seen = 0;
+    const result = await engine.exec('c1', ['true'], { onOutput: (_stream, text) => (seen += text.length) });
+    expect(result.stdout).toHaveLength(MAX_EXEC_OUTPUT_CHARACTERS);
+    expect(seen).toBe(big.length);
+  });
+
+  it('masks the secret of the input before the cut of each stream', async () => {
+    const secret = 'ghp_' + 'S'.repeat(36);
+    // The secret starts 10 characters before the limit, so a plain cut would keep its first 10 characters.
+    const before = 'a'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 10);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, before), frame(1, `${secret}tail`), frame(2, `${secret} on stderr`)])), {
+      secrets: { [SECRET_TOKEN]: secret },
+    });
+    const result = await engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN });
+    // Masked, the stream is shorter than the limit: nothing of it is cut.
+    expect(result.stdout).toBe(`${before}***tail`);
+    expect(result.stdout).not.toContain('ghp_');
+    expect(result.stderr).toBe('*** on stderr');
+    // Without a secret input, nothing is masked and the plain cut applies.
+    const plain = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, before), frame(1, `${secret}tail`)])));
+    expect((await plain.engine.exec('c1', ['cat'])).stdout).toBe(`${before}${secret}`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+  });
+
+  it('a repeated secret, the second one across the cut, leaves no part of itself', async () => {
+    const secret = 'ghp_' + 'R'.repeat(36);
+    // The second secret starts after the limit of the raw text, and its mask crosses the limit of the kept one.
+    const padding = 'p'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 5);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, `${secret}\n`), frame(1, padding), frame(1, `${secret}tail`)])), {
+      secrets: { [SECRET_TOKEN]: secret },
+    });
+    const seen: string[] = [];
+    const result = await engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN, onOutput: (_stream, text) => seen.push(text) });
+    expect(result.stdout).toBe(`***\n${padding}***tail`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+    expect(result.stdout).not.toContain('ghp_');
+    // onOutput gets the masked output only, all of it.
+    expect(seen.join('')).toBe(`***\n${padding}***tail`);
+    // A secret repeated so often that the masked text is far shorter than the limit.
+    const many = await serve(execAnswers(), (socket) => socket.end(frame(1, secret.repeat(30_000))), { secrets: { [SECRET_TOKEN]: secret } });
+    expect((await many.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).stdout).toBe('***'.repeat(30_000));
+  });
+
+  it('masks every secret of the operation, with and without a secret input, also across frames', async () => {
+    const registry = 'registry-password-' + 'Q'.repeat(20);
+    const token = 'ghp_' + 'T'.repeat(36);
+    const before = 'b'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 8);
+    const output = Buffer.concat([frame(1, before), frame(1, registry.slice(0, 5)), frame(1, `${registry.slice(5)} and ${token.slice(0, 10)}`), frame(1, token.slice(10)), frame(2, `${token}!`)]);
+    // Without a secret input: the secrets of the operation.
+    const plain = await serve(execAnswers(), (socket) => socket.end(output), { masked: [registry, token] });
+    const result = await plain.engine.exec('c1', ['env']);
+    expect(result.stdout).toBe(`${before}*** and ***`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+    expect(result.stderr).toBe('***!');
+    for (const text of [result.stdout, result.stderr]) {
+      expect(text).not.toContain('registry-pa');
+      expect(text).not.toContain('ghp_');
+    }
+    // With the token as the input, the registry password of the operation is masked too.
+    const withInput = await serve(execAnswers(), (socket) => socket.end(output), { secrets: { [SECRET_TOKEN]: token }, masked: [registry] });
+    expect((await withInput.engine.exec('c1', ['cat'], { secretInputName: SECRET_TOKEN })).stdout).toBe(`${before}*** and ***`.slice(0, MAX_EXEC_OUTPUT_CHARACTERS));
+  });
+
+  it('a frame that ends inside a secret, then the time limit, leaves no part of it', async () => {
+    const token = 'ghp_' + 'Z'.repeat(36);
+    const { engine } = await serve(execAnswers(), (socket) => {
+      // The rest of the token never comes.
+      socket.write(frame(1, `start ${token.slice(0, 39)}`));
+      socket.write(frame(2, `err ${token.slice(0, 20)}`));
+    }, { masked: [token] });
+    const seen: string[] = [];
+    const result = await engine.exec('c1', ['cat'], { timeoutMs: 300, onOutput: (_stream, text) => seen.push(text) });
+    expect(result).toMatchObject({ timedOut: true, stdout: 'start ***', stderr: 'err ***' });
+    for (const text of [result.stdout, result.stderr, seen.join('')]) {
+      for (let at = 0; at + MIN_SECRET_LENGTH <= token.length; at++) expect(text).not.toContain(token.slice(at, at + MIN_SECRET_LENGTH));
+    }
+  });
+
+  it('ends the exec when onOutput throws, never the process', async () => {
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(frame(1, 'x')));
+    await expect(
+      engine.exec('c1', ['true'], {
+        onOutput: () => {
+          throw new Error('the listener broke');
+        },
+      }),
+    ).rejects.toThrow('the listener broke');
+  });
+
+  it('a cancel while the output streams ends the exec with an AbortError', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.write(frame(1, 'started')) });
+    const controller = new AbortController();
+    const output: string[] = [];
+    const running = engine.exec('c1', ['sleep', '60'], { signal: controller.signal, onOutput: (_stream, text) => (output.push(text), controller.abort()) });
+    await expect(running).rejects.toMatchObject({ name: 'AbortError' });
+    expect(output).toEqual(['started']);
+  });
+
+  it('rejects without an uncaught error when the engine goes away while the input is written', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.destroy() });
+    await expect(engine.exec('c1', ['cat'], { input: 'x'.repeat(8 * 1024 * 1024) })).rejects.toThrow();
+  });
+
+  it('rejects a hijack to a socket that does not exist, and one that is cancelled before it starts', async () => {
+    folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-engine-'));
+    folders.push(folder);
+    await expect(engineHijack(path.join(folder, 'missing.sock'))({ path: '/exec/x/start', json: {}, onFrame: () => {} })).rejects.toThrow();
+    const { calls } = await serve(execAnswers());
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(engineHijack(path.join(folder, 'docker.sock'))({ path: '/exec/x/start', json: {}, onFrame: () => {}, signal: aborted.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toEqual([]);
+  });
+
+  it('fails the list when the inspect of a listed container fails', async () => {
+    const { engine } = await serve((call) => (call.url.startsWith('/containers/json') ? { status: 200, json: [{ Id: 'a'.repeat(64) }] } : { status: 500, json: { message: 'the daemon is busy' } }));
+    await expect(engine.containers('label')).rejects.toMatchObject({ name: 'EngineError', status: 500 });
+  });
+
+  it('refuses a header with padding or stream 0, and a frame of exactly the cap is accepted', async () => {
+    for (const header of [[1, 1, 0, 0], [1, 0, 0, 1], [0, 0, 0, 0]]) {
+      const bad = Buffer.concat([Buffer.from(header), Buffer.from([0, 0, 0, 1]), Buffer.from('x')]);
+      const { engine } = await serve(execAnswers(), (socket) => socket.end(bad));
+      await expect(engine.exec('c1', ['true']), JSON.stringify(header)).rejects.toThrow('not framed');
+    }
+    const atCap = Buffer.alloc(8);
+    atCap[0] = 1;
+    atCap.writeUInt32BE(MAX_ENGINE_FRAME_BYTES, 4);
+    const { engine } = await serve(execAnswers(), (socket) => socket.end(atCap));
+    await expect(engine.exec('c1', ['true'])).rejects.toThrow('in the middle of a frame');
+  });
+
+  it('caps the whole stream, keeps a decoder per stream, and flushes a cut character', async () => {
+    const euro = Buffer.from('€', 'utf8');
+    const raw = (stream: 1 | 2, data: Buffer) => {
+      const header = Buffer.alloc(8);
+      header[0] = stream;
+      header.writeUInt32BE(data.length, 4);
+      return Buffer.concat([header, data]);
+    };
+    const mixed = await serve(execAnswers(), (socket) =>
+      socket.end(Buffer.concat([raw(1, euro.subarray(0, 1)), raw(2, Buffer.from('e')), raw(1, euro.subarray(1)), raw(2, euro.subarray(0, 2))])),
+    );
+    expect(await mixed.engine.exec('c1', ['true'])).toMatchObject({ stdout: '€', stderr: 'e\uFFFD' });
+    const big = await serve(execAnswers(), (socket) => socket.end(Buffer.concat([frame(1, 'a'.repeat(MAX_EXEC_OUTPUT_CHARACTERS - 10)), frame(1, 'b'.repeat(100))])));
+    const result = await big.engine.exec('c1', ['true']);
+    expect(result.stdout).toHaveLength(MAX_EXEC_OUTPUT_CHARACTERS);
+    expect(result.stdout.endsWith('a'.repeat(5) + 'b'.repeat(10))).toBe(true);
+  });
+
+  it('attaches no input without one, starts without detaching, and fails an inspect that does not say the process ended', async () => {
+    const { engine, calls } = await serve(execAnswers(), (socket) => socket.end());
+    await engine.exec('c1', ['true']);
+    expect(JSON.parse(calls[0].body)).toMatchObject({ AttachStdin: false });
+    expect(JSON.parse(calls[1].body)).toEqual({ Detach: false, Tty: false });
+    const unknown = await serve(execAnswers({ ExitCode: 0 }), (socket) => socket.end());
+    await expect(unknown.engine.exec('c1', ['true'])).rejects.toThrow('the process did not');
+    const created = await serve((call) => (call.url.endsWith('/exec') ? { status: 200, json: { Id: 'exec-1' } } : { status: 200, json: { ExitCode: 0, Running: false } }));
+    await expect(created.engine.exec('c1', ['true'])).rejects.toBeInstanceOf(EngineError);
+    const list = await serve(() => ({ status: 200, json: { not: 'a list' } }));
+    await expect(list.engine.containers('label')).rejects.toBeInstanceOf(EngineError);
+  });
+
+  it('hands no further frame to a listener that cancelled the exec', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.write(Buffer.concat([frame(1, 'a'), frame(1, 'b'), frame(1, 'c')])) });
+    const controller = new AbortController();
+    const seen: string[] = [];
+    await expect(engine.exec('c1', ['true'], { signal: controller.signal, onOutput: (_stream, text) => (seen.push(text), controller.abort()) })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(seen).toEqual(['a']);
+  });
+
+  it('rejects with the error of a throwing listener, and hands it nothing more', async () => {
+    const { engine } = await serve(execAnswers(), undefined, { onUpgrade: (socket) => socket.write(Buffer.concat([frame(1, 'a'), frame(1, 'b')])) });
+    const thrown = new Error('the listener broke');
+    let calls = 0;
+    await expect(
+      engine.exec('c1', ['true'], {
+        onOutput: () => {
+          calls++;
+          throw thrown;
+        },
+      }),
+    ).rejects.toBe(thrown);
+    expect(calls).toBe(1);
+  });
+
+  // The requests of the pipeline's Docker over the port.
+  describe('the requests of the pipeline', () => {
+    it('reads the version, an inspect (missing is undefined), and the lists with their filters', async () => {
+      const { engine, calls } = await serve((call) => {
+        if (call.url === '/version') return { status: 200, json: { ApiVersion: '1.48', Version: '29.0.0' } };
+        if (call.url.startsWith('/volumes/gone') || call.url.startsWith('/images/gone')) return { status: 404, json: { message: 'No such volume' } };
+        if (call.url.startsWith('/volumes/v1')) return { status: 200, json: { Name: 'v1', Labels: { a: 'b' } } };
+        if (call.url.startsWith('/containers/json')) return { status: 200, json: [{ Id: 'a'.repeat(64) }, { Id: '' }, {}] };
+        if (call.url.startsWith('/images/json')) {
+          return { status: 200, json: [{ Id: 'sha256:1', RepoTags: ['p-app:1', '<none>:<none>'], RepoDigests: ['<none>@<none>'], Labels: null, Created: 1759485600 }, { noId: true }] };
+        }
+        if (call.url.startsWith('/volumes?')) return { status: 200, json: { Volumes: [{ Name: 'v1' }, { Name: '' }] } };
+        if (call.url.startsWith('/networks?')) return { status: 200, json: [{ Name: 'n1' }, { Name: 'n1' }, { Name: 'n2' }] };
+        return { status: 500, json: { message: 'unexpected' } };
+      });
+      expect(await engine.version()).toEqual({ apiVersion: '1.48', version: '29.0.0' });
+      expect(await engine.inspect('volume', 'v1')).toEqual({ Name: 'v1', Labels: { a: 'b' } });
+      expect(await engine.inspect('volume', 'gone')).toBeUndefined();
+      expect(await engine.inspect('image', 'gone')).toBeUndefined();
+      expect(await engine.containerIds({ label: ['a=b'] })).toEqual(['a'.repeat(64)]);
+      expect(await engine.images({ reference: ['p-*'] })).toEqual([{ id: 'sha256:1', repoTags: ['p-app:1'], repoDigests: [], labels: {}, created: '2025-10-03T10:00:00.000Z' }]);
+      expect(await engine.volumeNames({ label: ['x'] })).toEqual(['v1']);
+      expect(await engine.networkNames({ label: ['x'] })).toEqual(['n1', 'n2']);
+      const urls = calls.map((call) => decodeURIComponent(call.url));
+      expect(urls).toContain('/containers/json?all=true&filters={"label":["a=b"]}');
+      expect(urls).toContain('/images/json?filters={"reference":["p-*"]}');
+      expect(urls).toContain('/volumes?filters={"label":["x"]}');
+      expect(urls).toContain('/networks?filters={"label":["x"]}');
+    });
+
+    it('refuses an inspect or a list that it cannot read', async () => {
+      const { engine } = await serve((call) => (call.url.startsWith('/images/json') ? { status: 200, json: { not: 'a list' } } : { status: 200, body: 'not json' }));
+      await expect(engine.inspect('container', 'c')).rejects.toBeInstanceOf(EngineError);
+      await expect(engine.images({})).rejects.toBeInstanceOf(EngineError);
+      await expect(engine.version()).rejects.toBeInstanceOf(EngineError);
+    });
+
+    it('removes, renames and creates with the answers of the engine', async () => {
+      const answers: Record<string, number> = {};
+      const { engine, calls } = await serve((call) => ({ status: answers[`${call.method} ${decodeURIComponent(call.url.split('?')[0])}`] ?? 500, json: { message: 'conflict: unable to remove' } }));
+      answers['DELETE /containers/c'] = 204;
+      answers['DELETE /containers/gone'] = 404;
+      await engine.removeContainer('c');
+      await engine.removeContainer('gone');
+      answers['POST /containers/c/rename'] = 204;
+      await engine.renameContainer('c', 'new name');
+      for (const [status, outcome] of [
+        [200, 'removed'],
+        [404, 'missing'],
+        [409, 'inUse'],
+      ] as const) {
+        answers['DELETE /images/img:1'] = status;
+        expect(await engine.removeImage('img:1')).toBe(outcome);
+      }
+      answers['DELETE /images/img:1'] = 500;
+      await expect(engine.removeImage('img:1')).rejects.toMatchObject({ status: 500 });
+      answers['POST /volumes/create'] = 201;
+      await engine.createVolume('v', { a: 'b' });
+      answers['DELETE /volumes/v'] = 404;
+      answers['DELETE /networks/n'] = 404;
+      await engine.removeVolume('v');
+      await engine.removeNetwork('n');
+      answers['DELETE /volumes/v'] = 409;
+      await expect(engine.removeVolume('v')).rejects.toMatchObject({ status: 409 });
+      answers['POST /containers/c/rename'] = 409;
+      await expect(engine.renameContainer('c', 'taken')).rejects.toMatchObject({ status: 409 });
+      expect(calls.find((call) => call.url.startsWith('/containers/c?'))?.url).toBe('/containers/c?force=true');
+      expect(decodeURIComponent(calls.find((call) => call.url.includes('rename'))!.url)).toBe('/containers/c/rename?name=new name');
+      expect(JSON.parse(calls.find((call) => call.url === '/volumes/create')!.body)).toEqual({ Name: 'v', Labels: { a: 'b' } });
+    });
+
+    it('labels an image by a commit of a created container with the image\'s configuration and the labels, and removes the container', async () => {
+      const { engine, calls } = await serve((call) => {
+        if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: { Cmd: ['node'], Labels: { keep: 'x' }, User: 'dev' } } };
+        if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: 'tmp' } };
+        if (call.url.startsWith('/commit')) return { status: 201, json: { Id: 'sha256:new' } };
+        return { status: 204 };
+      });
+      expect(await engine.labelImage('registry:5000/devspaces-a:2', { add: 'y' })).toBe('sha256:new');
+      const commit = calls.find((call) => call.url.startsWith('/commit'))!;
+      expect(decodeURIComponent(commit.url)).toBe('/commit?container=tmp&repo=registry:5000/devspaces-a&tag=2&pause=false');
+      expect(JSON.parse(commit.body)).toEqual({ Cmd: ['node'], Labels: { keep: 'x', add: 'y' }, User: 'dev' });
+      // The throwaway container goes with its anonymous volumes (`v=true`).
+      expect(calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true&v=true' });
+      // The create is never cancelled half-way; a cancel before it creates nothing.
+      const cancelled = new AbortController();
+      cancelled.abort();
+      const before = calls.length;
+      await expect(engine.labelImage('img', {}, cancelled.signal)).rejects.toMatchObject({ name: 'AbortError' });
+      expect(calls.slice(before).filter((call) => call.url.startsWith('/containers/create'))).toEqual([]);
+      // A commit that fails removes the container too.
+      const failing = await serve((call) => {
+        if (call.url.startsWith('/images/')) return { status: 200, json: { Id: 'sha256:old', Config: {} } };
+        if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: 'tmp' } };
+        if (call.url.startsWith('/commit')) return { status: 500, json: { message: 'no space left on device' } };
+        return { status: 204 };
+      });
+      await expect(failing.engine.labelImage('img', {})).rejects.toThrow('no space left on device');
+      // The throwaway container goes with its anonymous volumes (`v=true`).
+      expect(failing.calls.at(-1)).toMatchObject({ method: 'DELETE', url: '/containers/tmp?force=true&v=true' });
+      expect(decodeURIComponent(failing.calls.find((call) => call.url.startsWith('/commit'))!.url)).toContain('repo=img&tag=latest');
+    });
+
+    // The requests and the reading of the answers, exactly.
+    describe('the requests and answers, exactly', () => {
+      type Route = (request: EngineRequest) => EngineAnswer | Promise<EngineAnswer> | undefined;
+      const ok = (value: unknown, status = 200): EngineAnswer => ({ status, body: typeof value === 'string' ? value : JSON.stringify(value), truncated: false });
+      function fake(route: Route): { engine: DockerEngine; requests: EngineRequest[] } {
+        const requests: EngineRequest[] = [];
+        const api: EngineApi = async (request) => {
+          requests.push(request);
+          return (await route(request)) ?? ok({ message: 'not routed' }, 500);
+        };
+        return { engine: dockerEngine(api, engineHijack(path.join(os.tmpdir(), 'devspaces-no-socket'))), requests };
+      }
+      const containerJson = (id: string) => ({ Id: id, Name: `/${id}`, State: { Status: 'running', Running: true }, Config: { Labels: {}, Image: 'img' }, Mounts: [] });
+
+      it('the paths of the inspects and the encoded filters', async () => {
+        const { engine, requests } = fake((request) => (request.path.endsWith('/json') && request.path.startsWith('/images/') ? ok({ Id: 'sha256:1' }) : request.path.startsWith('/networks/') ? ok({ Name: 'n' }) : ok([])));
+        expect(await engine.inspect('image', 'x:1')).toEqual({ Id: 'sha256:1' });
+        expect(await engine.inspect('network', 'n')).toEqual({ Name: 'n' });
+        await engine.containerIds({ label: ['a=b'] });
+        expect(requests.map((request) => request.path)).toEqual(['/images/x%3A1/json', '/networks/n', `/containers/json?all=true&filters=%7B%22label%22%3A%5B%22a%3Db%22%5D%7D`]);
+      });
+
+      it('a container gone after the list is left out, the ones after it are not; an invalid inspect fails', async () => {
+        const { engine } = fake((request) => {
+          if (request.path.startsWith('/containers/json')) return ok([{ Id: 'a' }, { Id: 'gone' }, { Id: 'c' }]);
+          if (request.path === '/containers/gone/json') return ok({ message: 'No such container' }, 404);
+          if (request.path === '/containers/bad/json') return ok({ Id: 'bad' });
+          return ok(containerJson(request.path.split('/')[2]));
+        });
+        expect((await engine.containers('l')).map((container) => container.id)).toEqual(['a', 'c']);
+        await expect(engine.container('bad')).rejects.toBeInstanceOf(EngineError);
+        // An inspect answered with a list is no object.
+        const listed = fake(() => ok([]));
+        await expect(listed.engine.inspect('image', 'x')).rejects.toThrow('invalid value');
+      });
+
+      it('the labels of an image, and a volume list of null', async () => {
+        const { engine } = fake((request) =>
+          request.path.startsWith('/images/json') ? ok([{ Id: 'sha256:1', RepoTags: ['a:1'], RepoDigests: [], Labels: { k: 'v', n: 1 }, Created: 0 }]) : ok({ Volumes: null, Warnings: null }),
+        );
+        expect((await engine.images({}))[0].labels).toEqual({ k: 'v' });
+        expect(await engine.volumeNames({})).toEqual([]);
+      });
+
+      it('labelImage overrides an old label, creates with `Cmd [true]`, and splits a registry port from the tag', async () => {
+        const { engine, requests } = fake((request) => {
+          if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: { Labels: { keep: 'x', add: 'old' } } });
+          if (request.path.startsWith('/containers/create')) return ok({ Id: 'tmp' }, 201);
+          if (request.path.startsWith('/commit')) return ok({ Id: 'sha256:new' }, 201);
+          return ok('', 204);
+        });
+        await engine.labelImage('registry:5000/name', { add: 'y' });
+        expect(requests.find((request) => request.path.startsWith('/containers/create'))?.json).toEqual({ Image: 'registry:5000/name', Cmd: ['true'], Entrypoint: [], Labels: {} });
+        const commit = requests.find((request) => request.path.startsWith('/commit'))!;
+        expect(commit.json).toEqual({ Labels: { keep: 'x', add: 'y' } });
+        expect(decodeURIComponent(commit.path)).toContain('repo=registry:5000/name&tag=latest');
+        // A cancel while the create is pending: the create is not cancelled; the container is removed.
+        const controller = new AbortController();
+        const slow = fake(async (request) => {
+          if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: {} });
+          if (request.path.startsWith('/containers/create')) {
+            controller.abort();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            if (request.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+            return ok({ Id: 'tmp2' }, 201);
+          }
+          if (request.path.startsWith('/commit')) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+          return ok('', 204);
+        });
+        await expect(slow.engine.labelImage('img:1', {}, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+        expect(slow.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/tmp2?force=true&v=true' });
+        // A missing image is an EngineError 404.
+        const missing = fake(() => ok({ message: 'No such image' }, 404));
+        await expect(missing.engine.labelImage('img:1', {})).rejects.toMatchObject({ status: 404 });
+      });
+
+      // The time limits of their own, driven by a spy of AbortSignal.timeout that hands out a controllable signal per
+      // call.
+      function controlledTimeouts(): { limits: { ms: number; controller: AbortController }[]; restore: () => void } {
+        const limits: { ms: number; controller: AbortController }[] = [];
+        const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+          const controller = new AbortController();
+          limits.push({ ms, controller });
+          return controller.signal;
+        });
+        return { limits, restore: () => spy.mockRestore() };
+      }
+      const abortWith = (signal: AbortSignal | undefined): Promise<never> =>
+        new Promise((_resolve, reject) => {
+          const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          if (signal?.aborted) fail();
+          signal?.addEventListener('abort', fail);
+        });
+      const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+      const limitOf = (limits: { ms: number; controller: AbortController }[], signal: AbortSignal | undefined) => limits.find((limit) => limit.controller.signal === signal);
+
+      it('a create of labelImage that does not answer in time is an EngineError, and its container is removed by its name', async () => {
+        const { limits, restore } = controlledTimeouts();
+        try {
+          const { engine, requests } = fake((request) => {
+            if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: {} });
+            if (request.path.startsWith('/containers/create')) return abortWith(request.signal);
+            return ok('', 204);
+          });
+          const labelling = engine.labelImage('img:1', {});
+          await settle();
+          const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+          expect(limitOf(limits, create.signal)?.ms).toBe(60_000);
+          limitOf(limits, create.signal)!.controller.abort();
+          const error = await labelling.catch((caught: unknown) => caught);
+          expect(error).toBeInstanceOf(EngineError);
+          expect(error).toMatchObject({ status: 0, message: expect.stringContaining('did not answer the create') });
+          expect(error).not.toMatchObject({ name: 'AbortError' });
+          const name = create.path.split('name=')[1];
+          expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+          // The removal by name has a time limit of its own, never an aborted signal, and its failure changes nothing.
+          expect(requests.at(-1)?.signal).toBeDefined();
+          expect(requests.at(-1)?.signal?.aborted).toBe(false);
+        } finally {
+          restore();
+        }
+        const failingRemoval = fake((request) => {
+          if (request.path.startsWith('/images/')) return ok({ Id: 'sha256:old', Config: {} });
+          if (request.path.startsWith('/containers/create')) return ok({ Id: '' }, 201);
+          if (request.method === 'DELETE') throw new Error('engine gone');
+          return ok('', 204);
+        });
+        await expect(failingRemoval.engine.labelImage('img:1', {})).rejects.toThrow('invalid value');
+      });
+
+      // The read of a file of an image, without an extra container that runs.
+      describe('imageFile', () => {
+        const PASSWD = Buffer.from('root:x:0:0:root:/root:/bin/sh\nvscode:x:1000:1000:Zoë Ünicode:/home/vscode:/bin/bash\n', 'utf8');
+        /** The archive answer as engineApi gives it with `latin1`: one character per byte. */
+        const archive = (bytes: Buffer, status = 200, truncated = false): EngineAnswer => ({ status, body: bytes.toString('latin1'), truncated });
+        function reading(answer: (request: EngineRequest) => EngineAnswer | Promise<EngineAnswer> | undefined) {
+          return fake((request) => {
+            if (request.path.startsWith('/containers/create')) return ok({ Id: 'read1' }, 201);
+            if (request.path.includes('/archive')) return answer(request);
+            if (request.method === 'DELETE') return ok('', 204);
+            return undefined;
+          });
+        }
+
+        it('creates a container that never starts, reads the file through the archive endpoint as Latin-1, decodes it as UTF-8, and removes the container', async () => {
+          const { engine, requests } = reading(() => archive(tarOf('passwd', PASSWD)));
+          expect(await engine.imageFile('img:1', '/etc/passwd')).toBe(PASSWD.toString('utf8'));
+          expect(requests.map((request) => `${request.method} ${request.path.split('?')[0]}`)).toEqual([
+            'POST /containers/create',
+            'GET /containers/read1/archive',
+            'DELETE /containers/read1',
+          ]);
+          const [create, read, removal] = requests;
+          expect(create.path).toMatch(/^\/containers\/create\?name=devspaces-read-[0-9a-f]{12}$/);
+          expect(create.json).toEqual({ Image: 'img:1', Cmd: ['true'], Entrypoint: [], Labels: {} });
+          expect(read.path).toBe('/containers/read1/archive?path=%2Fetc%2Fpasswd');
+          expect(read.latin1).toBe(true);
+          // No start: the container never runs.
+          expect(requests.some((request) => request.path.endsWith('/start'))).toBe(false);
+          expect(removal.path).toBe('/containers/read1?force=true&v=true');
+          expect(removal.signal?.aborted).toBe(false);
+        });
+
+        it('answers undefined for a missing path (404), a link, a folder, a file over the bound, a truncated answer, and a malformed archive; the container goes each time', async () => {
+          const cases: EngineAnswer[] = [
+            ok({ message: 'Could not find the file /etc/passwd in container read1' }, 404),
+            archive(tarOf('passwd', Buffer.from('/usr/lib/passwd'), '2')),
+            archive(tarOf('passwd', Buffer.alloc(0), '1')),
+            archive(tarOf('passwd/', Buffer.alloc(0), '5')),
+            archive(tarOf('passwd', Buffer.alloc(MAX_IMAGE_FILE_BYTES + 1, 0x61))),
+            archive(tarOf('passwd', PASSWD), 200, true),
+            archive(tarOf('passwd', PASSWD).subarray(0, 520)),
+            archive(Buffer.from('not a tar archive')),
+            archive(tarOf('group', PASSWD)),
+          ];
+          for (const [index, answer] of cases.entries()) {
+            const { engine, requests } = reading(() => answer);
+            expect(await engine.imageFile('img:1', '/etc/passwd'), `case ${index}`).toBeUndefined();
+            expect(requests.at(-1), `case ${index}`).toMatchObject({ method: 'DELETE', path: '/containers/read1?force=true&v=true' });
+          }
+        });
+
+        it('fails for a missing image and for other answers of the archive endpoint; the container goes after a failure', async () => {
+          const missing = fake((request) => (request.path.startsWith('/containers/create') ? ok({ message: 'No such image: img:1' }, 404) : undefined));
+          await expect(missing.engine.imageFile('img:1', '/etc/passwd')).rejects.toMatchObject({ status: 404, message: 'No such image: img:1' });
+          const failing = reading(() => ok({ message: 'the engine is busy' }, 500));
+          await expect(failing.engine.imageFile('img:1', '/etc/passwd')).rejects.toMatchObject({ status: 500 });
+          expect(failing.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/read1?force=true&v=true' });
+          const broken = reading(() => {
+            throw new Error('socket hang up');
+          });
+          await expect(broken.engine.imageFile('img:1', '/etc/passwd')).rejects.toThrow('socket hang up');
+          expect(broken.requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/read1?force=true&v=true' });
+          // A removal that fails changes nothing of the answer.
+          const failingRemoval = fake((request) => {
+            if (request.path.startsWith('/containers/create')) return ok({ Id: 'read1' }, 201);
+            if (request.path.includes('/archive')) return archive(tarOf('passwd', PASSWD));
+            throw new Error('engine gone');
+          });
+          expect(await failingRemoval.engine.imageFile('img:1', '/etc/passwd')).toBe(PASSWD.toString('utf8'));
+          // A path that is no absolute path of a file is refused before any request.
+          const none = fake(() => undefined);
+          await expect(none.engine.imageFile('img:1', 'etc/passwd')).rejects.toThrow('no absolute path');
+          await expect(none.engine.imageFile('img:1', '/etc/')).rejects.toThrow('no absolute path');
+          expect(none.requests).toEqual([]);
+        });
+
+        it('a cancel: never cancels the create, removes the container, and rejects with an AbortError', async () => {
+          const controller = new AbortController();
+          controller.abort();
+          const before = fake(() => undefined);
+          await expect(before.engine.imageFile('img:1', '/etc/passwd', controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+          expect(before.requests).toEqual([]);
+          const later = new AbortController();
+          const { engine, requests } = fake((request) => {
+            if (request.path.startsWith('/containers/create')) {
+              later.abort();
+              return ok({ Id: 'read2' }, 201);
+            }
+            if (request.method === 'DELETE') return ok('', 204);
+            return undefined;
+          });
+          await expect(engine.imageFile('img:1', '/etc/passwd', later.signal)).rejects.toMatchObject({ name: 'AbortError' });
+          const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+          expect(create.signal).not.toBe(later.signal);
+          expect(requests.some((request) => request.path.includes('/archive'))).toBe(false);
+          expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: '/containers/read2?force=true&v=true' });
+          expect(requests.at(-1)?.signal?.aborted).toBe(false);
+        });
+
+        it('a create that does not answer in time is an EngineError, and its container is removed by its name', async () => {
+          const { limits, restore } = controlledTimeouts();
+          try {
+            const { engine, requests } = fake((request) => {
+              if (request.path.startsWith('/containers/create')) return abortWith(request.signal);
+              return ok('', 204);
+            });
+            const reading = engine.imageFile('img:1', '/etc/passwd');
+            await settle();
+            const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+            expect(limitOf(limits, create.signal)?.ms).toBe(60_000);
+            limitOf(limits, create.signal)!.controller.abort();
+            const error = await reading.catch((caught: unknown) => caught);
+            expect(error).toBeInstanceOf(EngineError);
+            expect(error).toMatchObject({ status: 0, message: expect.stringContaining('did not answer the create of a container for the read of /etc/passwd') });
+            const name = create.path.split('name=')[1];
+            expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+          } finally {
+            restore();
+          }
+          // A create whose answer has no ID: removed by its name.
+          const invalid = fake((request) => (request.path.startsWith('/containers/create') ? ok({ Id: '' }, 201) : ok('', 204)));
+          await expect(invalid.engine.imageFile('img:1', '/etc/passwd')).rejects.toThrow('invalid value');
+          const name = invalid.requests[0].path.split('name=')[1];
+          expect(invalid.requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+        });
+      });
+
+      // The read of a file of a container in any of its states, without anything that runs in it.
+      describe('containerFile', () => {
+        const SCRIPT = Buffer.from('console.log("monitor ü")\n', 'utf8');
+        /** The archive answer as engineApi gives it with `latin1`: one character per byte. */
+        const archive = (bytes: Buffer, status = 200, truncated = false): EngineAnswer => ({ status, body: bytes.toString('latin1'), truncated });
+
+        it('reads the file of the container through the archive endpoint as Latin-1 and gives its bytes; nothing else is asked', async () => {
+          const { engine, requests } = fake(() => archive(tarOf('monitor.js', SCRIPT)));
+          const signal = new AbortController().signal;
+          expect(await engine.containerFile('devspaces-monitor', '/opt/devspace/monitor.js', 1024, signal)).toEqual(SCRIPT);
+          expect(requests).toHaveLength(1);
+          expect(requests[0]).toMatchObject({ method: 'GET', path: '/containers/devspaces-monitor/archive?path=%2Fopt%2Fdevspace%2Fmonitor.js', latin1: true, signal });
+          // The answer is bounded to the archive of a file of the bound, not to the default bound of an answer.
+          expect(requests[0].maxCharacters).toBe(maxTarFileArchiveBytes(1024));
+          const large = fake(() => archive(tarOf('monitor.js', SCRIPT)));
+          await large.engine.containerFile('devspaces-monitor', '/opt/devspace/monitor.js', 8 * 1024 * 1024);
+          expect(large.requests[0].maxCharacters).toBeGreaterThan(8 * 1024 * 1024);
+        });
+
+        it('missing: only a 404 with the message of a missing container or file', async () => {
+          for (const message of ['No such container: devspaces-monitor', 'no container with name or ID "devspaces-monitor" found: no such container', 'Could not find the file /opt/devspace/monitor.js in container devspaces-monitor', 'lstat /var/lib/docker/overlay2/x/merged/opt/devspace/monitor.js: no such file or directory', 'stat /opt/devspace/monitor.js: no such file or directory', 'Could not find the file /opt/devspace/monitor.js in container devspaces-monitor.\n', 'No such container: devspaces-monitor\n']) {
+            const { engine } = fake(() => ok({ message }, 404));
+            expect(await engine.containerFile('devspaces-monitor', '/opt/devspace/monitor.js', 1024), message).toBe('missing');
+          }
+          // A 404 of something on the way (an old API version, a proxy), or one that only quotes an inner error, is no
+          // evidence.
+          for (const message of ['page not found', 'error mounting "/var/lib/docker/volumes/x/_data" to rootfs at "/data": no such file or directory', 'no such container in the cache: retry']) {
+            const elsewhere = fake(() => ok({ message }, 404));
+            await expect(elsewhere.engine.containerFile('devspaces-monitor', '/opt/devspace/monitor.js', 1024), message).rejects.toMatchObject({ status: 404, message });
+          }
+        });
+
+        it('undefined for a link, a folder, a file over the bound, a truncated answer, and a malformed archive', async () => {
+          const cases: EngineAnswer[] = [
+            archive(tarOf('monitor.js', Buffer.from('/elsewhere.js'), '2')),
+            archive(tarOf('monitor.js/', Buffer.alloc(0), '5')),
+            archive(tarOf('monitor.js', Buffer.alloc(1025, 0x61))),
+            archive(tarOf('monitor.js', SCRIPT), 200, true),
+            archive(tarOf('monitor.js', SCRIPT).subarray(0, 520)),
+            archive(Buffer.from('not a tar archive')),
+            archive(tarOf('other.js', SCRIPT)),
+          ];
+          for (const [index, answer] of cases.entries()) {
+            const { engine } = fake(() => answer);
+            expect(await engine.containerFile('devspaces-monitor', '/opt/devspace/monitor.js', 1024), `case ${index}`).toBeUndefined();
+          }
+          // A file of exactly the bound is read.
+          const bound = Buffer.alloc(1024, 0x61);
+          expect(await fake(() => archive(tarOf('monitor.js', bound))).engine.containerFile('devspaces-monitor', '/opt/devspace/monitor.js', 1024)).toEqual(bound);
+        });
+
+        it('fails for other answers and for a transport error; a path that is no absolute path of a file is refused before any request', async () => {
+          await expect(fake(() => ok({ message: 'the engine is busy' }, 500)).engine.containerFile('m', '/opt/devspace/monitor.js', 1024)).rejects.toMatchObject({ status: 500 });
+          const broken = fake(() => {
+            throw new Error('socket hang up');
+          });
+          await expect(broken.engine.containerFile('m', '/opt/devspace/monitor.js', 1024)).rejects.toThrow('socket hang up');
+          const none = fake(() => undefined);
+          await expect(none.engine.containerFile('m', 'opt/devspace/monitor.js', 1024)).rejects.toThrow('no absolute path');
+          await expect(none.engine.containerFile('m', '/opt/devspace/', 1024)).rejects.toThrow('no absolute path');
+          expect(none.requests).toEqual([]);
+        });
+      });
+
+      it('a pull prints a line that is no JSON, fails with the first error, and needs the secret of its login', async () => {
+        const { engine } = fake((request) => {
+          request.onChunk?.('plain text\n{"error":"first"}\n{"error":"second"}\n');
+          return ok('');
+        });
+        const lines: string[] = [];
+        await expect(engine.pull('a:1', { onLine: (line) => lines.push(line) })).rejects.toThrow('first');
+        expect(lines).toEqual(['plain text']);
+        await expect(engine.pull('a:1', { login: { serveraddress: 'r', username: 'u', secretName: 'missing' } })).rejects.toThrow('holds no secret missing');
+      });
+    });
+
+    it('names the container of the commit, and removes it with a time limit of its own', async () => {
+      const requests: { method: string; path: string; signal?: AbortSignal }[] = [];
+      let createdId: unknown = 'tmp';
+      const fakeApi: EngineApi = async (request) => {
+        requests.push({ method: request.method, path: request.path, signal: request.signal });
+        if (request.path.startsWith('/images/')) return { status: 200, body: JSON.stringify({ Id: 'sha256:old', Config: {} }), truncated: false };
+        if (request.path.startsWith('/containers/create')) return { status: 201, body: JSON.stringify({ Id: createdId }), truncated: false };
+        if (request.path.startsWith('/commit')) return { status: 201, body: JSON.stringify({ Id: 'sha256:new' }), truncated: false };
+        return { status: 204, body: '', truncated: false };
+      };
+      const engine = dockerEngine(fakeApi, engineHijack(path.join(os.tmpdir(), 'devspaces-no-socket')));
+      expect(await engine.labelImage('img:1', { a: 'b' })).toBe('sha256:new');
+      const create = requests.find((request) => request.path.startsWith('/containers/create'))!;
+      expect(create.path).toMatch(/^\/containers\/create\?name=devspaces-label-[0-9a-f]{12}$/);
+      // The create has a time limit, never the cancel signal of the operation.
+      expect(create.signal).toBeDefined();
+      const removal = requests.at(-1)!;
+      expect(removal).toMatchObject({ method: 'DELETE', path: '/containers/tmp?force=true&v=true' });
+      expect(removal.signal?.aborted).toBe(false);
+      // The cancel signal of the operation never reaches the create.
+      const controller = new AbortController();
+      requests.length = 0;
+      await engine.labelImage('img:1', {}, controller.signal);
+      const limited = requests.find((request) => request.path.startsWith('/containers/create'))!;
+      expect(limited.signal).toBeDefined();
+      expect(limited.signal).not.toBe(controller.signal);
+      // A create whose answer fails: the container is removed by its name, and the failure stays as it is.
+      const broken = dockerEngine(async (request) => {
+        requests.push({ method: request.method, path: request.path, signal: request.signal });
+        if (request.path.startsWith('/containers/create')) throw new Error('socket hang up');
+        return fakeApi(request);
+      }, engineHijack(path.join(os.tmpdir(), 'devspaces-no-socket')));
+      requests.length = 0;
+      await expect(broken.labelImage('img:1', {})).rejects.toThrow('socket hang up');
+      const brokenName = requests.find((request) => request.path.startsWith('/containers/create'))!.path.split('name=')[1];
+      expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${brokenName}?force=true&v=true` });
+      // An answer without an ID: the container is removed by its name.
+      createdId = '';
+      requests.length = 0;
+      await expect(engine.labelImage('img:1', {})).rejects.toThrow('invalid value');
+      const name = requests.find((request) => request.path.startsWith('/containers/create'))!.path.split('name=')[1];
+      expect(requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/containers/${name}?force=true&v=true` });
+    });
+
+    it('imageFile over the socket: the bytes of the archive keep their offsets (latin1), and the file is UTF-8', async () => {
+      const content = Buffer.from('root:x:0:0:root:/root:/bin/sh\nmüller:x:1000:1000:Jürgen Müller ✓:/home/müller:/bin/sh\n', 'utf8');
+      const { engine, calls } = await serve((call) => {
+        if (call.url.startsWith('/containers/create')) return { status: 201, json: { Id: 'read3' } };
+        if (call.url.includes('/archive')) return { status: 200, raw: tarOf('passwd', content) };
+        return { status: 204 };
+      });
+      expect(await engine.imageFile('img:1', '/etc/passwd')).toBe(content.toString('utf8'));
+      expect(calls.map((call) => `${call.method} ${call.url.split('?')[0]}`)).toEqual(['POST /containers/create', 'GET /containers/read3/archive', 'DELETE /containers/read3']);
+    });
+
+    it('never pulls a reference without a tag or a digest', async () => {
+      const { engine, calls } = await serve(() => ({ status: 200, body: '' }));
+      // Also an invalid digest, and as an EngineError with status 0.
+      for (const reference of ['node', 'ghcr.io/o/i', 'registry:5000/i', 'node:', 'node@sha256:xyz', 'node@']) {
+        await expect(engine.pull(reference)).rejects.toThrow(`The pull of ${reference} needs a tag or a digest.`);
+        await expect(engine.pull(reference)).rejects.toMatchObject({ status: 0 });
+        await expect(engine.pull(reference)).rejects.toBeInstanceOf(EngineError);
+      }
+      expect(calls).toEqual([]);
+      await engine.pull('registry:5000/i:1');
+      expect(calls.map((call) => decodeURIComponent(call.url))).toEqual(['/images/create?fromImage=registry:5000/i:1']);
+    });
+  });
+});
+

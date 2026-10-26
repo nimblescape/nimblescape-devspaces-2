@@ -1,0 +1,626 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+
+vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
+
+import { dockerTargetOf, ownContextDescription, remoteContextNames } from '../core/docker/dockerHost';
+import { runWithDockerTarget } from '../core/docker/dockerTargets';
+import { ENGINE_INFO_FORMAT } from '../core/docker/remoteDocker';
+import { Messages, dockerHostReason } from '../core/messages';
+import type { RunOptions, RunResult } from '../core/ports';
+import { RemoteDockerState } from '../core/storage/remoteDockerState';
+import { RemoteDockerCommands, RemoteDockerTexts, describeEntry, type RemoteDockerDeps } from './remoteDockerCommands';
+import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
+
+const ok = (stdout = ''): RunResult => ({ exitCode: 0, stdout, stderr: '', timedOut: false });
+const fail = (stderr: string): RunResult => ({ exitCode: 1, stdout: '', stderr, timedOut: false });
+
+/**
+ * A Docker CLI with contexts: `context ls|create|update|use|inspect`, and `info` (with -H: the tested host; without:
+ * the current context). `hosts` answers per ssh host.
+ */
+class FakeCli {
+  readonly calls: Array<{ args: string[]; options?: RunOptions }> = [];
+  contexts = new Map<string, string>([
+    ['default', 'unix:///var/run/docker.sock'],
+    ['desktop-linux', 'unix:///home/me/.docker/desktop/docker.sock'],
+  ]);
+  /** The descriptions of the contexts (`--description` of `context create`); ours name the host (ownContextDescription). */
+  descriptions = new Map<string, string>();
+  current = 'desktop-linux';
+  hosts = new Map<string, RunResult>();
+
+  isInstalled = () => true;
+  processEnv = (): NodeJS.ProcessEnv => ({ PATH: '/usr/bin', SSH_AUTH_SOCK: '/tmp/agent' });
+
+  run = async (args: readonly string[], options?: RunOptions): Promise<RunResult> => {
+    this.calls.push({ args: [...args], options });
+    if (args[0] === '-H') return this.hosts.get(args[1].slice('ssh://'.length)) ?? fail('ssh: Could not resolve hostname');
+    if (args[0] !== 'context') return ok();
+    switch (args[1]) {
+      case 'ls':
+        // `docker context ls --format '{{json .}}'` (listContextInfos).
+        return ok(
+          [...this.contexts].map(([name, endpoint]) => `${JSON.stringify({ Name: name, Description: this.descriptions.get(name) ?? '', DockerEndpoint: endpoint })}\n`).join(''),
+        );
+      case 'create':
+      case 'update': {
+        this.contexts.set(args[2], args[args.length - 1].replace(/^host=/, ''));
+        const description = args.indexOf('--description');
+        if (description > 0) this.descriptions.set(args[2], args[description + 1]);
+        return ok();
+      }
+      case 'use':
+        if (!this.contexts.has(args[2])) return fail(`context "${args[2]}" does not exist`);
+        this.current = args[2];
+        return ok();
+      case 'inspect': {
+        // `context inspect [<name>] --format …`: the named context, else the current one.
+        const name = args[2] !== '--format' ? args[2] : this.current;
+        if (!this.contexts.has(name)) return fail(`context "${name}" does not exist`);
+        return ok(JSON.stringify({ Name: name, Endpoints: { docker: { Host: this.contexts.get(name) } } }));
+      }
+    }
+    return fail('unknown');
+  };
+
+  get changes(): string[][] {
+    return this.calls.filter((call) => call.args[0] === 'context' && ['create', 'update', 'use'].includes(call.args[1])).map((call) => call.args);
+  }
+}
+
+/** The ssh check before the Docker calls: `ssh … -- <host> true`. */
+const isSshCheck = (args: readonly string[]): boolean => args[args.length - 1] === 'true';
+// The context of a host is named after its alias.
+const BUILD_BOX = remoteContextNames('build-box')[0];
+const GPU = remoteContextNames('gpu')[0];
+
+const engineInfo = (rootless = false): RunResult =>
+  ok(JSON.stringify({ version: '28.1.0', securityOptions: rootless ? ['name=rootless'] : ['name=seccomp,profile=builtin'] }));
+
+let dir: string;
+let cli: FakeCli;
+let state: RemoteDockerState;
+let runner: { run: Mock<RemoteDockerDeps['runner']['run']> };
+let onDidSwitch: Mock<RemoteDockerDeps['onDidSwitch']>;
+let showLog: Mock<RemoteDockerDeps['showLog']>;
+let env: NodeJS.ProcessEnv;
+let commands: RemoteDockerCommands;
+const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+const { window } = fakeVscode;
+
+function create(): RemoteDockerCommands {
+  return new RemoteDockerCommands({
+    docker: cli,
+    runner,
+    targets: {
+      resolve: async () => {
+        const result = await cli.run(['context', 'inspect', '--format', '{{json .}}']);
+        const parsed = JSON.parse(result.stdout) as { Name: string; Endpoints: { docker: { Host: string } } };
+        return dockerTargetOf(parsed.Endpoints.docker.Host, parsed.Name);
+      },
+    },
+    state,
+    logger,
+    showLog,
+    sshHosts: () => [
+      { alias: 'build-box', hostName: 'build-box.example.com', user: 'me' },
+      { alias: 'gpu', port: '2222' },
+    ],
+    sshPath: () => '/usr/bin/ssh',
+    env,
+    platform: 'linux',
+    onDidSwitch,
+  });
+}
+
+beforeEach(() => {
+  resetFakeVscode();
+  vi.clearAllMocks();
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-remote-ui-'));
+  cli = new FakeCli();
+  state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
+  runner = { run: vi.fn(async () => ok('/run/user/1000')) };
+  onDidSwitch = vi.fn(async () => {});
+  showLog = vi.fn();
+  env = { PATH: '/usr/bin' };
+  window.withProgress.mockImplementation(async (_options: unknown, task: (...args: unknown[]) => Promise<unknown>) =>
+    task({ report: () => {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }),
+  );
+  commands = create();
+});
+
+afterEach(() => {
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** The user picks `label` in the quick pick, and answers the modal with `answer`. */
+function answer(label: string, confirm: 'yes' | 'no' = 'yes'): void {
+  window.showQuickPick.mockImplementation(async (items: Array<{ label: string }>) => items.find((item) => item.label === label));
+  window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => (confirm === 'yes' ? button : undefined));
+}
+
+describe('Use a Remote Docker Host…', () => {
+  it('lists the hosts of the SSH config with HostName and User, and "Enter an SSH address…" last', async () => {
+    await commands.useRemoteHost();
+    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string; kind?: number }>, { title: string }];
+    expect(items.map((item) => [item.label, item.description])).toEqual([
+      ['build-box', 'me@build-box.example.com'],
+      ['gpu', 'gpu:2222'],
+      ['', undefined],
+      [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
+    ]);
+    expect(items[2].kind).toBe(fakeVscode.QuickPickItemKind.Separator);
+    expect(options.title).toBe('Use a Remote Docker Host');
+    // Cancelled: nothing ran.
+    expect(cli.calls).toEqual([]);
+  });
+
+  it('tests the host, asks in a modal, remembers the context, then creates and uses the context of the host', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    // The test: docker -H ssh://build-box info, without questions.
+    const test = cli.calls.find((call) => call.args[0] === '-H');
+    expect(test?.args).toEqual(['-H', 'ssh://build-box', 'info', '--format', ENGINE_INFO_FORMAT]);
+    expect(test?.options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+    // The modal. The second button ("Don't Ask Again"); its answer counts for every host, and it says so.
+    expect(window.showWarningMessage).toHaveBeenCalledWith(
+      'All Docker tools on this computer will use build-box until you switch back.',
+      expect.objectContaining({ modal: true }),
+      'Use build-box',
+      "Use build-box, Don't Ask Again for Any Host",
+    );
+    // The context of this host.
+    expect(cli.changes).toEqual([
+      ['context', 'create', BUILD_BOX, '--description', 'Devspaces: remote Docker host build-box', '--docker', 'host=ssh://build-box'],
+      ['context', 'use', BUILD_BOX],
+    ]);
+    expect(await state.previousContext()).toBe('desktop-linux');
+    expect(window.showInformationMessage).toHaveBeenCalledWith('Docker now uses build-box.');
+    expect(onDidSwitch).toHaveBeenCalledTimes(1);
+    // Our own ssh only for the check before the test.
+    expect(runner.run.mock.calls.map((call) => (call as [string, string[]])[1])).toEqual([
+      ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '--', 'build-box', 'true'],
+    ]);
+    const check = cli.calls.findIndex((call) => call.args[0] === '-H');
+    expect(check).toBeGreaterThanOrEqual(0);
+  });
+
+  it('changes nothing when the modal is cancelled', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box', 'no');
+    await commands.useRemoteHost();
+    expect(cli.changes).toEqual([]);
+    expect(await state.previousContext()).toBeUndefined();
+    expect(onDidSwitch).not.toHaveBeenCalled();
+  });
+
+  it('shows the plain reason and changes nothing when the host cannot be used', async () => {
+    cli.hosts.set('build-box', fail('Host key verification failed.'));
+    answer('build-box');
+    window.showErrorMessage.mockResolvedValue('Show details');
+    await commands.useRemoteHost();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(
+      Messages.dockerHostUnreachable('build-box', dockerHostReason('hostKey', 'build-box')),
+      'Show details',
+    );
+    expect(window.showWarningMessage).not.toHaveBeenCalled();
+    expect(cli.changes).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(showLog).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes a typed SSH address after validation, and never changes an existing context', async () => {
+    // The context named after the host (remoteContextNames).
+    cli.contexts.set(remoteContextNames('old-box')[0], 'ssh://old');
+    cli.hosts.set('me@192.0.2.10:2222', engineInfo());
+    answer(RemoteDockerTexts.enterAddress);
+    window.showInputBox.mockImplementation(async (options: { validateInput: (value: string) => string | undefined }) => {
+      expect(options.validateInput('-oProxyCommand=x')).toBe(RemoteDockerTexts.addressProblem('option'));
+      expect(options.validateInput('me@2001:db8::1')).toBe(RemoteDockerTexts.addressProblem('ipv6'));
+      expect(options.validateInput('me@192.0.2.10:2222')).toBeUndefined();
+      return ' me@192.0.2.10:2222 ';
+    });
+    await commands.useRemoteHost();
+    // The context of this host is created; the context of another host stays as it is. The context named after the host
+    // (remoteContextNames).
+    const name = remoteContextNames('me@192.0.2.10:2222')[0];
+    expect(cli.changes[0]).toEqual([
+      'context',
+      'create',
+      name,
+      '--description',
+      'Devspaces: remote Docker host me@192.0.2.10:2222',
+      '--docker',
+      'host=ssh://me@192.0.2.10:2222',
+    ]);
+    // The context named after the host (remoteContextNames).
+    expect(cli.contexts.get(remoteContextNames('old-box')[0])).toBe('ssh://old');
+    expect(cli.current).toBe(name);
+  });
+
+  it('keeps the first remembered context when it switches from one remote host to another', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    answer('gpu');
+    await commands.useRemoteHost();
+    // Each host has its context.
+    expect(cli.contexts.get(BUILD_BOX)).toBe('ssh://build-box');
+    expect(cli.contexts.get(GPU)).toBe('ssh://gpu');
+    expect(cli.current).toBe(GPU);
+    expect(await state.previousContext()).toBe('desktop-linux');
+  });
+
+  it('a switch from host A to host B leaves an operation that runs on A on A', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    // An operation of another window started on build-box: its Docker calls name the context it read (BootstrapDocker).
+    const pinned = dockerTargetOf(cli.contexts.get(cli.current) ?? '', cli.current);
+    await runWithDockerTarget(pinned, async () => {
+      answer('gpu');
+      await commands.useRemoteHost();
+    });
+    expect(cli.current).toBe(GPU);
+    expect(pinned.context).toBe(BUILD_BOX);
+    // The context that the operation names still points to build-box: its next Docker calls stay there.
+    expect(cli.contexts.get(pinned.context as string)).toBe('ssh://build-box');
+    expect(cli.changes.filter((change) => change[2] === BUILD_BOX)).toEqual([
+      ['context', 'create', BUILD_BOX, '--description', 'Devspaces: remote Docker host build-box', '--docker', 'host=ssh://build-box'],
+      ['context', 'use', BUILD_BOX],
+    ]);
+  });
+
+  it('a second switch to the same host uses its context again without changing it', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    answer('gpu');
+    await commands.useRemoteHost();
+    answer('build-box');
+    await commands.useRemoteHost();
+    expect(cli.current).toBe(BUILD_BOX);
+    expect(cli.changes.filter((change) => change[1] !== 'use').map((change) => change[2])).toEqual([BUILD_BOX, GPU]);
+  });
+
+  // The context is named after the alias; the pair of the host only on a clash.
+  it('names the context after the alias, and takes the name with the pair when a context of the user has the name', async () => {
+    expect(BUILD_BOX).toBe('build-box');
+    cli.contexts.set('build-box', 'ssh://me@elsewhere');
+    cli.descriptions.set('build-box', 'my own box');
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    const pair = remoteContextNames('build-box')[1];
+    expect(cli.changes).toEqual([
+      ['context', 'create', pair, '--description', ownContextDescription('build-box'), '--docker', 'host=ssh://build-box'],
+      ['context', 'use', pair],
+    ]);
+    expect(cli.contexts.get('build-box')).toBe('ssh://me@elsewhere');
+  });
+
+  it('uses a context of the user that points to the host as it is; a switch away from it keeps the remembered local context', async () => {
+    cli.contexts.set('build-box', 'ssh://build-box');
+    cli.descriptions.set('build-box', 'my own box');
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    expect(cli.changes).toEqual([['context', 'use', 'build-box']]);
+    expect(await state.previousContext()).toBe('desktop-linux');
+    // Only a context of the local Docker is remembered to go back to; build-box points to a remote host, so the switch
+    // away from it keeps desktop-linux.
+    answer('gpu');
+    await commands.useRemoteHost();
+    expect(await state.previousContext()).toBe('desktop-linux');
+    expect(cli.current).toBe('gpu');
+  });
+
+  it('refuses when both names of the host point elsewhere, and changes nothing', async () => {
+    const [name, pair] = remoteContextNames('build-box');
+    cli.contexts.set(name, 'ssh://one');
+    cli.contexts.set(pair, 'ssh://two');
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost().catch(() => undefined);
+    expect(cli.changes).toEqual([]);
+    expect(cli.current).toBe('desktop-linux');
+  });
+
+  it('checks the SSH login first (BatchMode) and does not ask Docker when it fails', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    runner.run.mockImplementation(async (_file: string, args: readonly string[]) =>
+      isSshCheck(args) ? { exitCode: 255, stdout: '', stderr: 'Host key verification failed.', timedOut: false } : ok('/run/user/1000'),
+    );
+    await commands.useRemoteHost();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(
+      Messages.dockerHostUnreachable('build-box', dockerHostReason('hostKey', 'build-box')),
+      'Show details',
+    );
+    expect(cli.calls.filter((call) => call.args[0] === '-H')).toEqual([]);
+    expect(cli.changes).toEqual([]);
+  });
+
+  it('records the socket of a rootless engine (read once with ssh, BatchMode) before the switch', async () => {
+    cli.hosts.set('build-box', engineInfo(true));
+    answer('build-box');
+    await commands.useRemoteHost();
+    // The ssh check runs first.
+    expect(runner.run).toHaveBeenCalledTimes(2);
+    expect(isSshCheck((runner.run.mock.calls[0] as [string, string[]])[1])).toBe(true);
+    const [file, args] = runner.run.mock.calls[1] as [string, string[]];
+    expect(file).toBe('/usr/bin/ssh');
+    expect(args).toContain('BatchMode=yes');
+    expect(args.slice(-3)).toEqual(['--', 'build-box', 'printf %s "$XDG_RUNTIME_DIR"']);
+    expect(await state.rootlessSocket('build-box')).toBe('/run/user/1000/docker.sock');
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.nowRemote('build-box', true));
+  });
+
+  // Without a Docker CLI on this computer, the missing CLI is the reason, not the host.
+  it('names the missing Docker CLI of this computer before it asks for a host', async () => {
+    cli.isInstalled = () => false;
+    await commands.useRemoteHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.cliMissing);
+    expect(cli.calls).toEqual([]);
+  });
+
+  it('refuses while DOCKER_HOST is set for VS Code (the context would have no effect)', async () => {
+    env.DOCKER_HOST = 'unix:///var/run/docker.sock';
+    commands = create();
+    await commands.useRemoteHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(RemoteDockerTexts.variableSet('DOCKER_HOST'), 'Show details');
+    expect(cli.calls).toEqual([]);
+  });
+});
+
+// The choice of the Docker host (from the first row of the list).
+describe('Choose the Docker Host… (the choice of the first row)', () => {
+  // The hosts right away, the local Docker last.
+  it('lists the hosts of the SSH config with the current one marked, "Enter an SSH address…", and the local Docker', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await commands.chooseDockerHost();
+    const [items, options] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>, { title: string }];
+    expect(items.map((item) => [item.label, item.description])).toEqual([
+      ['$(check) build-box', 'me@build-box.example.com · current'],
+      ['gpu', 'gpu:2222'],
+      ['', undefined],
+      [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
+      ['', undefined],
+      // The switched-off monitor of the local Docker (header row).
+      [`$(devspaces-monitor-off) ${RemoteDockerTexts.useLocal}`, undefined],
+    ]);
+    expect(options.title).toBe('Docker host: build-box');
+  });
+
+  // A host entered as an SSH address is no alias of the SSH config; it is the first entry then, marked, and choosing it
+  // says that it is the current host already.
+  it('marks a current host that was entered as an SSH address', async () => {
+    // The context named after the host (remoteContextNames).
+    const typed = remoteContextNames('me@box:2222')[0];
+    cli.contexts.set(typed, 'ssh://me@box:2222');
+    cli.current = typed;
+    await commands.chooseDockerHost();
+    const [items] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>];
+    expect(items[0]).toMatchObject({ label: '$(check) me@box:2222', description: RemoteDockerTexts.current });
+    expect(items.filter((item) => item.label.startsWith('$(check)'))).toHaveLength(1);
+    answer('$(check) me@box:2222');
+    await commands.chooseDockerHost();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('me@box:2222'));
+    expect(cli.current).toBe(typed);
+  });
+
+  // The same choice for the local Docker, the local Docker marked.
+  it('marks the local Docker as current when Docker is local', async () => {
+    await commands.chooseDockerHost();
+    const [items] = window.showQuickPick.mock.calls[0] as [Array<{ label: string; description?: string }>];
+    expect(items.at(-1)).toMatchObject({ label: `$(check) ${RemoteDockerTexts.useLocal}`, description: RemoteDockerTexts.current });
+    expect(items.some((item) => item.label.startsWith('$(check)') && item.label !== `$(check) ${RemoteDockerTexts.useLocal}`)).toBe(false);
+  });
+
+  it('switches to the picked host, says so for the current one, and goes local on "Use the Local Docker"', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    cli.hosts.set('gpu', engineInfo());
+    const useLocal = vi.spyOn(commands, 'useLocalDocker').mockResolvedValue();
+    answer('gpu');
+    await commands.chooseDockerHost();
+    expect(cli.current).toBe(GPU);
+    cli.current = BUILD_BOX;
+    answer('$(check) build-box');
+    await commands.chooseDockerHost();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(cli.current).toBe(BUILD_BOX);
+    // The switched-off monitor of the local Docker (header row).
+    answer(`$(devspaces-monitor-off) ${RemoteDockerTexts.useLocal}`);
+    await commands.chooseDockerHost();
+    expect(useLocal).toHaveBeenCalledTimes(1);
+  });
+
+  // DOCKER_HOST or DOCKER_CONTEXT set for VS Code.
+  it('explains DOCKER_HOST first instead of offering choices that are refused', async () => {
+    env.DOCKER_HOST = 'ssh://build-box';
+    commands = create();
+    await commands.chooseDockerHost();
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.variableSet('DOCKER_HOST'));
+  });
+
+  it('changes nothing when the choice is cancelled', async () => {
+    const useRemote = vi.spyOn(commands, 'useRemoteHost');
+    const useLocal = vi.spyOn(commands, 'useLocalDocker');
+    await commands.chooseDockerHost();
+    expect(useRemote).not.toHaveBeenCalled();
+    expect(useLocal).not.toHaveBeenCalled();
+    expect(cli.changes).toEqual([]);
+  });
+});
+
+// "Don't Ask Again" for every Docker host question, and a command to be asked again.
+describe("Don't Ask Again for the Docker host questions", () => {
+  it('remembers "Don\'t Ask Again" for the switch to a remote host and switches without the modal next time', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    cli.hosts.set('gpu', engineInfo());
+    answer('build-box');
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, _button: string, always: string) => always);
+    await commands.useRemoteHost();
+    expect(cli.current).toBe(BUILD_BOX);
+    expect(await state.dontAsk('switchToRemote')).toBe(true);
+    answer('gpu');
+    window.showWarningMessage.mockClear();
+    window.showWarningMessage.mockResolvedValue(undefined);
+    await commands.useRemoteHost();
+    expect(window.showWarningMessage).not.toHaveBeenCalled();
+    expect(cli.current).toBe(GPU);
+  });
+
+  it('asks the questions of a restored window each on its own, and skips each one that was answered so', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    await state.setDontAsk('switchBack');
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
+    const current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
+    await expect(commands.offerSwitchBack('build-box', current)).resolves.toBe(true);
+    // "Use build-box again?" was skipped; the switch itself was still asked.
+    expect(window.showWarningMessage.mock.calls.map((call) => call[0])).toEqual([RemoteDockerTexts.confirm('build-box')]);
+    await state.setDontAsk('switchToLocal');
+    window.showWarningMessage.mockClear();
+    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://build-box', BUILD_BOX))).resolves.toBe(true);
+    // Both questions of this flow were answered so: no modal at all.
+    expect(window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it('labels the local question without "for Any Host"', async () => {
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await state.setDontAsk('switchBack');
+    await commands.offerSwitchBack('', dockerTargetOf('ssh://build-box', BUILD_BOX));
+    const call = window.showWarningMessage.mock.calls.find((entry) => entry[0] === RemoteDockerTexts.confirmLocal);
+    expect(call?.slice(2)).toEqual([RemoteDockerTexts.useLocal, "Use the Local Docker, Don't Ask Again"]);
+  });
+
+  it('asks again after "Ask Again Before Changing the Docker Host"', async () => {
+    await commands.askAgain();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.askAgainNothing);
+    await state.setDontAsk('switchToRemote');
+    await state.setDontAsk('switchBack');
+    await commands.askAgain();
+    expect(window.showInformationMessage.mock.calls.at(-1)?.[0]).toBe(RemoteDockerTexts.askAgainDone);
+    expect(await state.dontAsk('switchToRemote')).toBe(false);
+    expect(await state.dontAsk('switchBack')).toBe(false);
+  });
+});
+
+describe('Use the Local Docker', () => {
+  it('goes back to the remembered context and forgets it', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    answer('build-box');
+    await commands.useRemoteHost();
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('desktop-linux');
+    expect(await state.previousContext()).toBeUndefined();
+    expect(window.showInformationMessage).toHaveBeenLastCalledWith('Docker now uses the local Docker (context desktop-linux).');
+    expect(onDidSwitch).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the context default when the remembered context points to another computer, and says so', async () => {
+    cli.contexts.set('mybox', 'ssh://me@mybox');
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await state.setPreviousContext('mybox');
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('default');
+    expect(window.showInformationMessage).toHaveBeenLastCalledWith('Docker now uses the local Docker (context default).');
+  });
+
+  it('never says "local" when the context of the switch back does not point to the local Docker', async () => {
+    // A `default` context that is not local (for example Docker Desktop's CLI settings pointing elsewhere).
+    cli.contexts.set('default', 'tcp://10.0.0.5:2375');
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('default');
+    expect(window.showInformationMessage).not.toHaveBeenCalled();
+    expect(window.showWarningMessage).toHaveBeenCalledWith(RemoteDockerTexts.notLocal('default', 'tcp://10.0.0.5:2375'), 'Show details');
+  });
+
+  // A context of ours is known by its description, whatever its name; never the way back.
+  it('uses the context default when the remembered context is one of ours', async () => {
+    cli.contexts.set('box', 'unix:///var/run/docker.sock');
+    cli.descriptions.set('box', ownContextDescription('box'));
+    cli.contexts.set(BUILD_BOX, 'ssh://build-box');
+    cli.current = BUILD_BOX;
+    await state.setPreviousContext('box');
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('default');
+  });
+
+  it('uses the context default when none is remembered (or it is gone)', async () => {
+    // The context named after the host (remoteContextNames).
+    cli.contexts.set(remoteContextNames('box')[0], 'ssh://box');
+    cli.current = remoteContextNames('box')[0];
+    await state.setPreviousContext('removed-context');
+    await commands.useLocalDocker();
+    expect(cli.current).toBe('default');
+  });
+
+  it('says so when Docker is local already', async () => {
+    await commands.useLocalDocker();
+    expect(cli.changes).toEqual([]);
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.alreadyLocal);
+  });
+});
+
+describe('the mismatch of a restored window (offerSwitchBack)', () => {
+  it('asks "Use <host> again?", then switches as the command does (test and modal)', async () => {
+    cli.hosts.set('build-box', engineInfo());
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
+    const current = dockerTargetOf('unix:///home/me/.docker/desktop/docker.sock', 'desktop-linux');
+    await expect(commands.offerSwitchBack('build-box', current)).resolves.toBe(true);
+    expect(window.showWarningMessage.mock.calls[0][0]).toBe(
+      'This devspace is on build-box, but Docker is set to the local Docker. Use build-box again?',
+    );
+    expect(window.showWarningMessage.mock.calls[1][0]).toBe(RemoteDockerTexts.confirm('build-box'));
+    // The context of build-box.
+    expect(cli.current).toBe(BUILD_BOX);
+  });
+
+  it('switches back to the local Docker for a local devspace', async () => {
+    // The context named after the host (remoteContextNames).
+    cli.contexts.set(remoteContextNames('box')[0], 'ssh://box');
+    cli.current = remoteContextNames('box')[0];
+    await state.setPreviousContext('desktop-linux');
+    window.showWarningMessage.mockImplementation(async (_message: string, _options: unknown, button: string) => button);
+    await expect(commands.offerSwitchBack('', dockerTargetOf('ssh://box', remoteContextNames('box')[0]))).resolves.toBe(true);
+    expect(window.showWarningMessage.mock.calls[0][0]).toBe(
+      'This devspace is on the local Docker, but Docker is set to box. Use the local Docker again?',
+    );
+    expect(cli.current).toBe('desktop-linux');
+  });
+
+  it('changes nothing when the user declines', async () => {
+    await expect(commands.offerSwitchBack('build-box', dockerTargetOf('', 'default'))).resolves.toBe(false);
+    expect(cli.calls).toEqual([]);
+  });
+});
+
+describe('describeEntry', () => {
+  it('shows User, HostName and Port where set', () => {
+    expect(describeEntry({ alias: 'a' })).toBeUndefined();
+    expect(describeEntry({ alias: 'a', user: 'me' })).toBe('me@a');
+    expect(describeEntry({ alias: 'a', hostName: 'h', port: '22' })).toBe('h:22');
+  });
+});

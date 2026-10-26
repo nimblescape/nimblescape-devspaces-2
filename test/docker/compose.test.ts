@@ -1,0 +1,526 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// The open pipeline for a Docker Compose configuration against the real Docker engine: an app service built from a
+// one-line Dockerfile and a db service from an image, both from the test base image with `sleep infinity` under an
+// init process (`init: true`: `sleep` as process 1 ignores SIGTERM, so each stop would wait 10 s). Open: both
+// containers with the labels of the devspace, the dev container with the name of the devspace and the workspace
+// volume, the published port of db on 127.0.0.1 only, the repository files that db mounts (a folder and a single file)
+// from the workspace volume (volume.subpath), the volumes of the project and of `mounts` with our labels; the refusal
+// of a privileged service before any build; Stop of both; open again without a build. The host name of the dev
+// container; Delete (all containers, the network, and the images of the project; the data volumes of the services only
+// when the user ticks them); the label nimblescape.devspaces.host-access=unrestricted on every container, and ports as
+// the model writes them, while the host access checks are off for the repository. The operations are the flows of the
+// worker, as the window sends them (workerWindow.ts); Delete asks its questions through the requests of its check
+// (deleteCheckInWorker), as the window does. The opens make sure of the real Monitor.
+import * as fs from 'fs';
+import * as path from 'path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+// The Docker CLI of the extension (BootstrapDocker).
+import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
+import { toContainerInfo } from '../../src/core/docker/dockerObjects';
+import { devspaceDevcontainerId } from '../../src/core/helper/cliVariables';
+import { supportsVolumeSubpath } from '../../src/core/helper/composeModel';
+import { Messages } from '../../src/core/messages';
+import {
+  CONTAINER_VERSION,
+  GITHUB_TOKEN_FILE,
+  TOKEN_FOLDER,
+  TOKEN_TMPFS,
+  HOST_ACCESS_CHECKED,
+  HOST_ACCESS_UNRESTRICTED,
+  LABEL_COMPOSE_SERVICE,
+  LABEL_DEVSPACE_ID,
+  LABEL_HOST_ACCESS,
+  LABEL_REPOSITORY,
+  LABEL_VOLUME,
+  VOLUME_KIND_COMPOSE,
+  composeProjectName,
+  devspaceImageRepository,
+  newDevspaceId,
+  resourceName,
+} from '../../src/core/names';
+import { isoTime, systemClock } from '../../src/core/ports';
+import { NodeProcessRunner } from '../../src/core/process';
+import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
+import {
+  DUMMY_TOKEN,
+  FakeUi,
+  RecordingProgress,
+  TEST_ACCOUNT,
+  createVolume,
+  dockerTestContext,
+  expectLabelledDevspaceImage,
+  runInVolume,
+  testHelperImage } from './harness';
+import { monitorOfUser, removeTestMonitor, seedTestMonitorRun, workerWindow } from './workerWindow';
+
+const CONFIG_PATH = '.devcontainer/devcontainer.json';
+const INIT_SQL = 'select 1;';
+const SEED_TEXT = 'seed data';
+/** Lifecycle token: the file in the dev container where postCreateCommand notes its run. */
+const POST_CREATE_LOG = '/tmp/devspace-post-create';
+
+/** Writes the files of `$2` (JSON: relative path → text) into the repository folder `$1` and commits them, as root. */
+const SEED_SCRIPT = `set -eu
+mkdir -p "$1"
+cd "$1"
+node -e '
+const fs = require("fs");
+const path = require("path");
+for (const [file, text] of Object.entries(JSON.parse(process.argv[1]))) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text);
+}
+' "$2"
+git init -q -b main
+git add -A
+git -c user.name=Test -c user.email=test@example.invalid commit -q -m 'Initial commit'
+`;
+
+/** The questions of Delete, with the data volumes of the services that it offers (recorded). */
+class DeleteUi extends FakeUi {
+  /** The data volumes of the services that the last check of Delete offered (both lists of the question). */
+  offered: string[] = [];
+  /** Which of them the user ticks (default: none). */
+  tick: (offered: readonly string[]) => string[] = () => [];
+  override async deleteServiceData(volumes: readonly string[], possibly: readonly string[]): Promise<string[] | undefined> {
+    this.offered = [...volumes, ...possibly];
+    return this.tick(this.offered);
+  }
+}
+
+describe('open pipeline for a Docker Compose configuration', () => {
+  const { run, env, cli, log } = dockerTestContext('compose');
+  const runner = new NodeProcessRunner();
+  const docker = new BootstrapDocker(runner, run.dockerPath, env, log);
+  const ui = new DeleteUi();
+  // The window of the shared harness; its operations run in the worker.
+  const window = workerWindow({ run, env, cli, log }, docker, { name: 'compose', windowId: 'docker-test-compose', ui, settings: { updateImagesOnConnect: true } });
+  const { registry, service, settings } = window;
+  // The opens make sure of the real Monitor; a monitor of the user is never touched.
+  const skipped = monitorOfUser({ run });
+
+  /**
+   * Delete as the window runs it: the check in the worker (its questions: Delete, the data volumes of the services, of
+   * which `tick` picks those to remove), then the Delete with the volumes that the user picked. Answers the volumes
+   * that the check offered.
+   */
+  async function deleteDevspace(target: { id: string; repository: string }, tick: (offered: readonly string[]) => string[]): Promise<string[]> {
+    ui.tick = tick;
+    ui.offered = [];
+    try {
+      const decision = await service.deleteCheckInWorker(target.id, { progress: new RecordingProgress(), repository: target.repository, otherWindow: false });
+      expect(decision.decision).toBe('delete');
+      if (decision.decision === 'delete') await service.deleteInWorker(target.id, { progress: new RecordingProgress(), additionalVolumesToRemove: decision.additionalVolumesToRemove });
+    } finally {
+      ui.tick = () => [];
+    }
+    return ui.offered;
+  }
+
+  /**
+   * A seeded devspace: its workspace volume with the repository, and its registry entry.
+   * The project and the devspace image are named after the repository too (resourceName).
+   */
+  function devspace(repository: string) {
+    const id = newDevspaceId();
+    const name = resourceName(repository, id);
+    return { repository, id, name, project: composeProjectName(repository, id), folder: `/workspaces/${repository.split('/')[1]}` };
+  }
+  const app = devspace('devspaces-test/tiny-compose');
+  const refused = devspace('devspaces-test/refused-compose');
+  const unrestricted = devspace('devspaces-test/unrestricted-compose');
+  // A `mounts` entry that the Dev Container CLI would write as a bind of the Docker socket.
+  const tmpfsSource = devspace('devspaces-test/tmpfs-source-compose');
+  const TMPFS_SOURCE_MOUNT = 'type=tmpfs,src=/var/run/docker.sock,dst=/var/run/docker.sock';
+  const HISTORY_MOUNT = 'source=history-${devcontainerId},target=/history,type=volume';
+  let apiVersion: string;
+
+  /** The compose file: `db` publishes a port without an address and mounts a folder and a file of the repository. */
+  function composeFile(extra = ''): string {
+    return `services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sleep infinity
+    init: true
+    volumes:
+      - ../..:/workspaces:cached
+    labels:
+      ${TEST_RUN_LABEL}: "${run.runId}"
+  db:
+    image: ${TEST_BASE_IMAGE}
+    command: sleep infinity
+    init: true
+    # As the templates (Python & PostgreSQL); rewritten to no.
+    restart: unless-stopped
+    ports:
+      - "5432"
+    volumes:
+      - dbdata:/data
+      - ../seed:/init/seed:ro
+      - ../init.sql:/init/init.sql:ro
+    labels:
+      ${TEST_RUN_LABEL}: "${run.runId}"
+${extra}volumes:
+  dbdata:
+`;
+  }
+
+  async function seed(target: ReturnType<typeof devspace>, compose: string, mounts: readonly string[] = ['source=cache,target=/cache,type=volume']): Promise<void> {
+    const devcontainerJson = JSON.stringify({
+      name: 'Tiny Compose',
+      dockerComposeFile: ['compose.yml'],
+      service: 'app',
+      workspaceFolder: target.folder,
+      // A named volume of `mounts`: the Dev Container CLI declares it in the project; our model declares it external.
+      mounts,
+      // Lifecycle token: notes whether the token was there when the command ran.
+      postCreateCommand: `if test -s ${GITHUB_TOKEN_FILE}; then echo present; else echo missing; fi >> ${POST_CREATE_LOG}`,
+    });
+    const files = {
+      [CONFIG_PATH]: devcontainerJson,
+      '.devcontainer/compose.yml': compose,
+      '.devcontainer/Dockerfile': `FROM ${TEST_BASE_IMAGE}\nRUN apk add --no-cache git\nLABEL ${TEST_RUN_LABEL}=${run.runId}\n`,
+      'init.sql': `${INIT_SQL}\n`,
+      'seed/data.txt': `${SEED_TEXT}\n`,
+    };
+    await createVolume(docker, target.name, {
+      [LABEL_DEVSPACE_ID]: target.id,
+      [LABEL_REPOSITORY]: target.repository,
+      [TEST_RUN_LABEL]: run.runId,
+    });
+    // The seed is a plain container of the helper image (runInVolume).
+    const seeded = await runInVolume(docker, target.name, ['sh', '-c', SEED_SCRIPT, 'sh', target.folder, JSON.stringify(files)]);
+    expect(seeded.exitCode, seeded.stderr).toBe(0);
+    const now = isoTime(systemClock);
+    await registry.add({
+      id: target.id,
+      repository: target.repository,
+      configPath: CONFIG_PATH,
+      volumeName: target.name,
+      containerName: target.name,
+      createdAt: now,
+      lastUsedAt: now,
+      owner: TEST_ACCOUNT,
+    });
+  }
+
+  function containers(target: ReturnType<typeof devspace>): string[] {
+    return cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_DEVSPACE_ID}=${target.id}`]);
+  }
+
+  function dbContainer(target = app): string {
+    const ids = cli.lines(['ps', '-a', '-q', '--filter', `label=${LABEL_DEVSPACE_ID}=${target.id}`, '--filter', `label=${LABEL_COMPOSE_SERVICE}=db`]);
+    expect(ids).toHaveLength(1);
+    return ids[0];
+  }
+
+  function exec(container: string, script: string): string {
+    const result = cli.run(['exec', container, 'sh', '-c', script]);
+    if (result.code !== 0) throw new Error(`docker exec failed (${result.code}): ${result.err}`);
+    return result.out;
+  }
+
+  /** The containers, networks, and volumes of the Compose projects: they carry the labels of the devspace. */
+  function removeProjectObjects(): void {
+    for (const target of [app, refused, unrestricted, tmpfsSource]) {
+      for (const id of containers(target)) cli.run(['rm', '-f', id]);
+      for (const id of cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${target.project}`])) cli.run(['network', 'rm', id]);
+      for (const name of cli.lines(['volume', 'ls', '-q', '--filter', `label=${LABEL_DEVSPACE_ID}=${target.id}`])) {
+        if (name !== target.name) cli.run(['volume', 'rm', name]);
+      }
+      for (const image of cli.lines(['image', 'ls', '-q', '--filter', `reference=${devspaceImageRepository(target.repository, target.id)}*`])) cli.run(['image', 'rm', '-f', image]);
+    }
+  }
+
+  beforeAll(async () => {
+    if (skipped) {
+      log.info('The engine has a Monitor before the tests; the Compose opens through a real worker are skipped.');
+      return;
+    }
+    // The helper image through the harness.
+    await testHelperImage(docker, log, env);
+    // The real monitor of the opens runs no background run during the tests.
+    await seedTestMonitorRun(docker, { run });
+    apiVersion = cli.ok(['version', '--format', '{{.Server.APIVersion}}']);
+    log.info(`Docker Engine API ${apiVersion}`);
+    // With a volume named with `${devcontainerId}`, which read-configuration leaves as written.
+    await seed(app, composeFile(), ['source=cache,target=/cache,type=volume', HISTORY_MOUNT]);
+    // The privileged line goes into the db service; the replace must match (`restart` comes before `ports`).
+    const refusedFile = composeFile('').replace('    restart: unless-stopped\n    ports:', '    restart: unless-stopped\n    privileged: true\n    ports:');
+    expect(refusedFile).toContain('privileged: true');
+    await seed(refused, refusedFile);
+    await seed(unrestricted, composeFile());
+    await seed(tmpfsSource, composeFile(), [TMPFS_SOURCE_MOUNT]);
+    // Delete removes the base images that no build record uses any more; a stopped container of the base image keeps it
+    // for the other tests and for the baseline of the engine (Docker does not remove an image that a container uses).
+    cli.ok(['create', '--label', `${TEST_RUN_LABEL}=${run.runId}`, '--name', `devspaces-test-compose-guard-${run.runId}`, TEST_BASE_IMAGE, 'true']);
+  });
+
+  afterAll(async () => {
+    // No worker and no batch helper is left over.
+    const leftovers = await window.dispose();
+    removeProjectObjects();
+    removeRunObjects(cli, run.runId);
+    removeTestMonitor({ run, cli });
+    expect(leftovers).toEqual([]);
+    expect(containers(app)).toEqual([]);
+    expect(cli.volume(app.name)).toBeUndefined();
+  });
+
+  it.skipIf(skipped)('refuses a privileged service before any build: no image, no container, the volume stays', async () => {
+    const error = await service.openDevspaceInWorker(refused.id, { progress: new RecordingProgress() }).then(
+      () => undefined,
+      (reason: unknown) => reason as Error & { code?: string },
+    );
+    expect(error?.code).toBe('hostAccess');
+    expect(error?.message).toBe(Messages.hostAccess('service db: privileged mode'));
+    expect(containers(refused)).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${devspaceImageRepository(refused.repository, refused.id)}*`])).toEqual([]);
+    expect(cli.volume(refused.name)).toBeDefined();
+    expect(cli.volume(`${refused.project}_dbdata`)).toBeUndefined();
+  });
+
+  it.skipIf(skipped)('refuses a tmpfs mount with a source, which the CLI writes as a bind mount, also with the checks off: no container', async () => {
+    settings.hostAccessChecksOff = [tmpfsSource.repository];
+    let error: (Error & { code?: string }) | undefined;
+    try {
+      error = await service.openDevspaceInWorker(tmpfsSource.id, { progress: new RecordingProgress() }).then(
+        () => undefined,
+        (reason: unknown) => reason as Error & { code?: string },
+      );
+    } finally {
+      settings.hostAccessChecksOff = [];
+    }
+    expect(error?.code).toBe('hostAccess');
+    expect(error?.message).toContain(`mount ${JSON.stringify(TMPFS_SOURCE_MOUNT)} is written differently by the Dev Container CLI and is not supported`);
+    expect(containers(tmpfsSource)).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${devspaceImageRepository(tmpfsSource.repository, tmpfsSource.id)}*`])).toEqual([]);
+  });
+
+  it.skipIf(skipped)('first open: both services run with the labels, the port on 127.0.0.1, and repository files from the volume', async () => {
+    if (!supportsVolumeSubpath(apiVersion)) {
+      // Docker Engine before 26 has no volume.subpath: the bind mounts of repository files are refused (tested in the unit tests).
+      log.info(`Docker Engine API ${apiVersion} has no volume.subpath; the open is refused.`);
+      return;
+    }
+    const progress = new RecordingProgress();
+    // The batch helpers counted by the progress steps of the worker.
+    const batchesBefore = window.steps.length;
+    const result = await service.openDevspaceInWorker(app.id, { progress });
+    expect(result).toMatchObject({ containerName: app.name, remoteWorkspaceFolder: app.folder });
+    expect(progress.steps).toEqual(['checkingImage', 'downloadingImage', 'preparing', 'starting']);
+    // The whole open (the reads, the Compose model and hashes, the folders, the build, `up`, the lifecycle commands,
+    // the Git files) ran in exactly one batch helper container.
+    expect(window.batchesOf(app.name, batchesBefore)).toBe(1);
+
+    // The dev container: the name of the devspace, the labels, the project, the devspace image, the workspace volume.
+    const dev = cli.container(app.name);
+    expect(dev?.State.Running).toBe(true);
+    expect(dev?.Config.Image).toBe(`${devspaceImageRepository(app.repository, app.id)}:1`);
+    expect(dev?.Config.Labels).toMatchObject({
+      [LABEL_DEVSPACE_ID]: app.id,
+      'nimblescape.devspaces.container-version': String(CONTAINER_VERSION),
+      'com.docker.compose.project': app.project,
+      'com.docker.compose.service': 'app',
+    });
+    expect(dev?.Config.Labels?.[LABEL_COMPOSE_SERVICE]).toBeUndefined();
+    // With `--id-label`, the CLI sets no devcontainer.config_file, so a restored entry cannot read its configuration
+    // path from its containers.
+    expect(dev?.Config.Labels?.['devcontainer.config_file']).toBeUndefined();
+    expect(dev?.Mounts.find((mount) => mount.Destination === '/workspaces')).toMatchObject({ Type: 'volume', Name: app.name });
+    // The host name of the dev container is the repository name, as for a single container; db keeps the one of Docker.
+    expect(dev?.Config.Hostname).toBe('tiny-compose');
+    // The volume of `mounts` is the project volume that we created with the labels (the CLI's declaration merged into ours).
+    expect(dev?.Mounts.find((mount) => mount.Destination === '/cache')).toMatchObject({ Type: 'volume', Name: `${app.project}_cache` });
+    // D-7 (package C): a volume of the project, like the data of the services: `compose`, never shared.
+    expect(cli.volume(`${app.project}_cache`)?.Labels).toMatchObject({ [LABEL_DEVSPACE_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    // The `${devcontainerId}` volume by the name that the CLI computes, created with the labels.
+    const history = `${app.project}_history-${devspaceDevcontainerId(app.id)}`;
+    expect(dev?.Mounts.find((mount) => mount.Destination === '/history')).toMatchObject({ Type: 'volume', Name: history });
+    expect(cli.volume(history)?.Labels).toMatchObject({ [LABEL_DEVSPACE_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    // Compose kept our declaration `external: true` for it and for the project volume: it created no volume and warned
+    // about none that it did not create.
+    expect(fs.readFileSync(log.file, 'utf8')).not.toContain('was not created by Docker Compose');
+    expect(exec(app.name, `cat ${app.folder}/init.sql`)).toBe(INIT_SQL);
+    // The token is in the tmpfs of the dev container (in memory), not in the volume; db has no such tmpfs.
+    expect(dev?.HostConfig.Tmpfs).toEqual({ [TOKEN_FOLDER]: TOKEN_TMPFS.slice(TOKEN_FOLDER.length + 1) });
+    expect(exec(app.name, `stat -f -c %T ${TOKEN_FOLDER}`)).toBe('tmpfs');
+    expect(exec(app.name, `cat ${GITHUB_TOKEN_FILE}`)).toBe(DUMMY_TOKEN);
+    expect(exec(app.name, `grep -rl '${DUMMY_TOKEN}' /workspaces || true`)).toBe('');
+
+    // The db container: the labels of the devspace, the port on 127.0.0.1 only, the data volume of the project.
+    const db = dbContainer();
+    const details = cli.container(db);
+    expect(details?.State.Running).toBe(true);
+    expect(details?.Config.Hostname).not.toBe('tiny-compose');
+    expect(details?.Config.Labels).toMatchObject({ [LABEL_DEVSPACE_ID]: app.id, [LABEL_COMPOSE_SERVICE]: 'db', 'com.docker.compose.project': app.project });
+    // `restart: unless-stopped` of the compose file opens, and Docker never starts db by itself.
+    expect(details?.HostConfig.RestartPolicy?.Name).toBe('no');
+    expect(dev?.HostConfig.RestartPolicy?.Name ?? 'no').toBe('no');
+    expect(fs.readFileSync(log.file, 'utf8')).toContain('service db: restart unless-stopped');
+    const ports = cli.lines(['port', db, '5432/tcp']);
+    expect(ports.length).toBeGreaterThan(0);
+    for (const binding of ports) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
+    expect(details?.Mounts.find((mount) => mount.Destination === '/data')).toMatchObject({ Type: 'volume', Name: `${app.project}_dbdata` });
+    expect(cli.volume(`${app.project}_dbdata`)?.Labels).toMatchObject({ [LABEL_DEVSPACE_ID]: app.id, [LABEL_VOLUME]: VOLUME_KIND_COMPOSE });
+    // The data volume of db carries the label of the data of a service; the cache of the dev service does not.
+    expect(cli.volume(`${app.project}_dbdata`)?.Labels?.['nimblescape.devspaces.service-data']).toBe('true');
+    expect(cli.volume(`${app.project}_cache`)?.Labels?.['nimblescape.devspaces.service-data']).toBeUndefined();
+    // Every container gets nimblescape.devspaces.host-access=checked from the model, whatever its image says.
+    expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
+    expect(details?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe('checked');
+    // The dev container carries the configuration path, for the restore after a lost registry. Only the dev service
+    // gets it; on the other services a changed selection would change their Compose config hash and recreate them
+    // (their container file system would be lost).
+    expect(dev?.Config.Labels?.['nimblescape.devspaces.config-path']).toBe(CONFIG_PATH);
+    expect(details?.Config.Labels?.['nimblescape.devspaces.config-path']).toBeUndefined();
+    // Compose puts labels on its containers that images never have (isComposeContainer).
+    expect(dev?.Config.Labels?.['com.docker.compose.container-number']).toBeDefined();
+
+    // Repository files from the workspace volume (volume.subpath): a folder and a single file, read-only.
+    expect(details?.Mounts.find((mount) => mount.Destination === '/init/seed')).toMatchObject({ Type: 'volume', Name: app.name });
+    expect(details?.Mounts.find((mount) => mount.Destination === '/init/init.sql')).toMatchObject({ Type: 'volume', Name: app.name });
+    expect(exec(db, 'cat /init/seed/data.txt')).toBe(SEED_TEXT);
+    expect(exec(db, 'cat /init/init.sql')).toBe(INIT_SQL);
+    expect(cli.run(['exec', db, 'sh', '-c', 'echo changed > /init/init.sql']).code).not.toBe(0);
+    // Only these paths of the volume: not the configuration folder with the token.
+    expect(exec(db, 'ls /init')).toBe('init.sql\nseed');
+    expect(exec(db, 'test -e /workspaces && echo yes || echo no')).toBe('no');
+    expect(exec(db, `test -e ${TOKEN_FOLDER} && echo yes || echo no`)).toBe('no');
+
+    const entry = await registry.get(app.id);
+    expect(entry?.buildRecord).toMatchObject({
+      devspaceImage: `${devspaceImageRepository(app.repository, app.id)}:1`,
+      compose: { service: 'app', images: [`${app.project}-app`] },
+    });
+    // The Compose project, the dev container, and the workspace volume have one name.
+    expect(app.project).toBe(app.name);
+    // The devspace image carries the labels of the devspace and its build record (the record pins its ID); the
+    // image that Compose built for the service and the networks of the project carry the devspace ID (rewriteModel).
+    expectLabelledDevspaceImage(cli, entry);
+    expect(cli.image(`${app.project}-app`)?.Config.Labels?.[LABEL_DEVSPACE_ID]).toBe(app.id);
+    const networks = cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`]);
+    expect(networks.length).toBeGreaterThan(0);
+    for (const network of networks) expect(cli.ok(['network', 'inspect', '-f', `{{index .Labels "${LABEL_DEVSPACE_ID}"}}`, network])).toBe(app.id);
+    // The paths that other services mount are on the entry, not the build record, and read-only mounts are not
+    // recorded: db mounts seed and init.sql read-only, so neither is left out of the ownership fixes.
+    expect(entry?.buildRecord?.compose).not.toHaveProperty('serviceFolders');
+    expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/seed`]));
+    expect(entry?.serviceFolders ?? []).not.toEqual(expect.arrayContaining([`${app.folder}/init.sql`]));
+    // The inspect of the db container (with the list of the containers of the project) yields its subpaths of the
+    // workspace volume, read-only, as the list of the paths of the services reads them. The list and the inspect by the
+    // Docker CLI of the test harness, read as the pipeline reads them (toContainerInfo).
+    const dbId = cli.lines(['ps', '-aq', '--no-trunc', '--filter', `label=com.docker.compose.project=${app.project}`]).find((id) => id.startsWith(db));
+    expect(dbId).toBeDefined();
+    const listed = toContainerInfo((JSON.parse(cli.ok(['container', 'inspect', dbId!])) as unknown[])[0]);
+    expect(listed?.volumeSubpaths).toEqual(
+      expect.arrayContaining([
+        { volume: app.name, subpath: path.posix.relative('/workspaces', `${app.folder}/seed`), readOnly: true },
+        { volume: app.name, subpath: path.posix.relative('/workspaces', `${app.folder}/init.sql`), readOnly: true },
+      ]),
+    );
+    expect(entry?.buildRecord?.images).toHaveProperty([TEST_BASE_IMAGE]);
+    expect(entry?.additionalVolumes).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`]));
+    // Lifecycle token: postCreateCommand ran once in the dev container, with the token.
+    expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
+  });
+
+  it.skipIf(skipped)('Stop stops both containers; the next open starts them again without a build', async () => {
+    if (!supportsVolumeSubpath(apiVersion)) return;
+    const before = containers(app).sort();
+    await service.stop(app.id);
+    expect(cli.container(app.name)?.State.Running).toBe(false);
+    expect(cli.container(dbContainer())?.State.Running).toBe(false);
+
+    const progress = new RecordingProgress();
+    await service.openDevspaceInWorker(app.id, { progress });
+    expect(progress.steps).not.toContain('preparing');
+    expect(containers(app).sort()).toEqual(before);
+    expect(cli.container(app.name)?.State.Running).toBe(true);
+    expect(cli.container(dbContainer())?.State.Running).toBe(true);
+    expect(cli.lines(['image', 'ls', '--format', '{{.Tag}}', devspaceImageRepository(app.repository, app.id)])).toEqual(['1']);
+    expect((await registry.get(app.id))?.buildRecord?.buildNumber).toBe(1);
+    // Lifecycle token: run-user-commands after the start does not run postCreateCommand again.
+    expect(exec(app.name, `cat ${POST_CREATE_LOG}`)).toBe('present');
+  });
+
+  it.skipIf(skipped)('Delete removes the containers, the network, and the images of the project, and only the ticked data volumes', async () => {
+    if (!supportsVolumeSubpath(apiVersion)) return;
+    // A one-off container of the project (`docker compose run`), without the labels of the devspace.
+    const oneOff = cli.ok([
+      'create',
+      '--label',
+      `com.docker.compose.project=${app.project}`,
+      '--label',
+      `${TEST_RUN_LABEL}=${run.runId}`,
+      TEST_BASE_IMAGE,
+      'true',
+    ]);
+    expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`]).length).toBeGreaterThan(0);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`]).length).toBeGreaterThan(0);
+    // With the `${devcontainerId}` volume, which Delete lists like the other volumes of the project.
+    const history = `${app.project}_history-${devspaceDevcontainerId(app.id)}`;
+    // The data volumes are the ones that the check of Delete offers; the user ticks the cache and the history volume.
+    const ticked = [`${app.project}_cache`, history];
+    // A running db is stopped (its stop time) before `docker rm -f`, so that it shuts down cleanly.
+    const db = dbContainer();
+    cli.ok(['start', db]);
+    const logBefore = fs.readFileSync(log.file, 'utf8').length;
+
+    const offered = await deleteDevspace(app, (volumes) => volumes.filter((volume) => ticked.includes(volume)));
+    expect(offered).toEqual(expect.arrayContaining([`${app.project}_dbdata`, `${app.project}_cache`, history]));
+
+    const deleteLog = fs.readFileSync(log.file, 'utf8').slice(logBefore);
+    expect(deleteLog.indexOf(`Stopping container ${db}`)).toBeGreaterThanOrEqual(0);
+    expect(deleteLog.indexOf(`Removing container ${db}`)).toBeGreaterThan(deleteLog.indexOf(`Stopping container ${db}`));
+
+    expect(containers(app)).toEqual([]);
+    expect(cli.container(oneOff)).toBeUndefined();
+    expect(cli.lines(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${app.project}`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${app.project}-*`])).toEqual([]);
+    expect(cli.lines(['image', 'ls', '-q', '--filter', `reference=${devspaceImageRepository(app.repository, app.id)}:*`])).toEqual([]);
+    expect(cli.volume(app.name)).toBeUndefined();
+    // Ticked: removed. Not ticked: the data of the database stays.
+    expect(cli.volume(`${app.project}_cache`)).toBeUndefined();
+    expect(cli.volume(history)).toBeUndefined();
+    expect(cli.volume(`${app.project}_dbdata`)).toBeDefined();
+    expect(await registry.get(app.id)).toBeUndefined();
+  });
+
+  it.skipIf(skipped)('labels every container nimblescape.devspaces.host-access=unrestricted and keeps the ports while the checks are off', async () => {
+    if (!supportsVolumeSubpath(apiVersion)) return;
+    settings.hostAccessChecksOff = [unrestricted.repository];
+    try {
+      await service.openDevspaceInWorker(unrestricted.id, { progress: new RecordingProgress() });
+    } finally {
+      settings.hostAccessChecksOff = [];
+    }
+    const dev = cli.container(unrestricted.name);
+    expect(dev?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
+    const db = dbContainer(unrestricted);
+    expect(cli.container(db)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_UNRESTRICTED);
+    // The port without an address is published as the model writes it: not only on 127.0.0.1.
+    const ports = cli.lines(['port', db, '5432/tcp']);
+    expect(ports.length).toBeGreaterThan(0);
+    expect(ports.some((binding) => !binding.startsWith('127.0.0.1:'))).toBe(true);
+
+    // With the checks on again, the next open creates the containers again with nimblescape.devspaces.host-access=checked
+    // (the model sets the label on every service, so an image label cannot claim "unrestricted"), the port on
+    // 127.0.0.1.
+    await service.openDevspaceInWorker(unrestricted.id, { progress: new RecordingProgress() });
+    expect(cli.container(unrestricted.name)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
+    const again = dbContainer(unrestricted);
+    expect(cli.container(again)?.Config.Labels?.[LABEL_HOST_ACCESS]).toBe(HOST_ACCESS_CHECKED);
+    for (const binding of cli.lines(['port', again, '5432/tcp'])) expect(binding).toMatch(/^127\.0\.0\.1:\d+$/);
+
+    // Delete as the window runs it, with every data volume that its check offers ticked.
+    await deleteDevspace(unrestricted, (volumes) => [...volumes]);
+    expect(containers(unrestricted)).toEqual([]);
+    expect(cli.volume(`${unrestricted.project}_dbdata`)).toBeUndefined();
+  });
+});

@@ -1,0 +1,230 @@
+# Security model
+
+This document describes what Devspaces protects, how, and where its protection ends. The user guide is [guide.md](guide.md); how the parts work together is in [architecture.md](architecture.md).
+
+## What Devspaces does on your computer
+
+The README and the Marketplace page list these behaviors at the top. Each item links to its details.
+
+- **GitHub sign-in.** Devspaces uses the GitHub sign-in of VS Code with the scopes `repo` and `read:org`, and with `read:packages` only when a private image on `ghcr.io` needs it. The scope `repo` reads and changes all repositories that your account can access. VS Code keeps the sign-in, and Devspaces saves no token on your computer. At each open from a VS Code window, Devspaces writes the token into the memory of the devspace, where Git, the GitHub CLI and every other program of that container can use it; a container that Docker restarts by itself has no token until the next open. See [The GitHub token](#the-github-token).
+- **When.** Devspaces starts with every VS Code window: when VS Code starts, and right after the installation.
+  - Before your first devspace, Devspaces only reads the current Docker context when VS Code starts. When that read fails and `DOCKER_HOST` is not set, it also runs `docker --version` on this computer, to recognize Podman. It does not contact the Docker engine, read registry logins, build its helper image, or start a helper container; the first **Start** or **Refresh** builds the helper image.
+  - After your first devspace, each window also works with Docker by itself, on the engine of the current Docker context. This work never starts Docker. When the window starts, it builds the helper image on that engine when its records show no build of the current helper image there, for example after an update that changed the image. While `devspaces.updateImagesOnConnect` is on (the default), it also checks once a week whether the base image of the helper image has a newer version, and then builds it again. Before such a build, it checks that Docker runs there. For an engine on another computer, it first runs `ssh` to that computer without a question (`BatchMode=yes`), also for a Docker context that you created without Devspaces. When its list of devspaces was lost, it restores the list from the volumes there.
+  - While the view is visible, the window reads the state of your devspaces with a helper container, when this computer has devspaces on that engine. When this read finds the helper image missing, the window builds the image in the background, after the same checks, and the status bar shows "Devspaces: preparing" with the name of the engine. The state reads and the restore reach another computer through the `ssh` that the Docker CLI starts.
+  - When VS Code starts with an empty window and `devspaces.reopenLastOnStartup` is on (the default), Devspaces opens the devspace of the window that you closed last, if that window was connected to a devspace and you did not stop the devspace with **Stop** (see [Reopen at startup](architecture.md#reopen-at-startup)). When VS Code restores the window of a devspace, Devspaces opens that devspace first. Both can start Docker Desktop and the container, and both write the GitHub token into the container.
+  - None of this Docker work runs on an engine from which you removed Devspaces with **Devspaces: Remove Devspaces from This Docker Engine…**, until you start or rebuild a devspace there, or run **Update All Images Now** there.
+  - Each window where you are signed in reads your repository list from GitHub when it opens, and then every `devspaces.refreshIntervalMinutes` minutes (60 by default).
+  - A link `vscode://nimblescape.nimblescape-devspaces-2/open?repository=owner/name`, for example on a website, opens your devspace of that repository. Without one, it asks before it creates a devspace, and then starts the repository as a double-click on its row does, also when it is not in your list (see [Open from a link](guide.md#open-from-a-link)). VS Code first asks whether Devspaces may open the link, unless you chose "Do not ask me again for this extension" there. Like the reopen, a link can start Docker Desktop and the container, and it writes the GitHub token into the container. See [The trust model](#the-trust-model).
+- **Docker CLI.** Devspaces runs the Docker CLI on your computer, with the Docker context that is current: it checks and starts Docker, builds its helper image `devspaces-worker` on the Docker engine, and starts its helper containers there. The engine is the Docker of your computer, or Docker on another computer that you reach over SSH. For another computer, Devspaces runs `ssh` to check that the computer and its Docker answer and, after you confirm, creates a Docker context and makes it the current context of all Docker tools of your user. Each such question has a second button, "…, Don't Ask Again" or, for a remote host, "…, Don't Ask Again for Any Host"; after it, later changes of the Docker host happen without the question, until **Devspaces: Ask Again Before Changing the Docker Host**. See [Trust boundaries](#trust-boundaries), [the worker](architecture.md#the-worker-and-the-helper-channel) and [Remote Docker host](guide.md#remote-docker-host).
+- **Dev Containers CLI.** The helper containers clone the repository into a Docker volume, and build, create, start, stop and remove the containers of a devspace with the Docker Engine API and the Dev Containers CLI. The lifecycle commands of the Dev Container configuration run in the dev container; `initializeCommand` is refused. See [Host access checks](#host-access-checks) and [the batch helper](architecture.md#the-batch-helper).
+- **Registry logins.** The worker checks and pulls an image or Feature first without a login. When the registry refuses this or does not find the image, or when Docker Hub limits pulls without a login, the worker asks the extension for the login of its registry and names the image or Feature. The extension reads the login that Docker stored on your computer, from `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) and by running the `docker-credential-*` helpers that it names. For `ghcr.io` without such a login, it uses the GitHub session with `read:packages`. The extension gives the logins of at most 8 registries in one open and writes each request to the log of Devspaces. The worker holds the login only for that one check or pull, and nothing stores it. The build of the helper image runs `docker build --pull` with the Docker CLI of your computer: the Docker CLI, not the extension, then sends the Docker Hub login that Docker stored, if there is one, for the public base image `node:24-trixie-slim`, as for any build. See [Registry access](#registry-access).
+- **Docker installation.** When Docker is missing, Devspaces installs it only after a dialog that lists the exact commands, or the download address and the file. The commands run in a terminal of VS Code that you see. On Windows, Devspaces installs WSL 2 (`wsl --install`) and Docker Desktop, on macOS Docker Desktop, and on Linux Docker Engine; on Linux, your user joins the group `docker`, which gives root rights on the computer. Devspaces downloads an installer only from Docker over HTTPS; Homebrew, winget and the package manager of your Linux distribution use their own sources. Devspaces never installs Docker on another computer. See [Installing Docker](guide.md#installing-docker).
+- **Background container.** On each Docker engine, the Monitor, the container `devspaces-monitor`, runs while a devspace runs there. The first time that you start a devspace on an engine, Devspaces asks whether it keeps running there, also while no devspace runs and VS Code is closed. Until you answer, and after the answer **Stop When Idle** (the setting `devspaces.stopMonitorWhenIdle`), it ends 5 minutes after the last devspace stopped. A Monitor that keeps running ends itself after 30 days in which no devspace was used on its engine. At the times of the setting `devspaces.cacheUpdateSchedule`, it pulls newer images of your devspaces, builds their next images in advance, removes older images of the same image repositories that no container uses, and downloads the newest VS Code Server and the extensions of the recent opens on that engine into a volume that the dev containers share. To prepare an image, the engine runs the Dockerfile and the Features of the repository, also while no VS Code window is open. To link a newer VS Code Server into a running dev container that uses that volume, the Monitor runs a command in it as the remote user of the container, in the same way as `docker exec`. It stops a devspace a few minutes after its last window closes, unless you keep it running. It uses no token and no credentials. **Devspaces: Remove Devspaces from This Docker Engine…** removes it, with the helper containers, the helper images and the shared volumes of Devspaces (see [Uninstall](guide.md#uninstall)). See [the Monitor](architecture.md#the-monitor) and [Registry access](#registry-access).
+- **Network.** Devspaces and its helper containers connect to GitHub, to a remote Docker host over SSH, to the image registries of your Dev Container configurations and of the setting `devspaces.defaultImage`, to the update service of VS Code, and to the Visual Studio Marketplace. The build of the helper image pulls the image `node` from Docker Hub and installs packages from Debian, the Docker CLI from `download.docker.com` and the Dev Containers CLI from npm. The installation of Docker reaches Docker and the package sources of your system. Each HTTPS request of the code of Devspaces, in VS Code and in its helper containers, sends the header `User-Agent: nimblescape-devspaces/<version>`. Other programs, such as Docker, Git and the Dev Containers CLI, send their own User-Agent. Only the Monitor asks the Visual Studio Marketplace: in its background run, for the extensions that the devspaces on its Docker engine used in the last 14 days, also the devspaces of other users of that engine. For each extension, it takes the newest release that works with the current VS Code Server, or the exact version when the extension is listed as `publisher.name@x.y.z`. It downloads only the files that its store does not have. Devspaces collects no telemetry. The code in a devspace can connect to any address (see [The trust model](#the-trust-model)). See [the helper image](architecture.md#the-helper-image) and [Registry access](#registry-access).
+
+## The trust model
+
+**A repository that you open is code that you run.** A malicious dev container can do harm. Its Dockerfile and build, its Features, its lifecycle commands, and the extensions in its container run with the rights of the container. They can:
+
+- use the network: the internet, your local network, a VPN of your computer, and the services of your computer through `host.docker.internal`;
+- attack the kernel, which every container shares with the Docker host (with Docker Desktop: with its virtual machine);
+- use the channels that VS Code keeps open to your computer: the SSH and GPG agents, a socket that answers requests for your Git and Docker credentials, the opening of URLs, the clipboard, and your X11 display when one is set (see [Hardening your computer](#hardening-your-computer));
+- read and change the repository, and use the GitHub token of the devspace. The token can read and change the repositories that your account can access and read your organization memberships (scopes `repo` and `read:org`).
+
+The user in the container is the one that the repository chooses (`remoteUser`, `containerUser`, or the image), often a user without root rights that can use `sudo`. Devspaces does not change it.
+
+The aim of Devspaces is that no setting of a configuration grants a container access to the Docker host beyond three things that it allows on purpose: the network (including VPN connections), ports on `localhost` of the host, and URLs that open in your browser. The checks are a guard rail against mistakes and copied templates, not a sandbox: a crafted repository can get around them. Open only repositories that you trust. For others, use a virtual machine, or a separate user account with its own Docker.
+
+The first open of a repository that belongs neither to you nor to one of your organizations asks for a confirmation.
+
+**Links.** Any website can show a link to Devspaces (see [Open from a link](guide.md#open-from-a-link)). Your browser usually asks before it opens VS Code, and VS Code asks whether Devspaces may open the link. When you chose "Do not ask me again for this extension" in that question, VS Code no longer asks, and a click on such a link opens one of your devspaces without a further question; **Extensions: Manage Authorized Extension URIs...** in VS Code takes that choice back. When the link installed Devspaces, VS Code asked before the installation and does not ask again for that link. A link never creates a devspace without a question of Devspaces, which comes before any Docker work: for a repository of your account or of one of your organizations, Devspaces asks whether it may create the devspace; for a repository of another owner, it asks for the confirmation above. Devspaces takes only a link whose `owner/name` has the characters of GitHub names, and asks GitHub with your sign-in for a repository that is not in your list.
+
+**Workspace Trust.** In a VS Code window whose folder you have not trusted (Restricted Mode), Devspaces runs, and only your user settings count for its settings: VS Code ignores the values of the workspace or folder. The default extensions of `dev.containers.defaultExtensions`, which Devspaces records for the shared extension cache, also come only from your user settings, in every window.
+
+## Trust boundaries
+
+| Part | Where it runs | Trust |
+|---|---|---|
+| The extension | The local extension host of each VS Code window (`extensionKind: ui`) | Trusted. It holds the GitHub session, the local records, and the decisions. |
+| The worker, its batch helpers, and the Monitor | Containers on the Docker engine | Not trusted by the extension. The engine may be on another computer and shared with other people. |
+| The Docker engine | Your computer, or a remote host | Not trusted by the extension. Everyone who can use it controls every container on it. |
+| The dev container | The Docker engine | Not trusted by the worker. It runs the code of the repository. |
+
+**Extension and worker.** The extension commands the worker only through typed operations (see [architecture.md](architecture.md#the-worker-and-the-helper-channel)). No Docker command and no script crosses the channel. Both sides check every message strictly, and the extension limits each request in size. Towards the worker, the extension:
+
+- answers a request that changes its records only for the devspace of the operation, under its own registry lock, with its own clock and its own view of the windows; there is no generic write;
+- allows each operation only its own kinds of requests; only `open` may ask for a secret;
+- gives a secret only when the operation asks for it: the GitHub token to an open, and to an open the login of the registry that the request names together with an image or Feature, one request at a time and for at most 8 registries in one open (see [Registry access](#registry-access));
+- shows every text of the worker, of a configuration, and of an error as plain text in its messages: it breaks the syntax of a link (`[label](target)`) in them, so that no such text becomes a link that runs a command of VS Code when you click it;
+- keeps the remembered result of the host access check of a configuration in its own storage, stamped with the hash of the worker code that computed it; the worker and the engine never store it;
+- uses the Monitor's registry answers only to decide whether an update is due, never as an input of a security check.
+
+The code that runs in the worker, the batch helpers, the Monitor, and the analysis threads is one readable file in the extension's own `.vsix` package: `dist/helperChannel.js`. The container that loads it checks it against the SHA-256 hash on its command line, stores it, and runs it from that file (see [architecture.md](architecture.md#pipe-loading)). Before the worker starts an analysis thread from that file, it checks the hash of the file again. Nothing in the file runs with `eval`. It holds fixed scripts as text, which run with `node -e` or `sh -c`: the one-line pipe loader, and the scripts that the worker and the steps of the batch helpers run in containers. To check a container, compare the output of `sha256sum dist/helperChannel.js` in the folder of the installed extension with the hash in the command of the container (`docker inspect`).
+
+**Worker and dev container.** The worker writes into a dev container only through the scripts of its registry, with the arguments as positional parameters and secrets only on standard input. These scripts follow no symbolic link that they did not create, and overwrite nothing that they did not write: a process in the dev container can plant links at any time. The batch helper that works on the volume of a devspace runs as root, but:
+
+- the Docker socket lies in a folder that only root can enter;
+- the clone runs as the user `devspace-git` (UID 52741), without groups, capabilities, or new privileges, and cannot reach the socket;
+- the steps that read the repository (its configuration and its Docker Compose files) run as the user that owns the repository folder;
+- root follows no link that the dev container planted in the volume.
+
+## Host access checks
+
+Before a container is created, Devspaces checks the final configuration: `devcontainer.json` with what its Features and its base image add to it (the label `devcontainer.metadata`), and every service of Docker Compose. It checks again before `up`, on the `runArgs` as Docker gets them and on the metadata of the image that was built. A configuration that breaks a rule is refused, before anything is pulled, built, or started, with a message that names each offending setting. The volume of the devspace is kept.
+
+The checks are on for every repository by default. The user setting `devspaces.hostAccessChecksOff` lists the repositories whose checks are off; only your user settings count, never a workspace or folder setting.
+
+### Refused while the checks are on
+
+- Bind mounts of files and folders of the host, also of the Docker socket (for example by a Feature), and of `${localWorkspaceFolder}`.
+- Privileged mode; capabilities beyond Docker's default set and `SYS_PTRACE`; security options other than `seccomp=unconfined` and `no-new-privileges`.
+- Devices and GPUs, also `hostRequirements.gpu` and limits that name devices.
+- The namespaces and control groups of the host (`--pid=host`, `--ipc=host`, `--uts=host`, `--userns=host`, `--cgroupns=host`, `--cgroup-parent`).
+- Other container runtimes (`--runtime`), volume drivers and volume options other than `volume-nocopy` and `volume-subpath`, and `--use-api-socket`.
+- `--oom-kill-disable` and a negative `--oom-score-adj`; log drivers that write to the host or use credentials of Docker.
+- The network of another container (`--network container:…`, `network_mode: container:`), `--volumes-from`, and `--link`.
+- Published ports on another address than `127.0.0.1`, and `-P`.
+- The setting `remote.localPortHost` in the configuration, which would make VS Code forward ports on all addresses.
+- The volumes of other programs and containers: volumes that Docker Compose or the Dev Containers extension created (by their labels), and anonymous volumes of other containers.
+- Build options that reach files, keys, and agents of the helper during the build (`--secret`, `--ssh`, `--output`, `--allow`, `--build-context` with a folder).
+
+### Refused whatever the switch says
+
+- Everything of another devspace: its workspace volume, a volume that a devspace of another GitHub account uses or that its Delete kept, its named networks, and the images of the devspaces of other accounts (by image ID, not by name).
+- The processes of other containers, and their volumes through `--volumes-from` or `volumes_from`, also of the dev container for the other services of Docker Compose.
+- The folders of Devspaces as paths of the configuration (a mount, a build context, or a Dockerfile): the token folder `/run/devspace` (also as `/var/run/devspace`), the configuration folder `/workspaces/.devspace+`, and the folders of the helper with the Docker socket and the token. A mount propagation that shares `/`, `/run`, or `/var/run` with the host is refused too.
+- The cache volume of the helper and the volumes of Devspaces (`devspaces-monitor`, `devspaces-vscode`).
+- The variables that set the Git configuration (`GIT_CONFIG`, `GIT_CONFIG_*`) or that Devspaces sets (`GIT_SSH_COMMAND`, `DOCKER_CONFIG`, `GH_CONFIG_DIR`), and the token and host variables of the GitHub CLI (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`), in `runArgs`, `containerEnv`, and `remoteEnv`, also when a Feature or the base image sets them.
+- `initializeCommand`: it would run in the helper, which has the Docker socket.
+- Labels with the prefixes `nimblescape.devspaces.` and `devcontainer.` (except `devcontainer.metadata`), and the labels of Docker Compose. Such a label could hide a container from Devspaces or make it look like another devspace.
+- A Dockerfile longer than 1 MiB, or one that links out of the repository.
+- Options of `runArgs` and `build.options` that Devspaces does not know.
+
+### What Devspaces changes instead of refusing
+
+- Published ports without an address (`-p 3000:3000`, `appPort`) are bound to `127.0.0.1` while the checks are on.
+- `--rm`, `-it`, and `-d` are removed, because Devspaces runs the container itself; `--name` is replaced by the name of the devspace. The log names each removed option.
+- `shutdownAction` is `none`, so that only Devspaces stops the container.
+- For Docker Compose, only the dev service gets the workspace volume; a bind mount of files of the repository becomes a mount of that folder of the workspace volume (Docker Engine 26 or newer); every container gets the labels of the devspace.
+- Values of `${localEnv:…}` of your computer are not passed: the Dev Container CLI resolves them in the helper, where they are empty or have the helper's value.
+
+### Turning the checks off
+
+**Turn Off Host Access Checks…** in the context menu of a repository adds it to `devspaces.hostAccessChecksOff` after a warning; **Turn On Host Access Checks** removes it. With the checks off, the refusals of the first list are lifted, so the configuration, its Features, and its base image may use the files of the host, the Docker socket (which gives full control of Docker and of every other devspace, also their tokens), privileged mode, devices, and ports on all addresses. Everything in the second list stays refused. The row shows `host access unrestricted`, and the log says so at every start. A change applies when the container is created next; a container that was created without the checks is created again at the next start after they are turned on, if the configuration passes them.
+
+A repository with the checks off is never prepared in the background, and an open with the checks off never uses a prepared image.
+
+## The GitHub token
+
+Devspaces signs in with the GitHub authentication of VS Code, with the scopes `repo` (list and clone private repositories) and `read:org` (organization memberships). It asks for `read:packages` only when a private image on `ghcr.io` needs it. VS Code stores the session; Devspaces keeps no token in its settings or files.
+
+**Never in a variable, on a command line, or in a log.** The token travels only as the secret of an operation, and every process gets it on its standard input. The worker masks every secret that an operation held in all its progress, log lines, tool output, and errors; the extension's log masks it too.
+
+**The clone.** The batch helper clones with the token, which lies in a tmpfs of the helper (`/run/devspace-secrets`) only during the clone step and belongs to the Git user only during that step. The remote URL of the clone contains no token, and `.git/config` holds none.
+
+**In the dev container.** Devspaces keeps the token only in the memory of the running dev container:
+
+- `/run/devspace` is a tmpfs that Devspaces adds to every dev container it creates (`nosuid`, `nodev`, `noexec`, 1 MiB, mode 0700, owned by the remote user). It holds `github-token` (mode 0600) and `gh/hosts.yml`, which signs the GitHub CLI in with the same account. The settings of the GitHub CLI (`config.yml`) stay in the volume.
+- Devspaces writes the token at each open from a window, after the container runs and before the lifecycle commands, so that they can use Git and the GitHub CLI as the owner account. The write runs as root through `docker exec` with the token on standard input. It first checks that `/run/devspace` is exactly the tmpfs that Devspaces created, with no other mount at or below it and no propagation to the host; otherwise it writes nothing, and the open says that Git could not be prepared.
+- The token is never in the workspace volume, a kept volume, or an export. It is gone when the container stops. Like other memory, the kernel may swap it to the swap space of the host or of the Docker VM.
+- When a window leaves a devspace because you signed out or another account signed in, Devspaces removes the token from every running dev container of that devspace at once, before the window closes its remote connection (the window waits at most 30 seconds for that). Otherwise it stays in the running container until the container stops or the next open replaces it. A sign-out in VS Code may not make the token invalid on GitHub; to do that, revoke the access of VS Code in the GitHub settings (Applications).
+- A container that starts without an open from a window (a restart by Docker, `docker start`) has no token until the next open. The Monitor never writes the token.
+
+**Who can read it.** While the container runs, every process in it that runs as its user or as root can read the token, and so can everyone who can use the Docker engine (`docker exec`), on your computer or on a remote host.
+
+## Git inside the container
+
+Git and the GitHub CLI in a devspace use only its own configuration and the token of the account that owns it. Nothing of your computer is used: no copied `~/.gitconfig`, no forwarded credential helper, no forwarded Docker credentials, and no SSH agent for Git.
+
+- The folder `/workspaces/.devspace+` in the volume holds `gitconfig` (the identity of the owner account from its GitHub profile, and a credential helper that answers only for `https://github.com` from the token file), `credentials.gitconfig` (your credential helpers for other Git servers), `docker/`, and `gh/config.yml`. It holds no secret.
+- Devspaces sets only documented variables of Git, Docker, and the GitHub CLI in `containerEnv` and `remoteEnv`: `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` (they remove every other credential helper and add the helper of the container), `DOCKER_CONFIG`, `GIT_SSH_COMMAND=ssh -o IdentityAgent=none`, and `GH_CONFIG_DIR=/run/devspace/gh`.
+- For each container, the settings of the Dev Containers extension switch off the copy of your Git configuration (`dev.containers.copyGitConfig` and `remote.containers.copyGitConfig`), its Git credential helper (`dev.containers.gitCredentialHelperConfigLocation: none`), its Docker credential helper (`dev.containers.dockerCredentialHelper`), and the sign-in of the GitHub CLI with your token (`dev.containers.githubCLILoginWithToken`). Your global settings stay unchanged, so your other dev containers keep working.
+- A container gets a `~/.gitconfig` of Devspaces when it has none or an empty one, so that Git older than 2.32 reads the configuration of the volume too.
+
+### Variables that Devspaces never sets
+
+The Dev Containers extension and the VS Code server expect their own values in these variables, so Devspaces never sets or changes them, in the dev container or in the helper:
+
+- `REMOTE_CONTAINERS_IPC` and every other `REMOTE_CONTAINERS*` variable;
+- `SSH_AUTH_SOCK` and `BROWSER`;
+- every `VSCODE_*` variable.
+
+`DOCKER_HOST` is never set: the helper reaches Docker through `/var/run/docker.sock`, a link to the socket of its engine, and the remote engine is chosen by the Docker context alone. The steps of the batch helper also never pass `PATH`, `HOSTNAME`, `NODE_OPTIONS`, `TMPDIR`, or any `DOCKER_*`, `BUILDX_*`, `BUILDKIT_*`, or `LD_*` variable from a configuration to the tools.
+
+## Registry access
+
+- **At an open**, the image check and the pulls run in the worker, on the Docker engine. The image check asks each registry first without a login. The worker asks the extension for the login of the registry only when the registry refuses this request (HTTP 401 or 403, also when its token service refuses a token without a login), or when it answers 404, because some registries answer 404 for a private repository. After a 404, the worker asks the registry again only when your computer has a login for it. A pull also goes first without a login. The worker asks for the login only when the registry refuses the pull (HTTP 401 or 403, or Docker's answer that the repository does not exist or needs a login, also `no basic auth credentials`), when the registry does not find the image (`manifest unknown`, `name unknown`, or the `<reference>: not found` of the containerd image store), for the same reason as the 404 above, or when Docker Hub limits pulls without a login (`toomanyrequests`). It then pulls again with the login, when your computer has one. Each request names the image or Feature, as its registry and repository. The extension checks that they form a valid image name with a valid host name, and gives only the login of that registry: the credentials that Docker stored on your computer (the `docker-credential-*` helpers run on your computer), or for `ghcr.io` without such a login, the GitHub session with `read:packages`. It answers one request at a time and refuses a second request that comes meanwhile, gives the logins of at most 8 registries in one open, and writes each request with its answer or the reason of its refusal to the log of Devspaces (Devspaces: Show Log), never the login itself. A registry counts against this limit only when the worker asked for its login and your computer has one. The worker holds the login only for that check or pull, then forgets it, and asks again for the next one. It sends the login only in the header of its request to that registry, never into a file.
+- **Where this protection ends:** the extension cannot read the configuration of a devspace, because it lies on the Docker engine, so it relies on the worker for which images and Features an open uses. Whoever controls the Docker engine controls the worker, and can get the logins of up to 8 registries at each open, as well as the GitHub token (see [Trust boundaries](#trust-boundaries)).
+- **In the background**, the Monitor and its prepares use no token and no credentials at all. They pull and ask registries anonymously. A private image or Feature is therefore not updated or prepared in the background; its next open checks and builds it with your credentials.
+- The worker and the Monitor reach the internet through the proxy of the Docker daemon (`HTTPProxy`, `HTTPSProxy`, `NoProxy` of `docker info`), never through the proxy settings of your computer or of VS Code.
+- The image check asks for the digest of a tag with an HTTP `HEAD` request, which does not count against the pull limit of Docker Hub. An image is pulled only when its digest changed.
+
+## Accounts
+
+A devspace belongs to the GitHub account that created it. Another account that signs in to VS Code does not see it and cannot open it; its first **Start** of the repository creates its own devspace. The repository list of one account is never shown to another, and the list does not reveal that another account has a devspace of a repository.
+
+All devspaces of a Docker engine are Docker objects of the same engine. The separation protects against using the wrong account, not against another person who can use your user account or the engine.
+
+## Remote and shared engines
+
+- On a remote host, the token goes into the memory of the container on that host, never onto its disk: the extension sends it over SSH to its worker there, which writes it into the container through the Docker Engine API.
+- Devspaces never asks for an SSH password and never accepts a host key. Its own `ssh` check runs with `BatchMode=yes` before each operation on another computer and before each build in the background there, so an unknown host key or a key that is not loaded fails at once, with a message. The `ssh` that the Docker CLI starts for the Docker commands, for example for the state reads of the view, has no terminal to ask on; on Windows, it can wait until the time limit of the command instead.
+- A Docker context that points to another computer without SSH (for example `tcp://…`) is refused.
+- The name of a worker container carries the name of its window (see [architecture.md](architecture.md#the-worker-and-the-helper-channel)), on every engine that the window uses: in the window of a devspace, on the engine of the devspace, the name of the devspace with the owner and the name of its repository; otherwise, the name of its workspace file or of its first folder, also of a folder on your computer. Everyone who can use the engine sees it, for example with `docker ps`.
+- **A shared engine is for a group that trusts each other.** Root and every member of the group `docker` on the engine can reach every container and every volume on it, including the token in the memory of another person's running devspace. The account separation of Devspaces does not protect against them. For people who must not see each other's work, each person needs an engine of their own, for example in a virtual machine.
+
+## Known limits
+
+- The Dockerfile and the Features are not checked: they run as trusted code, like the rest of the repository. A Dockerfile can build from or copy out of the local images of other devspaces (`FROM`, `COPY --from`, `RUN --mount`), and choose a BuildKit frontend (`# syntax`). An `ONBUILD` instruction of a base image runs unchecked in the build.
+- All devspaces of an engine share its images and build cache, also across GitHub accounts. Do not open repositories that you do not trust on an engine where the devspaces of other accounts hold data that you need to protect.
+- Every container reaches the ports on `localhost` of the host through `host.docker.internal` (Docker Desktop), also the ports that VS Code forwards for other devspaces. Ports on `127.0.0.1` are protected against the network, not against other containers.
+- The kernel is shared. A container is not a strong security boundary.
+- The channels of VS Code and the Dev Containers extension stay open in every container. Git in the devspace does not use them, but a program that looks for them can.
+- The checks allow `--network host`, `SYS_PTRACE`, and `seccomp=unconfined`. With `--network host`, a server in the container that listens on all addresses can be reached from your network, and on Linux with Docker Engine the container can also reach local programs through their abstract Unix sockets (for example the X11 display and D-Bus).
+- When the default runtime of Docker is `nvidia`, the variable `NVIDIA_VISIBLE_DEVICES` gives a container the GPUs. It is not refused.
+- An `ENV` of an image, or an environment file of the repository, can set variables that the checks refuse in the configuration, for example `GH_TOKEN`.
+- An image or a program in the container can change the settings of VS Code in the container, for example to forward ports on all addresses.
+- A named volume without labels of another program (for example one made with `docker volume create`) can be mounted by any configuration that knows its name.
+- For a Docker Compose build with Features, the user that the Dev Container CLI writes into its compose file is not checked.
+- A symbolic link of the repository used as the build context of a single container is not resolved.
+- With the checks off, a configuration can join the network of another container, use the volumes of other containers, and use the Docker socket, which controls every devspace and its token.
+
+## Hardening your computer
+
+The Dev Containers extension and VS Code keep some channels from the container to your computer open. Most of them cannot be switched off by a setting, and a firewall does not help: inside the container they are Unix sockets, and between the container and your computer most of them travel inside the connection of the window. What you can do is keep things of value away from the end of each channel on your computer, and have your computer ask before it gives something out.
+
+**Git configuration, Git and Docker credentials, and the GitHub CLI.** Devspaces switches these off for its own containers. To make this the default for your other dev containers too, put this into your user `settings.json`:
+
+```json
+"dev.containers.copyGitConfig": false,
+"remote.containers.copyGitConfig": false,
+"dev.containers.gitCredentialHelperConfigLocation": "none",
+"dev.containers.dockerCredentialHelper": false,
+"dev.containers.githubCLILoginWithToken": false
+```
+
+The socket that answers credential requests stays open, and a program in the container that looks for it can still ask. On macOS, the Git credential helper `osxkeychain` gives out the passwords it stored without asking; on Windows and Linux, the usual credential helpers do too. On macOS you can make it ask: for the items that matter, open Keychain Access, select **Confirm before allowing access** in the item's **Access Control**, and remove `git-credential-osxkeychain` from **Always allow access by these applications**. Then answer each prompt with **Allow** or **Deny**, not **Always Allow**. When Git stores the password anew, repeat these steps.
+
+**SSH agent.** This is the biggest exposure. The Dev Containers extension forwards your SSH agent into every container when one runs as VS Code starts, and no setting turns this off ([microsoft/vscode-remote-release#11413](https://github.com/microsoft/vscode-remote-release/issues/11413)).
+
+- On Linux, start VS Code without an agent: quit VS Code, then start it with `env -u SSH_AUTH_SOCK code`. This affects every window.
+- On macOS, VS Code always gets the agent of your login. Keep that agent empty (`ssh-add -D`), and do not use `AddKeysToAgent` or `UseKeychain` in `~/.ssh/config`, or `ssh-add --apple-load-keychain`. Set another agent (for example 1Password) with `IdentityAgent` in `~/.ssh/config`, not by exporting `SSH_AUTH_SOCK` in a shell startup file.
+- On Windows, the agent is the service **OpenSSH Authentication Agent**, which keeps its keys across restarts. Keep it empty with `ssh-add -D`, or stop it while you do not need it (`Stop-Service ssh-agent` and `Set-Service ssh-agent -StartupType Manual` in an administrator PowerShell).
+- Or have the agent ask (not with the Windows OpenSSH agent): `ssh-add -c` loads a key that needs your confirmation at each use (it needs an `ssh-askpass` program), and `ssh-add -t 1h` loads it for a short time. 1Password and Secretive can ask too; make sure they ask at each use.
+
+**GPG agent.** It is forwarded when the container has `gpg` and your computer runs an agent. Use short cache times in `gpg-agent.conf` (for example `default-cache-ttl 60` and `max-cache-ttl 600`) and add `no-allow-external-cache`. On macOS, pinentry-mac of GPG Suite gives out a passphrase saved in Keychain without asking: switch saving off with `defaults write org.gpgtools.common DisableKeychain -bool yes`, then delete the saved passphrases (`security delete-generic-password -s GnuPG`, repeated until it finds none). Do not keep a key unlocked while a container that you do not trust is open.
+
+**WSL and Wayland.** `"dev.containers.forwardWSLServices": false` stops forwarding the SSH and GPG agents of WSL (not the agent of your computer). `"dev.containers.mountWaylandSocket": false` stops mounting your Wayland display into the containers that the Dev Containers extension creates; Devspaces creates its containers without this mount.
+
+**X11 display.** When `DISPLAY` is set for VS Code, the Dev Containers extension forwards your X11 display into the container, and a program there can see and type into the windows of that display. No setting turns this off ([microsoft/vscode-remote-release#8031](https://github.com/microsoft/vscode-remote-release/issues/8031)). On macOS, uninstall XQuartz if you do not need it, then log out and in. On Linux in a Wayland session, start VS Code with `env -u DISPLAY code --ozone-platform=wayland`. On an X11 desktop, only a separate user account or a virtual machine helps.
+
+**Ports, browser, and clipboard.** With `"remote.autoForwardPorts": false` and `"remote.localPortHost": "localhost"` (the default) in your user settings, VS Code forwards fewer ports on its own, and only on localhost. No setting limits the opening of URLs; if this worries you, make a separate browser profile your default browser. No setting limits the clipboard either: do not copy secrets while a container that you do not trust is open.
+
+**Everything else.** The only real boundary is a separate user account on your computer, or a virtual machine, for VS Code and Docker. On Linux, that account must not be in the group `docker`, which gives root rights on the computer and access to the containers of all users. Give it its own rootless Docker instead, and add `export DOCKER_HOST=unix:///run/user/<UID>/docker.sock` to a file that its login reads (for example `~/.profile`); Devspaces then mounts that socket into its helper. In that account, do not use the Docker installation or **Start Docker** of Devspaces, which set up the system Docker. With Docker Desktop, Enhanced Container Isolation (Business subscription) also hardens the container side.
+
+## Stored data
+
+- The repository lists (one per GitHub account) and the registry of devspaces in the global storage of the extension hold metadata only: repository names, URLs, dates, volume and image names, image digests, branch names, numbers of changes, and the user ID and login of the account of each devspace.
+- `computer.id` in the global storage of the extension: a random ID of this installation, not tied to you or to your GitHub account. The heartbeat records and the lists of images in use in the volume of the Monitor, and the label of a Monitor that keeps running, contain it, so that the Monitor can distinguish the computers that share an engine.
+- The volume of the Monitor on each engine holds heartbeat records, locks, the image references in use, registry answers, and the extension lists of recent opens. It holds no secret, and no dev container mounts it.
+- Devspaces collects no telemetry.

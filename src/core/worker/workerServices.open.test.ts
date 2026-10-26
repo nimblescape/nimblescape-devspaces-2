@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// What the worker's services of an open take from its operation: the image settings and list of the Monitor
+// (`images`, given by the operation; without it, none), and the answer "lifecycle unknown" of the window's memory.
+import { describe, expect, it, vi } from 'vitest';
+import { LIFECYCLE_UNKNOWN } from '../pipeline/lifecycleMemory';
+import { silentLogger } from '../ports';
+import { unusedEngine } from './dockerEngine.testkit';
+import { workerHostSide } from './workerHostSide';
+import { workerSessionMonitor } from './workerServices';
+
+const ID = '3f2a9c1e-5b7d-4e8a-9c0f-2d1e6a7b8c9d';
+
+describe("the worker's services of an open", () => {
+  it("the Monitor's images: those of the operation, with the signal of the pipeline; none without them", async () => {
+    const images = vi.fn(async (_signal: AbortSignal | undefined) => {});
+    const monitor = workerSessionMonitor(unusedEngine(), undefined, silentLogger, { images });
+    const signal = new AbortController().signal;
+    await monitor.images(signal);
+    expect(images).toHaveBeenCalledWith(signal);
+    // `images` is required by the port; without the operation's images it sends nothing and resolves. unusedEngine
+    // throws on any call.
+    await expect(workerSessionMonitor(unusedEngine(), undefined, silentLogger).images(signal)).resolves.toBeUndefined();
+  });
+
+  it('the memory of the window: a container ID, or LIFECYCLE_UNKNOWN; anything else is refused', async () => {
+    for (const [answer, expected] of [
+      [null, undefined],
+      ['a'.repeat(64), 'a'.repeat(64)],
+      [LIFECYCLE_UNKNOWN, LIFECYCLE_UNKNOWN],
+    ] as const) {
+      expect(await workerHostSide(async () => answer, () => undefined).state.unrecordedLifecycle(ID)).toBe(expected);
+    }
+    for (const odd of ['UNKNOWN', 'unknown ', 'abc', 42]) {
+      await expect(workerHostSide(async () => odd, () => undefined).state.unrecordedLifecycle(ID), String(odd)).rejects.toThrow('invalid value');
+    }
+  });
+});

@@ -1,0 +1,486 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
+
+import { Messages } from '../core/messages';
+import { silentLogger } from '../core/ports';
+import type { Devspace, RepositoryInfo } from '../core/types';
+import { resetFakeVscode, type ThemeIcon, type TreeItem } from './testing/fakeVscode';
+import { parseRepositoryGroups } from './repositoryGroups';
+import { buildTreeModel, type GroupNode, type HintRow, type OwnerGroup, type RepositoryNode, type RepositoryRow } from './treeModel';
+import { DOCKER_HOST_ROW_ID, DockerHostRowTexts, REPOSITORIES_VIEW_ID, RepositoriesTreeProvider, expandAll, revealRow, type TreeNode } from './treeView';
+
+function repo(nameWithOwner: string): RepositoryInfo {
+  const [owner, name] = nameWithOwner.split('/');
+  return {
+    nameWithOwner,
+    owner,
+    name,
+    url: `https://github.com/${nameWithOwner}`,
+    isArchived: false,
+    isFork: false,
+    isPrivate: false,
+    pushedAt: null,
+    defaultBranch: 'main',
+    configPaths: ['.devcontainer/devcontainer.json'],
+  };
+}
+
+const env: Devspace = {
+  id: 'e1',
+  repository: 'acme/api',
+  configPath: '.devcontainer/devcontainer.json',
+  volumeName: 'v',
+  containerName: 'c',
+  createdAt: '2026-09-24T15:00:00.000Z',
+  lastUsedAt: '2026-09-24T17:00:00.000Z',
+  owner: { id: '1001', login: 'me' },
+  gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: '' },
+};
+
+function model(): OwnerGroup[] {
+  return buildTreeModel({
+    discovery: {
+      version: 1,
+      fetchedAt: '',
+      viewerLogin: 'me',
+      organizations: ['acme'],
+      repositories: [repo('acme/api'), repo('acme/web')],
+      hints: [{ organization: 'acme', kind: 'saml', url: 'https://github.com/orgs/acme/sso' }],
+      scope: [],
+      withoutConfiguration: [],
+    },
+    settings: { owners: [], includeArchived: false, includeForks: true },
+    devspaces: [env],
+    runtime: new Map([['e1', { container: 'running', volume: true }]]),
+    currentDevspaceId: 'e1',
+    otherWindowDevspaceIds: new Set(),
+    busyDevspaceIds: new Set(),
+    liveBranches: new Map([['e1', 'main']]),
+    signedIn: true,
+  });
+}
+
+describe('RepositoriesTreeProvider', () => {
+  beforeEach(() => resetFakeVscode());
+
+  it('maps the model to tree items and fires a change on each new model', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const changes = vi.fn();
+    provider.onDidChangeTreeData(changes);
+    const groups = model();
+    provider.setModel(groups);
+    expect(changes).toHaveBeenCalledTimes(1);
+
+    const [group] = provider.getChildren() as OwnerGroup[];
+    const groupItem = provider.getTreeItem(group) as unknown as TreeItem;
+    expect(groupItem).toMatchObject({ label: 'acme', id: 'owner:acme', contextValue: 'owner' });
+
+    const [hint, api, web] = provider.getChildren(group) as [HintRow, RepositoryRow, RepositoryRow];
+    const hintItem = provider.getTreeItem(hint) as unknown as TreeItem;
+    expect(hintItem).toMatchObject({ label: 'Access to the organization acme is not authorized.', description: 'Authorize' });
+    expect(hintItem.command).toMatchObject({ command: 'vscode.open' });
+
+    const apiItem = provider.getTreeItem(api) as unknown as TreeItem;
+    expect(apiItem).toMatchObject({
+      label: 'api',
+      id: 'repo:acme/api',
+      description: 'main   Connected',
+      // The flag of the host access checks (on by default), Keep Running When Closed (off by default), and Close and
+      // Keep Running for the devspace of this window.
+      contextValue: 'repository;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning;canCloseAndKeepRunning',
+    });
+    // The switched-on monitor with the connection sign (the icon font of the extension).
+    expect((apiItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-connected');
+    // A repository without devspace has no state symbol.
+    expect(((provider.getTreeItem(web) as unknown as TreeItem).iconPath as ThemeIcon).id).toBe('blank');
+
+    expect(provider.getParent(api)).toBe(group);
+    expect(provider.getParent(group)).toBeUndefined();
+    expect(provider.getChildren(api)).toEqual([]);
+    provider.dispose();
+  });
+
+  it('shows the sign-in row first when the user is not signed in and the view lists devspaces', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const groups = model();
+    provider.setModel(groups, { signedIn: false });
+    const [first, ...rest] = provider.getChildren();
+    expect(first).toMatchObject({ kind: 'signIn', id: 'signIn' });
+    expect(rest).toEqual(groups);
+    const item = provider.getTreeItem(first) as unknown as TreeItem;
+    expect(item).toMatchObject({ label: 'Sign in with GitHub', id: 'signIn', contextValue: 'signIn' });
+    expect(item.command).toMatchObject({ command: 'devspaces.signIn' });
+    expect((item.iconPath as ThemeIcon).id).toBe('account');
+    expect(provider.getParent(first)).toBeUndefined();
+    expect(provider.getChildren(first)).toEqual([]);
+    // The model for the switcher never contains the sign-in row.
+    expect(provider.getModel()).toEqual(groups);
+    provider.dispose();
+  });
+
+  // Without a remote Docker host and without a local Docker, the repositories are not shown; the sidebar shows the
+  // Docker setup. The sidebar passes an empty model while the setup is required (sidebar.test.ts): the view has no rows
+  // at all, so VS Code shows the welcome view with the setup; with a list, the view shows no Docker row.
+  it('shows no rows for the empty model of the Docker setup, and no Docker row above a list', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel([], { signedIn: false });
+    expect(provider.getChildren()).toEqual([]);
+    const groups = model();
+    provider.setModel(groups, { signedIn: false });
+    const [first, ...rest] = provider.getChildren();
+    expect(first).toMatchObject({ kind: 'signIn', id: 'signIn' });
+    expect(rest).toEqual(groups);
+    provider.setModel(groups, { signedIn: true });
+    expect(provider.getChildren()).toEqual(groups);
+    provider.dispose();
+  });
+
+  // The list names the remote Docker host.
+  it('shows the remote Docker host as the first row above a list, never in an empty view', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    let changes = 0;
+    provider.onDidChangeTreeData(() => changes++);
+    provider.setDockerHost({ kind: 'remote', host: 'htldvmhn' });
+    provider.setModel([], { signedIn: true });
+    expect(provider.getChildren()).toEqual([]);
+    const groups = model();
+    provider.setModel(groups, { signedIn: false });
+    const [host, signIn, ...rest] = provider.getChildren();
+    expect(host).toEqual({ kind: 'dockerHost', id: DOCKER_HOST_ROW_ID, host: { kind: 'remote', host: 'htldvmhn' } });
+    expect(signIn).toMatchObject({ kind: 'signIn' });
+    expect(rest).toEqual(groups);
+    const item = provider.getTreeItem(host) as unknown as TreeItem;
+    expect(item.label).toBe('Remote Docker host: htldvmhn');
+    // The monitor with the remote badge: the switched-off monitor with the connection sign.
+    expect((item.iconPath as ThemeIcon).id).toBe('devspaces-monitor-remote');
+    expect(item.command).toMatchObject({ command: 'devspaces.chooseDockerHost' });
+    expect(item.contextValue).toBe('dockerHost');
+    expect(provider.getParent(host)).toBeUndefined();
+    expect(provider.getChildren(host)).toEqual([]);
+    const before = changes;
+    provider.setDockerHost({ kind: 'remote', host: 'htldvmhn' });
+    expect(changes).toBe(before);
+    // Not known (yet): no row.
+    provider.setDockerHost(undefined);
+    expect(changes).toBe(before + 1);
+    expect(provider.getChildren()[0]).toMatchObject({ kind: 'signIn' });
+    provider.dispose();
+  });
+
+  // The first row names the local Docker too, and opens the same choice of the Docker host.
+  it('shows the local Docker and an endpoint that is not supported as the first row too', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel(model(), { signedIn: true });
+    provider.setDockerHost({ kind: 'local', host: '' });
+    const [local] = provider.getChildren();
+    const localItem = provider.getTreeItem(local) as unknown as TreeItem;
+    expect(localItem.label).toBe('Local Docker');
+    expect(localItem.label).toBe(DockerHostRowTexts.label({ kind: 'local', host: '' }));
+    // The switched-off monitor of the sidebar.
+    expect((localItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-off');
+    expect(localItem.command).toMatchObject({ command: 'devspaces.chooseDockerHost' });
+    expect(localItem.tooltip).toBe('Docker runs on this computer. Click to use a remote Docker host.');
+    provider.setDockerHost({ kind: 'unsupported', host: 'tcp://192.0.2.10:2376' });
+    const unsupportedItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
+    expect(unsupportedItem.label).toBe('Docker endpoint not supported: tcp://192.0.2.10:2376');
+    // The monitor with the warning sign.
+    expect((unsupportedItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-warning');
+    // A current Docker context that cannot be read (no host).
+    provider.setDockerHost({ kind: 'unsupported', host: '' });
+    const unreadableItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
+    expect(unreadableItem.label).toBe(Messages.dockerContextUnreadableLabel);
+    expect(unreadableItem.tooltip).toBe(Messages.dockerContextUnreadableTooltip);
+    expect((unreadableItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-warning');
+    expect(unreadableItem.command).toMatchObject({ command: 'devspaces.chooseDockerHost' });
+    // A docker command that is Podman.
+    provider.setDockerHost({ kind: 'podman', host: '' });
+    const podmanItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
+    expect(podmanItem.label).toBe(Messages.podmanNotSupportedLabel);
+    expect(podmanItem.tooltip).toBe(Messages.podmanNotSupportedTooltip);
+    expect((podmanItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-warning');
+    provider.dispose();
+  });
+
+  it('shows no sign-in row in an empty view (the welcome view shows the sign-in button)', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel([], { signedIn: false });
+    expect(provider.getChildren()).toEqual([]);
+    provider.setModel(model(), { signedIn: true });
+    expect((provider.getChildren() as OwnerGroup[]).every((node) => node.kind === 'owner')).toBe(true);
+    provider.dispose();
+  });
+
+  it('has the icon of its view container, which VS Code shows when the view is moved to another place (package.json)', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { viewsContainers: { activitybar: Array<{ id: string; icon: string }> }; views: Record<string, Array<{ id: string; icon?: string }>> };
+    };
+    const [container] = manifest.contributes.viewsContainers.activitybar;
+    const view = manifest.contributes.views[container.id].find((entry) => entry.id === REPOSITORIES_VIEW_ID);
+    expect(view?.icon).toBe(container.icon);
+    expect(fs.existsSync(path.join(__dirname, '..', '..', container.icon))).toBe(true);
+  });
+});
+
+describe('nodes of the setting repositoryGroups', () => {
+  beforeEach(() => resetFakeVscode());
+
+  function groupedModel(): OwnerGroup[] {
+    const names = ['2026-3cWI-SWP-module-oop-Student-A81', '2026-3cWI-SWP-module-oop-student-b-021', '2025-3bWI-SWP-module-oop-student-c'];
+    return buildTreeModel({
+      discovery: {
+        version: 1,
+        fetchedAt: '',
+        viewerLogin: 'me',
+        organizations: ['school'],
+        repositories: names.map((name) => repo(`school/${name}`)),
+        hints: [],
+        scope: [],
+        withoutConfiguration: [],
+      },
+      settings: { owners: [], includeArchived: false, includeForks: true },
+      devspaces: [{ ...env, repository: 'school/2026-3cWI-SWP-module-oop-Student-A81' }],
+      runtime: new Map([['e1', { container: 'running', volume: true }]]),
+      currentDevspaceId: 'e1',
+      otherWindowDevspaceIds: new Set(),
+      busyDevspaceIds: new Set(),
+      liveBranches: new Map(),
+      signedIn: true,
+      repositoryGroups: parseRepositoryGroups([{ name: 'Courses', pattern: String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$` }])
+        .patterns,
+    });
+  }
+
+  it('Expand All opens every owner and every node, without selecting or focusing a row, and skips a node that is gone', async () => {
+    const groups = groupedModel();
+    const revealed: string[] = [];
+    const view = {
+      reveal: vi.fn(async (node: TreeNode, options?: { expand?: boolean | number; select?: boolean; focus?: boolean }) => {
+        expect(options).toEqual({ expand: true, select: false, focus: false });
+        if (node.id.endsWith('2025-3bWI-SWP')) throw new Error('Cannot resolve tree item');
+        revealed.push(node.id);
+      }),
+    };
+    await expandAll(view, groups);
+    const nodes: string[] = [];
+    const walk = (node: OwnerGroup | GroupNode): void => {
+      nodes.push(node.id);
+      for (const child of node.children) if (child.kind === 'group') walk(child);
+    };
+    for (const group of groups) walk(group);
+    expect(nodes.length).toBeGreaterThan(3);
+    expect(nodes.filter((id) => id.endsWith('2025-3bWI-SWP'))).toHaveLength(1);
+    expect(view.reveal).toHaveBeenCalledTimes(nodes.length);
+    expect(revealed).toEqual(nodes.filter((id) => !id.endsWith('2025-3bWI-SWP')));
+  });
+
+  it('maps the nested nodes to tree items, with parents, children, and the initial collapsible state', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel(groupedModel());
+    const [owner] = provider.getChildren() as OwnerGroup[];
+    const [root] = provider.getChildren(owner) as GroupNode[];
+    expect(provider.getTreeItem(root)).toMatchObject({
+      label: 'Courses',
+      id: 'group:school:0:',
+      contextValue: 'group',
+      collapsibleState: 2,
+      tooltip: String.raw`^(\d{4}-[^-]+-[^-]+)-([^-]+-[^-]+)-(.+)$`,
+    });
+    const [y2025, y2026] = provider.getChildren(root) as GroupNode[];
+    // Collapsed, except the node that holds the row of the devspace of this window.
+    expect(provider.getTreeItem(y2025)).toMatchObject({ label: '2025-3bWI-SWP', collapsibleState: 1 });
+    expect(provider.getTreeItem(y2026)).toMatchObject({ label: '2026-3cWI-SWP', collapsibleState: 2 });
+    const [module] = provider.getChildren(y2026) as GroupNode[];
+    const [studentA, studentB] = provider.getChildren(module) as RepositoryRow[];
+    const item = provider.getTreeItem(studentA) as unknown as TreeItem;
+    expect(item).toMatchObject({ label: 'Student-A81', id: 'repo:school/2026-3cwi-swp-module-oop-student-a81', collapsibleState: 0 });
+    expect(item.tooltip).toContain('school/2026-3cWI-SWP-module-oop-Student-A81');
+    expect((item.accessibilityInformation as { label: string }).label).toContain('school/2026-3cWI-SWP-module-oop-Student-A81');
+    expect((provider.getTreeItem(studentB) as unknown as TreeItem).label).toBe('student-b-021');
+    // Reveal walks up from any row to the owner group.
+    expect(provider.getParent(studentA)).toBe(module);
+    expect(provider.getParent(module)).toBe(y2026);
+    expect(provider.getParent(y2026)).toBe(root);
+    expect(provider.getParent(root)).toBe(owner);
+    expect(provider.getParent(owner)).toBeUndefined();
+    provider.dispose();
+  });
+
+  it('gives group nodes a contextValue that no row action of package.json matches', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { menus: Record<string, Array<{ when?: string }>> };
+    };
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const [owner] = groupedModel();
+    const value = (provider.getTreeItem(owner.children[0]) as unknown as TreeItem).contextValue ?? '';
+    for (const menu of ['view/item/context', 'devspaces.more']) {
+      for (const { when } of manifest.contributes.menus[menu]) {
+        for (const regex of (when ?? '').matchAll(/viewItem =~ \/(.+?)\//g)) expect(new RegExp(regex[1]).test(value)).toBe(false);
+      }
+    }
+    provider.dispose();
+  });
+
+  it('gives only repository rows and repository nodes the command that starts on a double-click', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const rowCommands = (node: TreeNode): string[] => {
+      const command = (provider.getTreeItem(node) as unknown as TreeItem).command as { command: string } | undefined;
+      return [command?.command ?? '', ...provider.getChildren(node).flatMap(rowCommands)];
+    };
+    provider.setModel(model(), { signedIn: false });
+    const [signIn, owner] = provider.getChildren();
+    const [hint, api] = provider.getChildren(owner) as [HintRow, RepositoryRow];
+    // The row itself is the argument, as for the row actions of package.json.
+    expect((provider.getTreeItem(api) as unknown as TreeItem).command).toEqual({
+      command: 'devspaces.rowActivated',
+      title: 'Start',
+      arguments: [api],
+    });
+    expect(rowCommands(owner)).toEqual(['', 'vscode.open', 'devspaces.rowActivated', 'devspaces.rowActivated']);
+    expect(rowCommands(signIn)).toEqual(['devspaces.signIn']);
+    expect((provider.getTreeItem(hint) as unknown as TreeItem).command).toMatchObject({ command: 'vscode.open' });
+    provider.setModel(groupedModel());
+    const [school] = provider.getChildren();
+    const [courses] = provider.getChildren(school) as GroupNode[];
+    expect((provider.getTreeItem(courses) as unknown as TreeItem).command).toBeUndefined();
+    // Every node below: owners and group nodes have no command, repository rows (and nodes) have the command of the row.
+    const walk = (node: TreeNode): TreeNode[] => [node, ...provider.getChildren(node).flatMap(walk)];
+    const nodes = walk(school);
+    expect(nodes.some((node) => node.kind === 'repository')).toBe(true);
+    for (const node of nodes) {
+      const command = ((provider.getTreeItem(node) as unknown as TreeItem).command as { command: string } | undefined)?.command;
+      expect(command).toBe(node.kind === 'repository' || node.kind === 'repositoryNode' ? 'devspaces.rowActivated' : undefined);
+    }
+    provider.dispose();
+  });
+});
+
+describe('the node of a repository with several sources', () => {
+  beforeEach(() => resetFakeVscode());
+  const IMAGE = 'ghcr.io/majikmate/devcontainer-base:latest';
+  const PYTHON = '.devcontainer/python/devcontainer.json';
+
+  /**
+   * acme/api with the default image and two configurations: a node with three child rows; acme/web without a
+   * configuration: one row (the default image is its only source).
+   */
+  function sourcesModel(): OwnerGroup[] {
+    const api = { ...repo('acme/api'), configPaths: ['.devcontainer/devcontainer.json', PYTHON] };
+    const web = { ...repo('acme/web'), configPaths: [] };
+    return buildTreeModel({
+      discovery: { version: 1, fetchedAt: '', viewerLogin: 'me', organizations: ['acme'], repositories: [api, web], hints: [], scope: [], withoutConfiguration: [] },
+      settings: { owners: [], includeArchived: false, includeForks: true, defaultImage: IMAGE },
+      devspaces: [{ ...env, configPath: PYTHON }],
+      runtime: new Map([['e1', { container: 'running', volume: true }]]),
+      currentDevspaceId: 'e1',
+      otherWindowDevspaceIds: new Set(),
+      busyDevspaceIds: new Set(),
+      liveBranches: new Map([['e1', 'main']]),
+      signedIn: true,
+    });
+  }
+
+  it('maps the node to an expanded item with the command of a row, with the child rows as its children and itself as their parent', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel(sourcesModel());
+    const [owner] = provider.getChildren() as OwnerGroup[];
+    const [node, web] = provider.getChildren(owner) as [RepositoryNode, RepositoryRow];
+    expect(node.kind).toBe('repositoryNode');
+    expect(web.kind).toBe('repository');
+    const item = provider.getTreeItem(node) as unknown as TreeItem;
+    expect(item).toMatchObject({ label: 'api', id: 'repo:acme/api', contextValue: 'sources', collapsibleState: 2 });
+    // A double-click on the node starts its first child row (rowActivation.ts); the node itself is the argument.
+    expect(item.command).toEqual({ command: 'devspaces.rowActivated', title: 'Start', arguments: [node] });
+    expect((item.iconPath as ThemeIcon).id).toBe('blank');
+    expect((item.accessibilityInformation as { label: string }).label).toBe('acme/api');
+    const children = provider.getChildren(node) as RepositoryRow[];
+    expect(children.map((child) => [child.kind, child.label, child.child])).toEqual([
+      ['repository', 'default', true],
+      ['repository', 'config', true],
+      ['repository', 'python', true],
+    ]);
+    // The child rows carry the actions of a row: the command of a double-click, the icon of their state.
+    for (const child of children) {
+      const row = provider.getTreeItem(child) as unknown as TreeItem;
+      expect(row.command).toEqual({ command: 'devspaces.rowActivated', title: 'Start', arguments: [child] });
+      expect(provider.getParent(child)).toBe(node);
+    }
+    expect((provider.getTreeItem(children[2]) as unknown as TreeItem).contextValue).toContain('canStop');
+    expect(provider.getParent(node)).toBe(owner);
+    expect(provider.getParent(web)).toBe(owner);
+    provider.dispose();
+  });
+
+  it('Expand All opens the node too', async () => {
+    const groups = sourcesModel();
+    const revealed: string[] = [];
+    const view = { reveal: vi.fn(async (node: TreeNode) => void revealed.push(node.id)) };
+    await expandAll(view, groups);
+    expect(revealed).toEqual(['owner:acme', 'repo:acme/api']);
+  });
+
+  it('shows a repository row of the current model without selecting or focusing it, and skips anything else', async () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    provider.setModel(sourcesModel());
+    const view = { reveal: vi.fn(async (_node: TreeNode, _options?: unknown) => {}) };
+    await revealRow(view, provider, 'repo:acme/api:default');
+    const [owner] = provider.getModel();
+    const [node, web] = owner.children as [RepositoryNode, RepositoryRow];
+    expect(view.reveal.mock.calls).toEqual([[node.children[0], { select: false, focus: false }]]);
+    // A row of an owner, without a node, too.
+    await revealRow(view, provider, web.id);
+    expect(view.reveal).toHaveBeenLastCalledWith(web, { select: false, focus: false });
+    // The node, the owner and a row that the model does not have (any more) are no repository rows.
+    for (const id of [node.id, owner.id, 'repo:acme/gone:default']) await revealRow(view, provider, id);
+    expect(view.reveal).toHaveBeenCalledTimes(2);
+    provider.dispose();
+  });
+
+  it('gives the node a contextValue that no row action of package.json matches', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+      contributes: { menus: Record<string, Array<{ when?: string }>> };
+    };
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const [owner] = sourcesModel();
+    const value = (provider.getTreeItem(owner.children[0]) as unknown as TreeItem).contextValue ?? '';
+    expect(value).toBe('sources');
+    let checked = 0;
+    for (const menu of ['view/item/context', 'devspaces.more']) {
+      for (const { when } of manifest.contributes.menus[menu]) {
+        for (const regex of (when ?? '').matchAll(/viewItem =~ \/(.+?)\//g)) {
+          checked += 1;
+          expect(new RegExp(regex[1]).test(value)).toBe(false);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    provider.dispose();
+  });
+});
+
+describe('hint row of an owner that GitHub does not return', () => {
+  beforeEach(() => resetFakeVscode());
+
+  it('offers no authorization, only the page of the owner', () => {
+    const provider = new RepositoriesTreeProvider(silentLogger);
+    const hint: HintRow = {
+      kind: 'hint',
+      id: 'hint:nobody',
+      organization: 'nobody',
+      notFound: true,
+      label: 'The organization nobody was not found or is not accessible.',
+      url: 'https://github.com/nobody',
+    };
+    const item = provider.getTreeItem(hint) as unknown as TreeItem;
+    expect(item.label).toBe('The organization nobody was not found or is not accessible.');
+    expect(item.description).toBeUndefined();
+    expect(item.tooltip).toBe('Open: https://github.com/nobody');
+    expect(item.command).toMatchObject({ command: 'vscode.open', title: 'Open' });
+  });
+});

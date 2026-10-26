@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# © 2026 Hannes Stauss (scalarion@nimblescape.com)
+# Licensed under the MIT License. See LICENSE in the repository root for details.
+
+# The package holds the bundles, the icons and the documents only: ignore
+# everything, then keep the listed files.
+**
+!dist/extension.js
+!dist/groupsPreviewWorker.js
+!dist/helperChannel.js
+!resources/**
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!ThirdPartyNotices.txt
+!SUPPORT.md
