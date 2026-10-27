@@ -173,7 +173,8 @@ async function activateExtension(
   // looks up `docker` in its PATH and in C:\Program Files\Docker\Docker\resources\bin only. A CLI that Devspaces found
   // elsewhere, for example of a per-user Docker Desktop installed after VS Code (or the browser that opened a link of
   // Devspaces) started, gets its folder at the end of PATH of this extension host, so that the Dev Containers extension
-  // uses the same CLI. Devspaces activates before the Dev Containers extension resolves the window of a devspace.
+  // uses the same CLI. Devspaces activates before the Dev Containers extension resolves the window of a devspace
+  // (ATTACHED_CONTAINER_ACTIVATION_EVENT), and this runs before the first await of the activation.
   const shareDockerFolder = (cli: string): void => {
     if (addDockerFolderToPath(process.env, platform, cli)) {
       logger.info(`The folder of the Docker CLI was added to PATH of the extension host: ${path.win32.dirname(cli)}`);
