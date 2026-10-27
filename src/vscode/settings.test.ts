@@ -62,6 +62,8 @@ describe('settings', () => {
       // No default image: every start uses the configuration of the repository.
       defaultImage: '',
       startWithDefaultImage: true,
+      // A link asks before it creates a devspace.
+      confirmOpenFromLink: true,
     });
   });
 
@@ -82,6 +84,15 @@ describe('settings', () => {
     expect(of(false)).toBe(false);
     expect(of(true)).toBe(true);
     expect(of('false')).toBe(true);
+    expect(of(undefined)).toBe(true);
+  });
+
+  it('reads confirmOpenFromLink as a boolean, true by default', () => {
+    const of = (value: unknown) => normalizeSettings((key) => (key === 'confirmOpenFromLink' ? value : undefined)).confirmOpenFromLink;
+    expect(of(false)).toBe(false);
+    expect(of(true)).toBe(true);
+    expect(of('false')).toBe(true);
+    expect(of(0)).toBe(true);
     expect(of(undefined)).toBe(true);
   });
 

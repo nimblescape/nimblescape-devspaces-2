@@ -184,6 +184,8 @@ export const ControllerTexts = {
     `Open ${repository} from a link? Devspaces creates a devspace for it: it clones the repository and runs code from it (Dockerfile, Features, and commands) on your Docker engine.`,
   // Buttons.
   stop: 'Stop',
+  /** The second button of the question linkStartConfirm: opens, and turns off the setting confirmOpenFromLink. */
+  openAndDontAskAgain: "Open and Don't Ask Again",
   /** The one button of the modal message stillConnected: the window closes its connection after it. */
   closeConnection: 'Close Connection',
   // Quick Picks.

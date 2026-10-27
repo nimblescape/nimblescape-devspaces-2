@@ -37,7 +37,11 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   updateContainer: 'notify',
   defaultImage: '',
   startWithDefaultImage: true,
+  confirmOpenFromLink: true,
 });
+
+/** The key of the setting that the button "Open and Don't Ask Again" of the question of a link turns off. */
+export const CONFIRM_OPEN_FROM_LINK_SETTING = 'confirmOpenFromLink';
 
 /**
  * Bounds of the setting stopAfterMinutes: five minutes to one day. At least 5 minutes, so that a tick with long stops
@@ -61,7 +65,7 @@ export const MAX_REFRESH_INTERVAL_MINUTES = Math.floor(0x7fffffff / 60_000);
  * does not decide which window a Start uses, and for `stopAfterMinutes`: one limit per user and computer, as every
  * window sends it in its heartbeats; the same for `stopOnClose` and `respectShutdownActionNone` (read by each window
  * for its heartbeats and its release): a repository's workspace settings cannot keep every devspace of the computer
- * running.
+ * running; and for `confirmOpenFromLink`: a workspace cannot turn off the question before a link creates a devspace.
  */
 export function readSettings(): ExtensionSettings {
   const configuration = vscode.workspace.getConfiguration(SETTINGS_SECTION);
@@ -316,5 +320,6 @@ export function normalizeSettings(get: (key: keyof ExtensionSettings) => unknown
     // The image reference, or '' (none; an invalid value is ignored, warnInvalidDefaultImage names it).
     defaultImage: normalizeDefaultImage(get('defaultImage')) ?? '',
     startWithDefaultImage: bool('startWithDefaultImage', DEFAULT_SETTINGS.startWithDefaultImage ?? true),
+    confirmOpenFromLink: bool('confirmOpenFromLink', DEFAULT_SETTINGS.confirmOpenFromLink ?? true),
   };
 }
