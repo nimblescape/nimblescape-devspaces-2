@@ -16,7 +16,7 @@ import { GITHUB_PROVIDER_ID, GITHUB_SCOPES, PACKAGES_SCOPES } from './auth';
 import { Commands } from './commands';
 import { ControllerTexts } from './controllerTexts';
 import { OUTPUT_CHANNEL_NAME } from './logger';
-import { OPEN_LINK_PATH, REPOSITORY_PARAMETER } from './links';
+import { COURSE_LINK_PATH, OPEN_LINK_PATH, REPOSITORY_PARAMETER, USERNAME_PLACEHOLDER } from './links';
 import { GITHUB_ENTERPRISE_SECTION } from './settings';
 import { TreeTexts } from './treeModel';
 
@@ -104,6 +104,25 @@ describe('the behaviors of Devspaces at the top of the Marketplace page', () => 
     const guide = section(read('docs/guide.md'), 'Open from a link');
     expect(guide).toContain(`<a href="${link}">`);
     expect(guide).toContain('**Do not ask me again for this extension**');
+  });
+
+  // The course link (links.ts) opens the repository with the login of the signed-in account: the same places name it,
+  // with the ID of the manifest and the placeholder of the code, and say that it asks for the sign-in first.
+  it('says that a course link opens the repository with the login, with the link of the code', () => {
+    const { publisher, name } = JSON.parse(read('package.json')) as { publisher: string; name: string };
+    const link = `vscode://${publisher}.${name}${COURSE_LINK_PATH}?${REPOSITORY_PARAMETER}=owner/name-${USERNAME_PLACEHOLDER}`;
+    const readmeWhen = item(section(read('README.md'), HEADING), '**When it works.**');
+    const securityWhen = item(section(read('docs/security.md'), HEADING), '**When.**');
+    for (const text of [readmeWhen, securityWhen]) {
+      expect(text).toContain(`\`${link}\``);
+      expect(text).toContain('asks for the GitHub sign-in');
+      expect(text).toContain(`in place of \`${USERNAME_PLACEHOLDER}\``);
+    }
+    const guide = section(read('docs/guide.md'), 'Open from a link');
+    expect(guide).toContain('\n### Course links\n');
+    expect(guide).toContain(link);
+    expect(guide).toContain(`<a href="vscode://${publisher}.${name}${COURSE_LINK_PATH}?${REPOSITORY_PARAMETER}=`);
+    expect(section(read('CHANGELOG.md'), '0.2.0')).toContain(`\`${link}\``);
   });
 
   it('has the section in docs/security.md, as the target of the link', () => {

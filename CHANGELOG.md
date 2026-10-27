@@ -3,6 +3,10 @@
 Each section lists the changes of one released version. The release workflow
 takes the section of a version as the notes of its GitHub release.
 
+## 0.2.0
+
+**Course links:** a course link `vscode://nimblescape.nimblescape-devspaces-2/course?repository=owner/name-<username>` opens your own repository of a course, for example the repository that GitHub Classroom creates for you when you accept an assignment. Devspaces asks for the GitHub sign-in first if you are not signed in, puts the login of the signed-in account in place of `<username>`, and then opens the repository as a link `/open?repository=owner/name` does. A course link without `<username>` gets `-<username>` at the end of the name. When Devspaces is not installed, VS Code first offers to install it from the Visual Studio Marketplace. The section [Course links](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#course-links) of the user guide shows the link for a web page.
+
 ## 0.1.0
 
 The first version.

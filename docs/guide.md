@@ -76,6 +76,26 @@ When you select the link:
 
 The devspace opens in the window that VS Code gives the link, usually the window that was active last, when that window is empty; otherwise it opens in a new window, and that window keeps what it has. A link opens nothing, and a message says why, when it does not name a repository as `owner/name`, when GitHub does not show the repository to your account, or when the repository has no Dev Container configuration and `devspaces.defaultImage` is empty. When GitHub cannot be asked, for example without a connection to the internet, the link opens your devspace of the repository on the current Docker engine, if you have one there.
 
+### Course links
+
+A course link opens your own repository of a course, for example the repository that GitHub Classroom creates for you when you accept an assignment. GitHub Classroom names it after the assignment, with your GitHub login at the end: for the login `octocat`, the assignment `my-school/module-ts-2` gives the repository `my-school/module-ts-2-octocat`. One course link works for every student of the course:
+
+```text
+vscode://nimblescape.nimblescape-devspaces-2/course?repository=owner/name-<username>
+```
+
+On a web page:
+
+```html
+<a href="vscode://nimblescape.nimblescape-devspaces-2/course?repository=my-school/module-ts-2-<username>">Open in Devspaces</a>
+```
+
+A course link needs the GitHub sign-in, because only the sign-in tells Devspaces your login. When you are not signed in, Devspaces asks for the sign-in first; without it, the link opens nothing. Devspaces then puts the login of the signed-in account in place of `<username>` and opens that repository, as a link `/open?repository=owner/name` does (see [Open from a link](#open-from-a-link)). This also works when Devspaces is not installed yet: VS Code first offers to install it, as for a link `/open`.
+
+- `<username>` can stand anywhere in the name, also more than once. A course link without `<username>` gets `-<username>` at the end of the name, so `/course?repository=my-school/module-ts-2` opens the same repository.
+- The owner is the organization of the course and cannot contain `<username>`.
+- When GitHub does not show the repository to your account, for example before you accepted the assignment, or when you signed in with another account than the one of the course, the link opens nothing, and a message names the repository and your login.
+
 ## The sidebar
 
 The first row names the Docker engine that the view shows: **Local Docker**, or **Remote Docker host: `<host>`**. Select it to choose another engine. Below it, the repositories are grouped by owner.
