@@ -7,6 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
+  addDockerFolderToPath,
   dockerProcessEnv,
   envValue,
   extraSearchFolders,
@@ -65,6 +66,24 @@ describe('extraSearchFolders', () => {
     ]);
   });
 
+  it('adds the folder of a per-user Docker Desktop installation on Windows when LOCALAPPDATA is known', () => {
+    expect(extraSearchFolders('win32', { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' })).toEqual([
+      'C:\\Program Files\\Docker\\Docker\\resources\\bin',
+      'C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin',
+    ]);
+  });
+
+  it('finds the Docker CLI of a per-user Docker Desktop installation on Windows with a PATH from before the installation', () => {
+    const cli = 'C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe';
+    const fake = existing(cli);
+    expect(findDockerCli({ Path: 'C:\\Windows\\System32', LocalAppData: 'C:\\Users\\me\\AppData\\Local' }, 'win32', fake.exists)).toBe(cli);
+    expect(fake.probed).toEqual([
+      'C:\\Windows\\System32\\docker.exe',
+      'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe',
+      cli,
+    ]);
+  });
+
   it('lists the usual folders on Linux', () => {
     expect(extraSearchFolders('linux')).toEqual(['/usr/local/bin', '/usr/bin']);
   });
@@ -73,8 +92,16 @@ describe('extraSearchFolders', () => {
 describe('windowsDockerDesktopFolders', () => {
   it('deduplicates case-insensitively and ignores relative values', () => {
     expect(
-      windowsDockerDesktopFolders({ ProgramW6432: 'c:\\program files', PROGRAMFILES: 'relative' }),
+      windowsDockerDesktopFolders({ ProgramW6432: 'c:\\program files', PROGRAMFILES: 'relative', LOCALAPPDATA: 'AppData\\Local' }),
     ).toEqual(['c:\\program files\\Docker\\Docker']);
+  });
+
+  it('lists the folder of an installation for all users first, then the per-user folder in LOCALAPPDATA', () => {
+    expect(windowsDockerDesktopFolders({ LocalAppData: 'C:\\Users\\me\\AppData\\Local', ProgramFiles: 'D:\\Programs' })).toEqual([
+      'D:\\Programs\\Docker\\Docker',
+      'C:\\Program Files\\Docker\\Docker',
+      'C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop',
+    ]);
   });
 });
 
@@ -184,6 +211,35 @@ describe('dockerProcessEnv', () => {
   it('compares folders case-insensitively on Windows', () => {
     const value = 'C:\\Windows;c:\\program files\\docker\\docker\\resources\\bin\\';
     expect(dockerProcessEnv({ Path: value }, 'win32').Path).toBe(value);
+  });
+});
+
+describe('addDockerFolderToPath', () => {
+  const cli = 'C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe';
+
+  it('puts the folder of the CLI at the end of PATH on Windows, under the spelling of the key', () => {
+    const env: NodeJS.ProcessEnv = { Path: 'C:\\Windows;C:\\Tools;' };
+    expect(addDockerFolderToPath(env, 'win32', cli)).toBe(true);
+    expect(env).toEqual({ Path: 'C:\\Windows;C:\\Tools;C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin' });
+  });
+
+  it('changes nothing when PATH contains the folder (case-insensitively, also with a trailing backslash)', () => {
+    const env: NodeJS.ProcessEnv = { PATH: 'C:\\Windows;c:\\users\\me\\appdata\\local\\programs\\dockerdesktop\\resources\\bin\\' };
+    expect(addDockerFolderToPath(env, 'win32', cli)).toBe(false);
+    expect(env.PATH).toBe('C:\\Windows;c:\\users\\me\\appdata\\local\\programs\\dockerdesktop\\resources\\bin\\');
+  });
+
+  it('sets PATH when there is none on Windows', () => {
+    const env: NodeJS.ProcessEnv = {};
+    expect(addDockerFolderToPath(env, 'win32', cli)).toBe(true);
+    expect(env).toEqual({ Path: 'C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin' });
+  });
+
+  it('changes nothing on macOS and Linux', () => {
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    expect(addDockerFolderToPath(env, 'darwin', '/Applications/Docker.app/Contents/Resources/bin/docker')).toBe(false);
+    expect(addDockerFolderToPath(env, 'linux', '/opt/docker/bin/docker')).toBe(false);
+    expect(env).toEqual({ PATH: '/usr/bin' });
   });
 });
 

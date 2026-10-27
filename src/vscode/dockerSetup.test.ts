@@ -11,6 +11,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 // The Docker CLI of the extension (BootstrapDocker).
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
+import { findDockerCli } from '../core/docker/dockerCli';
 import type { DownloadOptions } from '../core/docker/dockerDownload';
 import {
   DOCKER_DESKTOP_DOWNLOADS,
@@ -855,6 +856,48 @@ describe('DockerSetup: WSL 2 (sidebar button Install WSL 2, Windows)', () => {
     expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
     expect(fakeVscode.terminals).toEqual([]);
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.wslAlreadyInstalled);
+    dockerSetup.dispose();
+  });
+
+  // The installer of Docker Desktop installs for the user by default (in %LOCALAPPDATA%\Programs\DockerDesktop) and adds
+  // the folder to the PATH of the user, which VS Code, started before the installation, does not see.
+  it('finds a per-user Docker Desktop after the installation, with the PATH from before it', async () => {
+    const env = { Path: 'C:\\Windows\\System32', LOCALAPPDATA: 'C:\\Users\\octo\\AppData\\Local' };
+    const cli = 'C:\\Users\\octo\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe';
+    const files = new Set<string>();
+    const runner = { run: vi.fn(async (_file: string, _args: readonly string[]): Promise<RunResult> => status(0)) };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
+    const docker = new BootstrapDocker(runner, findDockerCli(env, 'win32', (file) => files.has(file)), env, logger, 'win32', {
+      findDocker: (lookupEnv, platform) => findDockerCli(lookupEnv, platform, (file) => files.has(file)),
+    });
+    const changed = vi.fn();
+    const dockerSetup = new DockerSetup({
+      docker,
+      runner,
+      logger,
+      showLog: vi.fn(),
+      platform: 'win32',
+      env,
+      onDidChangeInstalled: changed,
+      remoteDockerHostConfigured: () => false,
+      viewVisible: () => true,
+      planInput: async () => ({ platform: 'win32', arch: 'x64', has: (tool: SetupTool) => tool === 'winget' }),
+    });
+    dockerSetup.initialize();
+    await flush();
+    expect(dockerSetup.setupRequired).toBe(true);
+    confirmWith(DockerSetupTexts.install);
+    await dockerSetup.install();
+    expect(fakeVscode.terminals).toHaveLength(1);
+    // The installer puts the CLI in place.
+    files.add(cli);
+    vi.advanceTimersByTime(5_000);
+    expect(dockerSetup.setupRequired).toBe(false);
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(docker.dockerPath).toBe(cli);
+    // The Docker calls find the credential helper of Docker Desktop next to the CLI.
+    expect(docker.processEnv().Path).toBe(`C:\\Windows\\System32;${path.win32.dirname(cli)};C:\\Program Files\\Docker\\Docker\\resources\\bin`);
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(DockerSetupUiTexts.installedStartNow, DockerSetupUiTexts.startDocker);
     dockerSetup.dispose();
   });
 

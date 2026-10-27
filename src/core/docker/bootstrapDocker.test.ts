@@ -555,6 +555,45 @@ describe('BootstrapDocker: a Docker CLI that is installed later', () => {
     expect(lost).toHaveLength(1);
   });
 
+  it('reports a CLI that it finds after it was missing to onCliFound, not the CLI of the constructor', () => {
+    const found: Array<string | undefined> = [];
+    let cli: string | undefined;
+    const missing: BootstrapDocker = new BootstrapDocker(new FakeRunner(() => ok()), undefined, {}, silentLogger, 'linux', {
+      findDocker: () => cli,
+      onCliFound: (dockerPath) => found.push(`${dockerPath} ${String(missing.dockerPath)}`),
+    });
+    expect(missing.lookUpCliNow()).toBe(false);
+    expect(found).toEqual([]);
+    cli = '/opt/docker/bin/docker';
+    expect(missing.lookUpCliNow()).toBe(true);
+    // Reported after the adapter took the path.
+    expect(found).toEqual(['/opt/docker/bin/docker /opt/docker/bin/docker']);
+    expect(missing.lookUpCliNow()).toBe(true);
+    expect(found).toHaveLength(1);
+
+    const reported: string[] = [];
+    const installed = new BootstrapDocker(new FakeRunner(() => ok()), DOCKER, {}, silentLogger, 'linux', {
+      findDocker: () => DOCKER,
+      onCliFound: (dockerPath) => reported.push(dockerPath),
+    });
+    expect(installed.lookUpCliNow()).toBe(true);
+    expect(reported).toEqual([]);
+  });
+
+  it('keeps the found CLI when onCliFound throws', () => {
+    const warnings: string[] = [];
+    const logger: Logger = { ...silentLogger, warn: (message: string) => void warnings.push(message) };
+    const docker = new BootstrapDocker(new FakeRunner(() => ok()), undefined, {}, logger, 'linux', {
+      findDocker: () => DOCKER,
+      onCliFound: () => {
+        throw new Error('boom');
+      },
+    });
+    expect(docker.lookUpCliNow()).toBe(true);
+    expect(docker.dockerPath).toBe(DOCKER);
+    expect(warnings.some((line) => line.includes('boom'))).toBe(true);
+  });
+
   it('keeps its error when onCliLost throws', async () => {
     const runner = new FakeRunner(() => {
       throw Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' });

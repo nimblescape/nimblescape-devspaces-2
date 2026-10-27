@@ -162,6 +162,11 @@ export interface BootstrapDockerOptions {
    * seconds later (for example after Docker Desktop updated itself) would be found only 10 seconds later.
    */
   onCliLost?: () => void;
+  /**
+   * With `findDocker`: called with the full path of a CLI that was missing and is found now (not for the path that the
+   * constructor gets), after the adapter took it.
+   */
+  onCliFound?: (dockerPath: string) => void;
   /** Only for tests. Default: SSH_DROP_RETRY_DELAY_MS. */
   sshDropRetryDelayMs?: number;
   /** Only for tests. Default: cliFileIdentity. */
@@ -202,6 +207,7 @@ export class BootstrapDocker {
   private readonly clock: Clock;
   private readonly onDaemonStatus: BootstrapDockerOptions['onDaemonStatus'];
   private readonly onCliLost: BootstrapDockerOptions['onCliLost'];
+  private readonly onCliFound: BootstrapDockerOptions['onCliFound'];
   private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
   private readonly fileIdentity: (path: string) => Promise<string | undefined>;
@@ -233,6 +239,7 @@ export class BootstrapDocker {
     this.clock = options.clock ?? systemClock;
     this.onDaemonStatus = options.onDaemonStatus;
     this.onCliLost = options.onCliLost;
+    this.onCliFound = options.onCliFound;
     this.sshDropRetryDelayMs = options.sshDropRetryDelayMs ?? SSH_DROP_RETRY_DELAY_MS;
     this.fileIdentity = options.fileIdentity ?? cliFileIdentity;
     // The caller has just looked the CLI up.
@@ -371,6 +378,11 @@ export class BootstrapDocker {
     this.path = found;
     this.env = dockerProcessEnv(this.rawEnv, this.platform, found);
     this.logger.info(`Docker CLI: ${found}`);
+    try {
+      this.onCliFound?.(found);
+    } catch (error) {
+      this.logger.warn(`The found Docker CLI could not be reported: ${errorMessage(error)}`);
+    }
   }
 
   /** Like run, but throws CommandError on a non-zero exit code (also after a timeout); returns stdout. */
