@@ -2,7 +2,7 @@
   "name": "nimblescape-devspaces-2",
   "displayName": "nimblescape Devspaces 2",
   "description": "Open your GitHub repositories in dev containers on your own Docker. Uses your GitHub sign-in (scopes repo and read:org), runs Docker and the Dev Containers CLI, can install Docker after you confirm, and runs a background container that updates images, the VS Code Server and extensions. Before your first devspace, it does not contact the Docker engine. It asks before the background container keeps running on a Docker engine, and a command removes it.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "nimblescape",
   "license": "MIT",
   "author": {
