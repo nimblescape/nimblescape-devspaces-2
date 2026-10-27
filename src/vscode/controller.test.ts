@@ -7163,7 +7163,7 @@ describe('A link to Devspaces', () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
     h.settings.defaultImage = DEFAULT_IMAGE;
     await h.controller.openLink(link('acme/api'));
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.linkStartConfirm('acme/api'), { modal: true }, Actions.open);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.linkStartConfirm('acme/api'), { modal: true }, Actions.open, ControllerTexts.openAndDontAskAgain);
     // The user answered the question of the link: the pipeline asks no question of its own (trusted).
     expect(h.service.openInWorker).toHaveBeenLastCalledWith(expect.objectContaining({ repository: 'acme/api', trusted: true }), expect.objectContaining({ source: DEFAULT_SOURCE }));
     h.settings.startWithDefaultImage = false;
@@ -7186,6 +7186,82 @@ describe('A link to Devspaces', () => {
     // Not even the question about the Monitor of the engine (beforeUserFlow), which comes before the pipeline.
     expect(h.monitorQuestion.askIfNeeded).not.toHaveBeenCalled();
     expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
+  });
+
+  describe('Open and Don\'t Ask Again', () => {
+    /** The user settings of the section devspaces: the writes. */
+    function userSettings(): { update: ReturnType<typeof vi.fn> } {
+      const configuration = { update: vi.fn(async () => undefined) };
+      fakeVscode.workspace.getConfiguration.mockReturnValue(configuration);
+      return configuration;
+    }
+
+    it('opens, and turns off the question of the link in the user settings', async () => {
+      const settings = userSettings();
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? ControllerTexts.openAndDontAskAgain : undefined));
+      await h.controller.openLink(link('acme/api'));
+      expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith(SETTINGS_SECTION);
+      expect(settings.update).toHaveBeenCalledWith('confirmOpenFromLink', false, fakeVscode.ConfigurationTarget.Global);
+      // The setting is written before any Docker work, and the start goes on as after Open.
+      expect(settings.update.mock.invocationCallOrder[0]).toBeLessThan(h.service.openInWorker.mock.invocationCallOrder[0] ?? 0);
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api', trusted: true }), expect.objectContaining({ source: ROOT_SOURCE }));
+      expect(h.logger.info).toHaveBeenCalledWith(expect.stringContaining('the setting confirmOpenFromLink is off. Turn it on to get the question again.'));
+    });
+
+    it('does not write the setting after Open', async () => {
+      const settings = userSettings();
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      await h.controller.openLink(link('acme/api'));
+      expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+      expect(settings.update).not.toHaveBeenCalled();
+    });
+
+    it('opens also when the setting cannot be written, and says so in the log', async () => {
+      const settings = userSettings();
+      settings.update.mockRejectedValue(new Error('settings.json is read-only'));
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? ControllerTexts.openAndDontAskAgain : undefined));
+      await h.controller.openLink(link('acme/api'));
+      expect(h.logger.warn).toHaveBeenCalledWith('The setting confirmOpenFromLink could not be turned off, so the next link asks again: settings.json is read-only');
+      expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+      expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
+    });
+
+    it('with the setting off, creates the devspace of the account or of its organizations without the question', async () => {
+      h.settings.confirmOpenFromLink = false;
+      h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+      await h.controller.openLink(link('acme/api'));
+      expect(linkQuestions()).toEqual([]);
+      expect(h.logger.info).toHaveBeenCalledWith('The link creates the devspace of acme/api without a question: the setting confirmOpenFromLink is off.');
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api', trusted: true }), expect.objectContaining({ source: ROOT_SOURCE }));
+    });
+
+    // Any website can show a link: the setting never skips the confirmation of a repository of another owner, and that
+    // confirmation has no button that turns it off.
+    it('with the setting off, still asks for a repository of another owner, without the button', async () => {
+      h.settings.confirmOpenFromLink = false;
+      h.sidebar.trustedOwner.mockResolvedValue(false);
+      h.sidebar.infos.set('other/tool', repositoryInfo('other/tool'));
+      await h.controller.openLink(link('other/tool'));
+      expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(Messages.untrustedRepository('other/tool'), { modal: true }, Actions.open);
+      expect(linkQuestions()).toEqual([Messages.untrustedRepository('other/tool')]);
+      expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+      // Cancel: nothing starts.
+      fakeVscode.window.showWarningMessage.mockResolvedValue(undefined);
+      await h.controller.openLink(link('other/tool'));
+      expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads the setting as a user setting only, on by default (package.json)', () => {
+      const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+        contributes: { configuration: { properties: Record<string, { default?: unknown; scope?: string; type?: string; markdownDescription?: string }> } };
+      };
+      const property = manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.confirmOpenFromLink`];
+      expect(property).toMatchObject({ type: 'boolean', default: true, scope: 'application' });
+      expect(DEFAULT_SETTINGS.confirmOpenFromLink).toBe(true);
+      expect(property?.markdownDescription).toContain(`**${ControllerTexts.openAndDontAskAgain}**`);
+    });
   });
 
   it('asks GitHub for a repository that the list does not show, and starts it with its name and data from GitHub', async () => {
