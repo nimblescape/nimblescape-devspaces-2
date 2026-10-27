@@ -9,6 +9,8 @@ import * as path from 'path';
 
 const WINDOWS_PROGRAM_FILES = 'C:\\Program Files';
 const WINDOWS_DOCKER_FOLDER = 'Docker\\Docker';
+/** The folder of a per-user installation of Docker Desktop in %LOCALAPPDATA%. */
+const WINDOWS_PER_USER_DOCKER_FOLDER = 'Programs\\DockerDesktop';
 
 function pathApi(platform: NodeJS.Platform): path.PlatformPath {
   return platform === 'win32' ? path.win32 : path.posix;
@@ -29,25 +31,33 @@ export function envValue(env: NodeJS.ProcessEnv, name: string, platform: NodeJS.
 }
 
 /**
- * Installation folders of Docker Desktop on Windows, for example `C:\Program Files\Docker\Docker`.
- * Uses `ProgramFiles` / `ProgramW6432` when set, then the default folder.
+ * Installation folders of Docker Desktop on Windows. First the folder of an installation for all users, for example
+ * `C:\Program Files\Docker\Docker` (in `ProgramW6432` / `ProgramFiles` when set, then in the default folder). Then the
+ * folder of a per-user installation, `%LOCALAPPDATA%\Programs\DockerDesktop`, which the installer of Docker Desktop
+ * selects by default since version 4.83. Both folders have the same layout (`resources\bin\docker.exe`,
+ * `Docker Desktop.exe`). The installer adds `resources\bin` to the PATH of the user, but a program that started before
+ * the installation keeps its old PATH: VS Code until it restarts, and a browser that starts VS Code for a link.
  */
 export function windowsDockerDesktopFolders(env: NodeJS.ProcessEnv = {}): string[] {
-  const roots = [envValue(env, 'ProgramW6432', 'win32'), envValue(env, 'ProgramFiles', 'win32'), WINDOWS_PROGRAM_FILES];
   const folders: string[] = [];
-  for (const root of roots) {
-    if (!root || !path.win32.isAbsolute(root)) continue;
-    const folder = path.win32.join(root, WINDOWS_DOCKER_FOLDER);
+  const add = (root: string | undefined, name: string): void => {
+    if (!root || !path.win32.isAbsolute(root)) return;
+    const folder = path.win32.join(root, name);
     if (!folders.some((existing) => existing.toLowerCase() === folder.toLowerCase())) folders.push(folder);
+  };
+  for (const root of [envValue(env, 'ProgramW6432', 'win32'), envValue(env, 'ProgramFiles', 'win32'), WINDOWS_PROGRAM_FILES]) {
+    add(root, WINDOWS_DOCKER_FOLDER);
   }
+  add(envValue(env, 'LOCALAPPDATA', 'win32'), WINDOWS_PER_USER_DOCKER_FOLDER);
   return folders;
 }
 
 /**
  * Extra folders to search after PATH: /usr/local/bin, /opt/homebrew/bin, /Applications/Docker.app/Contents/Resources/bin, and with
  * HOME ~/.docker/bin and ~/Applications/Docker.app/Contents/Resources/bin (darwin),
- * C:\Program Files\Docker\Docker\resources\bin (win32). On Linux: /usr/local/bin and /usr/bin.
- * `env` is optional: on Windows, it gives the Program Files folder if it is not on drive C.
+ * C:\Program Files\Docker\Docker\resources\bin and with LOCALAPPDATA %LOCALAPPDATA%\Programs\DockerDesktop\resources\bin
+ * (win32, see windowsDockerDesktopFolders). On Linux: /usr/local/bin and /usr/bin.
+ * `env` is optional: on Windows, it gives the Program Files folder if it is not on drive C, and the folder LOCALAPPDATA.
  */
 export function extraSearchFolders(platform: NodeJS.Platform, env?: NodeJS.ProcessEnv): string[] {
   switch (platform) {
@@ -178,6 +188,23 @@ export function dockerProcessEnv(env: NodeJS.ProcessEnv, platform: NodeJS.Platfo
     result[key] = current.trim() === '' ? additions.join(delimiter) : `${current}${delimiter}${additions.join(delimiter)}`;
   }
   return result;
+}
+
+/**
+ * Windows: puts the folder of the Docker CLI at `dockerPath` at the end of PATH in `env` (under the spelling of the key
+ * that `env` has, for example `Path`) when PATH does not contain that folder. Changes `env`; true when it changed it.
+ * Nothing on other platforms, where VS Code takes PATH from the login shell when it starts.
+ */
+export function addDockerFolderToPath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, dockerPath: string): boolean {
+  if (platform !== 'win32') return false;
+  const folder = path.win32.dirname(dockerPath);
+  const key = Object.keys(env).find((name) => name.toLowerCase() === 'path' && env[name] !== undefined) ?? 'Path';
+  const current = env[key] ?? '';
+  const folderId = folderKey(folder, platform);
+  if (current.split(';').some((entry) => entry.trim() !== '' && folderKey(entry, platform) === folderId)) return false;
+  const kept = current.replace(/;+\s*$/, '');
+  env[key] = kept.trim() === '' ? folder : `${kept};${folder}`;
+  return true;
 }
 
 // The words of a Docker command and the calls that only read, for the Docker CLI of the bootstrap.

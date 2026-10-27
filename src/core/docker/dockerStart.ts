@@ -167,7 +167,8 @@ function startFailed(detail: string): UserFacingError {
 
 /**
  * Resolves when `docker info` succeeds. Starts Docker when needed: `docker desktop start`; fallback on darwin `open -g -a Docker`,
- * on win32 `Docker Desktop.exe` from C:\Program Files\Docker\Docker (spawned detached, not awaited); on linux without Docker Desktop
+ * on win32 `Docker Desktop.exe` from C:\Program Files\Docker\Docker or %LOCALAPPDATA%\Programs\DockerDesktop
+ * (windowsDockerDesktopFolders; spawned detached, not awaited); on linux without Docker Desktop
  * (the `desktop` command is missing) → UserFacingError('dockerEngineNotRunning', Messages.dockerEngineNotRunning).
  * No CLI → UserFacingError('dockerNotInstalled'). Timeout, or no way to start Docker → UserFacingError('dockerStartFailed',
  * Messages.dockerStartFailed, detail). Podman as the CLI or as the engine (BootstrapDocker.podmanInUse) →

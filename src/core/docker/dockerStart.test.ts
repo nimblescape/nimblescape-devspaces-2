@@ -306,6 +306,21 @@ describe('ensureDockerRunning', () => {
     expect(launched).toEqual(['C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe']);
   });
 
+  it('starts Docker Desktop.exe of a per-user installation on Windows', async () => {
+    const launched: string[] = [];
+    const exe = 'C:\\Users\\me\\AppData\\Local\\Programs\\DockerDesktop\\Docker Desktop.exe';
+    const s = setup({ info: [NOT_READY, READY], desktop: () => UNKNOWN_DESKTOP });
+    await s.run({
+      platform: 'win32',
+      env: { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' },
+      exists: (file) => file === exe,
+      launchDetached: async (file) => {
+        launched.push(file);
+      },
+    });
+    expect(launched).toEqual([exe]);
+  });
+
   it('fails on Windows when Docker Desktop.exe is missing', async () => {
     const s = setup({ info: [NOT_READY], desktop: () => UNKNOWN_DESKTOP });
     const error = await rejection(s.run({ platform: 'win32', env: {}, exists: () => false }));

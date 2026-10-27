@@ -11,7 +11,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
-import { dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
+import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
 import { describeDockerHost, dockerHostOf, isOnDockerHost, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
@@ -169,6 +169,17 @@ async function activateExtension(
   const runner = new NodeProcessRunner();
   const dockerPath = findDockerCli(env, platform);
   logger.info(dockerPath ? `Docker CLI: ${dockerPath}` : 'The Docker CLI was not found.');
+  // Windows: the Dev Containers extension, which connects the windows to the containers, runs in this extension host and
+  // looks up `docker` in its PATH and in C:\Program Files\Docker\Docker\resources\bin only. A CLI that Devspaces found
+  // elsewhere, for example of a per-user Docker Desktop installed after VS Code (or the browser that opened a link of
+  // Devspaces) started, gets its folder at the end of PATH of this extension host, so that the Dev Containers extension
+  // uses the same CLI. Devspaces activates before the Dev Containers extension resolves the window of a devspace.
+  const shareDockerFolder = (cli: string): void => {
+    if (addDockerFolderToPath(process.env, platform, cli)) {
+      logger.info(`The folder of the Docker CLI was added to PATH of the extension host: ${path.win32.dirname(cli)}`);
+    }
+  };
+  if (dockerPath) shareDockerFolder(dockerPath);
   // Set below; the adapter reports each `docker info` to it (context key devspaces.dockerReady).
   let dockerSetup: DockerSetup | undefined;
   // The worker (the helper channels), set below; its failed opens are tried again at once when the Docker engine begins
@@ -187,6 +198,7 @@ async function activateExtension(
   // Docker CLI of the extension is only the bootstrap's (BootstrapDocker).
   const docker = new BootstrapDocker(runner, dockerPath, env, logger, platform, {
     ...adapterOptions,
+    onCliFound: shareDockerFolder,
     onDaemonStatus: (running) => {
       if (running && !daemonRunning) helperChannels?.clearFailures();
       daemonRunning = running;
