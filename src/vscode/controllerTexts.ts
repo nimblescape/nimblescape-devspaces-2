@@ -168,9 +168,16 @@ export const ControllerTexts = {
   noDevspaces: 'There is no devspace yet. Start a repository to create one.',
   noRepositories: 'No repository is available. Sign in with GitHub, or refresh the list.',
   // A link to Devspaces (links.ts), for example on a website.
-  invalidLink: 'Devspaces cannot open this link. A link to Devspaces ends with /open?repository=owner/name, with the name of a GitHub repository.',
+  invalidLink:
+    'Devspaces cannot open this link. A link to Devspaces ends with /open?repository=owner/name, or for a course with /course?repository=owner/name-<username>, with the name of a GitHub repository.',
   linkRepositoryNotFound: (repository: string) =>
     `GitHub does not show the repository ${repository} to your GitHub account. Check the link, or sign in with an account that can access the repository.`,
+  /** A course link (/course): GitHub does not show the repository of the course with the login of the account. */
+  courseRepositoryNotFound: (repository: string, login: string) =>
+    `GitHub does not show the repository ${repository} to your GitHub account ${login}. A course link opens your own repository of the course: accept the assignment of the course first, for example in GitHub Classroom, or sign in with the GitHub account that you use for the course.`,
+  /** A course link whose name, with the login of the account, is no GitHub repository name (longer than 100 characters). */
+  courseLinkInvalidForLogin: (login: string) =>
+    `Devspaces cannot open this course link for your GitHub account ${login}: with your login, the name of the repository is longer than GitHub allows.`,
   linkRepositoryUnknown: (repository: string) => `GitHub could not be asked for the repository ${repository}. Open the link again later.`,
   /** The modal question before a link creates a devspace of the account or of one of its organizations (button Open). */
   linkStartConfirm: (repository: string) =>

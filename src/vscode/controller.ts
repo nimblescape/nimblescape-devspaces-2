@@ -57,7 +57,7 @@ import {
 import type { DockerSetup } from './dockerSetup';
 import type { MonitorQuestion } from './monitorQuestion';
 import { isCancellation, showError as presentError } from './errors';
-import { parseLink } from './links';
+import { courseRepository, parseLink, type RepositoryLink } from './links';
 import type { OutputChannelLogger } from './logger';
 import { showErrorMessage, showInformationMessage, showWarningMessage } from './notifications';
 import { selectOwners } from './ownerSelector';
@@ -1776,6 +1776,9 @@ export class Controller implements vscode.Disposable {
    * that was active last, in which the user did not ask for anything: the devspace opens in that window only when it is
    * empty, else in a new window, and the window keeps what it has. The repository can be one that the list does not show: then GitHub is asked for
    * it. A link that names no repository asks neither GitHub nor Docker. Never rejects: errors are shown.
+   *
+   * The course link `/course?repository=owner/name-<username>` opens the repository of the signed-in account in a
+   * course in the same way: after the sign-in, `<username>` becomes the GitHub login of the account (courseRepository).
    */
   async openLink(uri: { path: string; query: string }): Promise<void> {
     this.rowActivations.forgetEnter();
@@ -1785,13 +1788,13 @@ export class Controller implements vscode.Disposable {
       this.warn(ControllerTexts.invalidLink);
       return;
     }
-    this.logger.info(`A link asks to open ${link.repository}.`);
+    this.logger.info(link.kind === 'course' ? `A course link asks to open ${link.template} with the GitHub login of the account.` : `A link asks to open ${link.repository}.`);
     // Counted at once: the automatic reopen of the last devspace in an empty window does not start while the link waits
     // for the activation or the sign-in dialog is open (reopenLast).
     this.linksOpening += 1;
     try {
       await this.activation;
-      await this.startFromLink(link.repository, this.deps.connection.isEmptyWindow() ? 'currentWindow' : 'newWindow');
+      await this.startFromLink(link, this.deps.connection.isEmptyWindow() ? 'currentWindow' : 'newWindow');
     } catch (error) {
       this.showError(error);
     } finally {
@@ -1799,20 +1802,24 @@ export class Controller implements vscode.Disposable {
     }
   }
 
-  private async startFromLink(repository: string, window: WindowRequest): Promise<void> {
+  private async startFromLink(link: RepositoryLink, window: WindowRequest): Promise<void> {
     let session = await this.deps.auth.getSession({ interactive: true });
     if (!session) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    let repository = this.repositoryOfLink(link, session.account.login);
+    if (repository === undefined) return;
     let found = await this.linkedRepository(repository, session.token);
     if (found.failure === 'rejected') {
-      // GitHub rejected the token (HTTP 401): a new sign-in, and the link goes on with it.
+      // GitHub rejected the token (HTTP 401): a new sign-in, and the link goes on with it, also with another account.
       const token = await this.deps.auth.renewToken();
       session = token === undefined ? undefined : await this.deps.auth.getSession({ interactive: true });
       if (!session) throw new UserFacingError('signInRequired', Messages.signInRequired);
+      repository = this.repositoryOfLink(link, session.account.login);
+      if (repository === undefined) return;
       found = await this.linkedRepository(repository, session.token);
       if (found.failure === 'rejected') throw new UserFacingError('signInRequired', Messages.signInRequired);
     }
     if (found.failure === 'notFound') {
-      this.warn(ControllerTexts.linkRepositoryNotFound(repository));
+      this.warn(link.kind === 'course' ? ControllerTexts.courseRepositoryNotFound(repository, session.account.login) : ControllerTexts.linkRepositoryNotFound(repository));
       return;
     }
     const { info } = found;
@@ -1847,6 +1854,22 @@ export class Controller implements vscode.Disposable {
       }
       await this.startTarget({ ...target, info: target.info ?? info, source }, { window, confirmed: true });
     });
+  }
+
+  /**
+   * The repository that a link opens for the account of `login`: for a course link, its name with the login
+   * (courseRepository). `undefined`, after a message, when that is no GitHub repository.
+   */
+  private repositoryOfLink(link: RepositoryLink, login: string): string | undefined {
+    if (link.kind === 'open') return link.repository;
+    const repository = courseRepository(link.template, login);
+    if (repository === undefined) {
+      this.logger.info(`The course link ${link.template} names no GitHub repository with the login ${login}.`);
+      this.warn(ControllerTexts.courseLinkInvalidForLogin(login));
+    } else {
+      this.logger.info(`The course link opens ${repository} for ${login}.`);
+    }
+    return repository;
   }
 
   /**

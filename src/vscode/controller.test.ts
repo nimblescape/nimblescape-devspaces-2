@@ -7359,7 +7359,7 @@ describe('A link to Devspaces', () => {
     await h.controller.openLink({ path: '/open', query: 'repository=acme/api/../x' });
     await h.controller.openLink({ path: '/start', query: 'repository=acme/api' });
     expect(warningMessages()).toEqual([ControllerTexts.invalidLink, ControllerTexts.invalidLink]);
-    expect(h.logger.info).toHaveBeenCalledWith('A link to Devspaces was not opened: its path is not /open.');
+    expect(h.logger.info).toHaveBeenCalledWith('A link to Devspaces was not opened: its path is not /open or /course.');
     expect(h.auth.getSession).not.toHaveBeenCalled();
     expect(h.discovery.getRepository).not.toHaveBeenCalled();
     expect(h.service.openInWorker).not.toHaveBeenCalled();
@@ -7399,6 +7399,91 @@ describe('A link to Devspaces', () => {
     expect(warningMessages()).toEqual([Messages.signInRequired, Messages.signInRequired]);
     expect(h.discovery.getRepository).not.toHaveBeenCalled();
     expect(h.service.openInWorker).not.toHaveBeenCalled();
+  });
+});
+
+// The course link opens the repository of the signed-in account in a course, as GitHub Classroom names it: the name
+// of the course repository and the GitHub login of the account (ACCOUNT, octo).
+describe('A course link to Devspaces', () => {
+  /** The link vscode://nimblescape.nimblescape-devspaces-2/course?repository=<repository>, as vscode.Uri gives it. */
+  const courseLink = (repository: string) => ({ path: '/course', query: `repository=${repository}` });
+  const isLinkQuestion = (message: string) => message.includes(' from a link? ') || message.endsWith(Messages.untrustedRepository(''));
+
+  beforeEach(() => {
+    fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? Actions.open : undefined));
+  });
+
+  it('starts the repository of the course with the login of the account, after the sign-in and the question of the link', async () => {
+    h.sidebar.trustedOwner.mockResolvedValue(false);
+    h.discovery.getRepository.mockImplementation(async (repository: string) => repositoryInfo(repository.toLowerCase()));
+    await h.controller.openLink(courseLink('MySchool/module-ts-2-<username>'));
+    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+    expect(h.discovery.getRepository).toHaveBeenCalledWith('MySchool/module-ts-2-octo', 'gho_token');
+    expect(h.logger.info).toHaveBeenCalledWith('A course link asks to open MySchool/module-ts-2-<username> with the GitHub login of the account.');
+    expect(h.logger.info).toHaveBeenCalledWith('The course link opens MySchool/module-ts-2-octo for octo.');
+    // The organization of a course is often not one of the account: the confirmation of every first open.
+    expect(warningMessages()).toEqual([Messages.untrustedRepository('myschool/module-ts-2-octo')]);
+    expect(h.service.openInWorker).toHaveBeenLastCalledWith(expect.objectContaining({ repository: 'myschool/module-ts-2-octo', trusted: true }), expect.objectContaining({ source: ROOT_SOURCE }));
+    // Without the placeholder, the link adds `-<username>` at the end of the name.
+    await h.controller.openLink(courseLink('MySchool/module-ts-2'));
+    expect(h.discovery.getRepository).toHaveBeenLastCalledWith('MySchool/module-ts-2-octo', 'gho_token');
+    expect(h.service.openInWorker).toHaveBeenCalledTimes(2);
+  });
+
+  it('opens the devspace of the repository of the course when the account has one', async () => {
+    h.sidebar.infos.set('acme/api-octo', repositoryInfo('acme/api-octo'));
+    await h.registry.add(devspace({ repository: 'acme/api-octo' }));
+    await h.controller.openLink(courseLink('acme/api-<username>'));
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+    expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ source: ROOT_SOURCE }));
+    expect(warningMessages()).toEqual([]);
+  });
+
+  it('asks nobody without a sign-in, because the login is not known', async () => {
+    h.auth.getToken.mockResolvedValue(undefined);
+    await h.controller.openLink(courseLink('acme/api-<username>'));
+    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+    expect(warningMessages()).toEqual([Messages.signInRequired]);
+    expect(h.discovery.getRepository).not.toHaveBeenCalled();
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+  });
+
+  it('says that the account has no repository of the course when GitHub does not show it', async () => {
+    await h.controller.openLink(courseLink('acme/api-<username>'));
+    expect(h.discovery.getRepository).toHaveBeenCalledWith('acme/api-octo', 'gho_token');
+    expect(warningMessages()).toEqual([ControllerTexts.courseRepositoryNotFound('acme/api-octo', 'octo')]);
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+  });
+
+  it('takes the login of the new account after a new sign-in', async () => {
+    h.discovery.getRepository.mockRejectedValueOnce(new GitHubApiError('Bad credentials', 401));
+    h.discovery.getRepository.mockResolvedValueOnce(repositoryInfo('acme/api-someone'));
+    h.auth.renewToken.mockImplementationOnce(async () => {
+      h.auth.getToken.mockResolvedValue('gho_new');
+      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      return 'gho_new';
+    });
+    await h.controller.openLink(courseLink('acme/api-<username>'));
+    expect(h.discovery.getRepository.mock.calls).toEqual([['acme/api-octo', 'gho_token'], ['acme/api-someone', 'gho_new']]);
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api-someone' }), expect.objectContaining({ source: ROOT_SOURCE }));
+  });
+
+  it('opens nothing when the name with the login is longer than GitHub allows', async () => {
+    const login = 'a'.repeat(39);
+    h.auth.getAccount.mockResolvedValue({ id: '3003', login });
+    const name = 'b'.repeat(70);
+    await h.controller.openLink(courseLink(`acme/${name}`));
+    expect(h.logger.info).toHaveBeenCalledWith(`The course link acme/${name}-<username> names no GitHub repository with the login ${login}.`);
+    expect(warningMessages()).toEqual([ControllerTexts.courseLinkInvalidForLogin(login)]);
+    expect(h.discovery.getRepository).not.toHaveBeenCalled();
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+  });
+
+  it('opens nothing and asks nobody for a course link that names no repository', async () => {
+    await h.controller.openLink(courseLink('<username>/api'));
+    expect(warningMessages()).toEqual([ControllerTexts.invalidLink]);
+    expect(h.logger.info).toHaveBeenCalledWith('A link to Devspaces was not opened: its parameter repository is not a GitHub repository owner/name-<username>.');
+    expect(h.auth.getSession).not.toHaveBeenCalled();
   });
 });
 

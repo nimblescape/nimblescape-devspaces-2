@@ -95,6 +95,12 @@ describe('the extension in VS Code', () => {
       const link = vscode.Uri.parse(`${vscode.env.uriScheme}://${EXTENSION_ID}/open?repository=no-repository`);
       assert.strictEqual(await vscode.env.openExternal(link), true, `VS Code did not open ${link.toString(true)}`);
       await waitForLog(/\] info A link to Devspaces was not opened: its parameter repository is not a GitHub repository owner\/name\./);
+      // A course link reaches the extension in the same way. A web page sends its placeholder encoded, and the query of
+      // the link that the extension gets has it decoded (src/vscode/links.ts reads `<username>`).
+      const course = vscode.Uri.parse(`${vscode.env.uriScheme}://${EXTENSION_ID}/course?repository=%3Cusername%3E/name`);
+      assert.strictEqual(course.query, 'repository=<username>/name');
+      assert.strictEqual(await vscode.env.openExternal(course), true, `VS Code did not open ${course.toString(true)}`);
+      await waitForLog(/\] info A link to Devspaces was not opened: its parameter repository is not a GitHub repository owner\/name-<username>\./);
     } finally {
       // The later tests of this VS Code get the question of VS Code again.
       await extensions.update('confirmedUriHandlerExtensionIds', undefined, vscode.ConfigurationTarget.Global);
