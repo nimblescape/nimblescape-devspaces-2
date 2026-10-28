@@ -3059,7 +3059,7 @@ describe('Remove Devspaces from This Docker Engine…', () => {
     const [first, second] = modals();
     // No devspace of an account that is not signed in stays.
     expect(first?.[1]).toEqual({ modal: true, detail: ControllerTexts.removeDetail });
-    expect(second?.[0]).toBe('Also delete the 2 devspaces of your GitHub accounts octo and someone on build-box?');
+    expect(second?.[0]).toBe('Also delete the 2 devspaces of your GitHub accounts octo, someone on build-box?');
     expect(h.service.deleteInWorker.mock.calls.map((call) => call[0]).sort()).toEqual([ENV_ID, OTHER_ENV_ID].sort());
   });
 
@@ -7919,6 +7919,17 @@ describe('Several GitHub accounts', () => {
       return undefined;
     });
     await h.controller.openLink(courseLink('acme/task-<username>'));
+    expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
+  });
+
+  it('a link asks no further account to sign in again once a new sign-in finds the repository', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    h.auth.renewToken.mockResolvedValue('gho_renewed');
+    h.discovery.getRepository.mockImplementation(async (repository: string, token: string) => {
+      if (token !== 'gho_renewed') throw new GitHubApiError('Bad credentials', 401);
+      return repositoryInfo(repository);
+    });
+    await h.controller.openLink(link('acme/api'));
     expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
   });
 

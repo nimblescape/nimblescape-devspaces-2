@@ -32,7 +32,10 @@ export function ownerOf(account: GitHubAccount): GitHubAccount {
   return { id: account.id, login: account.login };
 }
 
-/** The IDs of `accounts` as one text, to compare two reads of the set of accounts. */
+/** The IDs of `accounts` as one text, to compare two reads of the set of accounts (in any order). */
 export function accountIds(accounts: readonly GitHubAccount[]): string {
-  return accounts.map((account) => account.id).join(' ');
+  return accounts
+    .map((account) => account.id)
+    .sort()
+    .join(' ');
 }

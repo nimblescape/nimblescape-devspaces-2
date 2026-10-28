@@ -4,6 +4,7 @@
 
 // User-visible texts of the controller that messages.ts lacks (plain language); to be moved there.
 // No `vscode` import.
+import { listSome } from '../core/messages';
 
 export const ControllerTexts = {
   // Progress titles (one notification per operation).
@@ -86,7 +87,7 @@ export const ControllerTexts = {
   /** `logins`: the accounts of Devspaces that own the devspaces, named when there are several. */
   removeDevspacesQuestion: (count: number, engine: string, logins: readonly string[] = []) =>
     logins.length > 1
-      ? `Also delete the ${count === 1 ? 'devspace' : `${count} devspaces`} of your GitHub accounts ${listAll(logins)} on ${engine}?`
+      ? `Also delete the ${count === 1 ? 'devspace' : `${count} devspaces`} of your GitHub accounts ${listSome(logins)} on ${engine}?`
       : `Also delete your ${count === 1 ? 'devspace' : `${count} devspaces`} on ${engine}?`,
   /** `changes`: the recorded changes of the devspaces (recordedChanges), or "none". */
   removeDevspacesDetail: (changes: string) =>
@@ -209,7 +210,7 @@ export const ControllerTexts = {
   /** `logins`: the accounts of Devspaces that GitHub was asked with, named when there are several. */
   linkRepositoryNotFound: (repository: string, logins: readonly string[] = []) =>
     logins.length > 1
-      ? `GitHub does not show the repository ${repository} to your GitHub accounts ${listAll(logins)}. Check the link, or add a GitHub account that can access the repository (Add GitHub Account…).`
+      ? `GitHub does not show the repository ${repository} to your GitHub accounts ${listSome(logins)}. Check the link, or add a GitHub account that can access the repository (Add GitHub Account…).`
       : `GitHub does not show the repository ${repository} to your GitHub account. Check the link, or sign in with an account that can access the repository.`,
   /** A course link (/course): GitHub does not show the repository of the course with the login of the account. */
   courseRepositoryNotFound: (repository: string, login: string) =>
@@ -226,7 +227,7 @@ export const ControllerTexts = {
   /** A course link whose name, with the login of the account, is no GitHub repository name (longer than 100 characters). */
   courseLinkInvalidForLogin: (logins: readonly string[]) =>
     logins.length > 1
-      ? `Devspaces cannot open this course link for your GitHub accounts ${listAll(logins)}: with your logins, the names of the repositories are longer than GitHub allows.`
+      ? `Devspaces cannot open this course link for your GitHub accounts ${listSome(logins)}: with your logins, the names of the repositories are longer than GitHub allows.`
       : `Devspaces cannot open this course link for your GitHub account ${logins.join('')}: with your login, the name of the repository is longer than GitHub allows.`,
   linkRepositoryUnknown: (repository: string) => `GitHub could not be asked for the repository ${repository}. Open the link again later.`,
   /** The modal question before a link creates a devspace of the account or of one of its organizations (button Open). */
@@ -251,9 +252,3 @@ export const ControllerTexts = {
   /** The marker of a source whose devspace exists (sourceChoices). */
   devspaceExists: 'devspace exists',
 } as const;
-
-/** The names as one text: `a`, `a and b`, `a, b and c`. */
-function listAll(names: readonly string[]): string {
-  if (names.length <= 1) return names.join('');
-  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
-}

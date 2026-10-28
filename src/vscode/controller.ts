@@ -2022,6 +2022,8 @@ export class Controller implements vscode.Disposable {
       if (results[index]?.failure !== 'rejected') continue;
       const token = await this.deps.auth.renewToken(account);
       if (token !== undefined) results[index] = await this.lookUpRepository(repository, account, token);
+      // That account found it: no further sign-in.
+      if (results[index]?.info !== undefined) break;
     }
     return results;
   }

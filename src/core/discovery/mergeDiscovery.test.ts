@@ -77,15 +77,21 @@ describe('mergeDiscovery', () => {
     expect(merged?.fetchedAt).toBe('2026-10-28T07:00:00.000Z');
   });
 
-  it('counts a repository with a configuration in one list as one with a configuration', () => {
-    const merged = mergeDiscovery([
+  it('takes from the list that was fetched last whether a repository has a configuration', () => {
+    const removed = mergeDiscovery([
       { account: SCALARION, data: data(SCALARION, { fetchedAt: '2026-10-28T09:00:00.000Z', withoutConfiguration: [info('acme/api', { configPaths: [] })] }) },
       { account: STAUSSH, data: data(STAUSSH, { repositories: [info('acme/api')], withoutConfiguration: [info('acme/plain', { configPaths: [] })] }) },
     ]);
-    expect(merged?.repositories.map((each) => each.nameWithOwner)).toEqual(['acme/api']);
-    expect(merged?.repositories[0]?.configPaths).toEqual(['.devcontainer/devcontainer.json']);
-    expect(merged?.repositories[0]?.access?.map((access) => access.account.login)).toEqual(['scalarion', 'staussh']);
-    expect(merged?.withoutConfiguration.map((each) => each.nameWithOwner)).toEqual(['acme/plain']);
+    // The configuration was removed after the older list of staussh.
+    expect(removed?.repositories).toEqual([]);
+    expect(removed?.withoutConfiguration.map((each) => each.nameWithOwner)).toEqual(['acme/api', 'acme/plain']);
+    expect(removed?.withoutConfiguration[0]?.access?.map((access) => access.account.login)).toEqual(['scalarion', 'staussh']);
+    const added = mergeDiscovery([
+      { account: SCALARION, data: data(SCALARION, { withoutConfiguration: [info('acme/api', { configPaths: [] })] }) },
+      { account: STAUSSH, data: data(STAUSSH, { fetchedAt: '2026-10-28T09:00:00.000Z', repositories: [info('acme/api')] }) },
+    ]);
+    expect(added?.repositories.map((each) => each.configPaths)).toEqual([['.devcontainer/devcontainer.json']]);
+    expect(added?.withoutConfiguration).toEqual([]);
   });
 
   it('joins the organizations and the uncertain repositories, each once', () => {

@@ -183,6 +183,51 @@ describe('VsCodeGitHubAuth', () => {
       auth.dispose();
     });
 
+    it('keeps the accounts of the last complete read when VS Code fails, and reads them again later', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        vscodeWithAccounts();
+        const auth = new VsCodeGitHubAuth(silentLogger);
+        const changes = vi.fn();
+        auth.onDidChangeSession(changes);
+        const both = [
+          { id: '2', login: 'cat' },
+          { id: '1', login: 'octocat' },
+        ];
+        await expect(auth.accounts()).resolves.toEqual(both);
+        // The session of CAT fails to load after a change of the sessions: CAT stays an account of Devspaces.
+        const signedIn = getSession.getMockImplementation();
+        getSession.mockImplementation(async (provider: string, scopes: string[], options: { account?: { id: string } }) => {
+          if (options.account?.id === CAT.id) throw new Error('keychain is locked');
+          return signedIn?.(provider, scopes, options);
+        });
+        fakeVscode.fireSessionChange('github');
+        await vi.advanceTimersByTimeAsync(100);
+        expect(changes).toHaveBeenCalledTimes(1);
+        await expect(auth.accounts()).resolves.toEqual(both);
+        // A failed list of the accounts removes none either.
+        fakeVscode.authentication.getAccounts.mockRejectedValue(new Error('not ready'));
+        fakeVscode.fireSessionChange('github');
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(auth.accounts()).resolves.toEqual(both);
+        // VS Code answers again: CAT was signed out meanwhile, and the next read reports it without a change event.
+        fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO]);
+        getSession.mockImplementation(async (provider: string, scopes: string[], options: { account?: { id: string } }) =>
+          options.account?.id === CAT.id ? undefined : signedIn?.(provider, scopes, options),
+        );
+        await vi.advanceTimersByTimeAsync(30_000 + 100);
+        expect(changes).toHaveBeenCalledTimes(3);
+        await expect(auth.accounts()).resolves.toEqual([{ id: '1', login: 'octocat' }]);
+        // A complete read is not repeated.
+        getSession.mockClear();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(getSession).not.toHaveBeenCalled();
+        auth.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('names the account in every request, so that each account gets its own token and ghcr.io login', async () => {
       vscodeWithAccounts();
       const auth = new VsCodeGitHubAuth(silentLogger);
