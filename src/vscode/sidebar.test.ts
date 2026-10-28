@@ -1565,6 +1565,21 @@ describe('Sidebar with several GitHub accounts', () => {
     await changed;
   });
 
+  it('reuses a running refresh that looks up the repositories of devspaces when no reached account has a new session', async () => {
+    await h.registry.add(devspace(OLD, 'school/old', { owner: OTHER }));
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) => (accountId === OTHER.id ? ofOther([]) : data([])));
+    let answer: (value: RepositoryInfo | undefined) => void = () => undefined;
+    h.discovery.getRepository.mockImplementation(() => new Promise<RepositoryInfo | undefined>((resolve) => (answer = resolve)));
+    await h.sidebar.initialize();
+    // Both lists loaded; the lookup of school/old runs.
+    await vi.waitFor(() => expect(h.discovery.getRepository).toHaveBeenCalledTimes(1));
+    const changed = h.sidebar.onSessionChanged();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    answer(undefined);
+    await changed;
+    expect(h.discovery.refresh).toHaveBeenCalledTimes(2);
+  });
+
   it('asks GitHub about the repository of a devspace that no list has with the token of its owner', async () => {
     await h.registry.add(devspace(OLD, 'school/old', { owner: OTHER }));
     await h.registry.add(devspace(GONE, 'acme/old'));

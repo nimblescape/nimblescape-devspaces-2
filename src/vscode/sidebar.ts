@@ -152,8 +152,8 @@ export class Sidebar implements vscode.Disposable {
   private readonly signInOffered = new Set<string>();
   /** Counts the changes of the accounts in onSessionChanged: a refresh that read older accounts does not use them. */
   private accountChanges = 0;
-  /** The account and the token of the refresh that asks GitHub now; `undefined` while none does. */
-  private refreshToken: { accountId: string; token: string } | undefined;
+  /** A refresh of the lists runs (runRefresh). */
+  private refreshing = false;
   /**
    * The token of each account that the running refresh of the lists reached so far (also an account that it skipped),
    * as it read the token: a new session of one of them needs a refresh of its own (refreshUsesCurrentSession).
@@ -170,7 +170,7 @@ export class Sidebar implements vscode.Disposable {
   private groupPlaces: { key: string; places: Map<string, GroupPlace | null>; off?: true } | undefined;
   private readonly renderTask = new CoalescingTask(() => this.renderNow());
   private readonly statesTask = new CoalescingTask(() => this.refreshStatesNow());
-  private readonly discoveryTask = new CoalescingTask(() => this.refreshDiscoveryNow());
+  private readonly discoveryTask = new CoalescingTask(() => this.runRefresh());
   private readonly statesEmitter = new vscode.EventEmitter<void>();
   private readonly renderEmitter = new vscode.EventEmitter<void>();
   /** The model of the last render, also while the view shows the Docker setup (model). */
@@ -333,11 +333,11 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /**
-   * True if a refresh asks GitHub now, and each account that it reached so far still has the session whose token it
+   * True if a refresh of the lists runs, and each account that it reached so far still has the session whose token it
    * read (the accounts after it are read when it reaches them).
    */
   private async refreshUsesCurrentSession(): Promise<boolean> {
-    if (this.refreshToken === undefined) return false;
+    if (!this.refreshing) return false;
     for (const [accountId, token] of this.passTokens) {
       const account = this.lists.get(accountId)?.account;
       if (account === undefined || (await this.readSession(account))?.token !== token) return false;
@@ -652,6 +652,17 @@ export class Sidebar implements vscode.Disposable {
     return { statesUnknown: { dockerHost: unread.dockerHost, reason: build === 'building' ? 'building' : build === 'failed' ? 'buildFailed' : 'notReady' } };
   }
 
+  /** refreshDiscoveryNow, while `refreshing` says that it runs. */
+  private async runRefresh(): Promise<DiscoveryData | undefined> {
+    this.refreshing = true;
+    try {
+      return await this.refreshDiscoveryNow();
+    } finally {
+      this.refreshing = false;
+      this.passTokens = new Map();
+    }
+  }
+
   /**
    * The refresh of the lists: one account after the other, each with its own token, so that no more than
    * DISCOVERY_CONCURRENCY requests run at the same time. An account whose token GitHub rejected keeps its stored list
@@ -734,7 +745,6 @@ export class Sidebar implements vscode.Disposable {
     const progressive = state.data === undefined;
     if (!progressive) state.partial = undefined;
     state.progressive = progressive;
-    this.refreshToken = { accountId: account.id, token };
     let rateLimited = false;
     try {
       const data = await vscode.window.withProgress({ location: viewProgressLocation(this.deps.view) }, () => this.deps.discovery.refresh(token, account.id));
@@ -760,7 +770,6 @@ export class Sidebar implements vscode.Disposable {
       this.deps.logger.warn(`The repository list of ${account.login} could not be updated. ${shown} ${errorMessage(error)}`);
       return rateLimited ? 'rateLimited' : 'failed';
     } finally {
-      this.refreshToken = undefined;
       if (!rateLimited) this.endProgressiveDisplay(state);
     }
   }
