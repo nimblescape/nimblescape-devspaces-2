@@ -195,6 +195,7 @@ describe('VsCodeGitHubAuth', () => {
           { id: '1', login: 'octocat' },
         ];
         await expect(auth.accounts()).resolves.toEqual(both);
+        await expect(auth.otherAccounts()).resolves.toEqual([{ id: '3', login: 'robot' }]);
         // The session of CAT fails to load after a change of the sessions: CAT stays an account of Devspaces.
         const signedIn = getSession.getMockImplementation();
         getSession.mockImplementation(async (provider: string, scopes: string[], options: { account?: { id: string } }) => {
@@ -205,6 +206,8 @@ describe('VsCodeGitHubAuth', () => {
         await vi.advanceTimersByTimeAsync(100);
         expect(changes).toHaveBeenCalledTimes(1);
         await expect(auth.accounts()).resolves.toEqual(both);
+        // No account is offered meanwhile: one that Devspaces uses could be missing.
+        await expect(auth.otherAccounts()).resolves.toEqual([]);
         // A failed list of the accounts removes none either.
         fakeVscode.authentication.getAccounts.mockRejectedValue(new Error('not ready'));
         fakeVscode.fireSessionChange('github');

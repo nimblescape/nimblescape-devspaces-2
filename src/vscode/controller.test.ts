@@ -7584,12 +7584,21 @@ describe('A course link to Devspaces', () => {
   });
 
   it('opens the devspace of the repository of the course when the account has one', async () => {
-    h.sidebar.infos.set('acme/api-octo', repositoryInfo('acme/api-octo'));
+    h.sidebar.infos.set('acme/api-octo', repositoryInfo('acme/api-octo', { access: [{ account: ACCOUNT }] }));
     await h.registry.add(devspace({ repository: 'acme/api-octo' }));
     await h.controller.openLink(courseLink('acme/api-<username>'));
+    expect(h.discovery.getRepository).not.toHaveBeenCalled();
     expect(h.service.openInWorker).not.toHaveBeenCalled();
     expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.objectContaining({ source: ROOT_SOURCE }));
     expect(warningMessages()).toEqual([]);
+  });
+
+  it('asks GitHub with the account about a repository of the course that the sidebar found with another token', async () => {
+    // A lookup of the sidebar (a devspace of another account) names no account with access.
+    h.sidebar.infos.set('acme/api-octo', repositoryInfo('acme/api-octo'));
+    await h.controller.openLink(courseLink('acme/api-<username>'));
+    expect(h.discovery.getRepository).toHaveBeenCalledWith('acme/api-octo', 'gho_token');
+    expect(warningMessages()).toEqual([ControllerTexts.courseRepositoryNotFound('acme/api-octo', 'octo')]);
   });
 
   it('asks nobody without a sign-in, because the login is not known', async () => {
@@ -7811,10 +7820,23 @@ describe('Several GitHub accounts', () => {
     await run('startWithAccount', row('acme/api'));
     expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(OTHER_ENV_ID, expect.anything());
 
+    // The devspace of the row opens for its owner, also when the registry keeps the name before a rename on GitHub.
+    const renamed = devspace({ repository: 'acme/old-api' });
+    await h.registry.add(renamed);
+    let offered: Array<{ label: string; description: string }> = [];
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string; description: string }>) => {
+      offered = items;
+      return items.find((item) => item.label === ACCOUNT.login);
+    });
+    await run('startWithAccount', row('acme/api', renamed));
+    expect(offered.map((item) => item.description)).toEqual([ControllerTexts.accountChoiceDescription('admin', true), ControllerTexts.accountChoiceDescription('write', true)]);
+    expect(h.service.openDevspaceInWorker).toHaveBeenLastCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+
     h.sidebar.infos.set('acme/web', repositoryInfo('acme/web', { access: [{ account: ACCOUNT, permission: 'ADMIN' }] }));
     await run('startWithAccount', row('acme/web'));
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.oneAccountOnly('acme/web'));
-    expect(fakeVscode.window.showQuickPick).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showQuickPick).toHaveBeenCalledTimes(2);
   });
 
   it('Add GitHub Account… tells which account Devspaces uses now, or that it used it already', async () => {
@@ -7920,6 +7942,19 @@ describe('Several GitHub accounts', () => {
     });
     await h.controller.openLink(courseLink('acme/task-<username>'));
     expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
+  });
+
+  it('a link opens the existing devspace of an account that GitHub could not be asked with, also when the token of another account was rejected', async () => {
+    await h.registry.add(devspace({ owner: OTHER_ACCOUNT }));
+    h.discovery.getRepository.mockImplementation(async (_repository: string, token: string) => {
+      if (token === OTHER_TOKEN) throw new Error('getaddrinfo ENOTFOUND api.github.com');
+      throw new GitHubApiError('Bad credentials', 401);
+    });
+    await h.controller.openLink(link('acme/api'));
+    // The user cancelled the new sign-in of octo (renewToken gives no token).
+    expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
+    expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(warningMessages()).not.toContain(Messages.signInRequired);
   });
 
   it('a link asks no further account to sign in again once a new sign-in finds the repository', async () => {

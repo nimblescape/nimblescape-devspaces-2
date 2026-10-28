@@ -22,7 +22,7 @@ import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { VSCODE_STORE_VOLUME, repositoryFolder, splitRepository } from '../core/names';
 import { candidateOf, chooseAccount, listedCandidates, permissionText, rankAccounts, type AccountCandidate } from '../core/accountChoice';
-import { availableDevspaces, ownerAmong } from '../core/ownership';
+import { availableDevspaces, isAvailableTo, ownerAmong } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import type { DevspaceOperations } from '../core/pipeline/devspaceOperations';
 import { PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS, type DockerStarter, type OpenResult } from '../core/pipeline/operationBase';
@@ -939,15 +939,22 @@ export class Controller implements vscode.Disposable {
     }
     const dockerHost = await this.currentDockerHost();
     const entries = await this.deps.registry.list();
+    // The devspace of the row is the one of its owner, also after a rename or a transfer on GitHub (the registry keeps
+    // the old name); another account has the devspace of the source under the name on GitHub.
+    const own = (account: GitHubAccount) => named !== undefined && isAvailableTo(named, account);
     const items = candidates.map((candidate) => {
-      const existing = lastUsedDevspaceOf(entries, repository, (accountId) => accountId === candidate.account.id, dockerHost, source);
-      return { label: candidate.account.login, description: ControllerTexts.accountChoiceDescription(permissionText(candidate.permission), existing !== undefined), candidate };
+      const existing = own(candidate.account) || lastUsedDevspaceOf(entries, repository, (accountId) => accountId === candidate.account.id, dockerHost, source) !== undefined;
+      return { label: candidate.account.login, description: ControllerTexts.accountChoiceDescription(permissionText(candidate.permission), existing), candidate };
     });
     const picked = await vscode.window.showQuickPick(items, { title: ControllerTexts.startWithAccountTitle(repository), placeHolder: ControllerTexts.startWithAccountPlaceholder });
     if (!picked) return;
-    const target = await this.repositoryTargetFor(repository, 'start', source, { account: picked.candidate.account });
+    const account = picked.candidate.account;
+    const target =
+      named !== undefined && own(account)
+        ? { repository: argument.repository, info, devspace: named, named: true, source: sourceOf(named), account }
+        : await this.repositoryTargetFor(repository, 'start', source, { account });
     if (!target) return;
-    this.logger.info(`Start with Account: ${repository} with the GitHub account ${picked.candidate.account.login}.`);
+    this.logger.info(`Start with Account: ${repository} with the GitHub account ${account.login}.`);
     await this.startTarget({ ...target, info: target.info ?? info, chosenAccount: true });
   }
 
@@ -1941,8 +1948,10 @@ export class Controller implements vscode.Disposable {
     const found = this.foundCandidates(accounts, results);
     const first = found[0];
     if (first !== undefined) return { repository, info: first.info, candidates: found.map((each) => each.candidate) };
-    if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    // An account that GitHub could not be asked with may still have the devspace; a rejected token without a new
+    // sign-in only shows nothing.
     if (results.some((result) => result.failure === 'unknown')) return { repository };
+    if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
     this.logger.info(`GitHub does not show ${repository} to ${accounts.map((account) => account.login).join(', ')}. The link opened nothing.`);
     this.warn(ControllerTexts.linkRepositoryNotFound(repository, accounts.map((account) => account.login)));
     return undefined;
@@ -1967,8 +1976,9 @@ export class Controller implements vscode.Disposable {
       }
       this.logger.info(`The course link asks for ${repository} for ${account.login}.`);
       const listed = this.deps.sidebar.repositoryInfo(repository);
-      // The list counts for the account only when its own list has the repository.
-      if (listed !== undefined && (listed.access === undefined || listed.access.some((access) => access.account.id === account.id))) {
+      // The list counts for the account only when its own list has the repository (a lookup of the sidebar with the
+      // token of another account names no access).
+      if (listed?.access?.some((access) => access.account.id === account.id) === true) {
         results.push({ account, repository, info: listed });
         continue;
       }
@@ -1996,9 +2006,10 @@ export class Controller implements vscode.Disposable {
     }
     const one = found[0];
     if (one !== undefined) return { repository: one.repository, info: one.info, account: one.account };
-    if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    // As for a link /open (openLinkRepository): an account that GitHub could not be asked with first.
     const unknown = results.find((result) => result.failure === 'unknown');
     if (unknown !== undefined) return { repository: unknown.repository, account: unknown.account };
+    if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
     const only = results.length === 1 ? results[0] : undefined;
     this.warn(
       only !== undefined

@@ -59,7 +59,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
    */
   private readonly rejected = new Map<string, RejectedSession>();
   /** The accounts of Devspaces, read once after each change of the sessions (`accounts`). */
-  private accountSet: Promise<GitHubAccount[]> | undefined;
+  private accountSet: Promise<AccountRead> | undefined;
   /** The accounts of the last read that VS Code answered without an error (readAccounts). */
   private lastCompleteAccounts: GitHubAccount[] | undefined;
   /**
@@ -101,27 +101,34 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
    * `read:org` that Devspaces may use (the user allowed it), in the order of their logins. Never shows a dialog; read
    * once after each change of the sessions, and again later when VS Code failed to answer.
    */
-  accounts(): Promise<GitHubAccount[]> {
-    if (this.accountSet === undefined) {
-      const read = this.readAccounts();
-      const accounts = read.then((result) => result.accounts);
-      this.accountSet = accounts;
-      void read.then(({ accounts: set, complete }) => {
-        if (this.accountSet !== accounts) return;
-        this.reportedAccounts ??= accountIds(set);
-        if (!complete) this.readAgainLater();
-      });
-    }
-    return this.accountSet;
+  async accounts(): Promise<GitHubAccount[]> {
+    return (await this.accountRead()).accounts;
   }
 
   /**
    * The GitHub accounts of VS Code that Devspaces does not use: no session with the scopes `repo` and `read:org`, or
    * the user did not allow Devspaces to use it (an account that only another extension uses). Never shows a dialog.
+   * None while VS Code fails to answer (an account that Devspaces uses could be missing from `accounts`).
    */
   async otherAccounts(): Promise<GitHubAccount[]> {
-    const used = new Set((await this.accounts()).map((account) => account.id));
+    const { accounts, complete } = await this.accountRead();
+    if (!complete) return [];
+    const used = new Set(accounts.map((account) => account.id));
     return (await this.vscodeAccounts()).filter((account) => !used.has(account.id)).map((account) => ({ id: account.id, login: account.label }));
+  }
+
+  /** The read of the accounts after the last change of the sessions (accounts); a new read after a failed one. */
+  private accountRead(): Promise<AccountRead> {
+    if (this.accountSet === undefined) {
+      const read = this.readAccounts();
+      this.accountSet = read;
+      void read.then(({ accounts, complete }) => {
+        if (this.accountSet !== read) return;
+        this.reportedAccounts ??= accountIds(accounts);
+        if (!complete) this.readAgainLater();
+      });
+    }
+    return this.accountSet;
   }
 
   /** Token with the scopes `repo` and `read:org`. `interactive` shows the sign-in dialog if needed; otherwise never a dialog. */
@@ -171,7 +178,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
         forceNewSession: { detail },
         ...(named !== undefined ? { account: named } : {}),
       });
-      this.afterDialog();
+      this.readAgain();
       if (named !== undefined && session.account.id !== named.id) {
         this.logger.warn(`The new GitHub sign-in is of ${session.account.label}, not of ${named.label}.`);
         return undefined;
@@ -191,7 +198,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   async addAccount(): Promise<GitHubAccount | undefined> {
     try {
       const session = await vscode.authentication.getSession(GITHUB_PROVIDER_ID, [...GITHUB_SCOPES], { createIfNone: true, clearSessionPreference: true });
-      this.afterDialog();
+      this.readAgain();
       return accountOf(session);
     } catch (error) {
       this.logger.warn(`GitHub sign-in was not completed: ${errorMessage(error)}`);
@@ -285,10 +292,11 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
 
   /**
    * The accounts of Devspaces (accounts), read from VS Code. `complete` is false when VS Code failed to list the accounts
-   * or to give a session: such a failure removes no account, so the accounts of the last complete read stay (a window
-   * keeps its devspace, the sidebar its rows).
+   * or to give a session: such a failure removes no account that a complete read found before (a window keeps its
+   * devspace, the sidebar its rows). The first read has none: it gives what VS Code gave, and the read after
+   * ACCOUNTS_RETRY_MS reports the accounts it missed.
    */
-  private async readAccounts(): Promise<{ accounts: GitHubAccount[]; complete: boolean }> {
+  private async readAccounts(): Promise<AccountRead> {
     let complete = true;
     const failed = () => (complete = false);
     const found = new Map<string, GitHubAccount>();
@@ -368,7 +376,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
     account: vscode.AuthenticationSessionAccountInformation | undefined,
   ): Promise<vscode.AuthenticationSession | undefined> {
     // A session that VS Code gives without a dialog is used as it is: no dialog ran, so the accounts did not change
-    // (afterDialog reads them only after a dialog).
+    // (readAgain reads them only after a dialog).
     const current = await this.silentSession(scopes, account);
     if (current !== undefined && !this.isRejected(scopes, current)) return current;
     // Workaround (see `rejected`): `createIfNone` would return the rejected session again without a dialog.
@@ -379,7 +387,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
         ...(account !== undefined ? { account } : {}),
       });
       if (session === undefined) return undefined;
-      this.afterDialog();
+      this.readAgain();
       if (account !== undefined && session.account.id !== account.id) {
         // The user signed in with another account in the browser: it is not the session that was asked for.
         this.logger.warn(`The GitHub sign-in is of ${session.account.label}, not of ${account.label}.`);
@@ -393,15 +401,6 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
     }
   }
 
-  /**
-   * A sign-in dialog ended with a session: the accounts are read again. VS Code fires no change of the sessions when the
-   * user only allowed an existing session for Devspaces, so a changed set of accounts fires onDidChangeSession here,
-   * unless the change of the sessions that VS Code fired for a new session reported that set already.
-   */
-  private afterDialog(): void {
-    this.readAgain();
-  }
-
   /** A read of the accounts failed: read them again in ACCOUNTS_RETRY_MS, and report the set if it changed. */
   private readAgainLater(): void {
     if (this.retryTimer !== undefined || this.disposed) return;
@@ -411,7 +410,12 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
     }, ACCOUNTS_RETRY_MS);
   }
 
-  /** Reads the accounts again; a set other than the one reported last (or the first one) fires onDidChangeSession. */
+  /**
+   * Reads the accounts again; a set other than the one reported last (or the first one) fires onDidChangeSession. After
+   * a sign-in dialog that ended with a session: VS Code fires no change of the sessions when the user only allowed an
+   * existing session for Devspaces, and the change of the sessions that VS Code fired for a new session may have
+   * reported that set already.
+   */
   private readAgain(): void {
     const first = this.reportedAccounts === undefined;
     this.accountSet = undefined;
@@ -441,6 +445,13 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
         });
     }, CHANGE_DELAY_MS);
   }
+}
+
+/** A read of the accounts of Devspaces (readAccounts). */
+interface AccountRead {
+  accounts: GitHubAccount[];
+  /** VS Code answered every question without an error. */
+  complete: boolean;
 }
 
 function accountOf(session: vscode.AuthenticationSession): GitHubAccount {
