@@ -576,7 +576,7 @@
         },
         {
           "command": "devspaces.startWithAccount",
-          "when": "view == devspaces.repositories && viewItem =~ /;canStartWithAccount(;|$)/",
+          "when": "view == devspaces.repositories && viewItem =~ /;canChooseAccount(;|$)/",
           "group": "1_actions@3"
         },
         {
@@ -638,7 +638,7 @@
         },
         {
           "command": "devspaces.startWithAccount",
-          "when": "viewItem =~ /;canStartWithAccount(;|$)/",
+          "when": "viewItem =~ /;canChooseAccount(;|$)/",
           "group": "0_start@2"
         },
         {

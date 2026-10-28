@@ -154,6 +154,11 @@ export class Sidebar implements vscode.Disposable {
   private accountChanges = 0;
   /** The account and the token of the refresh that asks GitHub now; `undefined` while none does. */
   private refreshToken: { accountId: string; token: string } | undefined;
+  /**
+   * The token of each account that the running refresh of the lists reached so far (also an account that it skipped),
+   * as it read the token: a new session of one of them needs a refresh of its own (refreshUsesCurrentSession).
+   */
+  private passTokens = new Map<string, string>();
   private disposed = false;
   /** Problems of the setting repositoryGroups that were shown: each distinct one once per window session. */
   private readonly shownGroupProblems = new Set<string>();
@@ -327,12 +332,17 @@ export class Sidebar implements vscode.Disposable {
     await this.refreshDiscovery({ again });
   }
 
-  /** True if a refresh asks GitHub now with the token of the current session of its account. */
+  /**
+   * True if a refresh asks GitHub now, and each account that it reached so far still has the session whose token it
+   * read (the accounts after it are read when it reaches them).
+   */
   private async refreshUsesCurrentSession(): Promise<boolean> {
-    const running = this.refreshToken;
-    if (running === undefined) return false;
-    const account = this.lists.get(running.accountId)?.account;
-    return account !== undefined && (await this.readSession(account))?.token === running.token;
+    if (this.refreshToken === undefined) return false;
+    for (const [accountId, token] of this.passTokens) {
+      const account = this.lists.get(accountId)?.account;
+      if (account === undefined || (await this.readSession(account))?.token !== token) return false;
+    }
+    return true;
   }
 
   /** Starts the background refresh again with the interval of the settings. */
@@ -665,6 +675,8 @@ export class Sidebar implements vscode.Disposable {
     let rateLimited = false;
     let failed = false;
     let refreshed = false;
+    const passTokens = new Map<string, string>();
+    this.passTokens = passTokens;
     for (const account of accounts) {
       if (this.disposed || changes !== this.accountChanges) break;
       const state = this.lists.get(account.id);
@@ -672,6 +684,7 @@ export class Sidebar implements vscode.Disposable {
       const session = state === undefined ? undefined : await this.readSession(account);
       // Security: only a session of this account gives its list (stored under its ID).
       if (state === undefined || session?.account.id !== account.id) continue;
+      passTokens.set(account.id, session.token);
       if (!(await this.authSignedIn(account))) {
         // GitHub rejected its token (also in a request outside this view): while another account keeps the view signed
         // in, only this offer says that the list of this account is not updated.

@@ -338,9 +338,12 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
     scopes: readonly string[],
     account: vscode.AuthenticationSessionAccountInformation | undefined,
   ): Promise<vscode.AuthenticationSession | undefined> {
+    // A session that VS Code gives without a dialog is used as it is: no dialog ran, so the accounts did not change
+    // (afterDialog reads them only after a dialog).
+    const current = await this.silentSession(scopes, account);
+    if (current !== undefined && !this.isRejected(scopes, current)) return current;
     // Workaround (see `rejected`): `createIfNone` would return the rejected session again without a dialog.
-    const current = this.rejected.size > 0 ? await this.silentSession(scopes, account) : undefined;
-    const force = current !== undefined && this.isRejected(scopes, current);
+    const force = current !== undefined;
     try {
       const session = await vscode.authentication.getSession(GITHUB_PROVIDER_ID, [...scopes], {
         ...(force ? { forceNewSession: true } : { createIfNone: true }),

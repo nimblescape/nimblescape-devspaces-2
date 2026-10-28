@@ -246,8 +246,8 @@ export interface RepositoryRow {
    * `repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning`, only the flags that
    * apply (package.json menus); `hostAccessUnrestricted` in place of `hostAccessChecked` while the checks are off;
    * `kept` in place of `canKeepRunning` for a kept devspace; neither without a devspace; `canCloseAndKeepRunning`
-   * for the devspace of this window; and `canStartWithAccount` when two or more accounts of Devspaces can access the
-   * repository.
+   * for the devspace of this window; and `canChooseAccount` when two or more accounts of Devspaces can access the
+   * repository and the row offers Start.
    */
   contextValue: string;
 }
@@ -486,7 +486,7 @@ export function rowActions(
  * the devspace, the flag `kept` (Stop When Closed) or `canKeepRunning` (Keep Running When Closed); none for a row
  * without devspace. `connectedHere`: the devspace of this window, the flag `canCloseAndKeepRunning` (Close and
  * Keep Running). `severalAccounts`: two or more accounts of Devspaces can access the repository, the flag
- * `canStartWithAccount` (Start with Account…).
+ * `canChooseAccount` (Start with Account…) while the row offers Start.
  */
 export function contextValue(actions: RowActions, checks?: HostAccessChecks, kept?: boolean, connectedHere = false, severalAccounts = false): string {
   const flags = ['repository'];
@@ -500,7 +500,8 @@ export function contextValue(actions: RowActions, checks?: HostAccessChecks, kep
   if (kept === true) flags.push('kept');
   if (kept === false) flags.push('canKeepRunning');
   if (connectedHere) flags.push('canCloseAndKeepRunning');
-  if (severalAccounts) flags.push('canStartWithAccount');
+  // Not `canStart…`: the `when` clauses of Start match /canStart/ without anchors. Only where Start is offered.
+  if (severalAccounts && actions.canStart) flags.push('canChooseAccount');
   return flags.join(';');
 }
 

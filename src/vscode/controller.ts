@@ -1976,7 +1976,7 @@ export class Controller implements vscode.Disposable {
       }
       unlisted.push({ account, repository });
     }
-    const looked = await this.lookUpWithRenewal(unlisted);
+    const looked = await this.lookUpWithRenewal(unlisted, results.length > 0);
     results.push(...unlisted.map((request, index) => ({ ...request, ...looked[index] })));
     // In the order of the accounts, as the Quick Pick below shows them.
     results.sort((a, b) => accounts.indexOf(a.account) - accounts.indexOf(b.account));
@@ -2012,11 +2012,14 @@ export class Controller implements vscode.Disposable {
 
   /**
    * lookUpRepository for each request (a repository and an account), all at the same time; when GitHub rejects the
-   * token of an account (HTTP 401), only that account is asked to sign in again (renewToken, one dialog after the
-   * other), and GitHub is asked once more with its new token. The results are in the order of `requests`.
+   * token of an account (HTTP 401) and no account found its repository (`found`: the caller found one already), only
+   * that account is asked to sign in again (renewToken, one dialog after the other), and GitHub is asked once more
+   * with its new token. The results are in the order of `requests`.
    */
-  private async lookUpWithRenewal(requests: ReadonlyArray<{ repository: string; account: GitHubAccount }>): Promise<LookUpResult[]> {
+  private async lookUpWithRenewal(requests: ReadonlyArray<{ repository: string; account: GitHubAccount }>, found = false): Promise<LookUpResult[]> {
     const results = await Promise.all(requests.map(({ repository, account }) => this.lookUpRepository(repository, account)));
+    // No new sign-in when another account opens the repository.
+    if (found || results.some((result) => result.info !== undefined)) return results;
     for (const [index, { repository, account }] of requests.entries()) {
       if (results[index]?.failure !== 'rejected') continue;
       const token = await this.deps.auth.renewToken(account);

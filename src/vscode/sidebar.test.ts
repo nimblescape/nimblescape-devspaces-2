@@ -1528,6 +1528,27 @@ describe('Sidebar with several GitHub accounts', () => {
     expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('not on GitHub');
   });
 
+  it('refreshes again when an account that the running refresh already reached gets a new session', async () => {
+    let octoToken = 'gho_token';
+    h.auth.getSession.mockImplementation(async (options: { account?: GitHubAccount } = {}) =>
+      options.account?.id === OTHER.id ? { token: 'gho_other', account: OTHER } : { token: octoToken, account: OCTO },
+    );
+    let finish: (value: DiscoveryData) => void = () => undefined;
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) =>
+      accountId === OTHER.id ? new Promise<DiscoveryData>((resolve) => (finish = resolve)) : data([info('acme/api')]),
+    );
+    await h.sidebar.initialize();
+    // octo is refreshed; the refresh of someone runs.
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(2));
+    octoToken = 'gho_new';
+    const changed = h.sidebar.onSessionChanged();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    finish(ofOther([]));
+    await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledWith('gho_new', OCTO.id));
+    finish(ofOther([]));
+    await changed;
+  });
+
   it('asks GitHub about the repository of a devspace that no list has with the token of its owner', async () => {
     await h.registry.add(devspace(OLD, 'school/old', { owner: OTHER }));
     await h.registry.add(devspace(GONE, 'acme/old'));
