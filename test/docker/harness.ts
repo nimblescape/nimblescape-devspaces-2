@@ -16,7 +16,7 @@ import { helperImageTag, type HelperImageUse } from '../../src/core/helper/helpe
 import { HelperImages, helperDockerSocket, type HelperImageDocker } from '../../src/core/helper/helperImages';
 import { WorkspaceHelper } from '../../src/core/helper/workspaceHelper';
 import { nodeHttpsTransport, type HttpTransport } from '../../src/core/http';
-import { DockerCredentialStore, withGitHubPackagesFallback } from '../../src/core/imageCheck/credentials';
+import { DockerCredentialStore } from '../../src/core/imageCheck/credentials';
 import type { ImageChecker } from '../../src/core/imageCheck/imageCheck';
 import { RegistryClient } from '../../src/core/imageCheck/registryClient';
 import type { ProgressStep } from '../../src/core/messages';
@@ -366,8 +366,8 @@ export const registryTransport: HttpTransport = {
 };
 
 /**
- * The registry client of the extension (src/vscode/extension.ts): the Docker credentials, then the GitHub session for
- * ghcr.io. With the Docker configuration of the run (no credentials) and the fake session, it never has credentials.
+ * The registry client of the extension (src/vscode/extension.ts): the Docker credentials only. With the Docker
+ * configuration of the run (no credentials), it never has credentials.
  */
 export function registryClient(transport: HttpTransport, runner: ProcessRunner, env: NodeJS.ProcessEnv, log: Logger): RegistryClient {
   const credentials = new DockerCredentialStore(runner, {
@@ -377,7 +377,7 @@ export function registryClient(transport: HttpTransport, runner: ProcessRunner, 
     findExecutable: (name) => findExecutable(name, env, process.platform),
     logger: log,
   });
-  return new RegistryClient(transport, withGitHubPackagesFallback(credentials.provider(), fakeAuth), log);
+  return new RegistryClient(transport, credentials.provider(), log);
 }
 
 /** The current registry digest of an image reference, read with the checker of the extension. */

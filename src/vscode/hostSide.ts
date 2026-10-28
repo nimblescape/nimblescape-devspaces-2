@@ -4,10 +4,14 @@
 
 // The HostSide of this computer, which answers the requests of a flow that runs in the worker (hostSideHandler; the
 // worker is the deputy of this computer). It is the only place where those requests reach VS Code, the registry, the
-// session files and the sign-ins; the flow itself has none of them.
+// session files and the sign-ins; the flow itself has none of them. Each flow belongs to at most one GitHub account,
+// which the extension chooses before it sends the flow (the account of the operation): its HostSide answers the
+// account, the token, the profile and the ghcr.io login of that account only, and writes only entries of that account.
+// The worker never names an account.
 import type { DevspaceRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type { GitHubAuth, Logger, PipelineUi } from '../core/ports';
+import type { GitHubAccount } from '../core/types';
 import { credentialServerName } from '../core/imageCheck/reference';
 import type { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { GITHUB_PACKAGES_REGISTRY, IDENTITY_TOKEN_USER } from '../core/imageCheck/credentials';
@@ -55,8 +59,16 @@ export interface HostSideDeps {
   logger: Logger;
 }
 
-/** What a flow in the worker may ask this computer for. */
-export function extensionHostSide(deps: HostSideDeps): HostSide {
+/**
+ * What a flow in the worker may ask this computer for, for the operation of `account` (the account of the operation,
+ * chosen by the extension: the owner of the devspace of the operation, or the account that a first open uses). Without
+ * an account, the flow belongs to none: it gets no account, no token, no profile and no GitHub login of ghcr.io, and
+ * writes no entry of the open.
+ */
+export function extensionHostSide(deps: HostSideDeps, account?: GitHubAccount): HostSide {
+  // The account of the operation while it has a session in VS Code (read now, never the worker's); never another one.
+  const operationAccount = async (interactive = false): Promise<GitHubAccount | undefined> =>
+    account === undefined ? undefined : deps.auth.getAccount({ interactive, account });
   // The same busy marks as the pipeline of this window sets itself.
   const markView: BusyMarkView = {
     owner: { windowId: deps.windowId, pid: deps.pid },
@@ -67,22 +79,22 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
   };
   const busyMarks = registryBusyMarks(deps.registry, markView);
   // The registry writes of the open for a request of the worker, with the owner, clock and view of the windows of this
-  // window, only on an entry of the account signed in here (read now, never the worker's) on the Docker host of the
-  // operation (`scope`, from the handler).
+  // window, only on an entry of the account of the operation on the Docker host of the operation (`scope`, from the
+  // handler).
   const openRequests = async (scope: OpenRequestScope | undefined): Promise<OpenRequests> => {
     if (scope === undefined) throw new Error('The registry write of the open names no Docker host of its operation.');
-    const account = await deps.auth.getAccount({ interactive: false });
-    if (account === undefined) throw new Error('No GitHub account is signed in in this window.');
-    return requestOpenRecords(deps.registry, markView, { account: { id: account.id, login: account.login }, dockerHost: scope.dockerHost });
+    const current = await operationAccount();
+    if (current === undefined) throw new Error('The GitHub account of the operation is not signed in in this window.');
+    return requestOpenRecords(deps.registry, markView, { account: { id: current.id, login: current.login }, dockerHost: scope.dockerHost });
   };
-  // The remembered check result only of an entry of the account signed in here (read now, never the worker's) on the
-  // Docker host of the operation (`scope`, from the handler), as the registry writes of the open.
+  // The remembered check result only of an entry of the account of the operation on the Docker host of the operation
+  // (`scope`, from the handler), as the registry writes of the open.
   const configCheckEntry = async (devspaceId: string, scope: OpenRequestScope | undefined): Promise<boolean> => {
     if (scope === undefined) throw new Error('The check result of the open names no Docker host of its operation.');
-    const account = await deps.auth.getAccount({ interactive: false });
-    if (account === undefined) throw new Error('No GitHub account is signed in in this window.');
+    const current = await operationAccount();
+    if (current === undefined) throw new Error('The GitHub account of the operation is not signed in in this window.');
     const entry = await deps.registry.get(devspaceId);
-    return entry !== undefined && entry.owner.id === account.id && isOnDockerHost(entry, scope.dockerHost);
+    return entry !== undefined && entry.owner.id === current.id && isOnDockerHost(entry, scope.dockerHost);
   };
   return {
     questions: {
@@ -99,21 +111,21 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       message: async (kind, text) => {
         if (kind === 'info') deps.ui.info(text);
         else if (kind === 'warn') deps.ui.warn(text);
-        else deps.ui.registrySignIn(text);
+        // The Sign in of the hint asks for the ghcr.io login of the account of the operation only.
+        else deps.ui.registrySignIn(text, account);
       },
     },
     state: {
       windowStatuses: () => deps.sessionFiles.readWindowStatuses(),
       pendings: async () => (await deps.sessionFiles.readPendings()).map((pending) => ({ ...pending })),
       processAlive: async (pid) => deps.isProcessAlive(pid),
-      account: (interactive) => deps.auth.getAccount({ interactive }),
-      // With the token of this window, never one of the worker; only the profile of the signed-in account.
+      account: (interactive) => operationAccount(interactive),
+      // With the token of this window, never one of the worker; only the profile of the account of the operation.
       viewer: async () => {
-        if (!deps.viewer) return undefined;
+        if (!deps.viewer || account === undefined) return undefined;
         try {
-          const account = await deps.auth.getAccount({ interactive: false });
-          const token = await deps.auth.getToken({ interactive: false });
-          if (account === undefined || token === undefined) return undefined;
+          const token = await deps.auth.getToken({ interactive: false, account });
+          if (token === undefined) return undefined;
           const profile = await deps.viewer(token, AbortSignal.timeout(VIEWER_TIMEOUT_MS));
           return String(profile.databaseId) === account.id ? profile : undefined;
         } catch (error) {
@@ -188,7 +200,7 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
       },
     },
     secrets: {
-      token: async () => deps.auth.getToken({ interactive: false }),
+      token: async () => (account === undefined ? undefined : deps.auth.getToken({ interactive: false, account })),
       // The handler checked the registry and the repository, and logs the request (hostSideHandler).
       registry: async (registry) => {
         const stored = await deps.credentials.getForPull(registry);
@@ -198,9 +210,10 @@ export function extensionHostSide(deps: HostSideDeps): HostSide {
             ? { identityToken: true, serveraddress, password: stored.password, from: 'docker' }
             : { username: stored.username, serveraddress, password: stored.password, from: 'docker' };
         }
-        if (registry.toLowerCase() !== GITHUB_PACKAGES_REGISTRY) return undefined;
-        // The GitHub sign-in is the login of ghcr.io when Docker has none; never asked with a dialog.
-        const login = await deps.auth.getPackagesCredentials({ interactive: false }).catch(() => undefined);
+        if (registry.toLowerCase() !== GITHUB_PACKAGES_REGISTRY || account === undefined) return undefined;
+        // The GitHub sign-in of the account of the operation is the login of ghcr.io when Docker has none; never asked
+        // with a dialog, and never the sign-in of another account.
+        const login = await deps.auth.getPackagesCredentials({ interactive: false, account }).catch(() => undefined);
         return login === undefined ? undefined : { username: login.username, serveraddress: GITHUB_PACKAGES_REGISTRY, password: login.password, from: 'github' };
       },
     },
@@ -229,13 +242,14 @@ function repositoryOf(params: unknown): string | undefined {
 }
 
 /**
- * Runs the flow `op` in the worker of the current engine; the HostSide of this computer answers its requests, and only
- * those that the operation may send (FLOW_REQUESTS: one place, tested).
+ * Runs the flow `op` in the worker of the current engine; the HostSide of this computer for the account of the operation
+ * (`options.account`; `host`, usually extensionHostSide) answers its requests, and only those that the operation may
+ * send (FLOW_REQUESTS: one place, tested).
  */
 export function extensionFlow(
   channels: Pick<HelperChannels, 'flow'>,
   current: () => Promise<DockerTarget>,
-  host: HostSide,
+  host: (account: GitHubAccount | undefined) => HostSide,
   logger: Logger,
 ): (
   op: string,
@@ -253,6 +267,9 @@ export function extensionFlow(
     target?: DockerTarget;
     // The helper image maintenance of the preparation of the worker of an operation `open`.
     helperMaintenance?: HelperMaintenance;
+    // The GitHub account of the operation, chosen by the extension (extensionHostSide); none: the flow belongs to no
+    // account.
+    account?: GitHubAccount;
   },
 ) => Promise<unknown> {
   return async (op, params, options) =>
@@ -265,7 +282,7 @@ export function extensionFlow(
       // Only the open passes it; the worker of the open is prepared with it (HelperChannels).
       ...(options.helperMaintenance ? { helperMaintenance: options.helperMaintenance } : {}),
       // The repository that the questions name, and the observer of the answers.
-      onAsk: hostSideHandler(host, logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], {
+      onAsk: hostSideHandler(host(options.account), logger, Object.hasOwn(FLOW_REQUESTS, op) ? FLOW_REQUESTS[op] : [], {
         devspaceId: devspaceOf(params),
         repository: repositoryOf(params),
         dockerHost: dockerHostOfParams(params),

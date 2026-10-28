@@ -157,17 +157,28 @@ export interface Credentials {
   password: string;
 }
 
-/** Access to the GitHub session of VS Code. */
+/**
+ * Which session of VS Code a call of GitHubAuth means. `account`: the session of that GitHub account only (VS Code can
+ * hold the sessions of several accounts); `interactive` then asks VS Code for that account. Without `account`: the
+ * session that VS Code gives the extension (the account that the user chose for it). `interactive: false` never shows
+ * a dialog.
+ */
+export interface GitHubAuthOptions {
+  interactive: boolean;
+  account?: GitHubAccount;
+}
+
+/** Access to the GitHub sessions of VS Code. */
 export interface GitHubAuth {
-  /** Token of the session with the scopes `repo` and `read:org`. `interactive: false` never shows a dialog. */
-  getToken(options: { interactive: boolean }): Promise<string | undefined>;
+  /** Token of the session with the scopes `repo` and `read:org`. */
+  getToken(options: GitHubAuthOptions): Promise<string | undefined>;
   /**
-   * The account of the same session as getToken: the GitHub user ID and the login. `undefined` when no session exists
-   * (not signed in). `interactive: false` never shows a dialog.
+   * The account of the same session as getToken: the GitHub user ID and the login. `undefined` when no such session
+   * exists (not signed in).
    */
-  getAccount(options: { interactive: boolean }): Promise<GitHubAccount | undefined>;
+  getAccount(options: GitHubAuthOptions): Promise<GitHubAccount | undefined>;
   /** Credentials for ghcr.io from the session with the additional scope `read:packages`. */
-  getPackagesCredentials(options: { interactive: boolean }): Promise<Credentials | undefined>;
+  getPackagesCredentials(options: GitHubAuthOptions): Promise<Credentials | undefined>;
   /**
    * GitHub rejected `token` (HTTP 401, or Git "Authentication failed" for github.com). Every caller of GitHub reports it
    * here, so that the session does not count as signed in and the next sign-in replaces it. Never throws.
@@ -227,6 +238,9 @@ export interface PipelineUi {
   info(message: string): void;
   /** Non-blocking warning message. */
   warn(message: string): void;
-  /** Non-blocking message "The registry … requires a sign-in." with the action Sign in (only for ghcr.io). */
-  registrySignIn(registry: string): void;
+  /**
+   * Non-blocking message "The registry … requires a sign-in." with the action Sign in (only for ghcr.io), which asks
+   * for the ghcr.io login of `account` (the account of the operation) only.
+   */
+  registrySignIn(registry: string, account?: GitHubAccount): void;
 }

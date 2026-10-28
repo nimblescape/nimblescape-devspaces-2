@@ -21,12 +21,13 @@ import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { VSCODE_STORE_VOLUME, repositoryFolder, splitRepository } from '../core/names';
-import { availableDevspaces, isAvailableTo } from '../core/ownership';
+import { chooseAccount, listedCandidates, permissionText, rankAccounts, type AccountCandidate } from '../core/accountChoice';
+import { availableDevspaces, ownerAmong } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import type { DevspaceOperations } from '../core/pipeline/devspaceOperations';
 import { PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS, type DockerStarter, type OpenResult } from '../core/pipeline/operationBase';
 import type { DockerEngineRecord, DockerEngineRecords, EngineRemoval } from '../core/storage/dockerEngineRecords';
-import type { DevspaceRegistry } from '../core/storage/registry';
+import { isDevspaceOf, type DevspaceRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
   BusyMark,
@@ -279,13 +280,13 @@ interface Target {
   info?: RepositoryInfo;
   /**
    * The devspace, read from the registry when the command started: the one that the command names (a row, the status
-   * bar item, the switcher), or else the devspace of the repository of the signed-in account.
+   * bar item, the switcher), or else the devspace of the repository of an account of Devspaces (repositoryTargetFor).
    */
   devspace?: Devspace;
   /**
    * The command names `devspace` (a row, the status bar item, the switcher, a restored window). Otherwise the
-   * devspace belongs to the repository for the account that was signed in, and Try again looks it up again for the
-   * account that is signed in then.
+   * devspace belongs to the repository for the accounts of Devspaces, and Try again looks it up again for the accounts
+   * of Devspaces then.
    */
   named?: boolean;
   /**
@@ -294,6 +295,28 @@ interface Target {
    * repository with one source that the discovery does not know yet (the open takes its first configuration).
    */
   source?: DevspaceSource;
+  /**
+   * The GitHub account that the command uses (accountChoice.ts): the owner of the devspace, or the account that the
+   * first open creates the devspace with. Missing: not chosen (a command other than Start on a repository without a
+   * devspace; the open of a devspace always uses its owner).
+   */
+  account?: GitHubAccount;
+  /** The user or the link chose `account` (Start with Account…, a course link): Try again keeps it. */
+  chosenAccount?: true;
+}
+
+/** What GitHub says about a repository for one account (Controller.lookUpRepository). */
+type LookUpResult = { info: RepositoryInfo; failure?: undefined } | { info?: undefined; failure: 'notFound' | 'rejected' | 'unknown' };
+
+/** The repository that a link opens (Controller.startFromLink). */
+interface LinkRepository {
+  repository: string;
+  /** Its GitHub data; missing when GitHub could not be asked. */
+  info?: RepositoryInfo;
+  /** A course link: the account of the login in the name, which opens it. */
+  account?: GitHubAccount;
+  /** A link `/open` of a repository in no list: the accounts that GitHub shows it to. */
+  candidates?: AccountCandidate[];
 }
 
 interface StartOptions {
@@ -452,6 +475,7 @@ export class Controller implements vscode.Disposable {
       start: (argument) => this.start(parseCommandArgument(argument)),
       startInNewWindow: (argument) => this.start(parseCommandArgument(argument), 'newWindow'),
       startInCurrentWindow: (argument) => this.start(parseCommandArgument(argument), 'currentWindow'),
+      startWithAccount: (argument) => this.startWithAccount(parseCommandArgument(argument)),
       stop: (argument) => this.stop(parseCommandArgument(argument)),
       delete: (argument) => this.delete(parseCommandArgument(argument)),
       rebuild: (argument) => this.rebuild(parseCommandArgument(argument)),
@@ -465,6 +489,7 @@ export class Controller implements vscode.Disposable {
       search: () => this.search(),
       showLog: (argument) => this.showLog(argument),
       signIn: () => this.signIn(),
+      addAccount: () => this.addAccount(),
       selectOwners: () => this.selectOwners(),
       selectOwnersFiltered: () => this.selectOwners(),
       showOnlyDevspaces: () => setShowOnlyDevspaces(true),
@@ -759,15 +784,15 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The pending ${operation.operation} of ${operation.devspaceId} is too old and is dropped.`);
       await this.removeOperationQuietly(operation.devspaceId);
     }
-    const account = await this.readAccount();
+    const accounts = await this.readAccounts();
     const dockerHost = await this.currentDockerHost();
     for (const operation of runnable) {
       if (this.disposed) return;
-      // An operation of a devspace of another account is not run by this window; it expires.
+      // An operation of a devspace of an account that Devspaces does not use is not run by this window; it expires.
       const target = await registry.get(operation.devspaceId);
-      if (target && !isAvailableTo(target, account)) {
+      if (target && ownerAmong(target, accounts) === undefined) {
         this.logger.info(
-          `The pending ${operation.operation} of ${operation.devspaceId} is for another GitHub account. It is not run.`,
+          `The pending ${operation.operation} of ${operation.devspaceId} is for a GitHub account that Devspaces does not use. It is not run.`,
         );
         continue;
       }
@@ -803,9 +828,9 @@ export class Controller implements vscode.Disposable {
       otherConnectedWindows: others.filter((status) => status.devspaceId !== null).length,
       pendingOperations: operations.length,
       record,
-      // Only a devspace of the signed-in account is opened again, and only of the current Docker host.
+      // Only a devspace of an account of Devspaces is opened again, and only of the current Docker host.
       devspaceIds: new Set(
-        availableDevspaces(devspacesOfHost(devspaces, dockerHost), account).map((devspace) => devspace.id),
+        availableDevspaces(devspacesOfHost(devspaces, dockerHost), accounts).map((devspace) => devspace.id),
       ),
       // The age of the record at activation (see `activatedAt`), not after the awaits and the pause.
       now: activatedAt,
@@ -893,6 +918,38 @@ export class Controller implements vscode.Disposable {
   async start(argument: CommandArgument, window: WindowRequest = 'default'): Promise<void> {
     const target = await this.resolveTarget(argument, 'open', this.repositoryPlaceholder(window));
     if (target) await this.startTarget(target, { window });
+  }
+
+  /**
+   * Start with Account… (the context menu of a row whose repository two or more accounts of Devspaces can access): the
+   * devspace of the source of the row of the account that the user picks, else a new one of it, with its own clone,
+   * container and images. The devspace of another account stays as it is; a later Start opens the one used last.
+   */
+  async startWithAccount(argument: CommandArgument): Promise<void> {
+    if (argument.kind !== 'row') return;
+    const accounts = await this.requireAccounts();
+    const info = this.deps.sidebar.repositoryInfo(argument.repository) ?? argument.info;
+    const repository = info?.nameWithOwner ?? argument.repository;
+    const named = argument.devspaceId !== undefined ? await this.deps.registry.get(argument.devspaceId) : undefined;
+    const source = named ? sourceOf(named) : argument.source;
+    const candidates = rankAccounts(repository, listedCandidates(info, accounts, this.deps.sidebar.accountListings()));
+    if (candidates.length < 2) {
+      this.inform(ControllerTexts.oneAccountOnly(repository));
+      return;
+    }
+    const dockerHost = await this.currentDockerHost();
+    const items = await Promise.all(
+      candidates.map(async (candidate) => {
+        const existing = await this.deps.registry.findForAccount(repository, candidate.account.id, dockerHost, source);
+        return { label: candidate.account.login, description: ControllerTexts.accountChoiceDescription(permissionText(candidate.permission), existing !== undefined), candidate };
+      }),
+    );
+    const picked = await vscode.window.showQuickPick(items, { title: ControllerTexts.startWithAccountTitle(repository), placeHolder: ControllerTexts.startWithAccountPlaceholder });
+    if (!picked) return;
+    const target = await this.repositoryTargetFor(repository, 'start', source, { account: picked.candidate.account });
+    if (!target) return;
+    this.logger.info(`Start with Account: ${repository} with the GitHub account ${picked.candidate.account.login}.`);
+    await this.startTarget({ ...target, info: target.info ?? info, chosenAccount: true });
   }
 
   /**
@@ -1160,7 +1217,7 @@ export class Controller implements vscode.Disposable {
    */
   async switchDevspace(window: WindowRequest = 'default'): Promise<void> {
     const { registry, sidebar } = this.deps;
-    // Only the devspaces and the repositories of the signed-in account.
+    // Only the devspaces and the repositories of the accounts of Devspaces.
     const [devspaces, repositories] = await Promise.all([sidebar.availableDevspaces(), sidebar.repositoriesForPicker()]);
     if (devspaces.length === 0 && repositories.length === 0) {
       this.inform(ControllerTexts.noRepositories);
@@ -1180,7 +1237,7 @@ export class Controller implements vscode.Disposable {
       if (target) await this.startTarget(target, { window });
       return;
     }
-    const target = await this.pickedRepositoryTarget(choice.repository.nameWithOwner, 'token');
+    const target = await this.pickedRepositoryTarget(choice.repository.nameWithOwner, 'start');
     if (target) await this.startTarget(target, { window });
   }
 
@@ -1353,10 +1410,11 @@ export class Controller implements vscode.Disposable {
       this.warn(ControllerTexts.removeEngineNotAnswering(engine));
       return;
     }
-    // Only the devspaces of the signed-in account; without a sign-in, none.
-    const account = here.length > 0 ? await this.readAccount() : undefined;
-    const own = account === undefined ? [] : here.filter((devspace) => isAvailableTo(devspace, account));
+    // The devspaces of all accounts of Devspaces (named in the question); without a sign-in, none.
+    const accounts = here.length > 0 ? await this.readAccounts() : [];
+    const own = availableDevspaces(here, accounts);
     const others = here.filter((devspace) => !own.includes(devspace));
+    const ownLogins = accounts.filter((account) => own.some((devspace) => devspace.owner.id === account.id)).map((account) => account.login);
     if (inventoryIsEmpty(inventory) && own.length === 0) {
       // Nothing to remove; the mark still keeps the background work of this computer away from the engine.
       const marked = await this.markRemoved(target.host);
@@ -1368,14 +1426,14 @@ export class Controller implements vscode.Disposable {
     const detail = [ControllerTexts.removeDetail];
     if (inventory.unknownDevspaces.length > 0) detail.push(ControllerTexts.removeUnknownDevspaces);
     else if (inventory.otherComputerMonitor) detail.push(ControllerTexts.removeOtherComputer);
-    if (account === undefined && here.length > 0) detail.push(ControllerTexts.removeSignedOut);
+    if (accounts.length === 0 && here.length > 0) detail.push(ControllerTexts.removeSignedOut);
     else if (others.length > 0) detail.push(ControllerTexts.removeOtherAccounts(listSome(others.map((devspace) => this.shownName(this.devspaceTarget(devspace))))));
     const confirmed = await showWarningMessage(ControllerTexts.removeQuestion(engine), { modal: true, detail: detail.join(' ') }, ControllerTexts.remove);
     if (confirmed !== ControllerTexts.remove) return;
     let deleteOwn = false;
     if (own.length > 0) {
       const choice = await showWarningMessage(
-        ControllerTexts.removeDevspacesQuestion(own.length, engine),
+        ControllerTexts.removeDevspacesQuestion(own.length, engine, ownLogins),
         { modal: true, detail: ControllerTexts.removeDevspacesDetail(this.recordedChanges(own)) },
         ControllerTexts.deleteDevspacesToo,
         ControllerTexts.keepDevspaces,
@@ -1398,7 +1456,7 @@ export class Controller implements vscode.Disposable {
       if (await this.removalRefusedByUse(engine, hereNow)) return;
       stopped = false;
       if (start.kind === 'started') this.logger.info(`This computer does no Docker work on ${engine} by itself until a Start, a Rebuild or "Update All Images Now" there.`);
-      this.logger.info(`Removing Devspaces from ${engine}${own.length > 0 ? (deleteOwn ? ', with the devspaces of the signed-in account there' : '; the devspaces stay') : ''}.`);
+      this.logger.info(`Removing Devspaces from ${engine}${own.length > 0 ? (deleteOwn ? `, with the devspaces of ${ownLogins.join(', ')} there` : '; the devspaces stay') : ''}.`);
       await this.removeConfirmed(removal, target, {
         own: deleteOwn ? own : [],
         devspacesStay: (!deleteOwn && own.length > 0) || others.length > 0 || inventory.unknownDevspaces.length > 0,
@@ -1761,7 +1819,7 @@ export class Controller implements vscode.Disposable {
     }
     const info = await pickRepository(repositories, this.repositoryPlaceholder('default'));
     if (!info) return;
-    const target = await this.pickedRepositoryTarget(info.nameWithOwner, 'token');
+    const target = await this.pickedRepositoryTarget(info.nameWithOwner, 'start');
     if (target) await this.startTarget(target);
   }
 
@@ -1769,17 +1827,19 @@ export class Controller implements vscode.Disposable {
    * A link to Devspaces (links.ts), for example on a website: `vscode://nimblescape.nimblescape-devspaces-2/open?repository=owner/name`.
    * VS Code asks first whether Devspaces may open it, unless the user answered "Do not ask me again for this
    * extension", and it installs Devspaces from the Marketplace when it is missing. The link opens the devspace of the
-   * repository that the account used last on the current Docker engine. Without one, it creates the devspace as a
-   * double-click on the row of the repository does, from its first source (possibleSources), after one question before
-   * any Docker work: the confirmation of every first open for a repository that belongs neither to the account nor to
-   * one of its organizations, else the question of the link (linkStartConfirm), which "Always Open" turns off (setting
+   * repository that an account of Devspaces used last on the current Docker engine. Without one, it creates the devspace
+   * as a double-click on the row of the repository does, from its first source (possibleSources), with the account that
+   * a Start chooses (accountChoice.ts), after one question before any Docker work: the confirmation of every first open
+   * for a repository that belongs neither to an account of Devspaces nor to one of their organizations, else the
+   * question of the link (linkStartConfirm), which "Always Open" turns off (setting
    * confirmOpenFromLink). VS Code gives the link to the window
    * that was active last, in which the user did not ask for anything: the devspace opens in that window only when it is
    * empty, else in a new window, and the window keeps what it has. The repository can be one that the list does not show: then GitHub is asked for
    * it. A link that names no repository asks neither GitHub nor Docker. Never rejects: errors are shown.
    *
-   * The course link `/course?repository=owner/name-<username>` opens the repository of the signed-in account in a
-   * course in the same way: after the sign-in, `<username>` becomes the GitHub login of the account (courseRepository).
+   * The course link `/course?repository=owner/name-<username>` opens the repository of one account in a course in the
+   * same way: after the sign-in, `<username>` becomes the GitHub login of each account of Devspaces (courseRepository),
+   * and the account whose repository exists opens it (courseLinkRepository).
    */
   async openLink(uri: { path: string; query: string }): Promise<void> {
     this.rowActivations.forgetEnter();
@@ -1804,31 +1864,19 @@ export class Controller implements vscode.Disposable {
   }
 
   private async startFromLink(link: RepositoryLink, window: WindowRequest): Promise<void> {
-    let session = await this.deps.auth.getSession({ interactive: true });
-    if (!session) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    let repository = this.repositoryOfLink(link, session.account.login);
-    if (repository === undefined) return;
-    let found = await this.linkedRepository(repository, session.token);
-    if (found.failure === 'rejected') {
-      // GitHub rejected the token (HTTP 401): a new sign-in, and the link goes on with it, also with another account.
-      const token = await this.deps.auth.renewToken();
-      session = token === undefined ? undefined : await this.deps.auth.getSession({ interactive: true });
-      if (!session) throw new UserFacingError('signInRequired', Messages.signInRequired);
-      repository = this.repositoryOfLink(link, session.account.login);
-      if (repository === undefined) return;
-      found = await this.linkedRepository(repository, session.token);
-      if (found.failure === 'rejected') throw new UserFacingError('signInRequired', Messages.signInRequired);
-    }
-    if (found.failure === 'notFound') {
-      this.warn(link.kind === 'course' ? ControllerTexts.courseRepositoryNotFound(repository, session.account.login) : ControllerTexts.linkRepositoryNotFound(repository));
-      return;
-    }
-    const { info } = found;
+    const accounts = await this.requireAccounts();
+    const found = link.kind === 'course' ? await this.courseLinkRepository(link.template, accounts) : await this.openLinkRepository(link.repository, accounts);
+    if (found === undefined) return;
+    const { repository, info, account, candidates } = found;
     const name = info?.nameWithOwner ?? repository;
+    if (link.kind === 'course' && account !== undefined) this.logger.info(`The course link opens ${repository} for ${account.login}.`);
     // One operation on the Docker host that is current now, as a Start (registerCommands): the target and the open.
     await this.withDockerTarget(async () => {
-      // The devspace of the repository that the account used last on this host (findForAccount).
-      const target = await this.repositoryTargetFor(name, 'token');
+      // The devspace of the repository that an account of Devspaces used last on this host; for a course link, the
+      // devspace of the account of the login in the name (repositoryTargetFor).
+      const target = await this.repositoryTargetFor(name, 'start', undefined, account !== undefined ? { account } : candidates !== undefined ? { candidates } : {});
+      if (!target) return;
+      if (account !== undefined) target.chosenAccount = true;
       if (target.devspace) {
         if (!info) this.logger.info(`Without the data of GitHub, the link opens the devspace of ${target.devspace.repository} that was used last.`);
         await this.startTarget({ ...target, info: target.info ?? info }, { window });
@@ -1879,40 +1927,118 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The repository that a link opens for the account of `login`: for a course link, its name with the login
-   * (courseRepository). `undefined`, after a message, when that is no GitHub repository.
+   * The repository of a link `/open` for the accounts of Devspaces: from the list, else from GitHub with each account,
+   * with the accounts that GitHub shows it to (`candidates`, rule 3 of accountChoice.ts). When GitHub could not be
+   * asked, the repository without data (the link then opens only an existing devspace). `undefined` after a message
+   * when GitHub shows it to none of them.
    */
-  private repositoryOfLink(link: RepositoryLink, login: string): string | undefined {
-    if (link.kind === 'open') return link.repository;
-    const repository = courseRepository(link.template, login);
-    if (repository === undefined) {
-      this.logger.info(`The course link ${link.template} names no GitHub repository with the login ${login}.`);
-      this.warn(ControllerTexts.courseLinkInvalidForLogin(login));
-    } else {
-      this.logger.info(`The course link opens ${repository} for ${login}.`);
+  private async openLinkRepository(repository: string, accounts: readonly GitHubAccount[]): Promise<LinkRepository | undefined> {
+    const listed = this.deps.sidebar.repositoryInfo(repository);
+    if (listed) return { repository, info: listed };
+    const listings = this.deps.sidebar.accountListings();
+    const results: Array<{ account: GitHubAccount } & LookUpResult> = [];
+    for (const account of accounts) results.push({ account, ...(await this.lookUpWithRenewal(repository, account)) });
+    const found = results.flatMap((result) => (result.info !== undefined ? [{ account: result.account, info: result.info }] : []));
+    const first = found[0];
+    if (first !== undefined) {
+      const candidates = found.map(({ account, info }): AccountCandidate => {
+        const organizations = listings.find((listing) => listing.account.id === account.id)?.organizations;
+        return { account, ...(info.permission !== undefined ? { permission: info.permission } : {}), ...(organizations !== undefined ? { organizations } : {}) };
+      });
+      return { repository, info: first.info, candidates };
     }
-    return repository;
+    if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    if (results.some((result) => result.failure === 'unknown')) return { repository };
+    this.logger.info(`GitHub does not show ${repository} to ${accounts.map((account) => account.login).join(', ')}. The link opened nothing.`);
+    this.warn(ControllerTexts.linkRepositoryNotFound(repository, accounts.map((account) => account.login)));
+    return undefined;
   }
 
   /**
-   * The GitHub data of the repository of a link: from the list, else from GitHub. Without data, `failure` says why:
-   * GitHub does not show the repository to the account (`notFound`), rejected the token (`rejected`, HTTP 401, which
-   * githubApi.ts reports to auth.ts), or could not be asked (`unknown`, logged).
+   * The repository of a course link and the account that opens it: one candidate per account of Devspaces, the
+   * template with its login (courseRepository), found in the list of that account, else with GitHub and that account.
+   * The account of the login in the name opens it, never the one with the highest permission: the repository is the
+   * personal one of that login. Several found: a Quick Pick (`undefined` when it is cancelled). None found: a message
+   * that names each repository that was tried, and `undefined`. When GitHub could not be asked, the first such
+   * candidate without data (it opens only an existing devspace).
    */
-  private async linkedRepository(
-    repository: string,
-    token: string,
-  ): Promise<{ info: RepositoryInfo; failure?: undefined } | { info?: undefined; failure: 'notFound' | 'rejected' | 'unknown' }> {
-    const listed = this.deps.sidebar.repositoryInfo(repository);
-    if (listed) return { info: listed };
+  private async courseLinkRepository(template: string, accounts: readonly GitHubAccount[]): Promise<LinkRepository | undefined> {
+    const results: Array<{ account: GitHubAccount; repository: string } & LookUpResult> = [];
+    for (const account of accounts) {
+      const repository = courseRepository(template, account.login);
+      if (repository === undefined) {
+        this.logger.info(`The course link ${template} names no GitHub repository with the login ${account.login}.`);
+        continue;
+      }
+      this.logger.info(`The course link asks for ${repository} for ${account.login}.`);
+      const listed = this.deps.sidebar.repositoryInfo(repository);
+      // The list counts for the account only when its own list has the repository.
+      if (listed !== undefined && (listed.access === undefined || listed.access.some((access) => access.account.id === account.id))) {
+        results.push({ account, repository, info: listed });
+        continue;
+      }
+      results.push({ account, repository, ...(await this.lookUpWithRenewal(repository, account)) });
+    }
+    if (results.length === 0) {
+      this.warn(ControllerTexts.courseLinkInvalidForLogin(accounts.map((account) => account.login)));
+      return undefined;
+    }
+    const found = results.flatMap((result) => (result.info !== undefined ? [{ ...result, info: result.info }] : []));
+    if (found.length > 1) {
+      const picked = await vscode.window.showQuickPick(
+        found.map((result) => ({ label: result.info.nameWithOwner, description: result.account.login, result })),
+        { title: ControllerTexts.courseRepositoryTitle, placeHolder: ControllerTexts.courseRepositoryPlaceholder },
+      );
+      if (!picked) {
+        this.logger.info('The course link opened nothing: the pick of the repository was cancelled.');
+        return undefined;
+      }
+      return { repository: picked.result.repository, info: picked.result.info, account: picked.result.account };
+    }
+    const one = found[0];
+    if (one !== undefined) return { repository: one.repository, info: one.info, account: one.account };
+    if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    const unknown = results.find((result) => result.failure === 'unknown');
+    if (unknown !== undefined) return { repository: unknown.repository, account: unknown.account };
+    const only = results.length === 1 ? results[0] : undefined;
+    this.warn(
+      only !== undefined
+        ? ControllerTexts.courseRepositoryNotFound(only.repository, only.account.login)
+        : ControllerTexts.courseRepositoriesNotFound(results.map((result) => `${result.repository} (${result.account.login})`).join(', ')),
+    );
+    return undefined;
+  }
+
+  /**
+   * lookUpRepository; when GitHub rejects the token of `account` (HTTP 401), only that account is asked to sign in
+   * again (renewToken), and GitHub is asked once more with its new token.
+   */
+  private async lookUpWithRenewal(repository: string, account: GitHubAccount): Promise<LookUpResult> {
+    const looked = await this.lookUpRepository(repository, account);
+    if (looked.failure !== 'rejected') return looked;
+    const token = await this.deps.auth.renewToken(account);
+    return token === undefined ? looked : this.lookUpRepository(repository, account, token);
+  }
+
+  /**
+   * The GitHub data of a repository for one account (with its token, or `token`): without data, `failure` says why:
+   * GitHub does not show the repository to the account (`notFound`), rejected the token (`rejected`, HTTP 401, which
+   * githubApi.ts reports to auth.ts), or could not be asked (`unknown`, logged). Never a dialog.
+   */
+  private async lookUpRepository(repository: string, account: GitHubAccount, token?: string): Promise<LookUpResult> {
+    const used = token ?? (await this.deps.auth.getToken({ interactive: false, account }).catch(() => undefined));
+    if (used === undefined) {
+      this.logger.info(`GitHub was not asked for ${repository} with ${account.login}: its session cannot be read.`);
+      return { failure: 'unknown' };
+    }
     try {
-      const info = await this.deps.discovery.getRepository(repository, token);
+      const info = await this.deps.discovery.getRepository(repository, used);
       if (info) return { info };
-      this.logger.info(`GitHub does not show ${repository} to the signed-in account. The link opened nothing.`);
+      this.logger.info(`GitHub does not show ${repository} to ${account.login}.`);
       return { failure: 'notFound' };
     } catch (error) {
       if (error instanceof GitHubApiError && error.status === 401) return { failure: 'rejected' };
-      this.logger.warn(`GitHub could not be asked for ${repository}: ${errorMessage(error)}`);
+      this.logger.warn(`GitHub could not be asked for ${repository} with ${account.login}: ${errorMessage(error)}`);
       return { failure: 'unknown' };
     }
   }
@@ -2005,12 +2131,32 @@ export class Controller implements vscode.Disposable {
   async selectOwners(): Promise<void> {
     await selectOwners({
       auth: this.deps.auth,
-      discoveryData: () => this.deps.sidebar.discoveryData,
+      accountList: (accountId) => this.deps.sidebar.accountList(accountId),
       discovery: this.deps.discovery,
       settings: this.deps.settings,
       signIn: () => this.signIn(),
       logger: this.logger,
     });
+  }
+
+  /**
+   * Add GitHub Account…: the account picker of VS Code, which ends with "Sign in to another account". The account that
+   * the user chooses becomes an account of Devspaces: auth.ts fires the change of the sessions, which loads its list
+   * and shows its devspaces.
+   */
+  async addAccount(): Promise<void> {
+    const before = new Set((await this.readAccounts()).map((account) => account.id));
+    const account = await this.deps.auth.addAccount();
+    if (!account) {
+      this.logger.info('No GitHub account was added.');
+      return;
+    }
+    if (before.has(account.id)) {
+      this.inform(ControllerTexts.accountAlreadyUsed(account.login));
+      return;
+    }
+    this.logger.info(`Devspaces uses the GitHub account ${account.login} now.`);
+    this.inform(ControllerTexts.accountAdded(account.login));
   }
 
   /** Sign in with GitHub. */
@@ -2191,8 +2337,8 @@ export class Controller implements vscode.Disposable {
                   if (devspace) {
                     result = await service.openDevspaceInWorker(devspace.id, { progress, signal, source });
                   } else {
-                    const trusted = options.confirmed === true || (await this.firstOpenTrust(repository));
-                    result = await service.openInWorker(repositoryTarget(repository, target.info, trusted), { progress, signal, source });
+                    const trusted = options.confirmed === true || (await this.firstOpenTrust(repository, target.account));
+                    result = await service.openInWorker(repositoryTarget(repository, target.info, trusted), { progress, signal, source, ...(target.account ? { account: target.account } : {}) });
                   }
                   await this.connect(result, progress, request, signal);
                 },
@@ -2205,8 +2351,11 @@ export class Controller implements vscode.Disposable {
         {
           retry:
             retry ??
-            (async () =>
-              this.startTarget(await this.refreshedTarget(target, 'token'), { window: options.window, source: options.source })),
+            (async () => {
+              // Nothing when the user cancels a question of the account (repositoryTargetFor).
+              const fresh = await this.refreshedTarget(target, 'start');
+              if (fresh) await this.startTarget(fresh, { window: options.window, source: options.source });
+            }),
           refused: () => (refused = true),
         },
       );
@@ -2357,20 +2506,20 @@ export class Controller implements vscode.Disposable {
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
       throw new UserFacingError('cancelled', PipelineTexts.cancelled);
     }
-    // The session is read at the start of the pipeline; the account may have changed while it ran (a build can take
-    // minutes). The window connects only to a devspace of the account that is signed in now.
-    const account = await this.readAccount();
+    // The session is read at the start of the pipeline; the account may have signed out while it ran (a build can take
+    // minutes). The window connects only to a devspace of an account of Devspaces now.
+    const accounts = await this.readAccounts();
     const entry = (await this.deps.registry.get(result.devspace.id).catch(() => undefined)) ?? result.devspace;
-    if (!isAvailableTo(entry, account)) {
+    if (ownerAmong(entry, accounts) === undefined) {
       const repository = this.displayName({ repository: result.devspace.repository });
-      this.logger.info(`${repository} is not connected: the GitHub account changed while it opened.`);
+      this.logger.info(`${repository} is not connected: its GitHub account signed out while it opened.`);
       // No window connects: the Monitor container stops it when the heartbeats of the open end (their long
       // limit).
       await this.deps.sessionFiles
         .removePending(result.devspace.id)
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
-      throw account
-        ? new UserFacingError('otherAccount', Messages.otherAccount(repository))
+      throw accounts.length > 0
+        ? new UserFacingError('otherAccount', Messages.otherAccount(repository, entry.owner.login))
         : new UserFacingError('signInRequired', Messages.signInRequired);
     }
     if (notReady) {
@@ -2390,11 +2539,12 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * A first open of a repository of another owner needs a confirmation. The trust needs the list of the signed-in
-   * account, so the sign-in comes first (the pipeline needs the token anyway).
+   * A first open of a repository of an owner that is neither an account of Devspaces nor one of their organizations
+   * needs a confirmation (ownerTrust). The trust needs the lists of the accounts, so the sign-in of the account of the
+   * open comes first (the pipeline needs its token anyway).
    */
-  private async firstOpenTrust(repository: string): Promise<boolean> {
-    const token = await this.deps.auth.getToken({ interactive: true });
+  private async firstOpenTrust(repository: string, account: GitHubAccount | undefined): Promise<boolean> {
+    const token = await this.deps.auth.getToken({ interactive: true, account });
     if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
     return this.deps.sidebar.trustedOwner(splitRepository(repository).owner);
   }
@@ -2737,8 +2887,8 @@ export class Controller implements vscode.Disposable {
       this.logger.info(`The request of another window for ${repository} is dropped: this window has left the devspace.`);
       return;
     }
-    if (!isAvailableTo(devspace, await this.readAccount())) {
-      this.logger.info(`The request of another window for ${repository} is dropped: the devspace is of another GitHub account.`);
+    if (ownerAmong(devspace, await this.readAccounts()) === undefined) {
+      this.logger.info(`The request of another window for ${repository} is dropped: the devspace is of a GitHub account that Devspaces does not use.`);
       return;
     }
     this.logger.info(`Another window asks this window to close its connection for the ${request.operation} of ${repository}.`);
@@ -2996,17 +3146,18 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The window left the devspace because of the account, and the signed-in account may use it now: the window
-   * reloads, and the open pipeline of role A runs (it writes the token again). Returns true when the window reloads.
+   * The window left the devspace because of the account, and its owner account is an account of Devspaces again: the
+   * window reloads, and the open pipeline of role A runs (it writes the token again). Returns true when the window
+   * reloads.
    */
   private async reopenLeftDevspace(left: LeftDevspace): Promise<boolean> {
     if (left.reason !== 'account') return false;
-    const account = await this.readAccount();
+    const accounts = await this.readAccounts();
     const devspace = await this.deps.registry.get(left.devspaceId).catch(() => undefined);
     if (this.left !== left || this.current || this.disposed) return false;
-    if (!devspace || !isAvailableTo(devspace, account)) return false;
+    if (!devspace || ownerAmong(devspace, accounts) === undefined) return false;
     this.left = undefined;
-    this.logger.info(`The signed-in GitHub account may use ${left.repository} again. The window reloads to open it.`);
+    this.logger.info(`The GitHub account of ${left.repository} is signed in again. The window reloads to open it.`);
     await this.deps.connection.open(...(await this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository))));
     return true;
   }
@@ -3051,22 +3202,32 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * Role A and a restored registry: the devspace that this window is attached to, when it belongs to the signed-in
-   * account (a sign-in is asked for when needed). Otherwise the window runs no pipeline, starts no container, and
+   * Role A and a restored registry: the devspace that this window is attached to, when it belongs to an account of
+   * Devspaces (without one, a sign-in is asked for: of the owner when its login is known). Otherwise the window runs no
+   * pipeline, starts no container, and
    * closes its remote connection with a message; `undefined`. Assumption: the activation blocks the connection of a
    * restored window, so the window of another account never connects to a stopped container, and the token of the
    * owner leaves a container that still runs before the window connects to it (leaveDevspace, within
    * TOKEN_REMOVE_WAIT_MS); the window closes that connection right after it connected.
    */
   private async ownWindowDevspace(devspace: Devspace, containerName: string): Promise<Devspace | undefined> {
-    const account = await this.readAccount(true);
-    if (account && isAvailableTo(devspace, account)) return devspace;
+    let accounts = await this.readAccounts();
+    if (accounts.length === 0) {
+      const named = nonEmptyLogin(devspace.owner.login) !== undefined ? devspace.owner : undefined;
+      const account = await this.deps.auth.getAccount({ interactive: true, ...(named ? { account: named } : {}) }).catch((error: unknown) => {
+        this.logger.warn(`The GitHub account could not be read: ${errorMessage(error)}`);
+        return undefined;
+      });
+      if (account) accounts = [account];
+    }
+    if (ownerAmong(devspace, accounts) !== undefined) return devspace;
     const repository = this.displayName({ repository: devspace.repository });
     let message: string;
-    if (!account) {
+    if (accounts.length === 0) {
       this.logger.info('Nobody is signed in to GitHub. The window closes its remote connection.');
       message = ControllerTexts.signedOutConnection(repository);
     } else {
+      // The attach tests look for this line.
       this.logger.info('This window is attached to a devspace of another GitHub account. It closes its remote connection.');
       message = Messages.otherAccountConnection(repository);
     }
@@ -3075,10 +3236,11 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * Sign-in, sign-out, or account change: a window connected to a devspace that the new account may not use closes
-   * its remote connection at once, after the token of the owner left the container (leaveDevspace). The Monitor
-   * container stops it after the waiting time (the release of the window). A window that has left such a devspace but
-   * kept its connection reloads when the owner account signs in again. The account rule outranks the removal mark: a
+   * Sign-in or sign-out of an account: a window connected to a devspace whose owner account is no longer an account of
+   * Devspaces closes its remote connection at once, after the token of the owner left the container (leaveDevspace).
+   * A new account never closes a window, and neither does the sign-out of another account. The Monitor container stops
+   * the devspace after the waiting time (the release of the window). A window that has left such a devspace but kept
+   * its connection reloads when the owner account signs in again. The account rule outranks the removal mark: a
    * window that works without Devspaces on an engine with the mark (workWithoutDevspaces) leaves its devspace in the
    * same way, without a release (its session has no devspace).
    */
@@ -3089,17 +3251,17 @@ export class Controller implements vscode.Disposable {
       await this.checkLeftConnection(false);
       return;
     }
-    const account = await this.readAccount();
+    const accounts = await this.readAccounts();
     const devspace = (await this.deps.registry.get(current.devspace.id).catch(() => undefined)) ?? current.devspace;
-    if (isAvailableTo(devspace, account) || (this.current ?? this.withoutDevspaces) !== current) return;
+    if (ownerAmong(devspace, accounts) !== undefined || (this.current ?? this.withoutDevspaces) !== current) return;
     const repository = this.displayName({ repository: devspace.repository });
     this.logger.info(
-      account
-        ? `The GitHub account changed. ${repository} belongs to another account: the window closes its remote connection.`
+      accounts.length > 0
+        ? `The GitHub account of ${repository} is no longer signed in to Devspaces: the window closes its remote connection.`
         : 'Nobody is signed in to GitHub anymore. The window closes its remote connection.',
     );
     await this.leaveDevspace(
-      account ? Messages.otherAccountConnection(repository) : ControllerTexts.signedOutConnection(repository),
+      accounts.length > 0 ? Messages.otherAccountConnection(repository) : ControllerTexts.signedOutConnection(repository),
       {
         devspaceId: devspace.id,
         containerName: current.containerName,
@@ -3327,58 +3489,96 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The target, when its devspace (if any) belongs to the signed-in account. Asks for a sign-in when the target has
-   * a devspace and nobody is signed in. Otherwise shows Messages.otherAccount and returns `undefined`: only a
-   * devspace that the command names can be one of another account (a row or the status bar item from before an
-   * account change), never the devspace of a repository.
+   * The target, when its devspace (if any) belongs to an account of Devspaces, with that account. Asks for a sign-in
+   * when the target has a devspace and Devspaces uses no account. A devspace of an account that Devspaces does not use
+   * (only a devspace that the command names: a row or the status bar item from before a sign-out, never the devspace of
+   * a repository) is used only after a sign-in of its owner (askForOwner); `undefined` otherwise.
    */
   private async ownTarget(target: Target): Promise<Target | undefined> {
     const devspace = target.devspace;
     if (!devspace) return target;
-    const account = await this.readAccount(true);
-    if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    if (isAvailableTo(devspace, account)) return target;
-    this.logger.info(`The devspace ${devspace.id} belongs to another GitHub account. It is not used.`);
-    this.warn(Messages.otherAccount(this.shownName(target)));
-    return undefined;
+    const owner = ownerAmong(devspace, await this.requireAccounts());
+    if (owner) return { ...target, account: owner };
+    this.logger.info(`The devspace ${devspace.id} belongs to a GitHub account that Devspaces does not use. It is used only after a sign-in of that account.`);
+    const signedIn = await this.askForOwner(this.shownName(target), devspace, undefined);
+    return signedIn?.kind === 'owner' ? { ...target, account: signedIn.account } : undefined;
   }
 
   /**
-   * The account of a session with a working token: while GitHub rejects the token of the session, the user signs in
-   * again first (auth.ts). `undefined` without a sign-in, or when the session cannot be read.
+   * Rule 2 of accountChoice.ts: the devspace `devspace` belongs to an account that Devspaces does not use. A modal
+   * question offers Sign In as <login> (when its login is known) and, with `other`, New Devspace as <other login>.
+   * Returns the owner after its sign-in, `other` for a new devspace, or `undefined` (Cancel, or the sign-in did not end
+   * with the owner; told).
    */
-  private async readWorkingAccount(): Promise<GitHubAccount | undefined> {
-    try {
-      return (await this.deps.auth.getSession({ interactive: true }))?.account;
-    } catch (error) {
-      this.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
+  private async askForOwner(
+    shown: string,
+    devspace: Devspace,
+    other: GitHubAccount | undefined,
+  ): Promise<{ kind: 'owner'; account: GitHubAccount } | { kind: 'other'; account: GitHubAccount } | undefined> {
+    const login = nonEmptyLogin(devspace.owner.login);
+    const signIn = login !== undefined ? ControllerTexts.signInAs(login) : undefined;
+    const create = other !== undefined ? ControllerTexts.newDevspaceAs(other.login) : undefined;
+    if (signIn === undefined && create === undefined) {
+      this.warn(Messages.otherAccount(shown));
       return undefined;
+    }
+    const choice = await showWarningMessage(
+      ControllerTexts.hiddenOwnerQuestion(shown, login),
+      { modal: true, detail: ControllerTexts.hiddenOwnerDetail(login, other?.login) },
+      ...[signIn, create].filter((item): item is string => item !== undefined),
+    );
+    if (choice === undefined) return undefined;
+    if (choice === create && other !== undefined) {
+      this.logger.info(`The Start of ${shown} creates a new devspace of ${other.login}; the devspace of ${login ?? devspace.owner.id} stays.`);
+      return { kind: 'other', account: other };
+    }
+    const account = await this.deps.auth.getAccount({ interactive: true, account: devspace.owner }).catch(() => undefined);
+    if (account === undefined || account.id !== devspace.owner.id) {
+      this.logger.info(`${login ?? devspace.owner.id} did not sign in, so the devspace of ${shown} is not used.`);
+      this.warn(Messages.otherAccount(shown, login));
+      return undefined;
+    }
+    return { kind: 'owner', account };
+  }
+
+  /** The accounts of Devspaces (auth.ts), in the order of their logins; empty without one, or when they cannot be read. Never a dialog. */
+  private async readAccounts(): Promise<GitHubAccount[]> {
+    try {
+      return await this.deps.auth.accounts();
+    } catch (error) {
+      this.logger.warn(`The GitHub accounts could not be read: ${errorMessage(error)}`);
+      return [];
     }
   }
 
-  /** The signed-in account; `undefined` without a sign-in, or when the session cannot be read. */
-  private async readAccount(interactive = false): Promise<GitHubAccount | undefined> {
-    try {
-      return await this.deps.auth.getAccount({ interactive });
-    } catch (error) {
+  /**
+   * The accounts of Devspaces; without one, the sign-in of VS Code first (the account that the user picks there). Throws
+   * signInRequired when there is still none.
+   */
+  private async requireAccounts(): Promise<GitHubAccount[]> {
+    const accounts = await this.readAccounts();
+    if (accounts.length > 0) return accounts;
+    const account = await this.deps.auth.getAccount({ interactive: true }).catch((error: unknown) => {
       this.logger.warn(`The GitHub account could not be read: ${errorMessage(error)}`);
       return undefined;
-    }
+    });
+    if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    return [account];
   }
 
   private async resolveTargetOfAnyAccount(argument: CommandArgument, pick: PickKind, placeholder: string): Promise<Target | undefined> {
     const { registry, sidebar } = this.deps;
-    // Show on GitHub needs neither a devspace nor a sign-in; Start needs a working token.
-    const signIn = pick === 'gitHub' ? false : pick === 'open' || pick === 'repository' ? 'token' : true;
+    // Show on GitHub needs neither a devspace nor a sign-in; Start chooses the account of a new devspace.
+    const signIn = pick === 'gitHub' ? false : pick === 'open' || pick === 'repository' ? 'start' : true;
     switch (argument.kind) {
       case 'row': {
         const info = sidebar.repositoryInfo(argument.repository) ?? argument.info;
         // The devspace of the row while it exists; otherwise (a row without devspace, or one deleted meanwhile)
-        // the devspace of the source of the row of the signed-in account.
+        // the devspace of the source of the row of an account of Devspaces.
         const named = argument.devspaceId !== undefined ? await registry.get(argument.devspaceId) : undefined;
         if (named) return { repository: argument.repository, info, devspace: named, named: true, source: sourceOf(named) };
         const target = await this.repositoryTargetFor(argument.repository, signIn, argument.source);
-        return { ...target, info: target.info ?? info };
+        return target && { ...target, info: target.info ?? info };
       }
       case 'devspace': {
         const devspace = await registry.get(argument.devspaceId);
@@ -3418,9 +3618,10 @@ export class Controller implements vscode.Disposable {
   /**
    * The target of a repository that a Quick Pick chose (the Command Palette, Search, the switcher): with one possible
    * source (possibleSources), that source; with several, the source that the user picks (sourceChoices), or
-   * `undefined` when the pick is cancelled. `signIn` as for `repositoryTargetFor`.
+   * `undefined` when the pick is cancelled (or the question of repositoryTargetFor). `signIn` as for
+   * `repositoryTargetFor`.
    */
-  private async pickedRepositoryTarget(repository: string, signIn: boolean | 'token'): Promise<Target | undefined> {
+  private async pickedRepositoryTarget(repository: string, signIn: boolean | 'start'): Promise<Target | undefined> {
     const info = this.deps.sidebar.repositoryInfo(repository);
     const own = (await this.deps.sidebar.availableDevspaces()).filter((devspace) => devspace.repository.toLowerCase() === repository.toLowerCase());
     const sources = possibleSources({ info, devspaces: own, settings: this.deps.settings() });
@@ -3433,38 +3634,82 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The target of a repository, with the devspace of the repository of the signed-in account, if it has one. The
-   * devspaces of other accounts are not looked at: they neither block nor name anything, and the first Start of an
-   * account creates its own. The account decides the devspace, so with `signIn` a sign-in is asked for when nobody
-   * is signed in; without it, the target has no devspace then. With `'token'` (a command that needs a working token:
-   * Start) the account comes from a session with a working token, so that the new sign-in while
-   * GitHub rejects the token happens before the devspace is chosen: an account change at that sign-in then chooses
-   * the devspace of the new account.
+   * The target of a repository, with the account that its command uses (accountChoice.ts):
+   * - rule 1: the devspace of the source of the repository on the current Docker host of an account of Devspaces (the
+   *   one used last), with its owner;
+   * - for a Start (`signIn` 'start') without one: rule 2, a devspace there of an account that Devspaces does not use
+   *   (askForOwner; `undefined` when the user cancels), else the rules 3 to 7 for the account of a new devspace;
+   * - with `options.account` (Start with Account…, a course link): the devspace of that account, else a new one of it.
+   * The devspaces of accounts that Devspaces does not use neither block nor name anything for other commands. With
+   * `signIn` a sign-in is asked for when Devspaces uses no account; without it, the target has no devspace then.
+   * `options.candidates`: the accounts that can access the repository, when the caller asked GitHub already (a link).
    */
-  private async repositoryTargetFor(repository: string, signIn: boolean | 'token', source?: DevspaceSource): Promise<Target> {
+  private async repositoryTargetFor(
+    repository: string,
+    signIn: boolean | 'start',
+    source?: DevspaceSource,
+    options: { account?: GitHubAccount; candidates?: readonly AccountCandidate[] } = {},
+  ): Promise<Target | undefined> {
     const info = this.deps.sidebar.repositoryInfo(repository);
-    const account = signIn === 'token' ? await this.readWorkingAccount() : await this.readAccount(signIn);
-    if (signIn && !account) throw new UserFacingError('signInRequired', Messages.signInRequired);
+    const accounts = signIn ? await this.requireAccounts() : await this.readAccounts();
+    const dockerHost = await this.currentDockerHost();
+    const base: Target = { repository, info, ...(source !== undefined ? { source } : {}) };
+    if (options.account !== undefined) {
+      const devspace = await this.deps.registry.findForAccount(repository, options.account.id, dockerHost, source);
+      return { ...base, devspace, account: options.account };
+    }
     // The devspace of the source of the repository; without a source (a repository with one source that the discovery
     // does not know), its most recently used devspace.
-    const devspace = account
-      ? await this.deps.registry.findForAccount(repository, account.id, await this.currentDockerHost(), source)
-      : undefined;
-    return { repository, info, devspace, ...(source !== undefined ? { source } : {}) };
+    const devspace = accounts.length > 0 ? await this.deps.registry.findForAccounts(repository, accounts.map((account) => account.id), dockerHost, source) : undefined;
+    if (devspace) return { ...base, devspace, account: ownerAmong(devspace, accounts) };
+    if (signIn !== 'start') return base;
+    const chosen = chooseAccount(repository, options.candidates ?? (await this.startCandidates(repository, info, accounts)));
+    const hidden = (await this.deps.registry.list())
+      .filter((entry) => ownerAmong(entry, accounts) === undefined && isDevspaceOf(entry, repository, entry.owner.id, dockerHost, source))
+      .sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt))[0];
+    if (hidden) {
+      const answer = await this.askForOwner(this.displayName({ repository, info }), hidden, chosen?.account);
+      if (answer === undefined) return undefined;
+      return answer.kind === 'owner' ? { ...base, devspace: hidden, account: answer.account } : { ...base, account: answer.account };
+    }
+    if (chosen && accounts.length > 1) this.logger.info(`A new devspace of ${repository} uses the GitHub account ${chosen.account.login}${chosen.permission !== undefined ? ` (${permissionText(chosen.permission)})` : ''}.`);
+    return { ...base, ...(chosen ? { account: chosen.account } : {}) };
+  }
+
+  /**
+   * The accounts of Devspaces that can access a repository (rule 3 of accountChoice.ts), with their permission: those
+   * whose list has it; for a repository in no list, those that GitHub shows it to (with more than one account only).
+   * Every account when none is found that way, so that the rules 5 to 7 still choose one (the open then reports what
+   * GitHub says).
+   */
+  private async startCandidates(repository: string, info: RepositoryInfo | undefined, accounts: readonly GitHubAccount[]): Promise<AccountCandidate[]> {
+    const listings = this.deps.sidebar.accountListings();
+    const listed = listedCandidates(info, accounts, listings);
+    if (listed.length > 0 || accounts.length <= 1) return listed.length > 0 ? listed : accounts.map((account) => ({ account }));
+    const found: AccountCandidate[] = [];
+    for (const account of accounts) {
+      const looked = await this.lookUpRepository(repository, account);
+      if (looked.info === undefined) continue;
+      const organizations = listings.find((listing) => listing.account.id === account.id)?.organizations;
+      found.push({ account, ...(looked.info.permission !== undefined ? { permission: looked.info.permission } : {}), ...(organizations !== undefined ? { organizations } : {}) });
+    }
+    return found.length > 0 ? found : accounts.map((account) => ({ account }));
   }
 
   /**
    * The target with the current registry entry (for Try again, and after a change of the devspace): a named
-   * devspace while it exists, otherwise the devspace of the repository of the account that is signed in now, if
-   * any. A repository never carries the devspace of the account that was signed in before. `signIn` as for
-   * `repositoryTargetFor`. The source stays the one of the target.
+   * devspace while it exists, otherwise the target of the repository again (repositoryTargetFor), with the account
+   * that the target chose by name (Start with Account…, a course link). `signIn` as for `repositoryTargetFor`. The
+   * source stays the one of the target.
    */
-  private async refreshedTarget(target: Target, signIn: boolean | 'token' = false): Promise<Target> {
+  private async refreshedTarget(target: Target, signIn: boolean | 'start' = false): Promise<Target | undefined> {
     const current = target.named && target.devspace ? await this.deps.registry.get(target.devspace.id) : undefined;
     const fresh = current
       ? this.devspaceTarget(current)
-      : await this.repositoryTargetFor(target.devspace?.repository ?? target.repository, signIn, target.source ?? (target.devspace ? sourceOf(target.devspace) : undefined));
-    return { ...fresh, info: fresh.info ?? target.info };
+      : await this.repositoryTargetFor(target.devspace?.repository ?? target.repository, signIn, target.source ?? (target.devspace ? sourceOf(target.devspace) : undefined), {
+          ...(target.chosenAccount === true && target.account !== undefined ? { account: target.account } : {}),
+        });
+    return fresh && { ...fresh, info: fresh.info ?? target.info, ...(target.chosenAccount === true ? { chosenAccount: true } : {}) };
   }
 
   private requireDevspace(target: Target | undefined): Devspace | undefined {
@@ -3849,3 +4094,8 @@ function uniqueNames(names: readonly string[]): string[] {
  * Devspaces on it on an engine with the removal mark (WindowStatus.plainDevspaceId, statusNamesDevspace).
  */
 const usesDevspace = statusNamesDevspace;
+
+/** `login` when it is not empty: an owner restored from a volume label has no login until the next open. */
+function nonEmptyLogin(login: string): string | undefined {
+  return login.trim() === '' ? undefined : login;
+}

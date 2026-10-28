@@ -61,7 +61,8 @@ function extension(overrides: Partial<HostSideDeps> = {}, account: { id: string;
     logger: { ...silentLogger, info: (text: string) => infos.push(text) },
     ...overrides,
   } as unknown as HostSideDeps;
-  return { host: extensionHostSide(deps), viewer, lifecycleMemory, infos };
+  // The account of the operation: the one signed in here (null: a flow of no account).
+  return { host: extensionHostSide(deps, account ?? undefined), viewer, lifecycleMemory, infos };
 }
 
 function handlerOf(host: HostSide, devspaceId: string | null = ID) {

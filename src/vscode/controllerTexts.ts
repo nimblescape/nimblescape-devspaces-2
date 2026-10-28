@@ -80,11 +80,14 @@ export const ControllerTexts = {
     'This engine also has devspaces that this computer does not know, for example from other computers. They stay, but operations that run for them now can fail.',
   /** The engine has a Monitor that another computer keeps running, and no devspace that this computer does not know. */
   removeOtherComputer: 'Another computer also uses Devspaces on this engine. Its operations that run now can fail.',
-  removeOtherAccounts: (repositories: string) => `The devspaces of other GitHub accounts stay: ${repositories}.`,
+  removeOtherAccounts: (repositories: string) => `The devspaces of GitHub accounts that are not signed in to Devspaces stay: ${repositories}.`,
   removeSignedOut: 'Your devspaces on this engine stay. To delete them too, sign in with GitHub first.',
   remove: 'Remove',
-  removeDevspacesQuestion: (count: number, engine: string) =>
-    `Also delete your ${count === 1 ? 'devspace' : `${count} devspaces`} on ${engine}?`,
+  /** `logins`: the accounts of Devspaces that own the devspaces, named when there are several. */
+  removeDevspacesQuestion: (count: number, engine: string, logins: readonly string[] = []) =>
+    logins.length > 1
+      ? `Also delete the ${count === 1 ? 'devspace' : `${count} devspaces`} of your GitHub accounts ${listAll(logins)} on ${engine}?`
+      : `Also delete your ${count === 1 ? 'devspace' : `${count} devspaces`} on ${engine}?`,
   /** `changes`: the recorded changes of the devspaces (recordedChanges), or "none". */
   removeDevspacesDetail: (changes: string) =>
     'Each one is deleted with its container and all its volumes, also the clone of the repository. Changes that you did not push are lost. ' +
@@ -145,7 +148,40 @@ export const ControllerTexts = {
   otherWindowNoAnswer: (repository: string) =>
     `The other window of ${repository} did not close its connection. Nothing was changed.`,
   alreadyDeleting: (repository: string) => `The devspace of ${repository} is being deleted in another window.`,
-  // Accounts. A named devspace of another account: Messages.otherAccount.
+  // Accounts (docs/security.md "Accounts"). A named devspace of an account that Devspaces does not use: Messages.otherAccount.
+  /**
+   * The question of a Start when the devspace of the repository belongs to an account that Devspaces does not use
+   * (rule 2 of accountChoice.ts). `login`: its login, when known.
+   */
+  hiddenOwnerQuestion: (repository: string, login: string | undefined) =>
+    login !== undefined
+      ? `The devspace of ${repository} belongs to the GitHub account ${login}, which is not signed in to Devspaces.`
+      : `The devspace of ${repository} belongs to a GitHub account that is not signed in to Devspaces.`,
+  /** The detail of hiddenOwnerQuestion. `other`: the account that a new devspace uses, when one can. */
+  hiddenOwnerDetail: (login: string | undefined, other: string | undefined) =>
+    [
+      login !== undefined ? `Sign in as ${login} to open it.` : undefined,
+      other !== undefined ? `A new devspace of ${other} is a separate devspace, with its own clone, container and images; the existing devspace stays.` : undefined,
+    ]
+      .filter((line) => line !== undefined)
+      .join(' '),
+  signInAs: (login: string) => `Sign In as ${login}`,
+  newDevspaceAs: (login: string) => `New Devspace as ${login}`,
+  /** The Quick Pick of Start with Account…. */
+  startWithAccountTitle: (repository: string) => `Start ${repository} with Account`,
+  startWithAccountPlaceholder: 'Select the GitHub account that the devspace uses',
+  /** The description of an account in that Quick Pick: its permission, and what the Start does. */
+  accountChoiceDescription: (permission: string | undefined, hasDevspace: boolean) =>
+    [permission, hasDevspace ? 'opens its devspace' : 'creates a new devspace'].filter((part) => part !== undefined).join(' · '),
+  /** Start with Account… on a repository that fewer than two accounts of Devspaces can access. */
+  oneAccountOnly: (repository: string) => `Only one of your GitHub accounts in Devspaces can access ${repository}.`,
+  /** Add GitHub Account…: the account that the user chose. */
+  accountAdded: (login: string) => `Devspaces now uses the GitHub account ${login}.`,
+  accountAlreadyUsed: (login: string) => `Devspaces already uses the GitHub account ${login}.`,
+  /** The notification of a GitHub account of VS Code that Devspaces does not use yet (AccountOffers). */
+  accountOffer: (login: string) => `The GitHub account ${login} is signed in to VS Code. Use it in Devspaces?`,
+  useInDevspaces: 'Use in Devspaces',
+  notNow: 'Not Now',
   signedOutConnection: (repository: string) =>
     `Nobody is signed in to GitHub. This window closes its connection to the devspace of ${repository}. Sign in with GitHub to use it again.`,
   /**
@@ -170,14 +206,28 @@ export const ControllerTexts = {
   // A link to Devspaces (links.ts), for example on a website.
   invalidLink:
     'Devspaces cannot open this link. A link to Devspaces ends with /open?repository=owner/name, or for a course with /course?repository=owner/name-<username>, with the name of a GitHub repository.',
-  linkRepositoryNotFound: (repository: string) =>
-    `GitHub does not show the repository ${repository} to your GitHub account. Check the link, or sign in with an account that can access the repository.`,
+  /** `logins`: the accounts of Devspaces that GitHub was asked with, named when there are several. */
+  linkRepositoryNotFound: (repository: string, logins: readonly string[] = []) =>
+    logins.length > 1
+      ? `GitHub does not show the repository ${repository} to your GitHub accounts ${listAll(logins)}. Check the link, or add a GitHub account that can access the repository (Add GitHub Account…).`
+      : `GitHub does not show the repository ${repository} to your GitHub account. Check the link, or sign in with an account that can access the repository.`,
   /** A course link (/course): GitHub does not show the repository of the course with the login of the account. */
   courseRepositoryNotFound: (repository: string, login: string) =>
     `GitHub does not show the repository ${repository} to your GitHub account ${login}. A course link opens your own repository of the course: accept the assignment of the course first, for example in GitHub Classroom, or sign in with the GitHub account that you use for the course.`,
+  /**
+   * A course link with several accounts of Devspaces: GitHub shows none of the repositories of the course, one per
+   * account with its login. `tried`: each repository with its login, for example `org/task-a (a), org/task-b (b)`.
+   */
+  courseRepositoriesNotFound: (tried: string) =>
+    `GitHub does not show a repository of this course to your GitHub accounts: ${tried}. A course link opens your own repository of the course: accept the assignment of the course first, for example in GitHub Classroom, or add the GitHub account that you use for the course (Add GitHub Account…).`,
+  /** The Quick Pick of a course link when the repositories of several accounts exist. */
+  courseRepositoryTitle: 'Open Course Repository',
+  courseRepositoryPlaceholder: 'Several of your GitHub accounts have a repository of this course. Select the one to open.',
   /** A course link whose name, with the login of the account, is no GitHub repository name (longer than 100 characters). */
-  courseLinkInvalidForLogin: (login: string) =>
-    `Devspaces cannot open this course link for your GitHub account ${login}: with your login, the name of the repository is longer than GitHub allows.`,
+  courseLinkInvalidForLogin: (logins: readonly string[]) =>
+    logins.length > 1
+      ? `Devspaces cannot open this course link for your GitHub accounts ${listAll(logins)}: with your logins, the names of the repositories are longer than GitHub allows.`
+      : `Devspaces cannot open this course link for your GitHub account ${logins.join('')}: with your login, the name of the repository is longer than GitHub allows.`,
   linkRepositoryUnknown: (repository: string) => `GitHub could not be asked for the repository ${repository}. Open the link again later.`,
   /** The modal question before a link creates a devspace of the account or of one of its organizations (button Open). */
   linkStartConfirm: (repository: string) =>
@@ -201,3 +251,9 @@ export const ControllerTexts = {
   /** The marker of a source whose devspace exists (sourceChoices). */
   devspaceExists: 'devspace exists',
 } as const;
+
+/** The names as one text: `a`, `a and b`, `a, b and c`. */
+function listAll(names: readonly string[]): string {
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}

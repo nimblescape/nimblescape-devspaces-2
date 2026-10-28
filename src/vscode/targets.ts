@@ -4,11 +4,11 @@
 
 // Targets of the commands and the choices of their Quick Picks. No `vscode` import, so the rules are unit-tested.
 import { defaultImageOf, isSourceOf, sourceLabel } from '../core/devspaceSource';
-import { filterRepositories, isTrustedOwner } from '../core/discovery/discoveryService';
+import { filterRepositories } from '../core/discovery/discoveryService';
 import { isRepositoryInScope } from '../core/discovery/scope';
 import { parseDevspaceSource } from '../core/helperChannel/protocol';
 import type { RepositoryTarget } from '../core/pipeline/operationBase';
-import type { DiscoveryData, Devspace, DevspaceSource, ExtensionSettings, RepositoryInfo } from '../core/types';
+import type { DiscoveryData, Devspace, DevspaceSource, ExtensionSettings, GitHubAccount, RepositoryInfo } from '../core/types';
 import { ControllerTexts } from './controllerTexts';
 import { isRecord } from '../core/valueChecks';
 
@@ -55,16 +55,18 @@ export function repositoryTarget(repository: string, info: RepositoryInfo | unde
 }
 
 /**
- * Trust of an owner for a first open. The discovery data belongs to `data.viewerLogin`: after a change of the GitHub
- * account it says nothing about the new account until a refresh finished (`unknown`).
+ * Trust of an owner for a first open: an account of Devspaces (`accounts`), or an organization where one of them is a
+ * member, as the lists in the merged data name them (DiscoveryData.accounts). While the list of an account is not
+ * loaded (for example right after its sign-in), another owner is `unknown` until a refresh finished.
  */
-export function ownerTrust(
-  data: DiscoveryData | undefined,
-  accountLogin: string | undefined,
-  owner: string,
-): 'trusted' | 'untrusted' | 'unknown' {
-  if (!data || !accountLogin || data.viewerLogin.toLowerCase() !== accountLogin.toLowerCase()) return 'unknown';
-  return isTrustedOwner(data, owner) ? 'trusted' : 'untrusted';
+export function ownerTrust(data: DiscoveryData | undefined, accounts: readonly GitHubAccount[], owner: string): 'trusted' | 'untrusted' | 'unknown' {
+  const wanted = owner.trim().toLowerCase();
+  if (accounts.length === 0) return 'unknown';
+  if (wanted === '') return 'untrusted';
+  if (accounts.some((account) => account.login.toLowerCase() === wanted)) return 'trusted';
+  const listings = (data?.accounts ?? []).filter((listing) => accounts.some((account) => account.id === listing.account.id));
+  if (listings.some((listing) => listing.organizations.some((organization) => organization.toLowerCase() === wanted))) return 'trusted';
+  return accounts.every((account) => listings.some((listing) => listing.account.id === account.id)) ? 'untrusted' : 'unknown';
 }
 
 /** A repository that only the registry knows, for the pickers. It has no URL of its own and no configurations. */

@@ -13,7 +13,7 @@ import {
   PACKAGES_SCOPES,
   SIGNED_IN_CONTEXT_KEY,
   VsCodeGitHubAuth,
-  ghcrRejectionReporter,
+  signInAgainDetailOf,
   updateGitHubEnterpriseContextKey,
   watchGitHubEnterpriseSettings,
 } from './auth';
@@ -25,6 +25,9 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 describe('VsCodeGitHubAuth', () => {
   beforeEach(() => resetFakeVscode());
   const { getSession } = fakeVscode.authentication;
+  /** The calls of getSession that may show a dialog: after a dialog, the accounts are read again without one. */
+  const dialogCalls = () => getSession.mock.calls.filter((call) => (call[2] as { silent?: boolean } | undefined)?.silent !== true);
+  const lastDialogCall = () => dialogCalls().at(-1);
 
   it('requests the scopes repo and read:org, with a dialog only when interactive', async () => {
     expect(GITHUB_SCOPES).toEqual(['repo', 'read:org']);
@@ -33,7 +36,7 @@ describe('VsCodeGitHubAuth', () => {
     await expect(auth.getToken({ interactive: false })).resolves.toBe('gho_silent');
     expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true });
     await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_silent');
-    expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { createIfNone: true });
+    expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { createIfNone: true }]);
     auth.dispose();
   });
 
@@ -45,7 +48,7 @@ describe('VsCodeGitHubAuth', () => {
     const second = auth.getToken({ interactive: true });
     answer(session('gho_1'));
     await expect(Promise.all([first, second])).resolves.toEqual(['gho_1', 'gho_1']);
-    expect(getSession).toHaveBeenCalledTimes(1);
+    expect(dialogCalls()).toHaveLength(1);
     getSession.mockResolvedValue(session('gho_2'));
     await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_2');
     auth.dispose();
@@ -131,6 +134,129 @@ describe('VsCodeGitHubAuth', () => {
     await flush();
     expect(changes).toHaveBeenCalledTimes(1);
   });
+  describe('several GitHub accounts (docs/security.md "Accounts")', () => {
+    const OCTO = { id: '1', label: 'octocat' };
+    const CAT = { id: '2', label: 'cat' };
+    const COPILOT_ONLY = { id: '3', label: 'robot' };
+    const sessionOf = (account: { id: string; label: string }, token: string, scopes: string[] = ['repo', 'read:org']) => ({ id: `${account.id}-${scopes.length}`, accessToken: token, account, scopes });
+    /** VS Code with the three accounts; Devspaces may use OCTO and CAT (each has its own session). */
+    const vscodeWithAccounts = () => {
+      fakeVscode.authentication.getAccounts.mockResolvedValue([CAT, OCTO, COPILOT_ONLY]);
+      getSession.mockImplementation(async (_provider: string, scopes: string[], options: { account?: { id: string } }) => {
+        const token = scopes.includes('read:packages') ? 'packages' : 'main';
+        if (options.account?.id === OCTO.id) return sessionOf(OCTO, `gho_octo_${token}`, scopes);
+        if (options.account?.id === CAT.id) return sessionOf(CAT, `gho_cat_${token}`, scopes);
+        // An account that only another extension uses has no session that Devspaces may use; without an account,
+        // VS Code gives the account preference of Devspaces.
+        return options.account === undefined ? sessionOf(OCTO, `gho_octo_${token}`, scopes) : undefined;
+      });
+    };
+
+    it('uses each account of VS Code that has a session that Devspaces may use, in the order of the logins, without a dialog', async () => {
+      vscodeWithAccounts();
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      await expect(auth.accounts()).resolves.toEqual([
+        { id: '2', login: 'cat' },
+        { id: '1', login: 'octocat' },
+      ]);
+      await expect(auth.otherAccounts()).resolves.toEqual([{ id: '3', login: 'robot' }]);
+      expect(dialogCalls()).toEqual([]);
+      // Read once until the sessions change.
+      getSession.mockClear();
+      await auth.accounts();
+      expect(getSession).not.toHaveBeenCalled();
+      fakeVscode.fireSessionChange('github');
+      await flush();
+      await auth.accounts();
+      expect(getSession).toHaveBeenCalled();
+      auth.dispose();
+    });
+
+    it('names the account in every request, so that each account gets its own token and ghcr.io login', async () => {
+      vscodeWithAccounts();
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      const cat = { id: '2', login: 'cat' };
+      await expect(auth.getToken({ interactive: false, account: cat })).resolves.toBe('gho_cat_main');
+      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true, account: CAT });
+      await expect(auth.getSession({ interactive: false, account: { id: '1', login: 'octocat' } })).resolves.toEqual({ token: 'gho_octo_main', account: { id: '1', login: 'octocat' } });
+      await expect(auth.getPackagesCredentials({ interactive: false, account: cat })).resolves.toEqual({ username: 'cat', password: 'gho_cat_packages' });
+      await expect(auth.isSignedIn(cat)).resolves.toBe(true);
+      await expect(auth.getToken({ interactive: false, account: { id: '3', login: 'robot' } })).resolves.toBeUndefined();
+      auth.dispose();
+    });
+
+    it('finds the login of an owner without one (read from a volume label) among the accounts of VS Code', async () => {
+      vscodeWithAccounts();
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      await expect(auth.getAccount({ interactive: false, account: { id: '2', login: '' } })).resolves.toEqual({ id: '2', login: 'cat' });
+      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true, account: CAT });
+      // An account that VS Code does not know is not asked for at all.
+      getSession.mockClear();
+      await expect(auth.getAccount({ interactive: true, account: { id: '9', login: '' } })).resolves.toBeUndefined();
+      expect(getSession).not.toHaveBeenCalled();
+      auth.dispose();
+    });
+
+    it('asks VS Code with the current login of an account whose recorded login is old (a rename on GitHub)', async () => {
+      vscodeWithAccounts();
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      await expect(auth.getToken({ interactive: false, account: { id: '2', login: 'old-cat' } })).resolves.toBe('gho_cat_main');
+      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true, account: CAT });
+      auth.dispose();
+    });
+
+    it('never gives the session of another account, also not one with the same login', async () => {
+      fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO]);
+      getSession.mockResolvedValue(sessionOf({ id: '7', label: 'octocat' }, 'gho_other'));
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      await expect(auth.getToken({ interactive: false, account: { id: '1', login: 'octocat' } })).resolves.toBeUndefined();
+      // The user signs in with another account in the browser: not the session that was asked for.
+      await expect(auth.getToken({ interactive: true, account: { id: '1', login: 'octocat' } })).resolves.toBeUndefined();
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { createIfNone: true, account: OCTO }]);
+      auth.dispose();
+    });
+
+    it('asks only the account whose token GitHub rejected to sign in again, and names it', async () => {
+      vscodeWithAccounts();
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      await auth.accounts();
+      await expect(auth.renewToken({ id: '2', login: 'cat' })).resolves.toBe('gho_cat_main');
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { forceNewSession: { detail: signInAgainDetailOf('cat') }, account: CAT }]);
+      expect(signInAgainDetailOf('cat')).toBe('GitHub did not accept the sign-in of cat. Sign in again as cat to see its repositories.');
+      // A rejected token of one account leaves the other one signed in.
+      auth.reportRejectedToken('gho_cat_main');
+      await vi.waitFor(async () => expect(await auth.isSignedIn({ id: '2', login: 'cat' })).toBe(false));
+      await expect(auth.isSignedIn({ id: '1', login: 'octocat' })).resolves.toBe(true);
+      await expect(auth.isSignedIn()).resolves.toBe(true);
+      await expect(auth.signedInAccounts()).resolves.toEqual([{ id: '1', login: 'octocat' }]);
+      auth.dispose();
+    });
+
+    it('adds an account with the account picker of VS Code, and reports the new set of accounts', async () => {
+      fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO]);
+      getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { account?: { id: string }; silent?: boolean }) =>
+        options.account?.id === OCTO.id || options.silent !== true ? sessionOf(options.silent === true ? OCTO : CAT, 'gho') : undefined,
+      );
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      const changes = vi.fn();
+      auth.onDidChangeSession(changes);
+      await expect(auth.accounts()).resolves.toEqual([{ id: '1', login: 'octocat' }]);
+      // The user signs in with CAT ("Sign in to another account"); VS Code knows both accounts now.
+      fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO, CAT]);
+      getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { account?: { id: string }; silent?: boolean }) =>
+        options.silent === true ? (options.account?.id === CAT.id ? sessionOf(CAT, 'gho_cat') : options.account?.id === OCTO.id ? sessionOf(OCTO, 'gho_octo') : undefined) : sessionOf(CAT, 'gho_cat'),
+      );
+      await expect(auth.addAccount()).resolves.toEqual({ id: '2', login: 'cat' });
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { createIfNone: true, clearSessionPreference: true }]);
+      await vi.waitFor(() => expect(changes).toHaveBeenCalledTimes(1));
+      await expect(auth.accounts()).resolves.toEqual([
+        { id: '2', login: 'cat' },
+        { id: '1', login: 'octocat' },
+      ]);
+      auth.dispose();
+    });
+  });
+
   describe('a token that GitHub rejected (workaround for VS Code keeping such a session)', () => {
     const rejectedSession = { id: 's1', accessToken: 'gho_old', account: { id: '1', label: 'octocat' }, scopes: [] };
 
@@ -154,11 +280,11 @@ describe('VsCodeGitHubAuth', () => {
       getSession.mockResolvedValue(session('gho_new'));
       getSession.mockResolvedValueOnce(rejectedSession);
       await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_new');
-      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { forceNewSession: true });
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { forceNewSession: true }]);
       await expect(auth.isSignedIn()).resolves.toBe(true);
       // The new session is not rejected: the next interactive request uses createIfNone again.
       await auth.getToken({ interactive: true });
-      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { createIfNone: true });
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { createIfNone: true }]);
       auth.dispose();
     });
 
@@ -172,7 +298,7 @@ describe('VsCodeGitHubAuth', () => {
       expect(getSession.mock.calls.map((call) => call[2])).toEqual([{ silent: true }]);
       // A request that needs a working token asks for a new session.
       await auth.getToken({ interactive: true });
-      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { forceNewSession: true });
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { forceNewSession: true }]);
       auth.dispose();
     });
 
@@ -218,19 +344,9 @@ describe('VsCodeGitHubAuth', () => {
       await vi.waitFor(() => expect(fakeVscode.commands.executeCommand).toHaveBeenCalled());
       await expect(auth.isSignedIn()).resolves.toBe(true);
       await auth.getPackagesCredentials({ interactive: true });
-      expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org', 'read:packages'], { forceNewSession: true });
+      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org', 'read:packages'], { forceNewSession: true }]);
       auth.dispose();
     });
-  });
-
-  it('reports the rejected credentials of ghcr.io (the GitHub session), and of no other registry', () => {
-    const reportRejectedToken = vi.fn();
-    const report = ghcrRejectionReporter({ reportRejectedToken });
-    report('ghcr.io', { username: 'octocat', password: 'gho_1' });
-    report('GHCR.IO', { username: 'octocat', password: 'gho_2' });
-    report('docker.io', { username: 'user', password: 'dckr_pat' });
-    report('ghcr.io.example.com', { username: 'user', password: 'other' });
-    expect(reportRejectedToken.mock.calls).toEqual([['gho_1'], ['gho_2']]);
   });
 });
 

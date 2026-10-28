@@ -15,7 +15,7 @@ describe('extensionFlow for the check of Delete', () => {
     const all = { registry: {}, sessionFiles: {}, ui, auth: {}, credentials: {}, settings: () => ({}), windowId: 'w1', pid: 1, clock: { now: () => 0 }, isProcessAlive: () => true, logger: silentLogger } as unknown as HostSideDeps;
     const sent: OperationOptions[] = [];
     const channels = { flow: vi.fn(async (_t: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push(options), { decision: 'cancel' })) };
-    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, extensionHostSide(all), silentLogger);
+    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, (account) => extensionHostSide(all, account), silentLogger);
     const answers: unknown[] = [];
     const states: string[] = [];
     await flow(OP_DELETE_CHECK, { devspaceId: 'e1', dockerHost: '', owner: 'o', repository: 'Acme/API', otherWindow: false }, {

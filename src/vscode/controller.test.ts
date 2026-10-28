@@ -35,7 +35,7 @@ import { availableDevspaces } from '../core/ownership';
 import { dockerTargetOf, ownContextDescription, remoteContextNames, type DockerTarget } from '../core/docker/dockerHost';
 import { DockerTargets, operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { silentLogger } from '../core/ports';
-import type { Devspace, DevspaceSource, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
+import type { AccountListing, Devspace, DevspaceSource, DiscoveryData, ExtensionSettings, GitHubAccount, GitSummary, RepositoryInfo, WindowStatus } from '../core/types';
 import { GITHUB_ENTERPRISE_CONTEXT_KEY, SIGNED_IN_CONTEXT_KEY } from './auth';
 import { Commands } from './commands';
 import { CONNECTED_CONTEXT_KEY, Controller, HELPER_BUILDS_STOP_WAIT_MS, type ControllerDeps } from './controller';
@@ -239,6 +239,8 @@ interface Harness {
     isSignedIn: ReturnType<typeof vi.fn>;
     updateContextKey: ReturnType<typeof vi.fn>;
     renewToken: ReturnType<typeof vi.fn>;
+    accounts: ReturnType<typeof vi.fn>;
+    addAccount: ReturnType<typeof vi.fn>;
   };
   dockerSetup: Record<'install' | 'start' | 'installWsl' | 'show', ReturnType<typeof vi.fn>>;
   /** The single lookup of a repository on GitHub; by default GitHub does not show it. */
@@ -253,6 +255,8 @@ interface Harness {
     trustedOwner: ReturnType<typeof vi.fn>;
     onSessionChanged: ReturnType<typeof vi.fn>;
     refreshDiscovery: ReturnType<typeof vi.fn>;
+    availableDevspaces: Mock<() => Promise<Devspace[]>>;
+    accountListings: Mock<() => AccountListing[]>;
   };
   statusBar: Record<'showConnected' | 'showNotConnected' | 'showBusy' | 'clearBusy' | 'showConnectionLost' | 'showStateUnknown', ReturnType<typeof vi.fn>>;
   logger: Record<'info' | 'warn' | 'error' | 'output' | 'show', ReturnType<typeof vi.fn>>;
@@ -412,6 +416,13 @@ function createHarness(
     updateContextKey: vi.fn(async () => true),
     // The new sign-in after GitHub rejected the token; by default the user cancels it.
     renewToken: vi.fn(async (): Promise<string | undefined> => undefined),
+    // The accounts of Devspaces: by default the one account of getAccount (a test of several accounts sets them).
+    accounts: vi.fn(async (): Promise<GitHubAccount[]> => {
+      const account = await auth.getAccount();
+      return account ? [account] : [];
+    }),
+    // Add GitHub Account…: by default the user cancels the picker.
+    addAccount: vi.fn(async (): Promise<GitHubAccount | undefined> => undefined),
   };
   const dockerSetup = {
     install: vi.fn(async () => {}),
@@ -429,7 +440,9 @@ function createHarness(
     repositoryInfo: (repository: string) => infos.get(repository.toLowerCase()),
     liveBranch: () => undefined,
     repositoriesForPicker: vi.fn(async () => [...infos.values()]),
-    availableDevspaces: vi.fn(async () => availableDevspaces(await registry.list(), await auth.getAccount())),
+    availableDevspaces: vi.fn(async () => availableDevspaces(await registry.list(), await auth.accounts())),
+    accountListings: vi.fn((): AccountListing[] => []),
+    accountList: vi.fn((_accountId: string): DiscoveryData | undefined => undefined),
     model: () => [],
     trustedOwner: vi.fn(async () => true),
     refreshDiscovery: vi.fn(async () => undefined),
@@ -622,6 +635,14 @@ function cancellableProgress(): { cancel(): void } {
   };
 }
 
+/** The sign-ins of the account picker of VS Code (getAccount with a dialog and without a named account). */
+function interactiveSignIns(): number {
+  return h.auth.getAccount.mock.calls.filter((call: unknown[]) => {
+    const options = call[0] as { interactive?: boolean; account?: GitHubAccount } | undefined;
+    return options?.interactive === true && options.account === undefined;
+  }).length;
+}
+
 function warningMessages(): string[] {
   return fakeVscode.window.showWarningMessage.mock.calls.map((call: unknown[]) => String(call[0]));
 }
@@ -667,12 +688,12 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    // 37 commands, among them hidden ones: Show Docker Setup (the action Install Docker… of an error: it looks for the
+    // 39 commands, among them hidden ones: Show Docker Setup (the action Install Docker… of an error: it looks for the
     // CLI, then shows the view), the command of a repository row (a double-click runs Start), Enter on a row (Enter
     // runs Start), and the choice of the Docker host (the command of the first row of the view). The last two that were
-    // added: "Remove Devspaces from This Docker Engine…", then Enter on a row.
-    expect(declared).toHaveLength(37);
-    expect(declared).toEqual(expect.arrayContaining([Commands.removeFromDockerEngine, Commands.rowEnter]));
+    // added: "Start with Account…" and "Add GitHub Account…".
+    expect(declared).toHaveLength(39);
+    expect(declared).toEqual(expect.arrayContaining([Commands.removeFromDockerEngine, Commands.rowEnter, Commands.startWithAccount, Commands.addAccount]));
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -2983,7 +3004,7 @@ describe('Remove Devspaces from This Docker Engine…', () => {
     expect(modals()).toEqual([
       [
         'Remove Devspaces from build-box?',
-        { modal: true, detail: `${ControllerTexts.removeDetail} The devspaces of other GitHub accounts stay: acme/web.` },
+        { modal: true, detail: `${ControllerTexts.removeDetail} The devspaces of GitHub accounts that are not signed in to Devspaces stay: acme/web.` },
         'Remove',
       ],
       [
@@ -3025,6 +3046,21 @@ describe('Remove Devspaces from This Docker Engine…', () => {
     );
     expect(h.progressTitles.some((title) => title.startsWith('Removing Devspaces from build-box…'))).toBe(true);
     expect(h.progressTitles.some((title) => title.includes('Removing the container devspaces-monitor.'))).toBe(true);
+  });
+
+  it('with several accounts, deletes the devspaces of all accounts of Devspaces and names the accounts', async () => {
+    const fake = removalFake({ engine: { inUse: ['devspaces-vscode'] } });
+    onBuildBox(fake);
+    h.auth.accounts.mockResolvedValue([ACCOUNT, OTHER_ACCOUNT]);
+    await h.registry.add(ownRemote());
+    await h.registry.add(otherAccountRemote());
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.remove).mockResolvedValueOnce(ControllerTexts.deleteDevspacesToo);
+    await run('removeFromDockerEngine');
+    const [first, second] = modals();
+    // No devspace of an account that is not signed in stays.
+    expect(first?.[1]).toEqual({ modal: true, detail: ControllerTexts.removeDetail });
+    expect(second?.[0]).toBe('Also delete the 2 devspaces of your GitHub accounts octo and someone on build-box?');
+    expect(h.service.deleteInWorker.mock.calls.map((call) => call[0]).sort()).toEqual([ENV_ID, OTHER_ENV_ID].sort());
   });
 
   it('Keep Devspaces deletes none; Cancel of either question removes nothing and sets no mark', async () => {
@@ -3939,7 +3975,7 @@ describe('Remove Devspaces from This Docker Engine…', () => {
     expect(h.flow).toHaveBeenCalledWith(OP_TOKEN_REMOVE, { devspaceId: ENV_ID, containerName: CONTAINER }, { timeoutMs: 60_000 });
     expect(h.flow.mock.invocationCallOrder[0]).toBeLessThan(h.connection.closeRemoteConnection.mock.invocationCallOrder[0]);
     expect(warningMessages()).toEqual([Messages.otherAccountConnection('acme/api')]);
-    expect(h.logger.info).toHaveBeenCalledWith('The GitHub account changed. acme/api belongs to another account: the window closes its remote connection.');
+    expect(h.logger.info).toHaveBeenCalledWith('The GitHub account of acme/api is no longer signed in to Devspaces: the window closes its remote connection.');
     // Its status file does not name the devspace anymore.
     expect(h.coordinator.setPlainDevspace.mock.calls).toEqual([[ENV_ID], [null]]);
     // The window left the devspace: the next change removes nothing more.
@@ -4868,7 +4904,7 @@ describe('Connection of this window', () => {
 });
 
 describe('Accounts', () => {
-  it('refuses Start, Stop, Delete, and Rebuild of a devspace of another account', async () => {
+  it('refuses Start, Stop, Delete, and Rebuild of a devspace of another account unless its owner signs in', async () => {
     const env = devspace({ owner: OTHER_ACCOUNT });
     await h.registry.add(env);
     for (const command of ['start', 'stop', 'delete', 'rebuild'] as const) {
@@ -4876,24 +4912,61 @@ describe('Accounts', () => {
     }
     // The status bar item Reconnect.
     await run('start', { devspaceId: ENV_ID });
-    expect(warningMessages()).toEqual(Array(5).fill(Messages.otherAccount('acme/api')));
+    // Each command asks for the sign-in of the owner (rule 2); the user cancels.
+    expect(warningMessages()).toEqual(Array(5).fill(ControllerTexts.hiddenOwnerQuestion('acme/api', OTHER_ACCOUNT.login)));
+    const buttons = fakeVscode.window.showWarningMessage.mock.calls.map((call: unknown[]) => call.slice(2));
+    expect(buttons).toEqual(Array(5).fill([ControllerTexts.signInAs(OTHER_ACCOUNT.login)]));
     for (const call of Object.values(h.service)) expect(call).not.toHaveBeenCalled();
     expect(h.connection.open).not.toHaveBeenCalled();
     expect(fakeVscode.window.createQuickPick).not.toHaveBeenCalled();
+    expect(h.auth.getAccount).not.toHaveBeenCalledWith(expect.objectContaining({ interactive: true }));
   });
 
-  it('starts the own devspace of the account for a repository that has a devspace of another account', async () => {
+  it('uses a devspace of another account after the sign-in of its owner, and refuses it after a sign-in of another account', async () => {
+    const env = devspace({ owner: OTHER_ACCOUNT });
+    await h.registry.add(env);
+    // The owner signs in: the devspace opens.
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.signInAs(OTHER_ACCOUNT.login));
+    h.auth.getAccount.mockImplementation(async (options?: { account?: GitHubAccount }) => options?.account ?? ACCOUNT);
+    await run('start', row('acme/api', env));
+    expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true, account: OTHER_ACCOUNT });
+    expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
+
+    // The sign-in ends with another account: nothing opens, and the message names the owner.
+    h.service.openDevspaceInWorker.mockClear();
+    fakeVscode.window.showWarningMessage.mockClear();
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.signInAs(OTHER_ACCOUNT.login));
+    h.auth.getAccount.mockImplementation(async () => ACCOUNT);
+    await run('start', row('acme/api', env));
+    expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
+    expect(warningMessages()).toEqual([ControllerTexts.hiddenOwnerQuestion('acme/api', OTHER_ACCOUNT.login), Messages.otherAccount('acme/api', OTHER_ACCOUNT.login)]);
+  });
+
+  it('asks before a Start of a repository whose devspace belongs to an account that is not signed in (rule 2)', async () => {
     await h.registry.add(devspace({ owner: OTHER_ACCOUNT }));
     const own = devspace({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devspaces-octo-api-c1d2e3f4' });
     h.service.openInWorker.mockImplementation(async () => {
       await h.registry.add(own);
       return openResult(own);
     });
-    // A stale row without the devspace, and a repository row: the devspace of the other account is not named.
+    // Cancel: nothing opens.
     await run('start', row('acme/api'));
-    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
     expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([]);
+    const [question] = fakeVscode.window.showWarningMessage.mock.calls;
+    expect(question).toEqual([
+      ControllerTexts.hiddenOwnerQuestion('acme/api', OTHER_ACCOUNT.login),
+      { modal: true, detail: ControllerTexts.hiddenOwnerDetail(OTHER_ACCOUNT.login, ACCOUNT.login) },
+      ControllerTexts.signInAs(OTHER_ACCOUNT.login),
+      ControllerTexts.newDevspaceAs(ACCOUNT.login),
+    ]);
+
+    // New Devspace as octo: the own devspace of the account; the devspace of the other account stays.
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.newDevspaceAs(ACCOUNT.login));
+    await run('start', row('acme/api'));
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ account: ACCOUNT }));
+    expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
     expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
   });
 
@@ -4903,9 +4976,11 @@ describe('Accounts', () => {
   ])('Try again after an account change: %s', async (_name, named) => {
     await h.registry.add(devspace());
     h.service.openDevspaceInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
-    // The user signs in with another account while the error shows, then presses Try again.
+    // The user signs in with another account while the error shows, then presses Try again; a repository asks about the
+    // devspace of the account before (rule 2), and the user creates one of the new account.
     fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
       h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
+      if (!named) fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.newDevspaceAs(OTHER_ACCOUNT.login));
       return Actions.tryAgain;
     });
     const own = devspace({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devspaces-acme-api-c1d2e3f4', owner: OTHER_ACCOUNT });
@@ -4924,7 +4999,7 @@ describe('Accounts', () => {
       await settle(() => h.connection.open.mock.calls.length === 1, 'the connection of the other account');
       expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
       expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
-      expect(warningMessages()).toEqual([]);
+      expect(warningMessages()).toEqual([ControllerTexts.hiddenOwnerQuestion('acme/api', ACCOUNT.login)]);
       expect(h.service.openDevspaceInWorker).toHaveBeenCalledTimes(1);
     }
   });
@@ -5113,7 +5188,8 @@ describe('Accounts', () => {
     h.auth.getAccount.mockResolvedValue(undefined);
     await h.controller.openAttachedWindow(env, CONTAINER, undefined);
     await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
-    expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true });
+    // The sign-in of the owner of the devspace.
+    expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true, account: ACCOUNT });
     expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
     expect(warningMessages()).toEqual([ControllerTexts.signedOutConnection('acme/api')]);
   });
@@ -5453,7 +5529,7 @@ describe('Accounts', () => {
     expect(h.coordinator.writePending).not.toHaveBeenCalled();
     // Without the pending connection file, the Monitor stops the container after the waiting time.
     expect(await h.sessionFiles.readPendings()).toEqual([]);
-    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api', ACCOUNT.login)]);
   });
 
   it('does not connect a first open when the account changed while the pipeline ran', async () => {
@@ -5470,7 +5546,7 @@ describe('Accounts', () => {
     pipeline.resolve(openResult(devspace()));
     await start;
     expect(h.connection.open).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api', ACCOUNT.login)]);
   });
 
   it('does not connect when nobody is signed in anymore at the end of the pipeline', async () => {
@@ -5505,38 +5581,41 @@ describe('Accounts', () => {
     pipeline.resolve(openResult(devspace()));
     await tasks;
     expect(h.connection.open).not.toHaveBeenCalled();
-    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api')]);
+    expect(warningMessages()).toEqual([Messages.otherAccount('acme/api', ACCOUNT.login)]);
   });
 
-  describe('a repository command while GitHub rejects the token, when another account signs in at the new sign-in', () => {
-    // The rejected session still names ACCOUNT (auth.ts: getAccount asks for no new sign-in); the session with a working
-    // token, which the new sign-in gives, belongs to OTHER_ACCOUNT.
+  describe('a repository command while GitHub rejects the token of the account', () => {
+    // The rejected session still names ACCOUNT (auth.ts: getAccount asks for no new sign-in). Only the pipeline asks
+    // for a new sign-in, of the account of the devspace (auth.ts renewToken refuses another account), so a repository
+    // command never switches to the devspace of another account.
     beforeEach(async () => {
       await h.registry.add(devspace());
-      h.auth.getSession.mockImplementation(async (options?: { interactive: boolean }) => {
-        if (!options?.interactive) return { token: 'gho_rejected', account: ACCOUNT };
-        h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
-        h.auth.getToken.mockResolvedValue('gho_other');
-        return { token: 'gho_other', account: OTHER_ACCOUNT };
-      });
-      // The pipeline creates the devspace of the account of its session.
-      h.service.openInWorker.mockResolvedValue(openResult(devspace({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT })));
+      h.auth.isSignedIn.mockResolvedValue(false);
+      h.auth.getSession.mockImplementation(async () => ({ token: 'gho_rejected', account: ACCOUNT }));
+      h.auth.getToken.mockResolvedValue('gho_rejected');
     });
+    const noSignInOfAnotherAccount = (): void => {
+      for (const call of [...h.auth.getSession.mock.calls, ...h.auth.getToken.mock.calls, ...h.auth.getAccount.mock.calls]) {
+        const options = call[0] as { interactive?: boolean; account?: GitHubAccount } | undefined;
+        if (options?.interactive) expect(options.account).toEqual(ACCOUNT);
+      }
+      expect(h.auth.addAccount).not.toHaveBeenCalled();
+    };
 
-    it('Start of the repository uses the devspace of the new account, not the one of the account before', async () => {
+    it('Start of the repository opens the devspace of the account', async () => {
       await run('start', row('acme/api'));
-      expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
-      expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
-      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
-      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+      expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
+      expect(h.service.openInWorker).not.toHaveBeenCalled();
+      noSignInOfAnotherAccount();
     });
 
     it('Search does the same', async () => {
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
       fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
       await run('search');
-      expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
-      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
+      expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
+      expect(h.service.openInWorker).not.toHaveBeenCalled();
+      noSignInOfAnotherAccount();
     });
 
     it('the repository choice of the switcher does the same', async () => {
@@ -5546,46 +5625,35 @@ describe('Accounts', () => {
           items.find((item) => item.choice?.kind === 'openRepository') ?? items.find((item) => item.repository?.nameWithOwner === 'acme/api'),
       );
       await run('switchDevspace');
-      expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
-      expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
-      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
-      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+      expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
+      expect(h.service.openInWorker).not.toHaveBeenCalled();
+      noSignInOfAnotherAccount();
     });
 
-    it('Start on the child row of a configuration creates the devspace of the new account with that configuration', async () => {
+    it('Start on the child row of a configuration creates the devspace of the account with that configuration', async () => {
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
       await run('start', row('acme/api', undefined, undefined, PYTHON_SOURCE));
       expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
-      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ source: PYTHON_SOURCE }));
-      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ source: PYTHON_SOURCE, account: ACCOUNT }));
+      noSignInOfAnotherAccount();
     });
 
-    it('Try again of a Start that failed asks for the new sign-in before it chooses the devspace', async () => {
-      // The first try: the token works, the session belongs to ACCOUNT, and the pipeline fails.
-      h.auth.getSession.mockImplementation(async () => ({ token: 'gho_token', account: ACCOUNT }));
-      h.auth.getAccount.mockResolvedValue(ACCOUNT);
+    it('Try again of a Start that failed opens the devspace of the account again', async () => {
       h.service.openDevspaceInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
-      // While the message shows, GitHub starts to reject the token; at the new sign-in, OTHER_ACCOUNT signs in.
-      fakeVscode.window.showErrorMessage.mockImplementationOnce(async () => {
-        h.auth.getSession.mockImplementation(async (options?: { interactive: boolean }) => {
-          if (!options?.interactive) return { token: 'gho_rejected', account: ACCOUNT };
-          h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
-          return { token: 'gho_other', account: OTHER_ACCOUNT };
-        });
-        return Actions.tryAgain;
-      });
+      fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
       fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ repository: RepositoryInfo }>) => items[0]);
       await run('search');
-      await settle(() => h.service.openInWorker.mock.calls.length === 1, 'Try again');
-      expect(h.service.openDevspaceInWorker).toHaveBeenCalledTimes(1);
-      expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.anything());
-      expect(warningMessages()).not.toContain(Messages.otherAccount('acme/api'));
+      await settle(() => h.service.openDevspaceInWorker.mock.calls.length === 2, 'Try again');
+      expect(h.service.openDevspaceInWorker.mock.calls.map((call) => call[0])).toEqual([ENV_ID, ENV_ID]);
+      expect(h.service.openInWorker).not.toHaveBeenCalled();
+      noSignInOfAnotherAccount();
     });
 
     it('Stop of the repository asks for no new sign-in (it needs no token)', async () => {
       await run('stop', row('acme/api'));
-      expect(h.auth.getSession).not.toHaveBeenCalledWith({ interactive: true });
+      expect(h.auth.getSession).not.toHaveBeenCalledWith(expect.objectContaining({ interactive: true }));
+      expect(h.auth.getToken).not.toHaveBeenCalledWith(expect.objectContaining({ interactive: true }));
     });
   });
 
@@ -5607,6 +5675,8 @@ describe('Accounts', () => {
     });
 
     it('opens the devspace of the account signed in now when it has one of that source', async () => {
+      // The first Start asks about the devspace of OTHER_ACCOUNT (rule 2); the user creates one of ACCOUNT.
+      fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.newDevspaceAs(ACCOUNT.login));
       await run('start', row('acme/api', undefined, undefined, ROOT_SOURCE));
       await settle(() => h.service.openDevspaceInWorker.mock.calls.length === 1, 'Try again');
       expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
@@ -6095,6 +6165,7 @@ describe('Start in a new window', () => {
       '1_actions@1 devspaces.start',
       '1_actions@2 devspaces.startInNewWindow',
       '1_actions@2 devspaces.startInCurrentWindow',
+      '1_actions@3 devspaces.startWithAccount',
       '1_actions@4 devspaces.stop',
       '1_actions@5 devspaces.delete',
       '1_actions@6 devspaces.keepRunning',
@@ -7268,7 +7339,8 @@ describe('A link to Devspaces', () => {
     h.sidebar.trustedOwner.mockResolvedValue(false);
     h.discovery.getRepository.mockResolvedValue(repositoryInfo('majikmate/classroom', { defaultBranch: 'trunk', configPaths: ['.devcontainer/web/devcontainer.json'] }));
     await h.controller.openLink(link('MajikMate/Classroom'));
-    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+    // The token of the account, without a dialog.
+    expect(h.auth.getToken).toHaveBeenCalledWith({ interactive: false, account: ACCOUNT });
     expect(h.discovery.getRepository).toHaveBeenCalledWith('MajikMate/Classroom', 'gho_token');
     // The owner is neither the account nor one of its organizations: the link asks for the confirmation of every first
     // open before any Docker work, and the pipeline asks it no second time (trusted: true).
@@ -7353,10 +7425,12 @@ describe('A link to Devspaces', () => {
     await h.registry.add(devspace());
     h.sessionFiles.writeReopenSync({ devspaceId: ENV_ID, closedAt: iso(NOW - 60_000) });
     h.connection.isEmptyWindow.mockReturnValue(true);
-    const signIn = deferred<{ token: string; account: GitHubAccount } | undefined>();
-    h.auth.getSession.mockReturnValueOnce(signIn.promise);
+    // Devspaces uses no account yet: the link asks for the sign-in.
+    const signIn = deferred<GitHubAccount | undefined>();
+    h.auth.accounts.mockResolvedValueOnce([]);
+    h.auth.getAccount.mockImplementationOnce(() => signIn.promise);
     const opening = h.controller.openLink(link('acme/web'));
-    await settle(() => h.auth.getSession.mock.calls.length === 1, 'the sign-in');
+    await settle(() => interactiveSignIns() === 1, 'the sign-in');
     await h.controller.runEmptyWindowTasks();
     expect(h.logger.info).toHaveBeenCalledWith('The last devspace is not opened: another devspace is opening in this window.');
     expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
@@ -7376,11 +7450,13 @@ describe('A link to Devspaces', () => {
     h.service.openDevspaceInWorker.mockReturnValueOnce(pipeline.promise);
     const starting = run('start', row('acme/api', devspace()));
     await settle(() => h.service.openDevspaceInWorker.mock.calls.length === 1, 'the pipeline');
-    const signIn = deferred<{ token: string; account: GitHubAccount } | undefined>();
-    const sessions = h.auth.getSession.mock.calls.length;
-    h.auth.getSession.mockReturnValueOnce(signIn.promise);
+    // Devspaces uses no account (a sign-out meanwhile): the link asks for the sign-in.
+    const signIn = deferred<GitHubAccount | undefined>();
+    const signIns = interactiveSignIns();
+    h.auth.accounts.mockResolvedValueOnce([]);
+    h.auth.getAccount.mockImplementationOnce(() => signIn.promise);
     const opening = h.controller.openLink(link('acme/web'));
-    await settle(() => h.auth.getSession.mock.calls.length > sessions, 'the sign-in of the link');
+    await settle(() => interactiveSignIns() > signIns, 'the sign-in of the link');
     pipeline.resolve(openResult(devspace()));
     await starting;
     expect(h.connection.open).toHaveBeenCalledTimes(1);
@@ -7416,17 +7492,18 @@ describe('A link to Devspaces', () => {
   // VS Code gives a link to the extension at its activation; the window then may not know its role and its devspace yet.
   it('waits for the end of the activation, also of one that failed', async () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
+    h.auth.accounts.mockClear();
     for (const end of ['resolve', 'reject'] as const) {
       const activation = deferred<void>();
       h.controller.setActivation(activation.promise);
       const opening = h.controller.openLink(link('acme/api'));
       await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(h.auth.getSession).not.toHaveBeenCalled();
+      expect(h.auth.accounts).not.toHaveBeenCalled();
       if (end === 'resolve') activation.resolve();
       else activation.reject(new Error('activation failed'));
       await opening;
-      expect(h.auth.getSession).toHaveBeenCalled();
-      h.auth.getSession.mockClear();
+      expect(h.auth.accounts).toHaveBeenCalled();
+      h.auth.accounts.mockClear();
     }
     expect(h.service.openInWorker).toHaveBeenCalledTimes(2);
   });
@@ -7451,7 +7528,7 @@ describe('A link to Devspaces', () => {
     h.discovery.getRepository.mockRejectedValue(new Error('rate limit'));
     await h.controller.openLink(link('acme/api'));
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.linkRepositoryUnknown('acme/api'), Actions.showDetails);
-    expect(h.logger.warn).toHaveBeenCalledWith('GitHub could not be asked for acme/api: rate limit');
+    expect(h.logger.warn).toHaveBeenCalledWith('GitHub could not be asked for acme/api with octo: rate limit');
     expect(h.service.openInWorker).not.toHaveBeenCalled();
   });
 
@@ -7467,11 +7544,11 @@ describe('A link to Devspaces', () => {
   });
 
   it('opens nothing without a sign-in, also for a listed repository', async () => {
-    h.auth.getToken.mockResolvedValue(undefined);
+    h.auth.getAccount.mockResolvedValue(undefined);
     await h.controller.openLink(link('acme/api'));
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
     await h.controller.openLink(link('acme/api'));
-    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+    expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true });
     expect(warningMessages()).toEqual([Messages.signInRequired, Messages.signInRequired]);
     expect(h.discovery.getRepository).not.toHaveBeenCalled();
     expect(h.service.openInWorker).not.toHaveBeenCalled();
@@ -7489,11 +7566,11 @@ describe('A course link to Devspaces', () => {
     fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? Actions.open : undefined));
   });
 
-  it('starts the repository of the course with the login of the account, after the sign-in and the question of the link', async () => {
+  it('starts the repository of the course with the login of the account, after the question of the link', async () => {
     h.sidebar.trustedOwner.mockResolvedValue(false);
     h.discovery.getRepository.mockImplementation(async (repository: string) => repositoryInfo(repository.toLowerCase()));
     await h.controller.openLink(courseLink('MySchool/module-ts-2-<username>'));
-    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+    expect(h.auth.getToken).toHaveBeenCalledWith({ interactive: false, account: ACCOUNT });
     expect(h.discovery.getRepository).toHaveBeenCalledWith('MySchool/module-ts-2-octo', 'gho_token');
     expect(h.logger.info).toHaveBeenCalledWith('A course link asks to open MySchool/module-ts-2-<username> with the GitHub login of the account.');
     expect(h.logger.info).toHaveBeenCalledWith('The course link opens MySchool/module-ts-2-octo for octo.');
@@ -7516,9 +7593,9 @@ describe('A course link to Devspaces', () => {
   });
 
   it('asks nobody without a sign-in, because the login is not known', async () => {
-    h.auth.getToken.mockResolvedValue(undefined);
+    h.auth.getAccount.mockResolvedValue(undefined);
     await h.controller.openLink(courseLink('acme/api-<username>'));
-    expect(h.auth.getSession).toHaveBeenCalledWith({ interactive: true });
+    expect(h.auth.getAccount).toHaveBeenCalledWith({ interactive: true });
     expect(warningMessages()).toEqual([Messages.signInRequired]);
     expect(h.discovery.getRepository).not.toHaveBeenCalled();
     expect(h.service.openInWorker).not.toHaveBeenCalled();
@@ -7531,17 +7608,18 @@ describe('A course link to Devspaces', () => {
     expect(h.service.openInWorker).not.toHaveBeenCalled();
   });
 
-  it('takes the login of the new account after a new sign-in', async () => {
+  it('asks the account whose token GitHub rejected for a new sign-in, and asks GitHub again with its new token', async () => {
     h.discovery.getRepository.mockRejectedValueOnce(new GitHubApiError('Bad credentials', 401));
-    h.discovery.getRepository.mockResolvedValueOnce(repositoryInfo('acme/api-someone'));
+    h.discovery.getRepository.mockResolvedValueOnce(repositoryInfo('acme/api-octo'));
     h.auth.renewToken.mockImplementationOnce(async () => {
       h.auth.getToken.mockResolvedValue('gho_new');
-      h.auth.getAccount.mockResolvedValue(OTHER_ACCOUNT);
       return 'gho_new';
     });
     await h.controller.openLink(courseLink('acme/api-<username>'));
-    expect(h.discovery.getRepository.mock.calls).toEqual([['acme/api-octo', 'gho_token'], ['acme/api-someone', 'gho_new']]);
-    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api-someone' }), expect.objectContaining({ source: ROOT_SOURCE }));
+    // The new sign-in is one of the same account (auth.ts refuses another one), so the login in the name stays.
+    expect(h.auth.renewToken).toHaveBeenCalledWith(ACCOUNT);
+    expect(h.discovery.getRepository.mock.calls).toEqual([['acme/api-octo', 'gho_token'], ['acme/api-octo', 'gho_new']]);
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api-octo' }), expect.objectContaining({ source: ROOT_SOURCE, account: ACCOUNT }));
   });
 
   it('opens nothing when the name with the login is longer than GitHub allows', async () => {
@@ -7550,7 +7628,7 @@ describe('A course link to Devspaces', () => {
     const name = 'b'.repeat(70);
     await h.controller.openLink(courseLink(`acme/${name}`));
     expect(h.logger.info).toHaveBeenCalledWith(`The course link acme/${name}-<username> names no GitHub repository with the login ${login}.`);
-    expect(warningMessages()).toEqual([ControllerTexts.courseLinkInvalidForLogin(login)]);
+    expect(warningMessages()).toEqual([ControllerTexts.courseLinkInvalidForLogin([login])]);
     expect(h.discovery.getRepository).not.toHaveBeenCalled();
     expect(h.service.openInWorker).not.toHaveBeenCalled();
   });
@@ -7648,5 +7726,208 @@ describe('the Delete command sends the check to the worker', () => {
     expect(options.signal).toBeInstanceOf(AbortSignal);
     // The only progress: the check (the dismissed confirmation deletes nothing).
     expect(fakeVscode.window.withProgress.mock.calls.map((call: unknown[]) => call[0])).toEqual([expect.objectContaining({ cancellable: true })]);
+  });
+});
+
+// Several GitHub accounts of VS Code that Devspaces uses at the same time (docs/security.md "Accounts"): ACCOUNT (octo)
+// and OTHER_ACCOUNT (someone), each with its own token.
+describe('Several GitHub accounts', () => {
+  const OTHER_TOKEN = 'gho_other';
+  const tokenOf = (options?: { account?: GitHubAccount }) => (options?.account?.id === OTHER_ACCOUNT.id ? OTHER_TOKEN : 'gho_token');
+  const link = (repository: string) => ({ path: '/open', query: `repository=${repository}` });
+  const courseLink = (repository: string) => ({ path: '/course', query: `repository=${repository}` });
+  /** A repository that both accounts can access, as the merged list of the sidebar gives it. */
+  const shared = (octo: RepositoryInfo['permission'], someone: RepositoryInfo['permission']) =>
+    repositoryInfo('acme/api', {
+      access: [
+        { account: ACCOUNT, ...(octo !== undefined ? { permission: octo } : {}) },
+        { account: OTHER_ACCOUNT, ...(someone !== undefined ? { permission: someone } : {}) },
+      ],
+    });
+
+  beforeEach(() => {
+    h.auth.accounts.mockResolvedValue([ACCOUNT, OTHER_ACCOUNT]);
+    h.auth.getAccount.mockImplementation(async (options?: { account?: GitHubAccount }) => options?.account ?? ACCOUNT);
+    h.auth.getToken.mockImplementation(async (options?: { account?: GitHubAccount }) => tokenOf(options));
+    h.sidebar.accountListings.mockReturnValue([
+      { account: ACCOUNT, organizations: [] },
+      { account: OTHER_ACCOUNT, organizations: ['acme'] },
+    ]);
+  });
+
+  it('starts a new devspace with the account of the highest permission (rule 4)', async () => {
+    h.sidebar.infos.set('acme/api', shared('WRITE', 'ADMIN'));
+    await run('start', row('acme/api'));
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+    expect(h.logger.info).toHaveBeenCalledWith('A new devspace of acme/api uses the GitHub account someone (admin).');
+  });
+
+  it('with equal permission, prefers the member of the owning organization (rule 6)', async () => {
+    h.sidebar.infos.set('acme/api', shared('READ', 'READ'));
+    await run('start', row('acme/api'));
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ account: OTHER_ACCOUNT }));
+  });
+
+  it('opens the existing devspace with its owner, also when another account has a higher permission (rule 1)', async () => {
+    h.sidebar.infos.set('acme/api', shared('READ', 'ADMIN'));
+    await h.registry.add(devspace());
+    await run('start', row('acme/api'));
+    expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(ENV_ID, expect.anything());
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+    // Two devspaces of one source (one per account): the one used last opens.
+    await h.registry.add(devspace({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, volumeName: 'other', containerName: 'other', lastUsedAt: iso(NOW - 1000) }));
+    await run('start', row('acme/api'));
+    expect(h.service.openDevspaceInWorker).toHaveBeenLastCalledWith(OTHER_ENV_ID, expect.anything());
+  });
+
+  it('Start with Account… offers the accounts in the order of the rules and creates a devspace of the chosen one; the other devspace stays', async () => {
+    h.sidebar.infos.set('acme/api', shared('ADMIN', 'WRITE'));
+    await h.registry.add(devspace());
+    const created = devspace({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, volumeName: 'other', containerName: 'other' });
+    h.service.openInWorker.mockImplementation(async () => {
+      await h.registry.add(created);
+      return openResult(created);
+    });
+    let offered: Array<{ label: string; description: string }> = [];
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string; description: string }>) => {
+      offered = items;
+      return items.find((item) => item.label === OTHER_ACCOUNT.login);
+    });
+    await run('startWithAccount', row('acme/api', devspace()));
+    expect(offered.map((item) => [item.label, item.description])).toEqual([
+      ['octo', ControllerTexts.accountChoiceDescription('admin', true)],
+      ['someone', ControllerTexts.accountChoiceDescription('write', false)],
+    ]);
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/api' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+    expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
+    expect(h.service.deleteInWorker).not.toHaveBeenCalled();
+    expect((await h.registry.list()).map((entry) => entry.id).sort()).toEqual([ENV_ID, OTHER_ENV_ID].sort());
+  });
+
+  it('Start with Account… opens the devspace of the chosen account when it has one, and says when only one account can access the repository', async () => {
+    h.sidebar.infos.set('acme/api', shared('ADMIN', 'WRITE'));
+    await h.registry.add(devspace({ id: OTHER_ENV_ID, owner: OTHER_ACCOUNT, volumeName: 'other', containerName: 'other' }));
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string }>) => items.find((item) => item.label === OTHER_ACCOUNT.login));
+    await run('startWithAccount', row('acme/api'));
+    expect(h.service.openDevspaceInWorker).toHaveBeenCalledWith(OTHER_ENV_ID, expect.anything());
+
+    h.sidebar.infos.set('acme/web', repositoryInfo('acme/web', { access: [{ account: ACCOUNT, permission: 'ADMIN' }] }));
+    await run('startWithAccount', row('acme/web'));
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledWith(ControllerTexts.oneAccountOnly('acme/web'));
+    expect(fakeVscode.window.showQuickPick).toHaveBeenCalledTimes(1);
+  });
+
+  it('Add GitHub Account… tells which account Devspaces uses now, or that it used it already', async () => {
+    const STUDENT: GitHubAccount = { id: '3003', login: 'student' };
+    h.auth.addAccount.mockResolvedValueOnce(STUDENT);
+    await run('addAccount');
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenLastCalledWith(ControllerTexts.accountAdded('student'));
+    h.auth.addAccount.mockResolvedValueOnce(OTHER_ACCOUNT);
+    await run('addAccount');
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenLastCalledWith(ControllerTexts.accountAlreadyUsed('someone'));
+    // Cancel: nothing.
+    await run('addAccount');
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('a link asks GitHub with each account and starts with the account of the highest permission', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    h.discovery.getRepository.mockImplementation(async (repository: string, token: string) =>
+      repository === 'acme/tool' ? repositoryInfo('acme/tool', { permission: token === OTHER_TOKEN ? 'MAINTAIN' : 'READ' }) : undefined,
+    );
+    await h.controller.openLink(link('acme/tool'));
+    expect(h.discovery.getRepository.mock.calls).toEqual([
+      ['acme/tool', 'gho_token'],
+      ['acme/tool', OTHER_TOKEN],
+    ]);
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/tool' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+
+    // GitHub shows the repository to no account: the message names both.
+    await h.controller.openLink(link('acme/secret'));
+    expect(warningMessages()).toContain(ControllerTexts.linkRepositoryNotFound('acme/secret', ['octo', 'someone']));
+  });
+
+  it('a link takes the account that GitHub shows the repository to, also with a lower permission elsewhere', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    h.discovery.getRepository.mockImplementation(async (repository: string, token: string) => (token === 'gho_token' ? repositoryInfo(repository, { permission: 'READ' }) : undefined));
+    await h.controller.openLink(link('octo/private'));
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'octo/private' }), expect.objectContaining({ account: ACCOUNT }));
+  });
+
+  it('a course link opens the repository of the login in its name with that account, never the account with more rights', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    // octo is an owner of the course organization (ADMIN on every repository of it); someone is the student.
+    h.discovery.getRepository.mockImplementation(async (repository: string, token: string) =>
+      repository === 'acme/task-someone' ? repositoryInfo(repository, { permission: token === OTHER_TOKEN ? 'WRITE' : 'ADMIN' }) : undefined,
+    );
+    await h.controller.openLink(courseLink('acme/task-<username>'));
+    expect(h.discovery.getRepository.mock.calls).toEqual([
+      ['acme/task-octo', 'gho_token'],
+      ['acme/task-someone', OTHER_TOKEN],
+    ]);
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/task-someone' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+    expect(h.logger.info).toHaveBeenCalledWith('The course link opens acme/task-someone for someone.');
+  });
+
+  it('a course link asks which repository to open when two accounts have one, and names all that it tried when none has one', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    h.discovery.getRepository.mockImplementation(async (repository: string) => repositoryInfo(repository));
+    fakeVscode.window.showQuickPick.mockImplementationOnce(async (items: Array<{ label: string; description: string }>) => {
+      expect(items.map((item) => [item.label, item.description])).toEqual([
+        ['acme/task-octo', 'octo'],
+        ['acme/task-someone', 'someone'],
+      ]);
+      return items[1];
+    });
+    await h.controller.openLink(courseLink('acme/task-<username>'));
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/task-someone' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+
+    h.discovery.getRepository.mockResolvedValue(undefined);
+    await h.controller.openLink(courseLink('acme/exam-<username>'));
+    expect(warningMessages()).toContain(ControllerTexts.courseRepositoriesNotFound('acme/exam-octo (octo), acme/exam-someone (someone)'));
+    expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('a course link asks only the account whose token GitHub rejected to sign in again; the other candidate still counts', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    h.discovery.getRepository.mockImplementation(async (repository: string, token: string) => {
+      if (token === 'gho_token') throw new GitHubApiError('Bad credentials', 401);
+      return repositoryInfo(repository);
+    });
+    await h.controller.openLink(courseLink('acme/task-<username>'));
+    expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
+    expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/task-someone' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+  });
+
+  it('closes the window of a devspace only when its own account leaves, not when another account leaves', async () => {
+    const env = devspace();
+    await h.registry.add(env);
+    await connectHere(env);
+    // someone signs out: the devspace of octo stays connected.
+    h.auth.accounts.mockResolvedValue([ACCOUNT]);
+    await h.controller.onSessionChanged();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    expect(tokenRemovals()).toBe(0);
+    // A new account never closes a window.
+    h.auth.accounts.mockResolvedValue([ACCOUNT, OTHER_ACCOUNT]);
+    await h.controller.onSessionChanged();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
+    // octo signs out: its window closes, and its token leaves the container.
+    h.auth.accounts.mockResolvedValue([OTHER_ACCOUNT]);
+    await h.controller.onSessionChanged();
+    await settle(() => h.connection.closeRemoteConnection.mock.calls.length > 0, 'the close of the connection');
+    expect(warningMessages()).toContain(Messages.otherAccountConnection('acme/api'));
+  });
+
+  it('lists and acts on the devspaces of both accounts, and never on one of an account that Devspaces does not use', async () => {
+    const STRANGER: GitHubAccount = { id: '4004', login: 'stranger' };
+    await h.registry.add(devspace());
+    await h.registry.add(devspace({ id: OTHER_ENV_ID, repository: 'acme/web', owner: OTHER_ACCOUNT, volumeName: 'web', containerName: 'web' }));
+    await h.registry.add(devspace({ id: '7c1d2e3f-0000-4000-8000-000000000009', repository: 'acme/hidden', owner: STRANGER, volumeName: 'hidden', containerName: 'hidden' }));
+    expect((await h.sidebar.availableDevspaces()).map((entry: Devspace) => entry.id)).toEqual([ENV_ID, OTHER_ENV_ID]);
+    await run('stop', row('acme/web', devspace({ id: OTHER_ENV_ID, repository: 'acme/web', owner: OTHER_ACCOUNT })));
+    expect(h.service.stop).toHaveBeenCalledWith(OTHER_ENV_ID);
   });
 });

@@ -7,7 +7,7 @@ import { ownerChoices, ownersFiltered, OwnerTexts, selectedOwners } from './owne
 
 describe('ownerChoices', () => {
   it('lists the account first, then its organizations in alphabetical order, and selects the owners of the setting', () => {
-    expect(ownerChoices({ viewerLogin: 'octo', organizations: ['zeta', 'Acme', 'beta'], owners: ['ACME', 'octo'] })).toEqual([
+    expect(ownerChoices({ accounts: [{ login: 'octo', organizations: ['zeta', 'Acme', 'beta'] }], owners: ['ACME', 'octo'] })).toEqual([
       { login: 'octo', label: 'octo', description: OwnerTexts.yourAccount, picked: true },
       { login: 'Acme', label: 'Acme', picked: true },
       { login: 'beta', label: 'beta', picked: false },
@@ -17,7 +17,7 @@ describe('ownerChoices', () => {
   });
 
   it('keeps the owners of the setting that are in neither list, selected, so that they can be removed', () => {
-    expect(ownerChoices({ viewerLogin: 'octo', organizations: ['acme'], owners: ['torvalds', ' Acme ', 'TORVALDS'] })).toEqual([
+    expect(ownerChoices({ accounts: [{ login: 'octo', organizations: ['acme'] }], owners: ['torvalds', ' Acme ', 'TORVALDS'] })).toEqual([
       { login: 'octo', label: 'octo', description: 'your account', picked: false },
       { login: 'acme', label: 'acme', picked: true },
       { login: 'torvalds', label: 'torvalds', description: OwnerTexts.fromSettings, picked: true },
@@ -28,9 +28,25 @@ describe('ownerChoices', () => {
     ['nothing selected when the setting is empty', [], []],
     ['an organization that is also the account is listed once', ['octo'], ['octo']],
   ])('%s', (_name, owners, picked) => {
-    const choices = ownerChoices({ viewerLogin: 'octo', organizations: ['OCTO', 'acme'], owners });
+    const choices = ownerChoices({ accounts: [{ login: 'octo', organizations: ['OCTO', 'acme'] }], owners });
     expect(choices.map((choice) => choice.login)).toEqual(['octo', 'acme']);
     expect(choices.filter((choice) => choice.picked).map((choice) => choice.login)).toEqual(picked);
+  });
+
+  it('lists every account, then the organizations of all of them once, each with the accounts that are members', () => {
+    const choices = ownerChoices({
+      accounts: [
+        { login: 'cat', organizations: ['Acme', 'cats'] },
+        { login: 'octo', organizations: ['acme', 'cat'] },
+      ],
+      owners: [],
+    });
+    expect(choices.map((choice) => [choice.login, choice.description])).toEqual([
+      ['cat', OwnerTexts.yourAccount],
+      ['octo', OwnerTexts.yourAccount],
+      ['Acme', 'member: cat, octo'],
+      ['cats', 'member: cat'],
+    ]);
   });
 });
 

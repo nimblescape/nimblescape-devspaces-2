@@ -17,6 +17,7 @@ import { DEFAULT_SETTINGS, SETTINGS_SECTION } from './settings';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 const OCTO: GitHubAccount = { id: '1001', login: 'octo' };
+const CAT: GitHubAccount = { id: '2002', login: 'cat' };
 
 interface Harness {
   deps: OwnerSelectorDeps;
@@ -28,6 +29,9 @@ interface Harness {
   viewerOrganizations: ReturnType<typeof vi.fn>;
   signIn: ReturnType<typeof vi.fn>;
   data: { value: DiscoveryData | undefined };
+  /** The accounts of Devspaces while signed in (OCTO by default) and the stored lists of the other accounts. */
+  accounts: { value: GitHubAccount[] };
+  lists: Map<string, DiscoveryData>;
 }
 
 function listOf(viewerLogin: string, organizations: string[]): DiscoveryData {
@@ -46,19 +50,21 @@ function harness(): Harness {
   const data = { value: listOf('octo', ['beta', 'acme']) as DiscoveryData | undefined };
   const viewerOrganizations = vi.fn(async () => ({ login: 'octo', organizations: ['from-github'] }));
   const signIn = vi.fn(async () => undefined);
+  const accounts = { value: [OCTO] };
+  const lists = new Map<string, DiscoveryData>();
   const deps: OwnerSelectorDeps = {
     auth: {
       isSignedIn: async () => signedIn.value,
-      getToken: async () => (signedIn.value ? 'gho_token' : undefined),
-      getAccount: async () => (signedIn.value ? OCTO : undefined),
+      accounts: async () => (signedIn.value ? accounts.value : []),
+      getToken: async (options) => (signedIn.value ? (options.account?.id === CAT.id ? 'gho_cat' : 'gho_token') : undefined),
     },
-    discoveryData: () => data.value,
+    accountList: (accountId) => (accountId === OCTO.id ? data.value : lists.get(accountId)),
     discovery: { viewerOrganizations },
     settings: () => settings,
     signIn,
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() },
   };
-  return { deps, settings, update, workspaceOwners, signedIn, viewerOrganizations, signIn, data };
+  return { deps, settings, update, workspaceOwners, signedIn, viewerOrganizations, signIn, data, accounts, lists };
 }
 
 interface PickItem {
@@ -142,6 +148,25 @@ describe('selectOwners (Select Organizations…)', () => {
     expect(lastPick().items.map((item) => item.label)).toEqual(['octo', 'from-github']);
   });
 
+  it('offers the logins and the organizations of all accounts of Devspaces, each organization with its members', async () => {
+    h.accounts.value = [CAT, OCTO];
+    h.lists.set(CAT.id, listOf('cat', ['acme', 'cats']));
+    await selectOwners(h.deps);
+    expect(lastPick().items.map((item) => [item.label, item.description])).toEqual([
+      ['cat', 'your account'],
+      ['octo', 'your account'],
+      ['acme', OwnerTexts.memberOf(['cat', 'octo'])],
+      ['beta', 'member: octo'],
+      ['cats', 'member: cat'],
+    ]);
+    expect(h.viewerOrganizations).not.toHaveBeenCalled();
+
+    // An account without a list in the view: GitHub with its own token.
+    h.lists.clear();
+    await selectOwners(h.deps);
+    expect(h.viewerOrganizations).toHaveBeenCalledWith('gho_cat');
+  });
+
   it('still offers the account and the setting when GitHub cannot be asked', async () => {
     h.data.value = undefined;
     h.settings.owners = ['acme'];
@@ -205,6 +230,8 @@ describe('the filter icon of the view title bar', () => {
       [Commands.refresh, 'navigation@3'],
       // Expand All, before VS Code's own Collapse All.
       [Commands.expandAll, 'navigation@4'],
+      // Add GitHub Account… first in the "…" menu of the view, while an account is signed in.
+      [Commands.addAccount, '0_accounts@1'],
       // Edit Repository Groups… in the "…" menu of the view.
       [Commands.editRepositoryGroups, '1_settings@1'],
       // Update All Images Now in the "…" menu of the view; "Remove Devspaces from This Docker Engine…" last, in a group of

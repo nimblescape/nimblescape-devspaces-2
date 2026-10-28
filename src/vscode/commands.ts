@@ -9,6 +9,9 @@ export const Commands = {
   // Start in a new window, or (while the setting openInNewWindow is on) in the current window.
   startInNewWindow: 'devspaces.startInNewWindow',
   startInCurrentWindow: 'devspaces.startInCurrentWindow',
+  // A new devspace of another GitHub account of Devspaces, or its devspace (row context menu only, hidden in the Command
+  // Palette): on a row whose repository two or more accounts can access.
+  startWithAccount: 'devspaces.startWithAccount',
   stop: 'devspaces.stop',
   delete: 'devspaces.delete',
   rebuild: 'devspaces.rebuild',
@@ -21,6 +24,8 @@ export const Commands = {
   search: 'devspaces.search',
   showLog: 'devspaces.showLog',
   signIn: 'devspaces.signIn',
+  // Another GitHub account for Devspaces: the account picker of VS Code with "Sign in to another account".
+  addAccount: 'devspaces.addAccount',
   selectOwners: 'devspaces.selectOwners',
   /** The same command with the filled filter icon, for the view title bar while the setting `owners` is set. */
   selectOwnersFiltered: 'devspaces.selectOwnersFiltered',

@@ -134,7 +134,15 @@ export class DevspaceRegistry {
    * recently used one first).
    */
   async findForAccount(repository: string, accountId: string, dockerHost = '', source?: DevspaceSource): Promise<Devspace | undefined> {
-    const found = (await this.list()).filter((devspace) => isDevspaceOf(devspace, repository, accountId, dockerHost, source));
+    return this.findForAccounts(repository, [accountId], dockerHost, source);
+  }
+
+  /**
+   * findForAccount for several GitHub accounts (the accounts of Devspaces): the devspace of one of them that was used
+   * last.
+   */
+  async findForAccounts(repository: string, accountIds: readonly string[], dockerHost = '', source?: DevspaceSource): Promise<Devspace | undefined> {
+    const found = (await this.list()).filter((devspace) => accountIds.some((accountId) => isDevspaceOf(devspace, repository, accountId, dockerHost, source)));
     return found.sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt))[0];
   }
 

@@ -32,7 +32,7 @@ async function onAskOf(params: Record<string, unknown>) {
   const deps = { registry, sessionFiles: {}, ui: {}, auth: {}, credentials: {}, settings: () => ({}), windowId: 'w1', pid: 1, clock: { now: () => NOW }, isProcessAlive: () => true, logger: silentLogger } as unknown as HostSideDeps;
   const sent: OperationOptions[] = [];
   const channels = { flow: vi.fn(async (_t: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push(options), { added: 0 })) };
-  await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, extensionHostSide(deps), silentLogger)(OP_RECONCILE, params, {});
+  await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, (account) => extensionHostSide(deps, account), silentLogger)(OP_RECONCILE, params, {});
   const onAsk = sent[0].onAsk!;
   return { restore: (entries: unknown[]) => onAsk('record', { call: 'restore', args: [entries] }, new AbortController().signal), restored };
 }

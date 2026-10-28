@@ -103,6 +103,9 @@ export type OperationFlow = (
     // Only the operation `open`: the helper image maintenance of the preparation of its worker
     // (HelperChannelsOptions.prepare), when no worker of the engine is open yet.
     helperMaintenance?: HelperMaintenance;
+    // The GitHub account of the operation: the requests of the flow get the account, the token, the profile and the
+    // ghcr.io login of this account only (extensionHostSide). Missing: the flow belongs to no account.
+    account?: GitHubAccount;
   },
 ) => Promise<unknown>;
 
@@ -244,13 +247,16 @@ export class DevspaceOperations extends OperationBase {
     options: OpenOptions,
   ): Promise<OpenResult> {
     const { signal } = options;
-    const session = await this.requireSession();
+    // The account of the operation: the owner of an existing devspace, else the account that the extension chose for the
+    // first open. The worker gets the secrets of this account only.
+    const entry = 'devspaceId' in what && what.devspaceId !== undefined ? await this.deps.registry.get(what.devspaceId) : undefined;
+    if ('devspaceId' in what && what.devspaceId !== undefined && !entry) throw devspaceMissing(repository);
+    // A devspace of an account without a session here is refused before anything is sent (otherAccount while another
+    // account is signed in).
+    if (entry) await this.requireOwnAccount(entry, true);
+    const session = await this.requireSession(entry?.owner ?? options.account);
     // A devspace of another account is never sent.
-    if ('devspaceId' in what && what.devspaceId !== undefined) {
-      const entry = await this.deps.registry.get(what.devspaceId);
-      if (!entry) throw devspaceMissing(repository);
-      this.availableEntry(entry, session.account);
-    }
+    if (entry) this.availableEntry(entry, session.account);
     const steps = new StepReporter(options.progress, this.logger);
     await this.startDocker(steps, signal);
     this.throwIfCancelled(signal);
@@ -307,7 +313,7 @@ export class DevspaceOperations extends OperationBase {
     };
     let answer: unknown;
     try {
-      answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, signal, undefined, undefined, onProgress, helperMaintenance);
+      answer = await this.workerFlow({ repository }, OP_OPEN, params, OPEN_FLOW_TIMEOUT_MS, { signal, onProgress, helperMaintenance, account: session.account });
     } catch (error) {
       // The user cancelled a question of the open in the worker (the worker cleaned up through its requests, which were
       // answered): a cancel. Never a worker that ended the operation itself (its shutdown, a defect): its requests
@@ -451,21 +457,17 @@ export class DevspaceOperations extends OperationBase {
   /**
    * A flow in the worker, with the refusals of the lock: a lock held elsewhere is devspaceLockBusy, no worker (or no
    * helper image for it) is devspaceLockUnavailable, and nothing runs another way. Any other failure of the flow is
-   * thrown as it is.
+   * thrown as it is. `options`: the observers of the flow (OperationFlow), the progress and the helper image maintenance
+   * of the open, and the GitHub account of the operation.
    */
   private async workerFlow(
     env: Pick<Devspace, 'repository'>,
     op: string,
     params: unknown,
     timeoutMs: number,
-    signal?: AbortSignal,
-    onAnswer?: (call: string, args: unknown[], value: unknown) => void,
-    onQuestion?: (state: 'asked' | 'settled') => void,
-    // The progress of the flow (the open).
-    onProgress?: (step: string, detail?: string) => void,
-    // The helper image maintenance of the preparation of the worker (the open).
-    helperMaintenance?: HelperMaintenance,
+    options: Pick<Parameters<OperationFlow>[2], 'signal' | 'onAnswer' | 'onQuestion' | 'onProgress' | 'helperMaintenance' | 'account'> = {},
   ): Promise<unknown> {
+    const { signal, onAnswer, onQuestion, onProgress, helperMaintenance, account } = options;
     try {
       return await this.deps.flow(op, params, {
         signal,
@@ -474,6 +476,7 @@ export class DevspaceOperations extends OperationBase {
         ...(onQuestion ? { onQuestion } : {}),
         ...(onProgress ? { onProgress } : {}),
         ...(helperMaintenance ? { helperMaintenance } : {}),
+        ...(account ? { account } : {}),
       });
     } catch (error) {
       if (this.isCancellation(error, signal)) throw error;
@@ -535,7 +538,10 @@ export class DevspaceOperations extends OperationBase {
       const onQuestion = (state: 'asked' | 'settled') => {
         open += state === 'asked' ? 1 : -1;
       };
-      const value = parseDeleteCheckValue(await this.workerFlow(devspace, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, options.signal, onAnswer, onQuestion));
+      // The worker checks the devspace against the account of the operation: its owner.
+      const value = parseDeleteCheckValue(
+        await this.workerFlow(devspace, OP_DELETE_CHECK, params, DELETE_CHECK_FLOW_TIMEOUT_MS, { signal: options.signal, onAnswer, onQuestion, account: devspace.owner }),
+      );
       if (value === undefined) throw new Error(`The worker answered the check of the Delete of ${devspace.repository} with an invalid value.`);
       if ('refused' in value) throw refusalError(value.refused);
       if (value.decision === 'cancel') return value;
@@ -580,7 +586,7 @@ export class DevspaceOperations extends OperationBase {
         if (params === undefined) throw new Error(`The Delete of ${devspace.repository} cannot be sent to the worker.`);
         let answer: unknown;
         try {
-          answer = await this.workerFlow(devspace, OP_DELETE, params, DELETE_FLOW_TIMEOUT_MS, options.signal);
+          answer = await this.workerFlow(devspace, OP_DELETE, params, DELETE_FLOW_TIMEOUT_MS, { signal: options.signal, account: devspace.owner });
         } catch (error) {
           // A worker that ended without an answer (its channel lost, its time limit, a cancel) may have marked the
           // devspace busy for this window and could not clear it; this window clears its own mark (never the mark of

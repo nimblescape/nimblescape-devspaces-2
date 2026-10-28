@@ -215,6 +215,11 @@
         "icon": "$(play)"
       },
       {
+        "command": "devspaces.startWithAccount",
+        "title": "Start with Account…",
+        "category": "Devspaces"
+      },
+      {
         "command": "devspaces.stop",
         "title": "Stop",
         "category": "Devspaces",
@@ -271,6 +276,11 @@
       {
         "command": "devspaces.signIn",
         "title": "Sign in with GitHub",
+        "category": "Devspaces"
+      },
+      {
+        "command": "devspaces.addAccount",
+        "title": "Add GitHub Account…",
         "category": "Devspaces"
       },
       {
@@ -404,6 +414,10 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "devspaces.startWithAccount",
+          "when": "false"
+        },
+        {
           "command": "devspaces.startInNewWindow",
           "when": "!config.devspaces.openInNewWindow"
         },
@@ -509,6 +523,11 @@
           "group": "navigation@4"
         },
         {
+          "command": "devspaces.addAccount",
+          "when": "view == devspaces.repositories && devspaces.signedIn",
+          "group": "0_accounts@1"
+        },
+        {
           "command": "devspaces.editRepositoryGroups",
           "when": "view == devspaces.repositories",
           "group": "1_settings@1"
@@ -554,6 +573,11 @@
           "command": "devspaces.startInCurrentWindow",
           "when": "view == devspaces.repositories && viewItem =~ /canStart/ && config.devspaces.openInNewWindow",
           "group": "1_actions@2"
+        },
+        {
+          "command": "devspaces.startWithAccount",
+          "when": "view == devspaces.repositories && viewItem =~ /;canStartWithAccount(;|$)/",
+          "group": "1_actions@3"
         },
         {
           "command": "devspaces.stop",
@@ -611,6 +635,11 @@
           "command": "devspaces.startInCurrentWindow",
           "when": "viewItem =~ /canStart/ && config.devspaces.openInNewWindow",
           "group": "0_start@1"
+        },
+        {
+          "command": "devspaces.startWithAccount",
+          "when": "viewItem =~ /;canStartWithAccount(;|$)/",
+          "group": "0_start@2"
         },
         {
           "command": "devspaces.keepRunning",

@@ -945,7 +945,7 @@ describe('buildTreeModel', () => {
     });
     const groups = buildTreeModel(input({ discovery: discovery([repo('acme/api')]), devspaces: [env] }));
     expect(row(groups, 'acme/api').tooltip).toBe(
-      ['acme/api', 'Source: the configuration .devcontainer/devcontainer.json', 'Stopped · 3 unpushed', 'Branch: main', 'Last used: T(2026-09-24T17:10:00.000Z)'].join('\n'),
+      ['acme/api', 'Source: the configuration .devcontainer/devcontainer.json', 'Stopped · 3 unpushed', 'Account: me', 'Branch: main', 'Last used: T(2026-09-24T17:10:00.000Z)'].join('\n'),
     );
   });
 
@@ -1861,5 +1861,88 @@ describe('Keep Running When Closed in the sidebar', () => {
     expect(flags(row(groups, 'acme/api').contextValue)).toContain('canCloseAndKeepRunning');
     expect(flags(row(groups, 'acme/web').contextValue)).not.toContain('canCloseAndKeepRunning');
     expect(contextValue(rowActions('connected', repo('acme/api')), 'on', false, true).split(';').at(-1)).toBe('canCloseAndKeepRunning');
+  });
+});
+
+describe('several GitHub accounts in the sidebar', () => {
+  const ME = { id: '1001', login: 'me' };
+  const STUDENT = { id: '2002', login: 'student' };
+  /** The merged list of both accounts (mergeDiscovery): acme/api for both, acme/web for ME only. */
+  const merged = () =>
+    discovery(
+      [
+        repo('acme/api', { access: [{ account: ME, permission: 'ADMIN' }, { account: STUDENT, permission: 'WRITE' }] }),
+        repo('acme/web', { access: [{ account: ME, permission: 'READ' }] }),
+      ],
+      { accounts: [{ account: ME, organizations: ['acme'] }, { account: STUDENT, organizations: [] }] },
+    );
+
+  it('shows the login of the owner in the description of a devspace row only with more than one account; the tooltip always names it', () => {
+    const one = buildTreeModel(input({ discovery: merged(), accounts: [ME], devspaces: [devspace('a', 'acme/api')] }));
+    expect(row(one, 'acme/api').description.startsWith('main')).toBe(true);
+    expect(row(one, 'acme/api').tooltip).toContain(TreeTexts.account('me', 'admin'));
+
+    const two = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/api')] }));
+    expect(row(two, 'acme/api').description.startsWith('@me main')).toBe(true);
+    expect(row(two, 'acme/api').tooltip).toContain(TreeTexts.account('me', 'admin'));
+  });
+
+  it('gives the devspaces of two accounts of one source a row each, with its login and a unique ID', () => {
+    const groups = buildTreeModel(
+      input({
+        discovery: merged(),
+        accounts: [ME, STUDENT],
+        devspaces: [devspace('mine', 'acme/api', { lastUsedAt: iso(T0 - 1000) }), devspace('theirs', 'acme/api', { owner: STUDENT, lastUsedAt: iso(T0) })],
+      }),
+    );
+    const mine = findRowByDevspaceId(groups, 'mine');
+    const theirs = findRowByDevspaceId(groups, 'theirs');
+    expect(theirs?.description.startsWith('@student ')).toBe(true);
+    expect(mine?.description.startsWith('@me ')).toBe(true);
+    expect(theirs?.tooltip).toContain(TreeTexts.account('student', 'write'));
+    expect(new Set([mine?.id, theirs?.id]).size).toBe(2);
+  });
+
+  it('names the current login of an account after a rename on GitHub, and the recorded one of an owner without account', () => {
+    const groups = buildTreeModel(
+      input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/api', { owner: { id: '1001', login: 'old-name' } })] }),
+    );
+    expect(row(groups, 'acme/api').description.startsWith('@me ')).toBe(true);
+    const restored = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/api', { owner: { id: '1001', login: '' } })] }));
+    expect(row(restored, 'acme/api').description.startsWith('@me ')).toBe(true);
+  });
+
+  it('names the account that Start uses in the tooltip of a row without devspace (the highest permission)', () => {
+    const groups = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT] }));
+    expect(row(groups, 'acme/api').tooltip).toContain(TreeTexts.account('me', 'admin'));
+    expect(row(groups, 'acme/web').tooltip).toContain(TreeTexts.account('me', 'read'));
+    // Without the access of the merged list (a list of an older version), no account is named.
+    const old = buildTreeModel(input({ discovery: discovery([repo('acme/api')]), accounts: [ME] }));
+    expect(row(old, 'acme/api').tooltip).not.toContain('Account:');
+  });
+
+  it('offers Start with Account… only where two or more accounts can access the repository', () => {
+    const groups = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/web')] }));
+    expect(flags(row(groups, 'acme/api').contextValue)).toContain('canStartWithAccount');
+    expect(flags(row(groups, 'acme/web').contextValue)).not.toContain('canStartWithAccount');
+    // An account that Devspaces does not use anymore does not count.
+    const one = buildTreeModel(input({ discovery: merged(), accounts: [ME] }));
+    expect(flags(row(one, 'acme/api').contextValue)).not.toContain('canStartWithAccount');
+    // The devspace row of a repository that both can access offers it too: it creates the devspace of the other account.
+    const withDevspace = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/api')] }));
+    expect(flags(row(withDevspace, 'acme/api').contextValue)).toContain('canStartWithAccount');
+  });
+
+  it('shows a hint of an organization that refuses one account per account, with its login', () => {
+    const hints = [
+      { organization: 'acme', kind: 'saml' as const, url: 'https://github.com/orgs/acme/sso', login: 'student' },
+      { organization: 'acme', kind: 'saml' as const, url: 'https://github.com/orgs/acme/sso', login: 'me' },
+    ];
+    const groups = buildTreeModel(input({ discovery: discovery([repo('acme/api')], { hints }), accounts: [ME, STUDENT] }));
+    const shown = groups.flatMap((group) => group.children).filter((child): child is HintRow => child.kind === 'hint');
+    expect(shown.map((hint) => [hint.id, hint.label])).toEqual([
+      ['hint:acme:me', Messages.organizationRefusesAccount('acme', 'me')],
+      ['hint:acme:student', Messages.organizationRefusesAccount('acme', 'student')],
+    ]);
   });
 });

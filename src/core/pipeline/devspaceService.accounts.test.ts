@@ -108,8 +108,8 @@ describe('two GitHub accounts open the same repository', () => {
     const second = (await h.service.open(TARGET, options())).devspace;
 
     const entries = await h.registry.list();
-    expect(availableDevspaces(entries, ACCOUNT).map((entry) => entry.id)).toEqual([first.id]);
-    expect(availableDevspaces(entries, OTHER_ACCOUNT).map((entry) => entry.id)).toEqual([second.id]);
+    expect(availableDevspaces(entries, [ACCOUNT]).map((entry) => entry.id)).toEqual([first.id]);
+    expect(availableDevspaces(entries, [OTHER_ACCOUNT]).map((entry) => entry.id)).toEqual([second.id]);
     expect((await h.registry.findForAccount(REPO, ACCOUNT.id))?.id).toBe(first.id);
     expect((await h.registry.findForAccount(REPO, OTHER_ACCOUNT.id))?.id).toBe(second.id);
 
