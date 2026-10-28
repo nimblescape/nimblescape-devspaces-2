@@ -666,13 +666,20 @@ export class Sidebar implements vscode.Disposable {
     }
     let rateLimited = false;
     let failed = false;
+    let refreshed = false;
     for (const account of accounts) {
       if (this.disposed || changes !== this.accountChanges) break;
       const state = this.lists.get(account.id);
       // Token and account of one session: the list is stored for the account.
       const session = state === undefined ? undefined : await this.readSession(account);
       // Security: only a session of this account gives its list (stored under its ID).
-      if (state === undefined || session?.account.id !== account.id || !(await this.authSignedIn(account))) continue;
+      if (state === undefined || session?.account.id !== account.id) continue;
+      if (!(await this.authSignedIn(account))) {
+        // GitHub rejected its token (also in a request outside this view): while another account keeps the view signed
+        // in, only this offer says that the list of this account is not updated.
+        this.offerSignInAgain(account);
+        continue;
+      }
       const outcome = await this.refreshAccount(state, session.token, { afterRateLimit, byUser });
       if (outcome === 'rateLimited') {
         rateLimited = true;
@@ -680,8 +687,10 @@ export class Sidebar implements vscode.Disposable {
         byUser = false;
       }
       if (outcome === 'failed') failed = true;
+      if (outcome === 'refreshed') refreshed = true;
     }
-    if (!rateLimited) this.clearRateLimitRetry();
+    // The refresh after a rate limit is no longer needed only when the lists loaded (a failed refresh keeps it).
+    if (refreshed && !rateLimited && !failed) this.clearRateLimitRetry();
     // Without any list, the view says that the list could not be loaded (not that no repository was found).
     this.setLoadFailed(failed && !this.hasList());
     if (changes === this.accountChanges && !this.disposed) {
@@ -811,8 +820,9 @@ export class Sidebar implements vscode.Disposable {
   private async lookUpUnlisted(): Promise<Map<string, RepositoryInfo | null>> {
     const result = new Map<string, RepositoryInfo | null>();
     const listed = listedRepositories(this.data);
+    const available = await this.availableDevspaces();
     for (const account of this.accounts) {
-      const devspaces = (await this.availableDevspaces()).filter((devspace) => devspace.owner.id === account.id);
+      const devspaces = available.filter((devspace) => devspace.owner.id === account.id);
       // GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
       const repositories = repositoriesToLookUp(devspaces, listed, this.deps.settings().owners).filter((repository) => !result.has(repositoryKey(repository)));
       if (repositories.length === 0 || this.disposed || !(await this.authSignedIn(account))) continue;

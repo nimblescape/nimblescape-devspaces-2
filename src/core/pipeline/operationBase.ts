@@ -270,8 +270,9 @@ export function devspaceBusy(repository: string, mark: BusyMark): UserFacingErro
   );
 }
 
-export function otherAccount(repository: string): UserFacingError {
-  return new UserFacingError('otherAccount', Messages.otherAccount(repository));
+/** `login`: the login of the owner account, when the message may name it (Messages.otherAccount). */
+export function otherAccount(repository: string, login?: string): UserFacingError {
+  return new UserFacingError('otherAccount', Messages.otherAccount(repository, login));
 }
 
 /** Waits for `promise`; rejects with an AbortError when `signal` aborts first. */
@@ -417,8 +418,8 @@ export abstract class OperationBase {
       this.availableEntry(devspace, account);
       return;
     }
-    // Another account is signed in, but not the owner.
-    if (await this.deps.auth.getAccount({ interactive: false })) throw otherAccount(devspace.repository);
+    // Another account is signed in, but not the owner: the message names the owner.
+    if (await this.deps.auth.getAccount({ interactive: false })) throw otherAccount(devspace.repository, devspace.owner.login);
     throw new UserFacingError('signInRequired', Messages.signInRequired);
   }
 

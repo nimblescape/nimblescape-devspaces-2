@@ -1029,6 +1029,23 @@ describe('Sidebar progressive display', () => {
       expect(h.discovery.refresh).toHaveBeenCalledTimes(4);
     });
 
+    it('keeps the planned refresh when a refresh before its time fails for another reason', async () => {
+      let fail: (error: unknown) => void = () => undefined;
+      h.discovery.refresh
+        .mockImplementationOnce(() => new Promise<DiscoveryData>((_resolve, reject) => (fail = reject)))
+        .mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND api.github.com'))
+        .mockResolvedValue(data([info('acme/api')]));
+      await h.sidebar.initialize();
+      await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
+      fail(limitedUntil(resetAt));
+      await h.sidebar.refreshDiscovery();
+      // An automatic refresh without internet access.
+      await h.sidebar.refreshDiscovery({ again: true });
+      expect(h.discovery.refresh).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(plannedAt(resetAt) - NOW);
+      await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(3));
+    });
+
     it('names the time again when GitHub refuses a Refresh of the user, but not when it refuses an automatic refresh', async () => {
       const earlier = resetAt - 15 * 60_000;
       let fail: (error: unknown) => void = () => undefined;
@@ -1479,6 +1496,17 @@ describe('Sidebar with several GitHub accounts', () => {
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(String(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0])).toContain('octo');
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('The repository list of octo could not be updated. The stored list is shown.'));
+  });
+
+  it('does not refresh an account whose token GitHub rejected in another request, and offers its new sign-in once', async () => {
+    h.auth.isSignedIn.mockImplementation(async (account?: GitHubAccount) => account?.id !== OCTO.id);
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) => (accountId === OTHER.id ? ofOther([info('school/task')]) : data([])));
+    await signedIn();
+    expect(h.discovery.refresh.mock.calls.map((call) => call[1])).toEqual([OTHER.id]);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(String(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0])).toContain('octo');
+    await h.sidebar.refreshDiscovery({ again: true });
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
   });
 
   it('asks GitHub about the repository of a devspace that no list has with the token of its owner', async () => {

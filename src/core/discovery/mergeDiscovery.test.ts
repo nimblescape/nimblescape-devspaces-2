@@ -119,6 +119,18 @@ describe('mergeDiscovery', () => {
     expect(merged?.hints).toEqual([notFound('gone')]);
   });
 
+  it('says that an owner is not found only when a first load that still runs says so too', () => {
+    const notFound: OrganizationHint = { organization: 'school', kind: 'notFound', url: 'https://github.com/school' };
+    const lists = (partialHints: OrganizationHint[]) =>
+      mergeDiscovery([
+        { account: SCALARION, data: data(SCALARION, { hints: [notFound] }) },
+        { account: STAUSSH, data: data(STAUSSH, { repositories: [info('school/task')], hints: partialHints }), partial: true },
+      ]);
+    // The first load of staussh shows a repository of the owner: the owner is not "not found".
+    expect(lists([])?.hints).toEqual([]);
+    expect(lists([notFound])?.hints).toEqual([notFound]);
+  });
+
   it('shows the repositories of a first load that still runs, but neither its account nor its hints', () => {
     const merged = mergeDiscovery([
       { account: SCALARION, data: data(SCALARION, { organizations: ['acme'], repositories: [info('acme/api')] }) },
