@@ -21,7 +21,7 @@ import { Actions, Messages, formatChanges, listSome } from '../core/messages';
 import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { VSCODE_STORE_VOLUME, repositoryFolder, splitRepository } from '../core/names';
-import { chooseAccount, listedCandidates, permissionText, rankAccounts, type AccountCandidate } from '../core/accountChoice';
+import { candidateOf, chooseAccount, listedCandidates, permissionText, rankAccounts, type AccountCandidate } from '../core/accountChoice';
 import { availableDevspaces, ownerAmong } from '../core/ownership';
 import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core/ports';
 import type { DevspaceOperations } from '../core/pipeline/devspaceOperations';
@@ -1936,15 +1936,12 @@ export class Controller implements vscode.Disposable {
     const listed = this.deps.sidebar.repositoryInfo(repository);
     if (listed) return { repository, info: listed };
     const listings = this.deps.sidebar.accountListings();
-    const results: Array<{ account: GitHubAccount } & LookUpResult> = [];
-    for (const account of accounts) results.push({ account, ...(await this.lookUpWithRenewal(repository, account)) });
+    const looked = await this.lookUpWithRenewal(accounts.map((account) => ({ repository, account })));
+    const results = accounts.map((account, index) => ({ account, ...looked[index] }));
     const found = results.flatMap((result) => (result.info !== undefined ? [{ account: result.account, info: result.info }] : []));
     const first = found[0];
     if (first !== undefined) {
-      const candidates = found.map(({ account, info }): AccountCandidate => {
-        const organizations = listings.find((listing) => listing.account.id === account.id)?.organizations;
-        return { account, ...(info.permission !== undefined ? { permission: info.permission } : {}), ...(organizations !== undefined ? { organizations } : {}) };
-      });
+      const candidates = found.map(({ account, info }) => candidateOf(account, info.permission, listings));
       return { repository, info: first.info, candidates };
     }
     if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
@@ -1964,6 +1961,7 @@ export class Controller implements vscode.Disposable {
    */
   private async courseLinkRepository(template: string, accounts: readonly GitHubAccount[]): Promise<LinkRepository | undefined> {
     const results: Array<{ account: GitHubAccount; repository: string } & LookUpResult> = [];
+    const unlisted: Array<{ account: GitHubAccount; repository: string }> = [];
     for (const account of accounts) {
       const repository = courseRepository(template, account.login);
       if (repository === undefined) {
@@ -1977,8 +1975,12 @@ export class Controller implements vscode.Disposable {
         results.push({ account, repository, info: listed });
         continue;
       }
-      results.push({ account, repository, ...(await this.lookUpWithRenewal(repository, account)) });
+      unlisted.push({ account, repository });
     }
+    const looked = await this.lookUpWithRenewal(unlisted);
+    results.push(...unlisted.map((request, index) => ({ ...request, ...looked[index] })));
+    // In the order of the accounts, as the Quick Pick below shows them.
+    results.sort((a, b) => accounts.indexOf(a.account) - accounts.indexOf(b.account));
     if (results.length === 0) {
       this.warn(ControllerTexts.courseLinkInvalidForLogin(accounts.map((account) => account.login)));
       return undefined;
@@ -2010,14 +2012,18 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * lookUpRepository; when GitHub rejects the token of `account` (HTTP 401), only that account is asked to sign in
-   * again (renewToken), and GitHub is asked once more with its new token.
+   * lookUpRepository for each request (a repository and an account), all at the same time; when GitHub rejects the
+   * token of an account (HTTP 401), only that account is asked to sign in again (renewToken, one dialog after the
+   * other), and GitHub is asked once more with its new token. The results are in the order of `requests`.
    */
-  private async lookUpWithRenewal(repository: string, account: GitHubAccount): Promise<LookUpResult> {
-    const looked = await this.lookUpRepository(repository, account);
-    if (looked.failure !== 'rejected') return looked;
-    const token = await this.deps.auth.renewToken(account);
-    return token === undefined ? looked : this.lookUpRepository(repository, account, token);
+  private async lookUpWithRenewal(requests: ReadonlyArray<{ repository: string; account: GitHubAccount }>): Promise<LookUpResult[]> {
+    const results = await Promise.all(requests.map(({ repository, account }) => this.lookUpRepository(repository, account)));
+    for (const [index, { repository, account }] of requests.entries()) {
+      if (results[index]?.failure !== 'rejected') continue;
+      const token = await this.deps.auth.renewToken(account);
+      if (token !== undefined) results[index] = await this.lookUpRepository(repository, account, token);
+    }
+    return results;
   }
 
   /**
@@ -3686,13 +3692,12 @@ export class Controller implements vscode.Disposable {
     const listings = this.deps.sidebar.accountListings();
     const listed = listedCandidates(info, accounts, listings);
     if (listed.length > 0 || accounts.length <= 1) return listed.length > 0 ? listed : accounts.map((account) => ({ account }));
-    const found: AccountCandidate[] = [];
-    for (const account of accounts) {
-      const looked = await this.lookUpRepository(repository, account);
-      if (looked.info === undefined) continue;
-      const organizations = listings.find((listing) => listing.account.id === account.id)?.organizations;
-      found.push({ account, ...(looked.info.permission !== undefined ? { permission: looked.info.permission } : {}), ...(organizations !== undefined ? { organizations } : {}) });
-    }
+    // The accounts are asked at the same time (no dialog: a rejected token counts as no access here).
+    const looked = await Promise.all(accounts.map((account) => this.lookUpRepository(repository, account)));
+    const found = accounts.flatMap((account, index) => {
+      const info = looked[index]?.info;
+      return info === undefined ? [] : [candidateOf(account, info.permission, listings)];
+    });
     return found.length > 0 ? found : accounts.map((account) => ({ account }));
   }
 

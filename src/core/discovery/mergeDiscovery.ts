@@ -25,7 +25,8 @@ export interface AccountList {
  *   `lists`); a repository with a configuration in one list is one with a configuration;
  * - the organizations of all accounts;
  * - an organization that refuses an account once per account, with the login of the account when there are several
- *   lists; an owner of the scan scope counts as not found only when every list says so (no account sees it);
+ *   lists; an owner of the scan scope counts as not found only when every list says so (no account sees it), also a
+ *   first load that still runs;
  * - `accounts`: the accounts of the complete lists, with their organizations.
  * The lists must have the same scan scope (the sidebar shows no list of another scope).
  */
@@ -66,7 +67,7 @@ export function mergeDiscovery(lists: readonly AccountList[]): DiscoveryData | u
     viewerLogin: first.data.viewerLogin,
     organizations: unique(lists.flatMap((list) => list.data.organizations)),
     repositories: [...withConfiguration.values()],
-    hints: mergedHints(complete, several),
+    hints: mergedHints(complete, lists, several),
     scope: [...first.data.scope],
     withoutConfiguration: [...withoutConfiguration.values()],
     ...(uncertain.length > 0 ? { uncertain } : {}),
@@ -74,8 +75,11 @@ export function mergeDiscovery(lists: readonly AccountList[]): DiscoveryData | u
   };
 }
 
-/** The hints of the complete lists (see mergeDiscovery). */
-function mergedHints(lists: readonly AccountList[], several: boolean): OrganizationHint[] {
+/**
+ * The hints of the complete lists (see mergeDiscovery). An owner counts as not found only when each of `all` (also a
+ * first load that still runs, which may show repositories of that owner) says so.
+ */
+function mergedHints(lists: readonly AccountList[], all: readonly AccountList[], several: boolean): OrganizationHint[] {
   const hints: OrganizationHint[] = [];
   const seen = new Set<string>();
   for (const { account, data } of lists) {
@@ -83,7 +87,7 @@ function mergedHints(lists: readonly AccountList[], several: boolean): Organizat
       const organization = hint.organization.toLowerCase();
       if (hint.kind === 'notFound') {
         // Not found only when no account sees the owner.
-        const everywhere = lists.every((list) => list.data.hints.some((other) => other.kind === 'notFound' && other.organization.toLowerCase() === organization));
+        const everywhere = all.every((list) => list.data.hints.some((other) => other.kind === 'notFound' && other.organization.toLowerCase() === organization));
         const key = `notFound ${organization}`;
         if (!everywhere || seen.has(key)) continue;
         seen.add(key);

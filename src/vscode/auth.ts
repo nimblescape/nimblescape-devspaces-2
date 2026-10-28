@@ -52,8 +52,12 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   private readonly rejected = new Map<string, RejectedSession>();
   /** The accounts of Devspaces, read once after each change of the sessions (`accounts`). */
   private accountSet: Promise<GitHubAccount[]> | undefined;
-  /** The IDs of the accounts of the last read of the set: a dialog that changed the set fires onDidChangeSession. */
-  private knownAccounts: string | undefined;
+  /**
+   * The IDs of the accounts that onDidChangeSession reported last (before any change: of the first read of the set). A
+   * dialog fires onDidChangeSession only for another set, so that a change that VS Code reported itself (a new session)
+   * is not reported twice.
+   */
+  private reportedAccounts: string | undefined;
 
   /**
    * Fires when the GitHub sessions of VS Code change (sign-in, sign-out, account change), and when a sign-in dialog of
@@ -73,7 +77,11 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
       vscode.authentication.onDidChangeSessions((event) => {
         if (event.provider.id !== GITHUB_PROVIDER_ID) return;
         this.accountSet = undefined;
-        this.updateContextKey()
+        this.accounts()
+          .then((accounts) => {
+            this.reportedAccounts = accountIds(accounts);
+            return this.updateContextKey();
+          })
           .then(undefined, (error: unknown) => this.logger.warn(`Could not update the sign-in state: ${errorMessage(error)}`))
           .finally(() => this.changeEmitter.fire());
       }),
@@ -90,17 +98,10 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
       const read = this.readAccounts();
       this.accountSet = read;
       void read.then((accounts) => {
-        if (this.accountSet === read) this.knownAccounts = accountIds(accounts);
+        if (this.accountSet === read) this.reportedAccounts ??= accountIds(accounts);
       });
     }
     return this.accountSet;
-  }
-
-  /** The accounts of Devspaces whose token GitHub did not reject (isSignedIn). Never shows a dialog. */
-  async signedInAccounts(): Promise<GitHubAccount[]> {
-    const accounts = await this.accounts();
-    const signedIn = await Promise.all(accounts.map((account) => this.isSignedIn(account)));
-    return accounts.filter((_, index) => signedIn[index]);
   }
 
   /**
@@ -362,14 +363,17 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
 
   /**
    * A sign-in dialog ended with a session: the accounts are read again. VS Code fires no change of the sessions when the
-   * user only allowed an existing session for Devspaces, so a changed set of accounts fires onDidChangeSession here.
+   * user only allowed an existing session for Devspaces, so a changed set of accounts fires onDidChangeSession here,
+   * unless the change of the sessions that VS Code fired for a new session reported that set already.
    */
   private afterDialog(): void {
-    const before = this.knownAccounts;
+    const first = this.reportedAccounts === undefined;
     this.accountSet = undefined;
     void this.accounts()
       .then(async (accounts) => {
-        if (before !== undefined && accountIds(accounts) === before) return;
+        const ids = accountIds(accounts);
+        if (!first && ids === this.reportedAccounts) return;
+        this.reportedAccounts = ids;
         await this.updateContextKey();
         this.changeEmitter.fire();
       })

@@ -68,10 +68,15 @@ export function listedCandidates(
   for (const access of info?.access ?? []) {
     const account = accounts.find((each) => each.id === access.account.id);
     if (account === undefined || candidates.some((candidate) => candidate.account.id === account.id)) continue;
-    const organizations = listings.find((listing) => listing.account.id === account.id)?.organizations;
-    candidates.push({ account, ...(access.permission !== undefined ? { permission: access.permission } : {}), ...(organizations !== undefined ? { organizations } : {}) });
+    candidates.push(candidateOf(account, access.permission, listings));
   }
   return candidates;
+}
+
+/** The candidate `account` with its permission on the repository and the organizations of its list (`listings`). */
+export function candidateOf(account: GitHubAccount, permission: RepositoryPermission | undefined, listings: readonly AccountListing[]): AccountCandidate {
+  const organizations = listings.find((listing) => listing.account.id === account.id)?.organizations;
+  return { account, ...(permission !== undefined ? { permission } : {}), ...(organizations !== undefined ? { organizations } : {}) };
 }
 
 /** The account that a Start of a new devspace uses (rules 4 to 7) among `candidates`; `undefined` without one. */

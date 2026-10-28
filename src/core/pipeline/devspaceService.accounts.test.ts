@@ -124,7 +124,10 @@ describe('two GitHub accounts open the same repository', () => {
     expect(h.docker.containersOf(first.id).map((container) => container.id)).toContain(h.docker.tokenWrites().at(-1)?.container);
     // Only an explicit reference to the devspace of the other account is refused.
     expect((await rejection(h.service.openDevspace(second.id, options()))).code).toBe('otherAccount');
-    expect((await rejection(h.operations.stop(second.id))).code).toBe('otherAccount');
+    const refused = await rejection(h.operations.stop(second.id));
+    expect(refused.code).toBe('otherAccount');
+    // The message names the owner account, which is not signed in.
+    expect(refused.message).toBe(Messages.otherAccount(REPO, OTHER_ACCOUNT.login));
   });
 
   it('creates a devspace of the account when another window created one of another account in the meantime', async () => {

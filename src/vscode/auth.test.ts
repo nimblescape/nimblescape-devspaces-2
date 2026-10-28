@@ -228,7 +228,6 @@ describe('VsCodeGitHubAuth', () => {
       await vi.waitFor(async () => expect(await auth.isSignedIn({ id: '2', login: 'cat' })).toBe(false));
       await expect(auth.isSignedIn({ id: '1', login: 'octocat' })).resolves.toBe(true);
       await expect(auth.isSignedIn()).resolves.toBe(true);
-      await expect(auth.signedInAccounts()).resolves.toEqual([{ id: '1', login: 'octocat' }]);
       auth.dispose();
     });
 
@@ -253,6 +252,29 @@ describe('VsCodeGitHubAuth', () => {
         { id: '2', login: 'cat' },
         { id: '1', login: 'octocat' },
       ]);
+      auth.dispose();
+    });
+
+    it('reports a new account of a dialog once when VS Code reports its new session too', async () => {
+      fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO]);
+      getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { account?: { id: string }; silent?: boolean }) =>
+        options.silent === true && options.account?.id === OCTO.id ? sessionOf(OCTO, 'gho_octo') : undefined,
+      );
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      const changes = vi.fn();
+      auth.onDidChangeSession(changes);
+      await expect(auth.accounts()).resolves.toEqual([{ id: '1', login: 'octocat' }]);
+      // The dialog creates a session of CAT: VS Code fires its change of the sessions before the dialog returns.
+      getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { account?: { id: string }; silent?: boolean }) => {
+        if (options.silent === true) return options.account?.id === CAT.id ? sessionOf(CAT, 'gho_cat') : options.account?.id === OCTO.id ? sessionOf(OCTO, 'gho_octo') : undefined;
+        fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO, CAT]);
+        fakeVscode.fireSessionChange('github');
+        return sessionOf(CAT, 'gho_cat');
+      });
+      await expect(auth.addAccount()).resolves.toEqual({ id: '2', login: 'cat' });
+      await vi.waitFor(() => expect(changes).toHaveBeenCalledTimes(1));
+      await flush();
+      expect(changes).toHaveBeenCalledTimes(1);
       auth.dispose();
     });
   });
