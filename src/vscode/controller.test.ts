@@ -7163,7 +7163,7 @@ describe('A link to Devspaces', () => {
     h.sidebar.infos.set('acme/api', repositoryInfo('acme/api', { configPaths: ['.devcontainer/devcontainer.json', '.devcontainer/python/devcontainer.json'] }));
     h.settings.defaultImage = DEFAULT_IMAGE;
     await h.controller.openLink(link('acme/api'));
-    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.linkStartConfirm('acme/api'), { modal: true }, Actions.open, ControllerTexts.openAndDontAskAgain);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.linkStartConfirm('acme/api'), { modal: true }, Actions.open, ControllerTexts.alwaysOpen);
     // The user answered the question of the link: the pipeline asks no question of its own (trusted).
     expect(h.service.openInWorker).toHaveBeenLastCalledWith(expect.objectContaining({ repository: 'acme/api', trusted: true }), expect.objectContaining({ source: DEFAULT_SOURCE }));
     h.settings.startWithDefaultImage = false;
@@ -7188,7 +7188,7 @@ describe('A link to Devspaces', () => {
     expect(h.connection.openInNewWindow).not.toHaveBeenCalled();
   });
 
-  describe('Open and Don\'t Ask Again', () => {
+  describe('Always Open', () => {
     /** The user settings of the section devspaces: the writes. */
     function userSettings(): { update: ReturnType<typeof vi.fn> } {
       const configuration = { update: vi.fn(async () => undefined) };
@@ -7199,7 +7199,7 @@ describe('A link to Devspaces', () => {
     it('opens, and turns off the question of the link in the user settings', async () => {
       const settings = userSettings();
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
-      fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? ControllerTexts.openAndDontAskAgain : undefined));
+      fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? ControllerTexts.alwaysOpen : undefined));
       await h.controller.openLink(link('acme/api'));
       expect(fakeVscode.workspace.getConfiguration).toHaveBeenCalledWith(SETTINGS_SECTION);
       expect(settings.update).toHaveBeenCalledWith('confirmOpenFromLink', false, fakeVscode.ConfigurationTarget.Global);
@@ -7221,7 +7221,7 @@ describe('A link to Devspaces', () => {
       const settings = userSettings();
       settings.update.mockRejectedValue(new Error('settings.json is read-only'));
       h.sidebar.infos.set('acme/api', repositoryInfo('acme/api'));
-      fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? ControllerTexts.openAndDontAskAgain : undefined));
+      fakeVscode.window.showWarningMessage.mockImplementation(async (message: string) => (isLinkQuestion(message) ? ControllerTexts.alwaysOpen : undefined));
       await h.controller.openLink(link('acme/api'));
       expect(h.logger.warn).toHaveBeenCalledWith('The setting confirmOpenFromLink could not be turned off, so the next link asks again: settings.json is read-only');
       expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
@@ -7260,7 +7260,7 @@ describe('A link to Devspaces', () => {
       const property = manifest.contributes.configuration.properties[`${SETTINGS_SECTION}.confirmOpenFromLink`];
       expect(property).toMatchObject({ type: 'boolean', default: true, scope: 'application' });
       expect(DEFAULT_SETTINGS.confirmOpenFromLink).toBe(true);
-      expect(property?.markdownDescription).toContain(`**${ControllerTexts.openAndDontAskAgain}**`);
+      expect(property?.markdownDescription).toContain(`**${ControllerTexts.alwaysOpen}**`);
     });
   });
 

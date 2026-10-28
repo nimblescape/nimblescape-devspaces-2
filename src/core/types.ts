@@ -416,7 +416,7 @@ export interface ExtensionSettings {
   /**
    * `confirmOpenFromLink`: a link to Devspaces asks before it creates a devspace of a repository of the account or of
    * one of its organizations (true, the default). False: such a link creates it without the question (the button
-   * "Open and Don't Ask Again" of the question writes false); a repository of another owner is always confirmed. Only
+   * "Always Open" of the question writes false); a repository of another owner is always confirmed. Only
    * the user setting counts (scope `application`).
    */
   confirmOpenFromLink?: boolean;
