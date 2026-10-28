@@ -135,9 +135,10 @@ describe('VsCodeGitHubAuth', () => {
     await flush();
     expect(changes).not.toHaveBeenCalled();
     fakeVscode.fireSessionChange('github');
-    await flush();
+    // Two reports of one change (a dialog and VS Code) fire once.
+    fakeVscode.fireSessionChange('github');
+    await vi.waitFor(() => expect(changes).toHaveBeenCalledTimes(1));
     expect(fakeVscode.commands.executeCommand).toHaveBeenLastCalledWith('setContext', SIGNED_IN_CONTEXT_KEY, false);
-    expect(changes).toHaveBeenCalledTimes(1);
 
     auth.dispose();
     fakeVscode.fireSessionChange('github');
@@ -284,6 +285,29 @@ describe('VsCodeGitHubAuth', () => {
       await expect(auth.addAccount()).resolves.toEqual({ id: '2', login: 'cat' });
       await vi.waitFor(() => expect(changes).toHaveBeenCalledTimes(1));
       await flush();
+      expect(changes).toHaveBeenCalledTimes(1);
+      auth.dispose();
+    });
+
+    it('reports a new account of a dialog once when VS Code reports its new session after the dialog returned', async () => {
+      fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO]);
+      getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { account?: { id: string }; silent?: boolean }) =>
+        options.silent === true && options.account?.id === OCTO.id ? sessionOf(OCTO, 'gho_octo') : undefined,
+      );
+      const auth = new VsCodeGitHubAuth(silentLogger);
+      const changes = vi.fn();
+      auth.onDidChangeSession(changes);
+      await expect(auth.accounts()).resolves.toEqual([{ id: '1', login: 'octocat' }]);
+      getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { account?: { id: string }; silent?: boolean }) => {
+        if (options.silent === true) return options.account?.id === CAT.id ? sessionOf(CAT, 'gho_cat') : options.account?.id === OCTO.id ? sessionOf(OCTO, 'gho_octo') : undefined;
+        fakeVscode.authentication.getAccounts.mockResolvedValue([OCTO, CAT]);
+        return sessionOf(CAT, 'gho_cat');
+      });
+      await expect(auth.addAccount()).resolves.toEqual({ id: '2', login: 'cat' });
+      await flush();
+      fakeVscode.fireSessionChange('github');
+      await vi.waitFor(() => expect(changes).toHaveBeenCalledTimes(1));
+      await new Promise((resolve) => setTimeout(resolve, 150));
       expect(changes).toHaveBeenCalledTimes(1);
       auth.dispose();
     });

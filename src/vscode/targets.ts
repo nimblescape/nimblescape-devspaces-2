@@ -56,17 +56,24 @@ export function repositoryTarget(repository: string, info: RepositoryInfo | unde
 
 /**
  * Trust of an owner for a first open: an account of Devspaces (`accounts`), or an organization where one of them is a
- * member, as the lists in the merged data name them (DiscoveryData.accounts). While the list of an account is not
- * loaded (for example right after its sign-in), another owner is `unknown` until a refresh finished.
+ * member, as the lists in the merged data name them (DiscoveryData.accounts). While the list of an account of `loading`
+ * (default: all of them) is not loaded (for example right after its sign-in), another owner is `unknown` until a
+ * refresh finished. A missing list of an account outside `loading` (GitHub rejected its token, so no refresh loads it)
+ * does not wait: its organizations count only after its new sign-in.
  */
-export function ownerTrust(data: DiscoveryData | undefined, accounts: readonly GitHubAccount[], owner: string): 'trusted' | 'untrusted' | 'unknown' {
+export function ownerTrust(
+  data: DiscoveryData | undefined,
+  accounts: readonly GitHubAccount[],
+  owner: string,
+  loading: readonly GitHubAccount[] = accounts,
+): 'trusted' | 'untrusted' | 'unknown' {
   const wanted = owner.trim().toLowerCase();
   if (accounts.length === 0) return 'unknown';
   if (wanted === '') return 'untrusted';
   if (accounts.some((account) => account.login.toLowerCase() === wanted)) return 'trusted';
   const listings = (data?.accounts ?? []).filter((listing) => accounts.some((account) => account.id === listing.account.id));
   if (listings.some((listing) => listing.organizations.some((organization) => organization.toLowerCase() === wanted))) return 'trusted';
-  return accounts.every((account) => listings.some((listing) => listing.account.id === account.id)) ? 'untrusted' : 'unknown';
+  return loading.every((account) => listings.some((listing) => listing.account.id === account.id)) ? 'untrusted' : 'unknown';
 }
 
 /** A repository that only the registry knows, for the pickers. It has no URL of its own and no configurations. */
