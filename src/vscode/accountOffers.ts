@@ -64,7 +64,9 @@ export class AccountOffers {
       // Remembered before the notification shows: one offer per account, also when the notification is closed, and also
       // in the other windows of this computer.
       offered.add(account.id);
-      await state.update(OFFERED_ACCOUNTS_KEY, [...offered]);
+      await state.update(OFFERED_ACCOUNTS_KEY, [...offered]).then(undefined, (error: unknown) =>
+        logger.warn(`Could not remember the offer of the GitHub account ${account.login}, so a later check may offer it again: ${errorMessage(error)}`),
+      );
       logger.info(`The GitHub account ${account.login} is signed in to VS Code, and Devspaces does not use it. Devspaces offers it once.`);
       void this.offer(account);
     }
