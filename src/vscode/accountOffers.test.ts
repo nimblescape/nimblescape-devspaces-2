@@ -115,6 +115,14 @@ describe('AccountOffers', () => {
     expect(h.auth.accounts).toHaveBeenCalledTimes(1);
   });
 
+  it('offers the account also when the offer cannot be remembered, and logs that', async () => {
+    const h = harness({ other: [STAUSSH, COPILOT_ONLY] });
+    h.state.update.mockRejectedValueOnce(new Error('storage is closed'));
+    await h.offers.check();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledTimes(2);
+    expect(h.logger.warn).toHaveBeenCalledWith('Could not remember the offer of the GitHub account staussh, so a later check may offer it again: storage is closed');
+  });
+
   it('never rejects: a failed read of the accounts is logged', async () => {
     const h = harness();
     h.auth.otherAccounts.mockRejectedValueOnce(new Error('no provider'));

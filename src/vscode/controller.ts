@@ -3695,7 +3695,8 @@ export class Controller implements vscode.Disposable {
     if (hidden) {
       const answer = await this.askForOwner(this.displayName({ repository, info }), hidden, chosen?.account);
       if (answer === undefined) return undefined;
-      return answer.kind === 'owner' ? { ...base, devspace: hidden, account: answer.account } : { ...base, account: answer.account };
+      // New Devspace as <login>: Try again keeps that account (chosenAccount).
+      return answer.kind === 'owner' ? { ...base, devspace: hidden, account: answer.account } : { ...base, account: answer.account, chosenAccount: true };
     }
     if (chosen && accounts.length > 1) this.logger.info(`A new devspace of ${repository} uses the GitHub account ${chosen.account.login}${chosen.permission !== undefined ? ` (${permissionText(chosen.permission)})` : ''}.`);
     return { ...base, ...(chosen ? { account: chosen.account } : {}) };

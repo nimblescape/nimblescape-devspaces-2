@@ -4970,6 +4970,22 @@ describe('Accounts', () => {
     expect(h.connection.open).toHaveBeenCalledWith(own.containerName, '/workspaces/api');
   });
 
+  it('Try again after New Devspace as <login> keeps that account and asks no second time (rule 2)', async () => {
+    await h.registry.add(devspace({ owner: OTHER_ACCOUNT }));
+    const own = devspace({ id: 'c1d2e3f4-0000-4000-8000-000000000003', containerName: 'devspaces-octo-api-c1d2e3f4' });
+    h.service.openInWorker.mockImplementation(async () => {
+      await h.registry.add(own);
+      return openResult(own);
+    });
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.newDevspaceAs(ACCOUNT.login));
+    h.service.openInWorker.mockRejectedValueOnce(new UserFacingError('buildFailed', Messages.buildFailed, 'log'));
+    fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
+    await run('start', row('acme/api'));
+    await settle(() => h.connection.open.mock.calls.length === 1, 'the connection after Try again');
+    expect(h.service.openInWorker.mock.calls.map((call) => call[1])).toEqual([expect.objectContaining({ account: ACCOUNT }), expect.objectContaining({ account: ACCOUNT })]);
+    expect(warningMessages()).toEqual([ControllerTexts.hiddenOwnerQuestion('acme/api', OTHER_ACCOUNT.login)]);
+  });
+
   it.each<[string, boolean]>([
     ['a repository row', false],
     ['a row that names the devspace', true],

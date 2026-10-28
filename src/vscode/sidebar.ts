@@ -148,7 +148,11 @@ export class Sidebar implements vscode.Disposable {
   private retryingAfterRateLimit = false;
   /** The next refresh is one of the Refresh command (refreshDiscovery `byUser`). */
   private refreshByUser = false;
-  /** The accounts whose rejected token got the offer of a new sign-in (offerSignInAgain): each one once per window. */
+  /**
+   * The accounts whose rejected token got the offer of a new sign-in (offerSignInAgain): each one once per window, and
+   * again after a Refresh of the user (the offer is the only way to sign in again as an account that is not the one
+   * that VS Code gives Devspaces).
+   */
   private readonly signInOffered = new Set<string>();
   /** Counts the changes of the accounts in onSessionChanged: a refresh that read older accounts does not use them. */
   private accountChanges = 0;
@@ -273,7 +277,10 @@ export class Sidebar implements vscode.Disposable {
    */
   refreshDiscovery(options: { again?: boolean; byUser?: boolean } = {}): Promise<DiscoveryData | undefined> {
     // The refresh that request() starts reads the flag when it starts; a running refresh read it already.
-    if (options.again && options.byUser) this.refreshByUser = true;
+    if (options.again && options.byUser) {
+      this.refreshByUser = true;
+      this.signInOffered.clear();
+    }
     const task = options.again ? this.discoveryTask.request() : this.discoveryTask.join();
     return task.catch((error: unknown) => {
       this.deps.logger.error('The repository list could not be updated.', error);

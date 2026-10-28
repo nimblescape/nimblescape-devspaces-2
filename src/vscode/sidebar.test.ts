@@ -1531,6 +1531,9 @@ describe('Sidebar with several GitHub accounts', () => {
     expect(String(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0])).toContain('octo');
     await h.sidebar.refreshDiscovery({ again: true });
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    // A Refresh of the user offers it again: the offer is the only way to sign in again as octo.
+    await h.sidebar.refreshDiscovery({ again: true, byUser: true });
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(2);
   });
 
   it('asks GitHub with the token of each owner account of the devspaces of a repository that the other account does not see', async () => {
