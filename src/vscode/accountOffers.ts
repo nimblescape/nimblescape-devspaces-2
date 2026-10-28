@@ -23,11 +23,15 @@ export interface AccountOffersDeps {
   /** The global state of the extension (ExtensionContext.globalState): shared by the windows of this computer. */
   state: Pick<vscode.Memento, 'get' | 'update'>;
   logger: Logger;
+  /** True while this window has the focus (vscode.window.state.focused). Missing: always. */
+  focused?: () => boolean;
 }
 
 export class AccountOffers {
   /** The check that runs; a check while one runs waits for it and then runs once more. */
   private running: Promise<void> = Promise.resolve();
+  /** A check found this window without the focus: the next focus of the window runs it (onFocused). */
+  private waiting = false;
 
   constructor(private readonly deps: AccountOffersDeps) {}
 
@@ -41,8 +45,18 @@ export class AccountOffers {
     return next;
   }
 
+  /** This window got the focus: a check that waited for it runs now. Never rejects. */
+  onFocused(): Promise<void> {
+    return this.waiting ? this.check() : Promise.resolve();
+  }
+
   private async checkNow(): Promise<void> {
     const { auth, state, logger } = this.deps;
+    // Only the window with the focus offers: windows that check at the same time (at the start of VS Code, after a change
+    // of the sessions) would each offer the same account, because a change of the global state reaches the other
+    // windows only later.
+    this.waiting = this.deps.focused?.() === false;
+    if (this.waiting) return;
     if ((await auth.accounts()).length === 0) return;
     const offered = new Set(offeredIds(state.get(OFFERED_ACCOUNTS_KEY)));
     for (const account of await auth.otherAccounts()) {

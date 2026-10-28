@@ -74,6 +74,22 @@ export function isDevspaceOf(
   );
 }
 
+/**
+ * Among `devspaces`, the devspace of `repository` (and, with `source`, of that source) on `dockerHost` whose owner
+ * account `owner` accepts (its GitHub user ID), the one used last; `undefined` without one.
+ */
+export function lastUsedDevspaceOf(
+  devspaces: readonly Devspace[],
+  repository: string,
+  owner: (accountId: string) => boolean,
+  dockerHost = '',
+  source?: DevspaceSource,
+): Devspace | undefined {
+  return devspaces
+    .filter((devspace) => owner(devspace.owner.id) && isDevspaceOf(devspace, repository, devspace.owner.id, dockerHost, source))
+    .sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt))[0];
+}
+
 /** The Devspace Registry. Used by the windows. It keeps no cache. */
 export class DevspaceRegistry {
   private readonly logger: Logger;
@@ -142,8 +158,7 @@ export class DevspaceRegistry {
    * last.
    */
   async findForAccounts(repository: string, accountIds: readonly string[], dockerHost = '', source?: DevspaceSource): Promise<Devspace | undefined> {
-    const found = (await this.list()).filter((devspace) => accountIds.some((accountId) => isDevspaceOf(devspace, repository, accountId, dockerHost, source)));
-    return found.sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt))[0];
+    return lastUsedDevspaceOf(await this.list(), repository, (accountId) => accountIds.includes(accountId), dockerHost, source);
   }
 
   /** Finds the devspace of a container name, with or without the leading `/` of `docker inspect`. */

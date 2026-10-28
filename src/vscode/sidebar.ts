@@ -118,8 +118,6 @@ interface AccountState {
   partial: DiscoveryData | undefined;
   /** Its running refresh is a first load, whose parts are shown. */
   progressive: boolean;
-  /** Its last refresh failed. */
-  failed: boolean;
 }
 
 export class Sidebar implements vscode.Disposable {
@@ -692,7 +690,7 @@ export class Sidebar implements vscode.Disposable {
     // The refresh after a rate limit is no longer needed only when the lists loaded (a failed refresh keeps it).
     if (refreshed && !rateLimited && !failed) this.clearRateLimitRetry();
     // Without any list, the view says that the list could not be loaded (not that no repository was found).
-    this.setLoadFailed(failed && !this.hasList());
+    this.setLoadFailed((failed || rateLimited) && !this.hasList());
     if (changes === this.accountChanges && !this.disposed) {
       const lookups = await this.lookUpUnlisted();
       if (changes === this.accountChanges) this.lookups = lookups;
@@ -725,7 +723,6 @@ export class Sidebar implements vscode.Disposable {
       // change requested loads the list of the new scope).
       if (this.lists.get(account.id) !== state || !this.isOfCurrentScope(data)) return 'dropped';
       state.data = data;
-      state.failed = false;
       // The complete list is shown at once. The repositories of devspaces that it lacks follow; until then their rows
       // show what the previous refresh found.
       this.endProgressiveDisplay(state);
@@ -742,7 +739,6 @@ export class Sidebar implements vscode.Disposable {
       // Without internet access, the view shows the stored list and skips the update.
       const shown = state.data ? 'The stored list is shown.' : 'No stored list exists.';
       this.deps.logger.warn(`The repository list of ${account.login} could not be updated. ${shown} ${errorMessage(error)}`);
-      state.failed = state.data === undefined;
       return rateLimited ? 'rateLimited' : 'failed';
     } finally {
       this.refreshToken = undefined;
@@ -814,20 +810,26 @@ export class Sidebar implements vscode.Disposable {
    * The discovery stores the repositories of its scan, with and without a configuration. The repositories of the other
    * devspaces are asked one by one, each with the token of the owner account of its devspace, at most
    * DISCOVERY_CONCURRENCY at the same time (the refreshes have ended, so no other request of the lists runs), so the
-   * view shows `not on GitHub` only for repositories that GitHub does not return to that account. A failed question
-   * leaves the repository unknown; an owner whose token GitHub rejected asks nothing.
+   * view shows `not on GitHub` only for repositories that GitHub returns to none of the owner accounts of their
+   * devspaces. A repository that one of these accounts could not ask about (a failed question, or an owner whose token
+   * GitHub rejected) stays unknown, unless another account finds it.
    */
   private async lookUpUnlisted(): Promise<Map<string, RepositoryInfo | null>> {
     const result = new Map<string, RepositoryInfo | null>();
+    const unknown = new Set<string>();
     const listed = listedRepositories(this.data);
     const available = await this.availableDevspaces();
     for (const account of this.accounts) {
       const devspaces = available.filter((devspace) => devspace.owner.id === account.id);
-      // GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
-      const repositories = repositoriesToLookUp(devspaces, listed, this.deps.settings().owners).filter((repository) => !result.has(repositoryKey(repository)));
-      if (repositories.length === 0 || this.disposed || !(await this.authSignedIn(account))) continue;
-      const session = await this.readSession(account);
-      if (session?.account.id !== account.id) continue;
+      // GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`. A repository
+      // that another account did not find is asked again: each account sees its own repositories.
+      const repositories = repositoriesToLookUp(devspaces, listed, this.deps.settings().owners).filter((repository) => !result.get(repositoryKey(repository)));
+      if (repositories.length === 0 || this.disposed) continue;
+      const session = (await this.authSignedIn(account)) ? await this.readSession(account) : undefined;
+      if (session?.account.id !== account.id) {
+        for (const repository of repositories) unknown.add(repositoryKey(repository));
+        continue;
+      }
       const token = session.token;
       await mapLimit(repositories, DISCOVERY_CONCURRENCY, async (repository) => {
         if (this.disposed) return;
@@ -835,10 +837,12 @@ export class Sidebar implements vscode.Disposable {
           const info = await this.deps.discovery.getRepository(repository, token);
           result.set(repositoryKey(repository), info ?? null);
         } catch (error) {
+          unknown.add(repositoryKey(repository));
           this.deps.logger.info(`GitHub could not be asked for ${repository}: ${errorMessage(error)}`);
         }
       });
     }
+    for (const key of unknown) if (result.get(key) === null) result.delete(key);
     return result;
   }
 
@@ -886,7 +890,7 @@ export class Sidebar implements vscode.Disposable {
     for (const id of [...this.lists.keys()]) if (!accounts.some((account) => account.id === id)) this.lists.delete(id);
     if (left) this.lookups = new Map();
     const added = accounts.filter((account) => !this.lists.has(account.id));
-    for (const account of added) this.lists.set(account.id, { account, data: undefined, partial: undefined, progressive: false, failed: false });
+    for (const account of added) this.lists.set(account.id, { account, data: undefined, partial: undefined, progressive: false });
     this.merge();
     if (accounts.length === 0) {
       this.setLoaded(false);

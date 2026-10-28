@@ -27,7 +27,7 @@ import { isoTime, systemClock, type Clock, type ProgressReporter } from '../core
 import type { DevspaceOperations } from '../core/pipeline/devspaceOperations';
 import { PipelineTexts, WINDOW_STATE_FLOW_TIMEOUT_MS, type DockerStarter, type OpenResult } from '../core/pipeline/operationBase';
 import type { DockerEngineRecord, DockerEngineRecords, EngineRemoval } from '../core/storage/dockerEngineRecords';
-import { isDevspaceOf, type DevspaceRegistry } from '../core/storage/registry';
+import { lastUsedDevspaceOf, type DevspaceRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
 import type {
   BusyMark,
@@ -938,12 +938,11 @@ export class Controller implements vscode.Disposable {
       return;
     }
     const dockerHost = await this.currentDockerHost();
-    const items = await Promise.all(
-      candidates.map(async (candidate) => {
-        const existing = await this.deps.registry.findForAccount(repository, candidate.account.id, dockerHost, source);
-        return { label: candidate.account.login, description: ControllerTexts.accountChoiceDescription(permissionText(candidate.permission), existing !== undefined), candidate };
-      }),
-    );
+    const entries = await this.deps.registry.list();
+    const items = candidates.map((candidate) => {
+      const existing = lastUsedDevspaceOf(entries, repository, (accountId) => accountId === candidate.account.id, dockerHost, source);
+      return { label: candidate.account.login, description: ControllerTexts.accountChoiceDescription(permissionText(candidate.permission), existing !== undefined), candidate };
+    });
     const picked = await vscode.window.showQuickPick(items, { title: ControllerTexts.startWithAccountTitle(repository), placeHolder: ControllerTexts.startWithAccountPlaceholder });
     if (!picked) return;
     const target = await this.repositoryTargetFor(repository, 'start', source, { account: picked.candidate.account });
@@ -3666,13 +3665,14 @@ export class Controller implements vscode.Disposable {
     }
     // The devspace of the source of the repository; without a source (a repository with one source that the discovery
     // does not know), its most recently used devspace.
-    const devspace = accounts.length > 0 ? await this.deps.registry.findForAccounts(repository, accounts.map((account) => account.id), dockerHost, source) : undefined;
+    const entries = await this.deps.registry.list();
+    const used = new Set(accounts.map((account) => account.id));
+    const devspace = lastUsedDevspaceOf(entries, repository, (accountId) => used.has(accountId), dockerHost, source);
     if (devspace) return { ...base, devspace, account: ownerAmong(devspace, accounts) };
     if (signIn !== 'start') return base;
+    // Also for the question of rule 2, which names the account of a new devspace.
     const chosen = chooseAccount(repository, options.candidates ?? (await this.startCandidates(repository, info, accounts)));
-    const hidden = (await this.deps.registry.list())
-      .filter((entry) => ownerAmong(entry, accounts) === undefined && isDevspaceOf(entry, repository, entry.owner.id, dockerHost, source))
-      .sort((a, b) => Date.parse(b.lastUsedAt) - Date.parse(a.lastUsedAt))[0];
+    const hidden = lastUsedDevspaceOf(entries, repository, (accountId) => !used.has(accountId), dockerHost, source);
     if (hidden) {
       const answer = await this.askForOwner(this.displayName({ repository, info }), hidden, chosen?.account);
       if (answer === undefined) return undefined;

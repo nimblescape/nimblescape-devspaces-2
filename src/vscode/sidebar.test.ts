@@ -330,6 +330,14 @@ describe('Sidebar', () => {
     expect(fakeVscode.commands.executeCommand).not.toHaveBeenCalledWith('setContext', LOAD_FAILED_CONTEXT_KEY, true);
   });
 
+  it('says that the list could not be loaded when GitHub refuses the first refresh for its rate limit at once', async () => {
+    h.discovery.refresh.mockRejectedValueOnce(new GitHubRateLimitError('GitHub refused the request for its rate limit: API rate limit exceeded', 200, Date.now() + 60_000));
+    await h.sidebar.initialize();
+    await h.sidebar.refreshDiscovery();
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', LOADED_CONTEXT_KEY, true);
+    expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', LOAD_FAILED_CONTEXT_KEY, true);
+  });
+
   it('says that the list could not be loaded when the first refresh fails without a stored list', async () => {
     h.discovery.refresh.mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND api.github.com'));
     await h.sidebar.initialize();
@@ -1507,6 +1515,17 @@ describe('Sidebar with several GitHub accounts', () => {
     expect(String(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0])).toContain('octo');
     await h.sidebar.refreshDiscovery({ again: true });
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks GitHub with the token of each owner account of the devspaces of a repository that the other account does not see', async () => {
+    await h.registry.add(devspace(OLD, 'school/shared'));
+    await h.registry.add(devspace(GONE, 'school/shared', { owner: OTHER, configPath: '.devcontainer/other/devcontainer.json' }));
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) => (accountId === OTHER.id ? ofOther([]) : data([])));
+    h.discovery.getRepository.mockImplementation(async (_repository: string, token: string) => (token === 'gho_other' ? info('school/shared') : undefined));
+    await signedIn();
+    expect(h.discovery.getRepository.mock.calls.map((call) => call[1]).sort()).toEqual(['gho_other', 'gho_token']);
+    await h.sidebar.render();
+    expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('not on GitHub');
   });
 
   it('asks GitHub about the repository of a devspace that no list has with the token of its owner', async () => {

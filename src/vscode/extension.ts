@@ -235,7 +235,7 @@ async function activateExtension(
   const disconnectRequests = new DisconnectRequests(paths.root);
   const auth = new VsCodeGitHubAuth(logger);
   context.subscriptions.push(auth);
-  const accountOffers = new AccountOffers({ auth, state: context.globalState, logger });
+  const accountOffers = new AccountOffers({ auth, state: context.globalState, logger, focused: () => vscode.window.state.focused });
   // Credential helpers (docker-credential-*) are found like the Docker CLI, also with the short PATH of the extension host.
   const credentialEnv = dockerProcessEnv(env, platform, dockerPath);
   const credentials = new DockerCredentialStore(runner, {
@@ -832,6 +832,8 @@ async function activateExtension(
       background(sidebar.refreshStates(), 'update the sidebar');
     }),
     vscode.window.onDidChangeWindowState((state) => {
+      // An offer of a GitHub account that waited for the focus of this window.
+      if (state.focused) background(accountOffers.onFocused(), 'offer the GitHub accounts of VS Code');
       if (!state.focused || !focusThrottle.tryAcquire()) return;
       background(view.visible ? sidebar.refreshStates() : sidebar.render(), 'update the sidebar');
     }),
