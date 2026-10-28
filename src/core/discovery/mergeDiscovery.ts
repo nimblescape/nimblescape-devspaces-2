@@ -21,8 +21,8 @@ export interface AccountList {
 /**
  * The merged list of `lists` (in the order of the accounts), or `undefined` without one:
  * - a repository once (its key: `owner/name` without case, as the registry compares repositories), with the data of the
- *   list that was fetched last, and in `access` each account whose list has it, with its permission (in the order of
- *   `lists`); a repository with a configuration in one list is one with a configuration;
+ *   list that was fetched last (also whether it has a configuration), and in `access` each account whose list has it,
+ *   with its permission (in the order of `lists`);
  * - the organizations of all accounts;
  * - an organization that refuses an account once per account, with the login of the account when there are several
  *   lists; an owner of the scan scope counts as not found only when every list says so (no account sees it), also a
@@ -38,16 +38,17 @@ export function mergeDiscovery(lists: readonly AccountList[]): DiscoveryData | u
   const latestFirst = [...lists].sort((a, b) => timeOf(b.data.fetchedAt) - timeOf(a.data.fetchedAt));
   const withConfiguration = new Map<string, RepositoryInfo & { access: AccountAccess[] }>();
   const withoutConfiguration = new Map<string, RepositoryInfo & { access: AccountAccess[] }>();
+  // The list that was fetched last also says whether the repository has a configuration (one may have been added or
+  // removed since an older list).
   for (const { data } of latestFirst) {
-    for (const info of data.repositories) {
-      const key = keyOf(info);
-      if (!withConfiguration.has(key)) withConfiguration.set(key, merged(info));
-    }
-  }
-  for (const { data } of latestFirst) {
-    for (const info of data.withoutConfiguration) {
-      const key = keyOf(info);
-      if (!withConfiguration.has(key) && !withoutConfiguration.has(key)) withoutConfiguration.set(key, merged(info));
+    for (const [infos, target] of [
+      [data.repositories, withConfiguration],
+      [data.withoutConfiguration, withoutConfiguration],
+    ] as const) {
+      for (const info of infos) {
+        const key = keyOf(info);
+        if (!withConfiguration.has(key) && !withoutConfiguration.has(key)) target.set(key, merged(info));
+      }
     }
   }
   for (const { account, data } of lists) {

@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { availableDevspaces, isAvailableTo, ownerAmong, ownerOf } from './ownership';
+import { accountIds, availableDevspaces, isAvailableTo, ownerAmong, ownerOf } from './ownership';
 import type { Devspace, GitHubAccount } from './types';
 
 const SCALARION: GitHubAccount = { id: '1001', login: 'scalarion' };
@@ -52,5 +52,13 @@ describe('isAvailableTo', () => {
 
   it('stores the ID and the login of the account as the owner', () => {
     expect(ownerOf({ ...SCALARION, extra: 1 } as GitHubAccount)).toEqual(SCALARION);
+  });
+});
+
+describe('accountIds', () => {
+  it('gives the same text for the same accounts in any order, and another text for another set', () => {
+    expect(accountIds([STAUSSH, SCALARION])).toBe(accountIds([SCALARION, STAUSSH]));
+    expect(accountIds([SCALARION])).not.toBe(accountIds([SCALARION, OTHER]));
+    expect(accountIds([])).toBe('');
   });
 });

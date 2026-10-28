@@ -935,7 +935,8 @@ export class Sidebar implements vscode.Disposable {
     );
     this.merge();
     this.setLoaded(this.hasList());
-    if (!this.hasList()) this.setLoadFailed(false);
+    // Until the refresh of the new accounts ends: a list is shown, or the view loads.
+    this.setLoadFailed(false);
   }
 
   /** Token and account of the GitHub session of `account`, without a dialog; undefined when it cannot be read. */
