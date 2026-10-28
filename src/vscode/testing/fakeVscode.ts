@@ -123,6 +123,8 @@ export const fakeVscode = {
     withProgress: vi.fn(),
     createTerminal: vi.fn(),
     registerUriHandler: vi.fn(),
+    /** `window.state`: resetFakeVscode gives the window the focus. */
+    state: { focused: true },
   },
   env: { openExternal: vi.fn(), remoteName: undefined as string | undefined },
   commands: { executeCommand: vi.fn(), registerCommand: vi.fn() },
@@ -164,9 +166,11 @@ export function resetFakeVscode(): void {
   fakeVscode.terminals.length = 0;
   fakeVscode.env.remoteName = undefined;
   fakeVscode.workspace.isTrusted = true;
+  window.state.focused = true;
   fakeVscode.outputChannels.length = 0;
+  const { state: _state, ...windowMocks } = window;
   for (const mock of [
-    ...Object.values(window),
+    ...Object.values(windowMocks),
     fakeVscode.env.openExternal,
     fakeVscode.commands.executeCommand,
     fakeVscode.commands.registerCommand,

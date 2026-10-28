@@ -15,7 +15,7 @@ const SCALARION: GitHubAccount = { id: '1001', login: 'scalarion' };
 const STAUSSH: GitHubAccount = { id: '2002', login: 'staussh' };
 const COPILOT_ONLY: GitHubAccount = { id: '3003', login: 'bot-user' };
 
-function harness(options: { used?: GitHubAccount[]; other?: GitHubAccount[]; stored?: unknown } = {}) {
+function harness(options: { used?: GitHubAccount[]; other?: GitHubAccount[]; stored?: unknown; focused?: () => boolean } = {}) {
   const values = new Map<string, unknown>(options.stored === undefined ? [] : [[OFFERED_ACCOUNTS_KEY, options.stored]]);
   const state = {
     get: vi.fn((key: string) => values.get(key)),
@@ -29,7 +29,7 @@ function harness(options: { used?: GitHubAccount[]; other?: GitHubAccount[]; sto
     getAccount: vi.fn(async (_options: { interactive: boolean; account?: GitHubAccount }): Promise<GitHubAccount | undefined> => undefined),
   };
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
-  const offers = new AccountOffers({ auth, state, logger } as unknown as ConstructorParameters<typeof AccountOffers>[0]);
+  const offers = new AccountOffers({ auth, state, logger, focused: options.focused } as unknown as ConstructorParameters<typeof AccountOffers>[0]);
   return { offers, auth, state, values, logger };
 }
 
@@ -99,6 +99,20 @@ describe('AccountOffers', () => {
     const h = harness();
     await Promise.all([h.offers.check(), h.offers.check()]);
     expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers only in the window with the focus; a window without it offers when it gets the focus', async () => {
+    let focused = false;
+    const h = harness({ focused: () => focused });
+    await h.offers.check();
+    expect(h.auth.accounts).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showInformationMessage).not.toHaveBeenCalled();
+    focused = true;
+    await h.offers.onFocused();
+    expect(fakeVscode.window.showInformationMessage).toHaveBeenCalledTimes(1);
+    // Nothing waits any more: the next focus checks nothing.
+    await h.offers.onFocused();
+    expect(h.auth.accounts).toHaveBeenCalledTimes(1);
   });
 
   it('never rejects: a failed read of the accounts is logged', async () => {
