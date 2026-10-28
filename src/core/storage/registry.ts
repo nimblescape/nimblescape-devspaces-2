@@ -150,15 +150,7 @@ export class DevspaceRegistry {
    * recently used one first).
    */
   async findForAccount(repository: string, accountId: string, dockerHost = '', source?: DevspaceSource): Promise<Devspace | undefined> {
-    return this.findForAccounts(repository, [accountId], dockerHost, source);
-  }
-
-  /**
-   * findForAccount for several GitHub accounts (the accounts of Devspaces): the devspace of one of them that was used
-   * last.
-   */
-  async findForAccounts(repository: string, accountIds: readonly string[], dockerHost = '', source?: DevspaceSource): Promise<Devspace | undefined> {
-    return lastUsedDevspaceOf(await this.list(), repository, (accountId) => accountIds.includes(accountId), dockerHost, source);
+    return lastUsedDevspaceOf(await this.list(), repository, (owner) => owner === accountId, dockerHost, source);
   }
 
   /** Finds the devspace of a container name, with or without the leading `/` of `docker inspect`. */

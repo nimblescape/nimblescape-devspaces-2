@@ -274,6 +274,16 @@ describe('row actions and contextValue', () => {
     expect(contextValue(rowActions(state, info))).toBe(expected);
   });
 
+  it('offers Start with Account… only where Start is offered, with a flag that the `when` clauses of Start do not match', () => {
+    expect(contextValue(rowActions('stopped', info), undefined, undefined, false, true)).toBe('repository;canStart;canDelete;canRebuild;onGitHub;canChooseAccount');
+    for (const state of ['connected', 'updating'] as const) {
+      const value = contextValue(rowActions(state, info), undefined, undefined, false, true);
+      expect(flags(value)).not.toContain('canChooseAccount');
+      // package.json: Start, Start in New Window and Start in Current Window match `viewItem =~ /canStart/`.
+      expect(/canStart/.test(value)).toBe(false);
+    }
+  });
+
   it('offers Delete while the devspace is updating, except while it is being deleted', () => {
     for (const operation of ['create', 'update', 'rebuild'] as const) {
       expect(contextValue(rowActions('updating', info, operation))).toBe('repository;canDelete;onGitHub');
@@ -1923,14 +1933,14 @@ describe('several GitHub accounts in the sidebar', () => {
 
   it('offers Start with Account… only where two or more accounts can access the repository', () => {
     const groups = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/web')] }));
-    expect(flags(row(groups, 'acme/api').contextValue)).toContain('canStartWithAccount');
-    expect(flags(row(groups, 'acme/web').contextValue)).not.toContain('canStartWithAccount');
+    expect(flags(row(groups, 'acme/api').contextValue)).toContain('canChooseAccount');
+    expect(flags(row(groups, 'acme/web').contextValue)).not.toContain('canChooseAccount');
     // An account that Devspaces does not use anymore does not count.
     const one = buildTreeModel(input({ discovery: merged(), accounts: [ME] }));
-    expect(flags(row(one, 'acme/api').contextValue)).not.toContain('canStartWithAccount');
+    expect(flags(row(one, 'acme/api').contextValue)).not.toContain('canChooseAccount');
     // The devspace row of a repository that both can access offers it too: it creates the devspace of the other account.
     const withDevspace = buildTreeModel(input({ discovery: merged(), accounts: [ME, STUDENT], devspaces: [devspace('a', 'acme/api')] }));
-    expect(flags(row(withDevspace, 'acme/api').contextValue)).toContain('canStartWithAccount');
+    expect(flags(row(withDevspace, 'acme/api').contextValue)).toContain('canChooseAccount');
   });
 
   it('shows a hint of an organization that refuses one account per account, with its login', () => {

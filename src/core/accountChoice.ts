@@ -6,7 +6,7 @@
 // this order:
 // 1. An existing devspace of the source of the repository opens with its owner account (the one used last, when two
 //    accounts have one). Docker cannot change the owner of its volumes and images, and the clone belongs to that
-//    account. The caller finds it in the registry (DevspaceRegistry.findForAccounts).
+//    account. The caller finds it in the registry (lastUsedDevspaceOf, src/core/storage/registry.ts).
 // 2. A devspace of an account that is not signed in: the Start asks (the controller).
 // 3. A new devspace: only the accounts that have access to the repository count (their list has it, or GitHub
 //    shows it to them).

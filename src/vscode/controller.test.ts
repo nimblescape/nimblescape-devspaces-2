@@ -7888,15 +7888,25 @@ describe('Several GitHub accounts', () => {
     expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
   });
 
-  it('a course link asks only the account whose token GitHub rejected to sign in again; the other candidate still counts', async () => {
+  it('a course link asks no new sign-in of an account whose token GitHub rejected while another account finds its repository', async () => {
     fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
     h.discovery.getRepository.mockImplementation(async (repository: string, token: string) => {
       if (token === 'gho_token') throw new GitHubApiError('Bad credentials', 401);
       return repositoryInfo(repository);
     });
     await h.controller.openLink(courseLink('acme/task-<username>'));
-    expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
+    expect(h.auth.renewToken).not.toHaveBeenCalled();
     expect(h.service.openInWorker).toHaveBeenCalledWith(expect.objectContaining({ repository: 'acme/task-someone' }), expect.objectContaining({ account: OTHER_ACCOUNT }));
+  });
+
+  it('a course link asks only the account whose token GitHub rejected to sign in again when no account finds its repository', async () => {
+    fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
+    h.discovery.getRepository.mockImplementation(async (repository: string, token: string) => {
+      if (token === 'gho_token') throw new GitHubApiError('Bad credentials', 401);
+      return undefined;
+    });
+    await h.controller.openLink(courseLink('acme/task-<username>'));
+    expect(h.auth.renewToken.mock.calls).toEqual([[ACCOUNT]]);
   });
 
   it('closes the window of a devspace only when its own account leaves, not when another account leaves', async () => {

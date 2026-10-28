@@ -29,13 +29,19 @@ describe('VsCodeGitHubAuth', () => {
   const dialogCalls = () => getSession.mock.calls.filter((call) => (call[2] as { silent?: boolean } | undefined)?.silent !== true);
   const lastDialogCall = () => dialogCalls().at(-1);
 
-  it('requests the scopes repo and read:org, with a dialog only when interactive', async () => {
+  it('requests the scopes repo and read:org, with a dialog only when interactive and VS Code gives no session without one', async () => {
     expect(GITHUB_SCOPES).toEqual(['repo', 'read:org']);
     const auth = new VsCodeGitHubAuth(silentLogger);
     getSession.mockResolvedValue(session('gho_silent'));
     await expect(auth.getToken({ interactive: false })).resolves.toBe('gho_silent');
     expect(getSession).toHaveBeenLastCalledWith('github', ['repo', 'read:org'], { silent: true });
     await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_silent');
+    expect(dialogCalls()).toEqual([]);
+    // No dialog: the accounts are not read again.
+    await flush();
+    expect(fakeVscode.authentication.getAccounts).not.toHaveBeenCalled();
+    getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { silent?: boolean }) => (options.silent === true ? undefined : session('gho_dialog')));
+    await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_dialog');
     expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { createIfNone: true }]);
     auth.dispose();
   });
@@ -43,12 +49,16 @@ describe('VsCodeGitHubAuth', () => {
   it('shares one sign-in dialog between parallel interactive requests', async () => {
     const auth = new VsCodeGitHubAuth(silentLogger);
     let answer!: (value: unknown) => void;
-    getSession.mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+    getSession.mockImplementation(async (_provider: string, _scopes: string[], options: { silent?: boolean }) =>
+      options.silent === true ? undefined : new Promise((resolve) => (answer = resolve)),
+    );
     const first = auth.getToken({ interactive: true });
     const second = auth.getToken({ interactive: true });
+    await vi.waitFor(() => expect(dialogCalls()).toHaveLength(1));
     answer(session('gho_1'));
     await expect(Promise.all([first, second])).resolves.toEqual(['gho_1', 'gho_1']);
     expect(dialogCalls()).toHaveLength(1);
+    getSession.mockReset();
     getSession.mockResolvedValue(session('gho_2'));
     await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_2');
     auth.dispose();
@@ -304,9 +314,10 @@ describe('VsCodeGitHubAuth', () => {
       await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_new');
       expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { forceNewSession: true }]);
       await expect(auth.isSignedIn()).resolves.toBe(true);
-      // The new session is not rejected: the next interactive request uses createIfNone again.
-      await auth.getToken({ interactive: true });
-      expect(lastDialogCall()).toEqual(['github', ['repo', 'read:org'], { createIfNone: true }]);
+      // The new session is not rejected: the next interactive request uses it without a dialog.
+      const dialogs = dialogCalls().length;
+      await expect(auth.getToken({ interactive: true })).resolves.toBe('gho_new');
+      expect(dialogCalls()).toHaveLength(dialogs);
       auth.dispose();
     });
 
