@@ -1772,8 +1772,8 @@ export class Controller implements vscode.Disposable {
    * repository that the account used last on the current Docker engine. Without one, it creates the devspace as a
    * double-click on the row of the repository does, from its first source (possibleSources), after one question before
    * any Docker work: the confirmation of every first open for a repository that belongs neither to the account nor to
-   * one of its organizations, else the question of the link (linkStartConfirm), which "Open and Don't Ask Again" turns
-   * off (setting confirmOpenFromLink). VS Code gives the link to the window
+   * one of its organizations, else the question of the link (linkStartConfirm), which "Always Open" turns off (setting
+   * confirmOpenFromLink). VS Code gives the link to the window
    * that was active last, in which the user did not ask for anything: the devspace opens in that window only when it is
    * empty, else in a new window, and the window keeps what it has. The repository can be one that the list does not show: then GitHub is asked for
    * it. A link that names no repository asks neither GitHub nor Docker. Never rejects: errors are shown.
@@ -1850,13 +1850,13 @@ export class Controller implements vscode.Disposable {
       const trusted = await this.deps.sidebar.trustedOwner(splitRepository(name).owner);
       if (!trusted || this.deps.settings().confirmOpenFromLink !== false) {
         const choice = trusted
-          ? await showWarningMessage(ControllerTexts.linkStartConfirm(name), { modal: true }, Actions.open, ControllerTexts.openAndDontAskAgain)
+          ? await showWarningMessage(ControllerTexts.linkStartConfirm(name), { modal: true }, Actions.open, ControllerTexts.alwaysOpen)
           : await showWarningMessage(Messages.untrustedRepository(name), { modal: true }, Actions.open);
-        if (choice !== Actions.open && choice !== ControllerTexts.openAndDontAskAgain) {
+        if (choice !== Actions.open && choice !== ControllerTexts.alwaysOpen) {
           this.logger.info(`The start of ${name} from the link was not confirmed.`);
           return;
         }
-        if (choice === ControllerTexts.openAndDontAskAgain) await this.turnOffLinkQuestion();
+        if (choice === ControllerTexts.alwaysOpen) await this.turnOffLinkQuestion();
       } else {
         this.logger.info(`The link creates the devspace of ${name} without a question: the setting confirmOpenFromLink is off.`);
       }
@@ -1865,7 +1865,7 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * Open and Don't Ask Again in the question of a link: the user setting confirmOpenFromLink becomes false, so that
+   * Always Open in the question of a link: the user setting confirmOpenFromLink becomes false, so that
    * later links create a devspace of the account or of its organizations without the question. The devspace opens also
    * when the setting cannot be written; then the next link asks again.
    */

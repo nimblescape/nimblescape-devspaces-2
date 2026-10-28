@@ -185,7 +185,7 @@ export const ControllerTexts = {
   // Buttons.
   stop: 'Stop',
   /** The second button of the question linkStartConfirm: opens, and turns off the setting confirmOpenFromLink. */
-  openAndDontAskAgain: "Open and Don't Ask Again",
+  alwaysOpen: 'Always Open',
   /** The one button of the modal message stillConnected: the window closes its connection after it. */
   closeConnection: 'Close Connection',
   // Quick Picks.

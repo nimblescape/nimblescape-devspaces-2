@@ -40,7 +40,7 @@ export const DEFAULT_SETTINGS: Readonly<ExtensionSettings> = Object.freeze({
   confirmOpenFromLink: true,
 });
 
-/** The key of the setting that the button "Open and Don't Ask Again" of the question of a link turns off. */
+/** The key of the setting that the button "Always Open" of the question of a link turns off. */
 export const CONFIRM_OPEN_FROM_LINK_SETTING = 'confirmOpenFromLink';
 
 /**

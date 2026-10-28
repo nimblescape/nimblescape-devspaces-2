@@ -850,7 +850,7 @@
           "type": "boolean",
           "scope": "application",
           "default": true,
-          "markdownDescription": "Ask before a link, for example on a website or a course page, creates a devspace of a repository of your account or of one of your organizations. **Open and Don't Ask Again** in that question turns this off. A repository of another owner is always confirmed.\n\n[Open from a link in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#open-from-a-link)"
+          "markdownDescription": "Ask before a link, for example on a website or a course page, creates a devspace of a repository of your account or of one of your organizations. **Always Open** in that question turns this off. A repository of another owner is always confirmed.\n\n[Open from a link in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#open-from-a-link)"
         }
       }
     }
