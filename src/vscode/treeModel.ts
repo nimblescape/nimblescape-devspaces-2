@@ -1063,7 +1063,8 @@ function defaultFormatTime(isoTime: string): string {
   return Number.isNaN(date.getTime()) ? isoTime : date.toLocaleString();
 }
 
-function nonEmpty(value: string | undefined): string | undefined {
+/** `value` when it has a character that is not white space. */
+export function nonEmpty(value: string | undefined): string | undefined {
   return value !== undefined && value.trim() !== '' ? value : undefined;
 }
 

@@ -74,7 +74,7 @@ import type { DevspaceStatusBar } from './statusBar';
 import { pickRepository, showSwitcher, SwitcherTexts } from './switcher';
 import { CoalescingTask, OperationGate } from './tasks';
 import { parseCommandArgument, repositoryTarget, sourceChoices, type CommandArgument } from './targets';
-import { TreeTexts, devspaceName, recentDevspaces, repositoryRows, stateIcon } from './treeModel';
+import { TreeTexts, devspaceName, nonEmpty, recentDevspaces, repositoryRows, stateIcon } from './treeModel';
 import { opensNewWindow, type WindowRequest } from './windowChoice';
 
 /**
@@ -1873,7 +1873,10 @@ export class Controller implements vscode.Disposable {
     await this.withDockerTarget(async () => {
       // The devspace of the repository that an account of Devspaces used last on this host; for a course link, the
       // devspace of the account of the login in the name (repositoryTargetFor).
-      const target = await this.repositoryTargetFor(name, 'start', undefined, account !== undefined ? { account } : candidates !== undefined ? { candidates } : {});
+      // Without the data of GitHub (it could not be asked), only an existing devspace opens: no account is chosen for a
+      // new one, and nothing is asked.
+      const signIn = info !== undefined || account !== undefined ? 'start' : true;
+      const target = await this.repositoryTargetFor(name, signIn, undefined, account !== undefined ? { account } : candidates !== undefined ? { candidates } : {});
       if (!target) return;
       if (account !== undefined) target.chosenAccount = true;
       if (target.devspace) {
@@ -1934,15 +1937,10 @@ export class Controller implements vscode.Disposable {
   private async openLinkRepository(repository: string, accounts: readonly GitHubAccount[]): Promise<LinkRepository | undefined> {
     const listed = this.deps.sidebar.repositoryInfo(repository);
     if (listed) return { repository, info: listed };
-    const listings = this.deps.sidebar.accountListings();
-    const looked = await this.lookUpWithRenewal(accounts.map((account) => ({ repository, account })));
-    const results = accounts.map((account, index) => ({ account, ...looked[index] }));
-    const found = results.flatMap((result) => (result.info !== undefined ? [{ account: result.account, info: result.info }] : []));
+    const results = await this.lookUpWithRenewal(accounts.map((account) => ({ repository, account })));
+    const found = this.foundCandidates(accounts, results);
     const first = found[0];
-    if (first !== undefined) {
-      const candidates = found.map(({ account, info }) => candidateOf(account, info.permission, listings));
-      return { repository, info: first.info, candidates };
-    }
+    if (first !== undefined) return { repository, info: first.info, candidates: found.map((each) => each.candidate) };
     if (results.some((result) => result.failure === 'rejected')) throw new UserFacingError('signInRequired', Messages.signInRequired);
     if (results.some((result) => result.failure === 'unknown')) return { repository };
     this.logger.info(`GitHub does not show ${repository} to ${accounts.map((account) => account.login).join(', ')}. The link opened nothing.`);
@@ -3221,12 +3219,13 @@ export class Controller implements vscode.Disposable {
   private async ownWindowDevspace(devspace: Devspace, containerName: string): Promise<Devspace | undefined> {
     let accounts = await this.readAccounts();
     if (accounts.length === 0) {
-      const named = nonEmptyLogin(devspace.owner.login) !== undefined ? devspace.owner : undefined;
+      const named = nonEmpty(devspace.owner.login) !== undefined ? devspace.owner : undefined;
       const account = await this.deps.auth.getAccount({ interactive: true, ...(named ? { account: named } : {}) }).catch((error: unknown) => {
         this.logger.warn(`The GitHub account could not be read: ${errorMessage(error)}`);
         return undefined;
       });
-      if (account) accounts = [account];
+      // Another account that the user signed in with instead counts too (the message then names another account).
+      accounts = account ? [account] : await this.readAccounts();
     }
     if (ownerAmong(devspace, accounts) !== undefined) return devspace;
     const repository = this.displayName({ repository: devspace.repository });
@@ -3523,7 +3522,7 @@ export class Controller implements vscode.Disposable {
     devspace: Devspace,
     other: GitHubAccount | undefined,
   ): Promise<{ kind: 'owner'; account: GitHubAccount } | { kind: 'other'; account: GitHubAccount } | undefined> {
-    const login = nonEmptyLogin(devspace.owner.login);
+    const login = nonEmpty(devspace.owner.login);
     const signIn = login !== undefined ? ControllerTexts.signInAs(login) : undefined;
     const create = other !== undefined ? ControllerTexts.newDevspaceAs(other.login) : undefined;
     if (signIn === undefined && create === undefined) {
@@ -3662,10 +3661,14 @@ export class Controller implements vscode.Disposable {
     const accounts = signIn ? await this.requireAccounts() : await this.readAccounts();
     const dockerHost = await this.currentDockerHost();
     const base: Target = { repository, info, ...(source !== undefined ? { source } : {}) };
-    if (options.account !== undefined) {
-      const devspace = await this.deps.registry.findForAccount(repository, options.account.id, dockerHost, source);
-      return { ...base, devspace, account: options.account };
+    const named = options.account;
+    if (named !== undefined && accounts.some((account) => account.id === named.id)) {
+      const devspace = await this.deps.registry.findForAccount(repository, named.id, dockerHost, source);
+      return { ...base, devspace, account: named };
     }
+    // The account chosen before (Try again) left Devspaces meanwhile: the rules below choose, and its devspace is one of
+    // an account that Devspaces does not use (rule 2).
+    if (named !== undefined) this.logger.info(`The GitHub account ${named.login} is no longer signed in to Devspaces: the account of ${repository} is chosen again.`);
     // The devspace of the source of the repository; without a source (a repository with one source that the discovery
     // does not know), its most recently used devspace.
     const entries = await this.deps.registry.list();
@@ -3697,11 +3700,20 @@ export class Controller implements vscode.Disposable {
     if (listed.length > 0 || accounts.length <= 1) return listed.length > 0 ? listed : accounts.map((account) => ({ account }));
     // The accounts are asked at the same time (no dialog: a rejected token counts as no access here).
     const looked = await Promise.all(accounts.map((account) => this.lookUpRepository(repository, account)));
-    const found = accounts.flatMap((account, index) => {
-      const info = looked[index]?.info;
-      return info === undefined ? [] : [candidateOf(account, info.permission, listings)];
-    });
+    const found = this.foundCandidates(accounts, looked).map((each) => each.candidate);
     return found.length > 0 ? found : accounts.map((account) => ({ account }));
+  }
+
+  /**
+   * The candidates of rule 3 (accountChoice.ts) among `accounts` that GitHub showed the repository to (`looked`: the
+   * lookUpRepository results, in the order of `accounts`), each with the data that its account got.
+   */
+  private foundCandidates(accounts: readonly GitHubAccount[], looked: readonly LookUpResult[]): Array<{ candidate: AccountCandidate; info: RepositoryInfo }> {
+    const listings = this.deps.sidebar.accountListings();
+    return accounts.flatMap((account, index) => {
+      const info = looked[index]?.info;
+      return info === undefined ? [] : [{ candidate: candidateOf(account, info.permission, listings), info }];
+    });
   }
 
   /**
@@ -4103,7 +4115,3 @@ function uniqueNames(names: readonly string[]): string[] {
  */
 const usesDevspace = statusNamesDevspace;
 
-/** `login` when it is not empty: an owner restored from a volume label has no login until the next open. */
-function nonEmptyLogin(login: string): string | undefined {
-  return login.trim() === '' ? undefined : login;
-}

@@ -11,6 +11,7 @@
 import * as vscode from 'vscode';
 import { errorMessage } from '../core/errors';
 import type { Credentials, GitHubAuth, GitHubAuthOptions, Logger } from '../core/ports';
+import { accountIds } from '../core/ownership';
 import type { GitHubAccount } from '../core/types';
 import { GITHUB_ENTERPRISE_SECTION, githubEnterpriseConfigured } from './settings';
 
@@ -23,6 +24,11 @@ export const PACKAGES_SCOPES: readonly string[] = ['repo', 'read:org', 'read:pac
 export const SIGNED_IN_CONTEXT_KEY = 'devspaces.signedIn';
 /** Context key for the welcome view (package.json): the settings of VS Code name a GitHub Enterprise instance. */
 export const GITHUB_ENTERPRISE_CONTEXT_KEY = 'devspaces.githubEnterprise';
+/**
+ * The reports of a change of the sessions within this time fire onDidChangeSession once (reportChange): VS Code
+ * reports the session of a sign-in dialog at about the time that the dialog returns it.
+ */
+const CHANGE_DELAY_MS = 100;
 
 // User-visible text that messages.ts lacks; to be moved there.
 /** Shown by VS Code when a new session is requested because GitHub rejected the stored one. */
@@ -54,10 +60,12 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   private accountSet: Promise<GitHubAccount[]> | undefined;
   /**
    * The IDs of the accounts that onDidChangeSession reported last (before any change: of the first read of the set). A
-   * dialog fires onDidChangeSession only for another set, so that a change that VS Code reported itself (a new session)
-   * is not reported twice.
+   * dialog reports a change only for another set.
    */
   private reportedAccounts: string | undefined;
+  /** The report of a change that waits for CHANGE_DELAY_MS (reportChange). */
+  private changeTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
 
   /**
    * Fires when the GitHub sessions of VS Code change (sign-in, sign-out, account change), and when a sign-in dialog of
@@ -77,13 +85,7 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
       vscode.authentication.onDidChangeSessions((event) => {
         if (event.provider.id !== GITHUB_PROVIDER_ID) return;
         this.accountSet = undefined;
-        this.accounts()
-          .then((accounts) => {
-            this.reportedAccounts = accountIds(accounts);
-            return this.updateContextKey();
-          })
-          .then(undefined, (error: unknown) => this.logger.warn(`Could not update the sign-in state: ${errorMessage(error)}`))
-          .finally(() => this.changeEmitter.fire());
+        this.reportChange();
       }),
     );
   }
@@ -232,6 +234,9 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
   }
 
   dispose(): void {
+    this.disposed = true;
+    if (this.changeTimer !== undefined) clearTimeout(this.changeTimer);
+    this.changeTimer = undefined;
     for (const subscription of this.subscriptions.splice(0)) subscription.dispose();
   }
 
@@ -373,24 +378,35 @@ export class VsCodeGitHubAuth implements GitHubAuth, vscode.Disposable {
     const first = this.reportedAccounts === undefined;
     this.accountSet = undefined;
     void this.accounts()
-      .then(async (accounts) => {
-        const ids = accountIds(accounts);
-        if (!first && ids === this.reportedAccounts) return;
-        this.reportedAccounts = ids;
-        await this.updateContextKey();
-        this.changeEmitter.fire();
+      .then((accounts) => {
+        if (first || accountIds(accounts) !== this.reportedAccounts) this.reportChange();
       })
       .catch((error: unknown) => this.logger.warn(`Could not update the sign-in state: ${errorMessage(error)}`));
+  }
+
+  /**
+   * Fires onDidChangeSession once for the reports of CHANGE_DELAY_MS, after the context key is up to date: a dialog
+   * that created a session and VS Code (onDidChangeSessions) both report that session, in either order.
+   */
+  private reportChange(): void {
+    if (this.changeTimer !== undefined || this.disposed) return;
+    this.changeTimer = setTimeout(() => {
+      this.changeTimer = undefined;
+      this.accounts()
+        .then((accounts) => {
+          this.reportedAccounts = accountIds(accounts);
+          return this.updateContextKey();
+        })
+        .then(undefined, (error: unknown) => this.logger.warn(`Could not update the sign-in state: ${errorMessage(error)}`))
+        .finally(() => {
+          if (!this.disposed) this.changeEmitter.fire();
+        });
+    }, CHANGE_DELAY_MS);
   }
 }
 
 function accountOf(session: vscode.AuthenticationSession): GitHubAccount {
   return { id: session.account.id, login: session.account.label };
-}
-
-/** The IDs of `accounts` as one text, to compare two reads of the set. */
-function accountIds(accounts: readonly GitHubAccount[]): string {
-  return accounts.map((account) => account.id).join(' ');
 }
 
 /** The key of the session of the account `accountId` ('' = the session that VS Code gives Devspaces) and `scopes`. */

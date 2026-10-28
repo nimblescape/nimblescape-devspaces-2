@@ -129,6 +129,13 @@ describe('ownerTrust', () => {
     // The login of an account is known without its list.
     expect(ownerTrust(undefined, [ME], 'me')).toBe('trusted');
   });
+
+  it('does not wait for the list of an account outside `loading` (a rejected token): its organizations do not count', () => {
+    const NEW = { id: '3', login: 'new' };
+    expect(ownerTrust(data, [ME, NEW], 'stranger', [ME])).toBe('untrusted');
+    // Its login still counts.
+    expect(ownerTrust(data, [ME, NEW], 'new', [ME])).toBe('trusted');
+  });
 });
 
 describe('repository lists', () => {

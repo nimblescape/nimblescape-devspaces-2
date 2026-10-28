@@ -680,6 +680,22 @@ describe('Sidebar: the time until the list is shown', () => {
     expect(rowOf('acme/old').notOnGitHub).toBe(true);
   });
 
+  it('keeps what GitHub said about the repositories that the list lacks while no list loads (without internet access)', async () => {
+    await h.registry.add(devspace(API, 'acme/api'));
+    await h.registry.add(devspace(OLD, 'acme/old'));
+    h.discovery.getRepository.mockResolvedValue(undefined);
+    await signedIn();
+    await h.sidebar.render();
+    expect(rowOf('acme/old').notOnGitHub).toBe(true);
+    const asked = h.discovery.getRepository.mock.calls.length;
+    h.discovery.refresh.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+    h.discovery.getRepository.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+    await h.sidebar.refreshDiscovery({ again: true });
+    await h.sidebar.render();
+    expect(rowOf('acme/old').notOnGitHub).toBe(true);
+    expect(h.discovery.getRepository).toHaveBeenCalledTimes(asked);
+  });
+
   it('asks GitHub about the repositories that the list lacks, at most 4 at the same time', async () => {
     const ids = ['a', 'b', 'c', 'd', 'e', 'f'].map((letter) => `${letter.repeat(8)}-1111-4111-8111-111111111111`);
     for (const [index, id] of ids.entries()) await h.registry.add(devspace(id, `acme/unlisted${index}`));

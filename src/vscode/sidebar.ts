@@ -18,7 +18,7 @@ import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
 import { devspacesOfHost } from '../core/docker/dockerHost';
-import { availableDevspaces } from '../core/ownership';
+import { accountIds, availableDevspaces } from '../core/ownership';
 import { systemClock, type Clock, type Logger } from '../core/ports';
 import type { DevspaceOperations } from '../core/pipeline/devspaceOperations';
 import type { DevspaceRegistry } from '../core/storage/registry';
@@ -447,14 +447,17 @@ export class Sidebar implements vscode.Disposable {
   /**
    * Security: the owner is an account of Devspaces or one of their organizations (ownerTrust). The organizations come
    * from the list of each account; while the list of an account is not loaded (after its sign-in, or without a list),
-   * another owner counts as trusted only after a refresh.
+   * another owner counts as trusted only after a refresh. An account whose token GitHub rejected does not wait for a
+   * refresh, which skips it: without its list, the owner counts as untrusted (the first open asks).
    */
   async trustedOwner(owner: string): Promise<boolean> {
     const accounts = await this.readAccounts();
-    let trust = ownerTrust(this.data, accounts, owner);
+    const signedIn = await Promise.all(accounts.map((account) => this.authSignedIn(account)));
+    const loading = accounts.filter((_, index) => signedIn[index]);
+    let trust = ownerTrust(this.data, accounts, owner, loading);
     if (trust === 'unknown' && accounts.length > 0) {
       await this.refreshDiscovery();
-      trust = ownerTrust(this.data, accounts, owner);
+      trust = ownerTrust(this.data, accounts, owner, loading);
     }
     return trust === 'trusted';
   }
@@ -653,7 +656,8 @@ export class Sidebar implements vscode.Disposable {
    * The refresh of the lists: one account after the other, each with its own token, so that no more than
    * DISCOVERY_CONCURRENCY requests run at the same time. An account whose token GitHub rejected keeps its stored list
    * (no refresh, which would fail again, until its new sign-in); a failed refresh of one account keeps its stored list,
-   * and the other accounts still refresh. Then the repositories of the devspaces that no list has are looked up.
+   * and the other accounts still refresh. When a list loaded, the repositories of the devspaces that no list has are
+   * looked up.
    */
   private async refreshDiscoveryNow(): Promise<DiscoveryData | undefined> {
     if (this.disposed) return this.data;
@@ -704,7 +708,9 @@ export class Sidebar implements vscode.Disposable {
     if (refreshed && !rateLimited && !failed) this.clearRateLimitRetry();
     // Without any list, the view says that the list could not be loaded (not that no repository was found).
     this.setLoadFailed((failed || rateLimited) && !this.hasList());
-    if (changes === this.accountChanges && !this.disposed) {
+    // As before several accounts: only after a list loaded (without internet access, or while GitHub refuses the lists
+    // for its rate limit, the lookups of the last refresh stay).
+    if (refreshed && changes === this.accountChanges && !this.disposed) {
       const lookups = await this.lookUpUnlisted();
       if (changes === this.accountChanges) this.lookups = lookups;
     }
@@ -987,7 +993,3 @@ function localClockTime(time: number): string {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
-/** The IDs of `accounts` as one text, to compare two reads of the accounts. */
-function accountIds(accounts: readonly GitHubAccount[]): string {
-  return accounts.map((account) => account.id).join(' ');
-}

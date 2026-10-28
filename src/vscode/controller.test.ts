@@ -7888,6 +7888,19 @@ describe('Several GitHub accounts', () => {
     expect(h.service.openInWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('a link that GitHub could not be asked about opens only an existing devspace: no question, no second lookup', async () => {
+    const STRANGER: GitHubAccount = { id: '4004', login: 'stranger' };
+    await h.registry.add(devspace({ owner: STRANGER }));
+    h.discovery.getRepository.mockRejectedValue(new Error('getaddrinfo ENOTFOUND api.github.com'));
+    await h.controller.openLink(link('acme/api'));
+    // One lookup per account, and no question of rule 2 about the devspace of stranger.
+    expect(h.discovery.getRepository).toHaveBeenCalledTimes(2);
+    expect(warningMessages()).not.toContain(ControllerTexts.hiddenOwnerQuestion('acme/api', STRANGER.login));
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(ControllerTexts.linkRepositoryUnknown('acme/api'), Actions.showDetails);
+    expect(h.service.openInWorker).not.toHaveBeenCalled();
+    expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
+  });
+
   it('a course link asks no new sign-in of an account whose token GitHub rejected while another account finds its repository', async () => {
     fakeVscode.window.showWarningMessage.mockResolvedValue(Actions.open);
     h.discovery.getRepository.mockImplementation(async (repository: string, token: string) => {
