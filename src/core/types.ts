@@ -232,6 +232,16 @@ export interface RegistryFile {
   keptVolumes?: KeptVolume[];
 }
 
+/** The permission of a GitHub account on a repository (the GraphQL field `viewerPermission`), highest first. */
+export type RepositoryPermission = 'ADMIN' | 'MAINTAIN' | 'WRITE' | 'TRIAGE' | 'READ';
+
+/** An account of Devspaces whose list has a repository, with its permission there (the merged list, mergeDiscovery). */
+export interface AccountAccess {
+  account: GitHubAccount;
+  /** Missing: not known (a list of an older version, or GitHub gave none). */
+  permission?: RepositoryPermission;
+}
+
 /** A repository found by the discovery. */
 export interface RepositoryInfo {
   /** `owner/name`. */
@@ -247,6 +257,16 @@ export interface RepositoryInfo {
   defaultBranch: string | null;
   /** Configuration paths in the order of precedence. The first one is the default. */
   configPaths: string[];
+  /**
+   * The permission of the account of the list on the repository (`viewerPermission`). Missing in a list of an older
+   * version (until its next refresh), and when GitHub gave none.
+   */
+  permission?: RepositoryPermission;
+  /**
+   * Only in the merged list of the sidebar (mergeDiscovery): each account of Devspaces whose list has the repository,
+   * with its permission, in the order of the accounts.
+   */
+  access?: AccountAccess[];
 }
 
 /**
@@ -261,6 +281,11 @@ export interface OrganizationHint {
   kind: OrganizationHintKind;
   /** URL where the user can authorize the access. */
   url: string;
+  /**
+   * Only in the merged list of the sidebar, when Devspaces uses more than one account: the login of the account that the
+   * organization refuses.
+   */
+  login?: string;
 }
 
 /** Content of repositories-<account ID>.json. */
@@ -289,6 +314,19 @@ export interface DiscoveryData {
    * `owner/name`: the next refresh reads their configurations again. Missing when there are none.
    */
   uncertain?: string[];
+  /**
+   * Only in the merged list of the sidebar (mergeDiscovery): the accounts whose complete lists it merges, with the
+   * organizations where each one is a member. The list of an account that is still loading (its first load) is not
+   * named here.
+   */
+  accounts?: AccountListing[];
+}
+
+/** An account whose list the merged list holds (DiscoveryData.accounts). */
+export interface AccountListing {
+  account: GitHubAccount;
+  /** Logins of the organizations where the account is a member. */
+  organizations: string[];
 }
 
 /** Content of sessions/<window-id>.json. */

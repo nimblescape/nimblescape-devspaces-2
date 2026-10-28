@@ -73,7 +73,7 @@ describe('the calls of a window to the Monitor, as operations of the worker', ()
     const sent: { target: unknown; options: OperationOptions }[] = [];
     const channels = { flow: vi.fn(async (target: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push({ target, options }), { recorded: true })) };
     const current = vi.fn(async () => ({ kind: 'local' }) as DockerTarget);
-    const flow = extensionFlow(channels as never, current, extensionHostSide(deps), silentLogger);
+    const flow = extensionFlow(channels as never, current, (account) => extensionHostSide(deps, account), silentLogger);
     await flow(OP_RECORD_GIT_STATE, { devspaceId: ID, dockerHost: 'ssh://box', owner: { windowId: 'w1', pid: 1 } }, { target: TARGET });
     expect(sent[0].target).toBe(TARGET);
     expect(current).not.toHaveBeenCalled();

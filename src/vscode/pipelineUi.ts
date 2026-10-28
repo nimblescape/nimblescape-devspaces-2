@@ -10,7 +10,7 @@ import { ControllerTexts } from './controllerTexts';
 import { systemClock, type Clock, type Logger, type PipelineUi, type ConfigurationChangeKind } from '../core/ports';
 import type { VsCodeGitHubAuth } from './auth';
 import { GITHUB_PACKAGES_REGISTRY } from '../core/imageCheck/credentials';
-import type { UpdateContainer } from '../core/types';
+import type { GitHubAccount, UpdateContainer } from '../core/types';
 import { showInformationMessage, showWarningMessage } from './notifications';
 
 /** Identical non-blocking messages within this time are shown once. */
@@ -161,9 +161,9 @@ export class VsCodePipelineUi implements PipelineUi {
     );
   }
 
-  registrySignIn(registry: string): void {
+  registrySignIn(registry: string, account?: GitHubAccount): void {
     const message = Messages.registrySignIn(registry);
-    if (!this.shouldShow(`registry:${registry.toLowerCase()}`)) return;
+    if (!this.shouldShow(`registry:${registry.toLowerCase()}:${account?.id ?? ''}`)) return;
     this.logger.info(message);
     if (registry.toLowerCase() !== GITHUB_PACKAGES_REGISTRY) {
       showInformationMessage(message)
@@ -173,8 +173,9 @@ export class VsCodePipelineUi implements PipelineUi {
     showInformationMessage(message, Actions.signIn)
       .then(async (choice) => {
         if (choice !== Actions.signIn) return;
-        // The next connection uses the session through the credentials provider of the image check.
-        const credentials = await this.auth.getPackagesCredentials({ interactive: true });
+        // The next connection uses the session through the credentials provider of the image check: the session of the
+        // account of the operation (the owner of the devspace), never of another account.
+        const credentials = await this.auth.getPackagesCredentials({ interactive: true, account });
         this.logger.info(
           credentials
             ? `Signed in for ${registry}. The next connection uses the sign-in.`

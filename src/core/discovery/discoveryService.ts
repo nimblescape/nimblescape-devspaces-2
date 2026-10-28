@@ -16,7 +16,9 @@ import type {
   OrganizationHint,
   OrganizationHintKind,
   RepositoryInfo,
+  RepositoryPermission,
 } from '../types';
+import { REPOSITORY_PERMISSIONS } from '../accountChoice';
 import { detectConfigurations, type ConfigurationNode } from './detect';
 import { needsConfigurationLookup, nodesWithErrors, storedDetections, type StoredDetection } from './incremental';
 import {
@@ -77,6 +79,7 @@ const REPOSITORY_FIELDS_FRAGMENT = `fragment RepositoryFields on Repository {
   isFork
   isPrivate
   pushedAt
+  viewerPermission
   owner {
     login
   }
@@ -101,6 +104,7 @@ const REPOSITORY_LIST_FIELDS_FRAGMENT = `fragment RepositoryListFields on Reposi
   isFork
   isPrivate
   pushedAt
+  viewerPermission
   owner {
     login
   }
@@ -324,6 +328,7 @@ interface RepositoryNode extends ConfigurationNode {
   pushedAt?: string | null;
   owner?: LoginNode | null;
   defaultBranchRef?: { name?: string } | null;
+  viewerPermission?: string | null;
 }
 
 interface ViewerNode {
@@ -1082,19 +1087,6 @@ export function filterRepositories(
   );
 }
 
-/**
- * Security: the owner is the signed-in user or an organization where the user is a member. Without discovery data, no
- * owner is trusted. The data belongs to `data.viewerLogin`: after a change of the GitHub account, a refresh is needed
- * first.
- */
-export function isTrustedOwner(data: DiscoveryData | undefined, owner: string): boolean {
-  if (!data) return false;
-  const wanted = owner.trim().toLowerCase();
-  if (wanted === '') return false;
-  if (data.viewerLogin.toLowerCase() === wanted) return true;
-  return data.organizations.some((organization) => organization.toLowerCase() === wanted);
-}
-
 // ---------------------------------------------------------------------------------------------------------------------
 // Organization hints
 
@@ -1421,7 +1413,13 @@ function toRepositoryInfo(node: RepositoryNode): RepositoryInfo | undefined {
     pushedAt: typeof node.pushedAt === 'string' ? node.pushedAt : null,
     defaultBranch: typeof defaultBranch === 'string' && defaultBranch !== '' ? defaultBranch : null,
     configPaths: detectConfigurations(node),
+    ...(isRepositoryPermission(node.viewerPermission) ? { permission: node.viewerPermission } : {}),
   };
+}
+
+/** True for a value of the GraphQL enum RepositoryPermission. */
+export function isRepositoryPermission(value: unknown): value is RepositoryPermission {
+  return typeof value === 'string' && (REPOSITORY_PERMISSIONS as readonly string[]).includes(value);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1446,7 +1444,8 @@ function isRepositoryInfo(value: unknown): value is RepositoryInfo {
     typeof value.isPrivate === 'boolean' &&
     (value.pushedAt === null || typeof value.pushedAt === 'string') &&
     (value.defaultBranch === null || typeof value.defaultBranch === 'string') &&
-    isStringArray(value.configPaths)
+    isStringArray(value.configPaths) &&
+    (value.permission === undefined || isRepositoryPermission(value.permission))
   );
 }
 

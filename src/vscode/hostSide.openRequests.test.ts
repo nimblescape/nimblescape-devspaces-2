@@ -22,6 +22,9 @@ const NOW = Date.parse('2026-10-04T12:00:00.000Z');
 const SCOPE = { dockerHost: HOST };
 const other: BusyMark = { operation: 'update', since: '2026-10-04T11:59:00.000Z', pid: 200, windowId: 'w2' };
 
+/** The account of the operation of the flows here (chosen by the extension). */
+const OPERATION_ACCOUNT = { id: '42', login: 'octo' };
+
 function setup(fields: Partial<Devspace> = {}, overrides: { account?: { id: string; login: string } | null; windowStatuses?: WindowStatus[] } = {}) {
   let entry = { id: ID, repository: 'acme/api', owner: { id: '42', login: 'old' }, dockerHost: HOST, lastUsedAt: '2020-01-01T00:00:00.000Z', ...fields } as Devspace;
   const registry = {
@@ -48,18 +51,19 @@ function setup(fields: Partial<Devspace> = {}, overrides: { account?: { id: stri
     isProcessAlive: () => true,
     logger: silentLogger,
   } as unknown as HostSideDeps;
-  return { host: extensionHostSide(deps), entry: () => entry, getAccount, readWindowStatuses };
+  // The account of the operation is 42; `account` is its session in this window (null: none).
+  return { host: extensionHostSide(deps, OPERATION_ACCOUNT), entry: () => entry, getAccount, readWindowStatuses };
 }
 
 describe('the registry writes of the open in the extension', () => {
   it('the login of the account signed in here, read without a dialog; never an entry of another account or host', async () => {
     const { host, entry, getAccount } = setup();
     expect(await host.records.ownerLogin(ID, SCOPE)).toMatchObject({ owner: { id: '42', login: 'octo' } });
-    expect(getAccount).toHaveBeenCalledWith({ interactive: false });
+    expect(getAccount).toHaveBeenCalledWith({ interactive: false, account: OPERATION_ACCOUNT });
     expect(entry().owner).toEqual({ id: '42', login: 'octo' });
     await expect(setup({ owner: { id: '7', login: 'x' } }).host.records.ownerLogin(ID, SCOPE)).rejects.toThrow('another account');
     await expect(setup().host.records.ownerLogin(ID, { dockerHost: '' })).rejects.toThrow('another Docker host');
-    await expect(setup({}, { account: null }).host.records.ownerLogin(ID, SCOPE)).rejects.toThrow('No GitHub account');
+    await expect(setup({}, { account: null }).host.records.ownerLogin(ID, SCOPE)).rejects.toThrow('The GitHub account of the operation is not signed in in this window.');
     // Without the scope of the handler (as the worker would call it), nothing is written.
     const unscoped = setup();
     await expect(unscoped.host.records.lifecycleMark(ID, 'clear')).rejects.toThrow('names no Docker host');
@@ -99,7 +103,7 @@ describe('the registry writes of the open in the extension', () => {
     const { host } = setup();
     const sent: OperationOptions[] = [];
     const channels = { flow: vi.fn(async (_t: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push(options), {})) };
-    await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, host, silentLogger)(OP_DELETE, { devspaceId: ID, dockerHost: HOST }, {});
+    await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, () => host, silentLogger)(OP_DELETE, { devspaceId: ID, dockerHost: HOST }, {});
     await expect(sent[0].onAsk!('record', { call: 'ownerLogin', args: [ID] }, new AbortController().signal)).rejects.toMatchObject({ code: 'invalid' });
   });
 
@@ -139,7 +143,7 @@ describe('the registry writes of the open in the extension', () => {
         isProcessAlive: () => true,
         logger: { ...silentLogger, warn: (text: string) => warnings.push(text) },
       } as unknown as HostSideDeps;
-      return { host: extensionHostSide(deps), file: () => file, warnings, getAccount };
+      return { host: extensionHostSide(deps, OPERATION_ACCOUNT), file: () => file, warnings, getAccount };
     }
 
     it('the entry of a first open with the account signed in here, the clock and the create mark of this window', async () => {
@@ -152,12 +156,12 @@ describe('the registry writes of the open in the extension', () => {
         createdAt: new Date(NOW).toISOString(),
         busy: { operation: 'create', since: new Date(NOW).toISOString(), pid: 100, windowId: 'w1' },
       });
-      expect(getAccount).toHaveBeenCalledWith({ interactive: false });
+      expect(getAccount).toHaveBeenCalledWith({ interactive: false, account: OPERATION_ACCOUNT });
       expect(file().devspaces).toEqual([created]);
       // Removed again only with the create mark of this window.
       await host.records.dropCreated(NEW, SCOPE);
       expect(file().devspaces).toEqual([]);
-      await expect(filed([], null).host.records.createDevspace(NEW, 'acme/api', DEFAULT, SCOPE)).rejects.toThrow('No GitHub account');
+      await expect(filed([], null).host.records.createDevspace(NEW, 'acme/api', DEFAULT, SCOPE)).rejects.toThrow('The GitHub account of the operation is not signed in in this window.');
       // Without the scope of the handler (as the worker would call it), nothing is written.
       const unscoped = filed();
       await expect(unscoped.host.records.createDevspace(NEW, 'acme/api', DEFAULT)).rejects.toThrow('names no Docker host');
@@ -181,7 +185,7 @@ describe('the registry writes of the open in the extension', () => {
       const { host } = filed();
       const sent: OperationOptions[] = [];
       const channels = { flow: vi.fn(async (_t: unknown, _op: string, _p: unknown, options: OperationOptions = {}) => (sent.push(options), {})) };
-      await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, host, silentLogger)(OP_DELETE, { repository: 'acme/api', dockerHost: HOST }, {});
+      await extensionFlow(channels as never, async () => ({ kind: 'remote' }) as never, () => host, silentLogger)(OP_DELETE, { repository: 'acme/api', dockerHost: HOST }, {});
       for (const payload of [
         { call: 'createDevspace', args: [{ id: NEW, repository: 'acme/api', configPath: DEFAULT }] },
         { call: 'configuration', args: [NEW, { cloned: true }] },

@@ -172,7 +172,7 @@ export interface RepositoryTarget {
   defaultBranch?: string | null;
   /** From the discovery, in the order of precedence. Empty for an unknown repository: the pipeline then uses the first configuration in the volume. */
   configPaths: string[];
-  /** isTrustedOwner(). */
+  /** The owner is an account of Devspaces or one of its organizations (ownerTrust, src/vscode/targets.ts). */
   trusted: boolean;
 }
 
@@ -198,6 +198,12 @@ export interface OpenOptions extends OperationOptions {
    * source of the other kind is not followed.
    */
   source?: DevspaceSource;
+  /**
+   * The GitHub account that a first open creates the devspace with (the account choice of the extension,
+   * accountChoice.ts). The open of an existing devspace always uses its owner account. Missing: the account of the
+   * session that VS Code gives Devspaces.
+   */
+  account?: GitHubAccount;
 }
 
 export interface OpenResult {
@@ -402,34 +408,41 @@ export abstract class OperationBase {
   }
 
   /**
-   * The signed-in account (`interactive`: a sign-in may be asked for); refuses a devspace of another account.
+   * The owner account of the devspace, while it has a session (`interactive`: a sign-in of that account may be asked
+   * for); in the worker, the account of the operation, which the extension chose. Refuses a devspace of another account.
    */
   protected async requireOwnAccount(devspace: Devspace, interactive: boolean): Promise<void> {
-    const account = await this.deps.auth.getAccount({ interactive });
-    if (!account) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    this.availableEntry(devspace, account);
+    const account = await this.deps.auth.getAccount({ interactive, account: devspace.owner });
+    if (account) {
+      this.availableEntry(devspace, account);
+      return;
+    }
+    // Another account is signed in, but not the owner.
+    if (await this.deps.auth.getAccount({ interactive: false })) throw otherAccount(devspace.repository);
+    throw new UserFacingError('signInRequired', Messages.signInRequired);
   }
 
   /** The registry entry, when it belongs to `account`. Throws otherAccount for an entry of another account. */
   protected availableEntry(devspace: Devspace, account: GitHubAccount): Devspace {
     if (isAvailableTo(devspace, account)) return devspace;
-    this.logger.info(`The devspace ${devspace.id} does not belong to the signed-in account. It is not used.`);
+    this.logger.info(`The devspace ${devspace.id} does not belong to the GitHub account of the operation. It is not used.`);
     throw otherAccount(devspace.repository);
   }
 
   /**
-   * The token and the account of the GitHub session; asks for a sign-in when needed. Both must come from one session: a
-   * sign-in with another account between the two questions would give a devspace of this account the token of the
-   * other one.
+   * The token and the account of the GitHub session of `account` (without one: of the session that VS Code gives
+   * Devspaces; in the worker, of the account of the operation); asks for a sign-in when needed. Both must come from one
+   * session: a sign-in with another account between the two questions would give a devspace of this account the token
+   * of the other one.
    */
-  protected async requireSession(): Promise<GitHubSession> {
-    const token = await this.deps.auth.getToken({ interactive: true });
+  protected async requireSession(account?: GitHubAccount): Promise<GitHubSession> {
+    const token = await this.deps.auth.getToken({ interactive: true, account });
     if (!token) throw new UserFacingError('signInRequired', Messages.signInRequired);
-    const account = await this.deps.auth.getAccount({ interactive: false });
-    if (!account || (await this.deps.auth.getToken({ interactive: false })) !== token) {
+    const current = await this.deps.auth.getAccount({ interactive: false, account });
+    if (!current || (account !== undefined && current.id !== account.id) || (await this.deps.auth.getToken({ interactive: false, account })) !== token) {
       throw new UserFacingError('signInRequired', Messages.signInRequired, 'The GitHub session changed during the open.');
     }
-    return { token, account };
+    return { token, account: current };
   }
 
   /**

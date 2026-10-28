@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
-import { GitHubRateLimitError } from '../core/discovery/githubApi';
+import { GitHubApiError, GitHubRateLimitError } from '../core/discovery/githubApi';
 import { LOCAL_DOCKER_TARGET } from '../core/docker/dockerHost';
 import { operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { Actions, Messages, StateTexts } from '../core/messages';
@@ -110,6 +110,7 @@ interface Harness {
     getToken: ReturnType<typeof vi.fn>;
     getSession: ReturnType<typeof vi.fn>;
     getAccount: ReturnType<typeof vi.fn>;
+    accounts: ReturnType<typeof vi.fn>;
     isSignedIn: ReturnType<typeof vi.fn>;
     updateContextKey: ReturnType<typeof vi.fn>;
   };
@@ -165,13 +166,18 @@ function createHarness(): Harness {
   };
   const auth = {
     getToken: vi.fn(async () => 'gho_token'),
-    // One session: the token and the account that getToken and getAccount give.
-    getSession: vi.fn(async (): Promise<{ token: string; account: GitHubAccount } | undefined> => {
+    // One session: the token of getToken and the named account (by default the account of getAccount).
+    getSession: vi.fn(async (options: { account?: GitHubAccount } = {}): Promise<{ token: string; account: GitHubAccount } | undefined> => {
       const token = (await auth.getToken()) as string | undefined;
-      const account = await auth.getAccount();
+      const account = options.account ?? (await auth.getAccount());
       return token !== undefined && account !== undefined ? { token, account } : undefined;
     }),
     getAccount: vi.fn(async (): Promise<GitHubAccount | undefined> => OCTO),
+    // The accounts of Devspaces: by default the one account of getAccount (a test of several accounts sets them).
+    accounts: vi.fn(async (): Promise<GitHubAccount[]> => {
+      const account = await auth.getAccount();
+      return account ? [account] : [];
+    }),
     isSignedIn: vi.fn(async () => true),
     updateContextKey: vi.fn(async () => true),
     renewToken: vi.fn(async () => undefined),
@@ -610,20 +616,32 @@ describe('Sidebar', () => {
 
     h.auth.getAccount.mockResolvedValue(OTHER);
     void h.sidebar.onSessionChanged();
-    await vi.waitFor(() => expect(h.sidebar.currentAccount).toEqual(OTHER));
+    await vi.waitFor(() => expect(h.sidebar.currentAccounts).toEqual([OTHER]));
     await h.sidebar.render();
     expect(h.discovery.loadStored).toHaveBeenLastCalledWith(OTHER.id);
     expect(rows().map((row) => row.repository).sort()).toEqual(['staussh/public', 'staussh/tools']);
     expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('scalarion');
   });
 
-  it('refreshes with the token and the account of one session', async () => {
-    await h.sidebar.initialize();
-    await h.sidebar.refreshDiscovery();
-    // Separate reads would give OCTO's token with OTHER's account after a switch between them.
-    h.auth.getSession.mockResolvedValue({ token: 'gho_other', account: OTHER });
-    await h.sidebar.refreshDiscovery({ again: true });
-    expect(h.discovery.refresh).toHaveBeenLastCalledWith('gho_other', OTHER.id);
+  it('refreshes the list of each account with the token of its own session', async () => {
+    h.auth.accounts.mockResolvedValue([OCTO, OTHER]);
+    h.auth.getSession.mockImplementation(async (options: { account?: GitHubAccount } = {}) =>
+      options.account?.id === OTHER.id ? { token: 'gho_other', account: OTHER } : { token: 'gho_token', account: OCTO },
+    );
+    await signedIn();
+    expect(h.discovery.refresh).toHaveBeenCalledWith('gho_token', OCTO.id);
+    expect(h.discovery.refresh).toHaveBeenCalledWith('gho_other', OTHER.id);
+    expect(h.discovery.refresh).not.toHaveBeenCalledWith('gho_token', OTHER.id);
+    expect(h.discovery.refresh).not.toHaveBeenCalledWith('gho_other', OCTO.id);
+  });
+
+  it('never stores a list under an account whose session VS Code gave for another account', async () => {
+    h.auth.accounts.mockResolvedValue([OCTO, OTHER]);
+    // VS Code answers the question for OTHER with a session of OCTO.
+    h.auth.getSession.mockImplementation(async () => ({ token: 'gho_token', account: OCTO }));
+    await signedIn();
+    expect(h.discovery.refresh).toHaveBeenCalledWith('gho_token', OCTO.id);
+    expect(h.discovery.refresh).not.toHaveBeenCalledWith(expect.anything(), OTHER.id);
   });
 
   it('refreshes with the ID of the account, so the list is stored for that account', async () => {
@@ -679,6 +697,8 @@ describe('Sidebar: the time until the list is shown', () => {
     await h.sidebar.initialize();
     await vi.waitFor(() => expect(h.discovery.refresh).toHaveBeenCalledTimes(1));
     const changed = h.sidebar.onSessionChanged();
+    // The change is checked while the refresh runs.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     finish(data([info('acme/api')]));
     await changed;
     expect(h.discovery.refresh).toHaveBeenCalledTimes(1);
@@ -805,8 +825,8 @@ describe('Sidebar progressive display', () => {
     h.sidebar.onPartialResult(part([info('acme/api'), info('acme/web')]));
     await h.sidebar.render();
     expect(rows().map((row) => row.repository)).toEqual(['acme/api', 'acme/web']);
-    // The trust of an owner still waits for the complete list.
-    expect(h.sidebar.discoveryData).toBeUndefined();
+    // The trust of an owner still waits for the complete list: no account has a complete list yet.
+    expect(h.sidebar.accountListings()).toEqual([]);
 
     finish(data([info('acme/api'), info('acme/web'), info('acme/zeta')]));
     await h.sidebar.refreshDiscovery();
@@ -840,7 +860,7 @@ describe('Sidebar progressive display', () => {
     h.auth.getAccount.mockResolvedValue(OTHER);
     // The refresh of OTHER waits behind the running one; the view changes at once.
     void h.sidebar.onSessionChanged();
-    await vi.waitFor(() => expect(h.sidebar.currentAccount?.id).toBe(OTHER.id));
+    await vi.waitFor(() => expect(h.sidebar.currentAccounts.map((account) => account.id)).toEqual([OTHER.id]));
     await h.sidebar.render();
     expect(rows()).toEqual([]);
     expect(h.sidebar.repositoryInfo('octo/private-a')).toBeUndefined();
@@ -1400,5 +1420,75 @@ describe('Sidebar progressive display', () => {
     await h.sidebar.render();
     expect(rows()).toEqual([]);
     expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith('setContext', LOAD_FAILED_CONTEXT_KEY, true);
+  });
+});
+
+describe('Sidebar with several GitHub accounts', () => {
+  const ofOther = (repositories: RepositoryInfo[]): DiscoveryData => ({ ...data(repositories), viewerLogin: 'someone', organizations: ['school'] });
+
+  beforeEach(() => {
+    h.auth.accounts.mockResolvedValue([OCTO, OTHER]);
+    h.auth.getSession.mockImplementation(async (options: { account?: GitHubAccount } = {}) =>
+      options.account?.id === OTHER.id ? { token: 'gho_other', account: OTHER } : { token: 'gho_token', account: OCTO },
+    );
+  });
+
+  it('shows one list of the stored lists of both accounts at once, with the devspaces of both', async () => {
+    await h.registry.add(devspace(API, 'acme/api'));
+    await h.registry.add(devspace(OLD, 'school/task', { owner: OTHER }));
+    h.discovery.loadStored.mockImplementation(async (accountId: string) => (accountId === OTHER.id ? ofOther([info('school/task'), info('acme/api')]) : data([info('acme/api')])));
+    h.discovery.refresh.mockImplementation(() => new Promise(() => undefined));
+    await h.sidebar.initialize();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository).sort()).toEqual(['acme/api', 'school/task']);
+    expect(h.sidebar.repositoryInfo('acme/api')?.access?.map((access) => access.account.login)).toEqual(['octo', 'someone']);
+    expect(h.sidebar.accountListings().map((listing) => [listing.account.login, listing.organizations])).toEqual([
+      ['octo', ['acme']],
+      ['someone', ['school']],
+    ]);
+    expect(h.sidebar.accountList(OTHER.id)?.viewerLogin).toBe('someone');
+    expect((await h.sidebar.availableDevspaces()).map((entry) => entry.id)).toEqual([API, OLD]);
+  });
+
+  it('removes the list and the devspaces of an account that leaves, and keeps those of the other account', async () => {
+    await h.registry.add(devspace(API, 'acme/api'));
+    await h.registry.add(devspace(OLD, 'school/task', { owner: OTHER }));
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) => (accountId === OTHER.id ? ofOther([info('school/task')]) : data([info('acme/api')])));
+    await signedIn();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository).sort()).toEqual(['acme/api', 'school/task']);
+
+    h.auth.accounts.mockResolvedValue([OCTO]);
+    await h.sidebar.onSessionChanged();
+    await h.sidebar.render();
+    expect(rows().map((row) => row.repository)).toEqual(['acme/api']);
+    expect(JSON.stringify(h.models[h.models.length - 1])).not.toContain('school');
+    expect(h.sidebar.accountList(OTHER.id)).toBeUndefined();
+  });
+
+  it('a rejected token of one account offers the new sign-in of that account only; the other account still refreshes', async () => {
+    h.discovery.loadStored.mockImplementation(async (accountId: string) => (accountId === OCTO.id ? data([info('acme/stored')]) : undefined));
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) => {
+      if (accountId === OCTO.id) throw new GitHubApiError('Bad credentials', 401);
+      return ofOther([info('school/task')]);
+    });
+    await signedIn();
+    await h.sidebar.render();
+    // octo keeps its stored list; someone shows its new one.
+    expect(rows().map((row) => row.repository).sort()).toEqual(['acme/stored', 'school/task']);
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(String(fakeVscode.window.showWarningMessage.mock.calls[0]?.[0])).toContain('octo');
+    expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('The repository list of octo could not be updated. The stored list is shown.'));
+  });
+
+  it('asks GitHub about the repository of a devspace that no list has with the token of its owner', async () => {
+    await h.registry.add(devspace(OLD, 'school/old', { owner: OTHER }));
+    await h.registry.add(devspace(GONE, 'acme/old'));
+    h.discovery.refresh.mockImplementation(async (_token: string, accountId: string) => (accountId === OTHER.id ? ofOther([]) : data([])));
+    await signedIn();
+    expect(h.discovery.getRepository.mock.calls.sort()).toEqual([
+      ['acme/old', 'gho_token'],
+      ['school/old', 'gho_other'],
+    ]);
   });
 });

@@ -128,19 +128,23 @@ export function workerWindow(context: DockerTestContext, docker: BootstrapDocker
   const extension = extensionFlow(
     locks.channels,
     () => targets.current(),
-    extensionHostSide({
-      registry: computer.registry,
-      sessionFiles: computer.sessionFiles,
-      ui,
-      auth,
-      credentials: { getForPull: async () => undefined },
-      windowId: owner.windowId,
-      pid: owner.pid,
-      clock: systemClock,
-      isProcessAlive: (pid) => pid === process.pid,
-      lifecycleMemory: memory,
-      logger: log,
-    }),
+    (account) =>
+      extensionHostSide(
+        {
+          registry: computer.registry,
+          sessionFiles: computer.sessionFiles,
+          ui,
+          auth,
+          credentials: { getForPull: async () => undefined },
+          windowId: owner.windowId,
+          pid: owner.pid,
+          clock: systemClock,
+          isProcessAlive: (pid) => pid === process.pid,
+          lifecycleMemory: memory,
+          logger: log,
+        },
+        account,
+      ),
     log,
   );
   // Every step of every flow is recorded, and passed on to the observer of the operation (the progress of the open).

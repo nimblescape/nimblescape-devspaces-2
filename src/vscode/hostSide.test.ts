@@ -58,6 +58,9 @@ function deps(overrides: Partial<HostSideDeps> = {}) {
   return { all, devspace, registry, sessionFiles, ui, auth, credentials };
 }
 
+/** The account of the operation of a flow. */
+const OCTO = { id: '42', login: 'octo' };
+
 describe('the HostSide of this computer', () => {
   it('takes a registry login from the store of Docker first, an identity token without its user', async () => {
     const { all, credentials, auth } = deps();
@@ -69,27 +72,39 @@ describe('the HostSide of this computer', () => {
     expect(await host.secrets.registry('registry.example', 'team/app')).toEqual({ identityToken: true, serveraddress: 'registry.example', password: 'refresh-token', from: 'docker' });
   });
 
-  it('uses the GitHub sign-in only for ghcr.io, never with a dialog, and nothing for other registries', async () => {
+  it('uses the GitHub sign-in of the account of the operation only for ghcr.io, never with a dialog, and nothing for other registries', async () => {
     const { all, auth } = deps();
-    const host = extensionHostSide(all);
+    const host = extensionHostSide(all, OCTO);
     expect(await host.secrets.registry('GHCR.io', 'octo/app')).toEqual({ username: 'octocat', serveraddress: 'ghcr.io', password: 'gho_packages', from: 'github' });
-    expect(auth.getPackagesCredentials).toHaveBeenCalledWith({ interactive: false });
+    expect(auth.getPackagesCredentials).toHaveBeenCalledWith({ interactive: false, account: OCTO });
     expect(await host.secrets.registry('registry.example', 'team/app')).toBeUndefined();
     auth.getPackagesCredentials.mockRejectedValueOnce(new Error('signed out'));
     expect(await host.secrets.registry('ghcr.io', 'octo/app')).toBeUndefined();
     expect(await host.secrets.token()).toBe('ghp_token');
-    expect(auth.getToken).toHaveBeenCalledWith({ interactive: false });
+    expect(auth.getToken).toHaveBeenCalledWith({ interactive: false, account: OCTO });
   });
 
-  // The account of the sign-in, with the dialog only when the flow asks for it.
-  it('reads the signed-in account with the interactive flag of the flow', async () => {
+  // The account of the operation, with the dialog only when the flow asks for it.
+  it('reads the account of the operation with the interactive flag of the flow', async () => {
     const { all, auth } = deps();
-    const host = extensionHostSide(all);
+    const host = extensionHostSide(all, OCTO);
     expect(await host.state.account(true)).toEqual({ id: '42', login: 'octo' });
-    expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: true });
+    expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: true, account: OCTO });
     auth.getAccount.mockResolvedValueOnce(undefined);
     expect(await host.state.account(false)).toBeUndefined();
-    expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: false });
+    expect(auth.getAccount).toHaveBeenLastCalledWith({ interactive: false, account: OCTO });
+  });
+
+  // Security (docs/security.md "Accounts"): the worker cannot choose an account.
+  it('gives a flow of no account no account, no token and no GitHub login of ghcr.io, and asks VS Code for none', async () => {
+    const { all, auth } = deps();
+    const host = extensionHostSide(all);
+    expect(await host.state.account(true)).toBeUndefined();
+    expect(await host.secrets.token()).toBeUndefined();
+    expect(await host.secrets.registry('ghcr.io', 'octo/app')).toBeUndefined();
+    expect(auth.getAccount).not.toHaveBeenCalled();
+    expect(auth.getToken).not.toHaveBeenCalled();
+    expect(auth.getPackagesCredentials).not.toHaveBeenCalled();
   });
 
   it('finds the devspace of a repository for an account with the source that the worker names, or without one', async () => {
@@ -121,7 +136,10 @@ describe('the HostSide of this computer', () => {
     await host.questions.message('info', 'i');
     await host.questions.message('warn', 'w');
     await host.questions.message('registrySignIn', 'ghcr.io');
-    expect([ui.info.mock.calls, ui.warn.mock.calls, ui.registrySignIn.mock.calls]).toEqual([[['i']], [['w']], [['ghcr.io']]]);
+    expect([ui.info.mock.calls, ui.warn.mock.calls, ui.registrySignIn.mock.calls]).toEqual([[['i']], [['w']], [['ghcr.io', undefined]]]);
+    // The Sign in of the hint is for the account of the operation.
+    await extensionHostSide(all, OCTO).questions.message('registrySignIn', 'ghcr.io');
+    expect(ui.registrySignIn).toHaveBeenLastCalledWith('ghcr.io', OCTO);
   });
 
   it('runs a flow in the worker of the current engine, answering only the requests of its operation', async () => {
@@ -133,7 +151,7 @@ describe('the HostSide of this computer', () => {
       flow: vi.fn(async (given: unknown, op: string, params: unknown, options: OperationOptions = {}) => (sent.push({ target: given, op, params, options }), { outcome: 'notRunning' })),
     };
     const warnings: string[] = [];
-    const flow = extensionFlow(channels as never, async () => target as never, extensionHostSide(all), { ...silentLogger, warn: (text) => warnings.push(text) });
+    const flow = extensionFlow(channels as never, async () => target as never, (account) => extensionHostSide(all, account), { ...silentLogger, warn: (text) => warnings.push(text) });
     const signal = new AbortController().signal;
     expect(await flow(OP_TOKEN_REMOVE, { devspaceId: 'e1' }, { signal, timeoutMs: 60_000 })).toEqual({ outcome: 'notRunning' });
     expect(sent[0]).toMatchObject({ target, op: OP_TOKEN_REMOVE, params: { devspaceId: 'e1' }, options: { signal, timeoutMs: 60_000 } });
@@ -193,7 +211,7 @@ describe('the busy marks and the reopen record of a flow', () => {
     const { all } = deps();
     const sent: OperationOptions[] = [];
     const channels = { flow: vi.fn(async (_target: unknown, _op: string, _params: unknown, options: OperationOptions = {}) => (sent.push(options), { deleted: true })) };
-    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, extensionHostSide(all), silentLogger);
+    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, (account) => extensionHostSide(all, account), silentLogger);
     await flow(OP_DELETE, { devspaceId: 'e1' }, {});
     const onAsk = sent[0].onAsk!;
     const signal = new AbortController().signal;
@@ -230,7 +248,7 @@ describe('the flow of an open', () => {
     const { all } = deps();
     const sent: OperationOptions[] = [];
     const channels = { flow: vi.fn(async (_target: unknown, _op: string, _params: unknown, options: OperationOptions = {}) => (sent.push(options), { opened: {} })) };
-    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, extensionHostSide(all), silentLogger);
+    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, (account) => extensionHostSide(all, account), silentLogger);
     const onProgress = vi.fn();
     await flow(OP_OPEN, { devspaceId: 'e1', repository: 'acme/app', dockerHost: '' }, { onProgress });
     expect(sent[0].onProgress).toBe(onProgress);

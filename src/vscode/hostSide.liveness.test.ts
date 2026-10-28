@@ -38,6 +38,6 @@ describe('the liveness of the extension', () => {
       isProcessAlive: (pid: number) => pid !== 200,
       logger: silentLogger,
     } as unknown as HostSideDeps;
-    expect(await extensionHostSide(deps).records.openFinished(ID, { remoteWorkspaceFolder: '/workspaces/api' }, { dockerHost: 'ssh://box' })).not.toHaveProperty('busy');
+    expect(await extensionHostSide(deps, { id: '42', login: 'octo' }).records.openFinished(ID, { remoteWorkspaceFolder: '/workspaces/api' }, { dockerHost: 'ssh://box' })).not.toHaveProperty('busy');
   });
 });

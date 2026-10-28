@@ -17,7 +17,6 @@ import {
   DiscoveryService,
   filterRepositories,
   hintUrl,
-  isTrustedOwner,
   OAUTH_APP_CONNECTIONS_URL,
   organizationFromMessage,
   organizationFromPath,
@@ -703,30 +702,6 @@ describe('filterRepositories', () => {
 
   it('hides forks when includeForks is false', () => {
     expect(names(filterRepositories(all, { owners: [], includeArchived: true, includeForks: false }))).toEqual(['Acme/a', 'acme/archived', 'other/c']);
-  });
-});
-
-describe('isTrustedOwner', () => {
-  const data: DiscoveryData = {
-    version: 1,
-    fetchedAt: '2026-09-24T12:00:00Z',
-    viewerLogin: 'Octo',
-    organizations: ['Acme-University'],
-    repositories: [],
-    hints: [],
-    scope: [],
-    withoutConfiguration: [],
-  };
-
-  it('trusts the user and the organizations of the user, case-insensitively', () => {
-    expect(isTrustedOwner(data, 'octo')).toBe(true);
-    expect(isTrustedOwner(data, 'acme-university')).toBe(true);
-  });
-
-  it('does not trust other owners, an empty owner, or anything without data', () => {
-    expect(isTrustedOwner(data, 'stranger')).toBe(false);
-    expect(isTrustedOwner(data, '')).toBe(false);
-    expect(isTrustedOwner(undefined, 'octo')).toBe(false);
   });
 });
 

@@ -60,7 +60,9 @@ function extension(options: { account?: { id: string; login: string }; token?: s
     lifecycleMemory,
     logger: { ...silentLogger, info: (text: string) => infos.push(text) },
   } as unknown as HostSideDeps;
-  return { host: extensionHostSide(deps), viewer, lifecycleMemory, infos, getAccount, getToken };
+  // The account of the operation: the one that the sign-in of the window gives (none: a flow of no account).
+  const account = 'account' in options ? options.account : { id: '42', login: 'octo' };
+  return { host: extensionHostSide(deps, account), viewer, lifecycleMemory, infos, getAccount, getToken };
 }
 
 function handlerOf(host: HostSide) {
@@ -93,11 +95,11 @@ describe('local viewer on the side of the extension', () => {
     }
   });
 
-  it('the account and the token are asked without asking the user to sign in', async () => {
+  it('the token of the account of the operation is asked without asking the user to sign in', async () => {
     const window = extension();
     await handlerOf(window.host)('local', 'viewer');
-    expect(window.getAccount.mock.calls).toEqual([[{ interactive: false }]]);
-    expect(window.getToken.mock.calls).toEqual([[{ interactive: false }]]);
+    expect(window.getAccount).not.toHaveBeenCalled();
+    expect(window.getToken.mock.calls).toEqual([[{ interactive: false, account: { id: '42', login: 'octo' } }]]);
   });
 
   it('the question to GitHub has a time limit of 5 seconds', async () => {

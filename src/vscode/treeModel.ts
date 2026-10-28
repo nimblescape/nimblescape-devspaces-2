@@ -4,6 +4,7 @@
 
 // Pure model of the sidebar: one list of repositories, grouped by owner. This module never imports `vscode`, so the
 // rules for rows, states, actions, and sorting are unit-tested; treeView.ts only maps the model to tree items.
+import { chooseAccount, listedCandidates, permissionText, type AccountCandidate } from '../core/accountChoice';
 import { defaultImageOf, hasConfiguration, isSourceOf, possibleSources, sourceKey, sourceLabel, sourceOf } from '../core/devspaceSource';
 import { filterRepositories } from '../core/discovery/discoveryService';
 import { isOnDockerHost } from '../core/docker/dockerHost';
@@ -19,6 +20,7 @@ import type {
   DevspaceSource,
   DevspaceState,
   ExtensionSettings,
+  GitHubAccount,
   RepositoryInfo,
 } from '../core/types';
 import { matchRepositoryGroup, type RepositoryGroupMatch, type RepositoryGroupPattern } from './repositoryGroups';
@@ -34,6 +36,13 @@ export const TreeTexts = {
   /** The brackets of the description of the one row of a repository whose devspace is the default-image devspace. */
   defaultImageShort: 'default image',
   lastUsed: (time: string) => `Last used: ${time}`,
+  /**
+   * Tooltip line of the GitHub account of a row: the owner of its devspace, or for a row without devspace the account
+   * that Start uses (accountChoice.ts), with its permission on the repository when known (`admin`, `write`, …).
+   */
+  account: (login: string, permission?: string) => (permission !== undefined ? `Account: ${login} (${permission})` : `Account: ${login}`),
+  /** The login in the description of a devspace row, when Devspaces uses more than one account. */
+  accountShort: (login: string) => `@${login}`,
   noDevspace: 'No devspace yet. Start creates it on the default branch.',
   noConfiguration: 'No Dev Container configuration: Start uses the default image.',
   /** Tooltip of a repository with child rows: each child row is one source. */
@@ -121,8 +130,8 @@ export interface TreeInput {
   settings: Pick<ExtensionSettings, 'owners' | 'includeArchived' | 'includeForks'> &
     Partial<Pick<ExtensionSettings, 'hostAccessChecksOff' | 'stopOnClose' | 'respectShutdownActionNone' | 'showOnlyDevspaces' | 'defaultImage' | 'startWithDefaultImage'>>;
   /**
-   * The entries of the Devspace Registry that the signed-in account may use (`availableDevspaces`). Devspaces
-   * of another account are never passed, so no row, name, or count reveals them.
+   * The entries of the Devspace Registry that the accounts of Devspaces may use (`availableDevspaces`). Devspaces of
+   * an account that Devspaces does not use are never passed, so no row, name, or count reveals them.
    */
   devspaces: readonly Devspace[];
   /** Container and volume state per devspace ID. `undefined`: Docker is not running or not asked yet. */
@@ -142,6 +151,12 @@ export interface TreeInput {
   /** Devspace ID → branch read from the running container. */
   liveBranches: ReadonlyMap<string, string>;
   signedIn: boolean;
+  /**
+   * The GitHub accounts of Devspaces (docs/security.md "Accounts"). With more than one, the description of each
+   * devspace row shows the login of its owner, and a row whose repository two or more of them can access offers
+   * Start with Account…. Missing: none (not signed in).
+   */
+  accounts?: readonly GitHubAccount[];
   /**
    * Compiled entries of the setting `repositoryGroups` (`parseRepositoryGroups`). Empty or missing: no grouping, the
    * model is the same as without the setting.
@@ -186,7 +201,7 @@ export interface RepositoryRow {
   /**
    * Stable tree item ID: `repo:` + lower-case owner/name for the one row of a repository; `repo:<owner/name>:<source
    * key>` (sourceKey) for a child row; with the suffix `#<devspace ID>` for the second and further devspaces of one
-   * source (one per Docker host).
+   * source (one per Docker host and account).
    */
   id: string;
   /** `owner/name`, with the case that GitHub uses when the discovery lists it. */
@@ -220,15 +235,19 @@ export interface RepositoryRow {
   actions: RowActions;
   /** The repository name, or the word of the source of a child row (sourceLabel). */
   label: string;
-  /** For example `main   Stopped · 3 unpushed`, `main (default image)   Connected`, or `` for a row without devspace. */
+  /**
+   * For example `main   Stopped · 3 unpushed`, `main (default image)   Connected`, `@scalarion main   Stopped` with
+   * several accounts, or `` for a row without devspace.
+   */
   description: string;
-  /** Includes the source and the time of the last use. */
+  /** Includes the source, the GitHub account, and the time of the last use. */
   tooltip: string;
   /**
    * `repository;canStart;canStop;canDelete;canRebuild;onGitHub;hostAccessChecked;canKeepRunning`, only the flags that
    * apply (package.json menus); `hostAccessUnrestricted` in place of `hostAccessChecked` while the checks are off;
-   * `kept` in place of `canKeepRunning` for a kept devspace; neither without a devspace; and `canCloseAndKeepRunning`
-   * for the devspace of this window.
+   * `kept` in place of `canKeepRunning` for a kept devspace; neither without a devspace; `canCloseAndKeepRunning`
+   * for the devspace of this window; and `canStartWithAccount` when two or more accounts of Devspaces can access the
+   * repository.
    */
   contextValue: string;
 }
@@ -261,12 +280,17 @@ export type RepositoryEntry = RepositoryRow | RepositoryNode;
 /** Organization whose repositories GitHub did not return. The row opens `url` (action Authorize). */
 export interface HintRow {
   kind: 'hint';
-  /** `hint:` + lower-case organization. */
+  /** `hint:` + lower-case organization; with `:` + the lower-case login for a hint of one of several accounts. */
   id: string;
   organization: string;
+  /** The login of the account that the organization refuses, when Devspaces uses more than one account. */
+  login?: string;
   /** Set for an owner of the scan scope that GitHub did not return: the row opens its page, there is nothing to authorize. */
   notFound?: true;
-  /** `Messages.organizationNotAuthorized(organization)`, or `Messages.organizationNotFound(organization)`. */
+  /**
+   * `Messages.organizationNotAuthorized(organization)` (with a login: `Messages.organizationRefusesAccount`), or
+   * `Messages.organizationNotFound(organization)`.
+   */
   label: string;
   url: string;
 }
@@ -461,9 +485,10 @@ export function rowActions(
  * `hostAccessUnrestricted` (Turn On Host Access Checks); none without it. `kept`: the switch Keep Running When Closed of
  * the devspace, the flag `kept` (Stop When Closed) or `canKeepRunning` (Keep Running When Closed); none for a row
  * without devspace. `connectedHere`: the devspace of this window, the flag `canCloseAndKeepRunning` (Close and
- * Keep Running).
+ * Keep Running). `severalAccounts`: two or more accounts of Devspaces can access the repository, the flag
+ * `canStartWithAccount` (Start with Account…).
  */
-export function contextValue(actions: RowActions, checks?: HostAccessChecks, kept?: boolean, connectedHere = false): string {
+export function contextValue(actions: RowActions, checks?: HostAccessChecks, kept?: boolean, connectedHere = false, severalAccounts = false): string {
   const flags = ['repository'];
   if (actions.canStart) flags.push('canStart');
   if (actions.canStop) flags.push('canStop');
@@ -475,6 +500,7 @@ export function contextValue(actions: RowActions, checks?: HostAccessChecks, kep
   if (kept === true) flags.push('kept');
   if (kept === false) flags.push('canKeepRunning');
   if (connectedHere) flags.push('canCloseAndKeepRunning');
+  if (severalAccounts) flags.push('canStartWithAccount');
   return flags.join(';');
 }
 
@@ -550,18 +576,22 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
     for (const hint of input.discovery.hints) {
       const key = hint.organization.toLowerCase();
       if (key === '' || (owners.size > 0 && !owners.has(key))) continue;
-      const id = `hint:${key}`;
+      const login = hint.kind !== 'notFound' && hint.login !== undefined && hint.login !== '' ? hint.login : undefined;
+      const id = login !== undefined ? `hint:${key}:${login.toLowerCase()}` : `hint:${key}`;
       if (hintIds.has(id)) continue;
       hintIds.add(id);
       groupFor(hint.organization).hints.push({
         kind: 'hint',
         id,
         organization: hint.organization,
+        ...(login !== undefined ? { login } : {}),
         ...(hint.kind === 'notFound' ? { notFound: true as const } : {}),
         label:
           hint.kind === 'notFound'
             ? Messages.organizationNotFound(hint.organization)
-            : Messages.organizationNotAuthorized(hint.organization),
+            : login !== undefined
+              ? Messages.organizationRefusesAccount(hint.organization, login)
+              : Messages.organizationNotAuthorized(hint.organization),
         url: hint.url,
       });
     }
@@ -573,7 +603,7 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
   return [...groups.values()]
     .sort((a, b) => compareNames(a.group.owner, b.group.owner))
     .map(({ group, hints, devspaces: withDevspace, others }) => {
-      hints.sort((a, b) => compareNames(a.organization, b.organization));
+      hints.sort((a, b) => compareNames(a.organization, b.organization) || compareNames(a.login ?? '', b.login ?? ''));
       // Patterns apply per owner: an owner where no repository matches a pattern keeps the plain list, so no owner is
       // hidden by the patterns; without patterns, the model is exactly the plain list.
       const grouped =
@@ -584,9 +614,9 @@ export function buildTreeModel(input: TreeInput): OwnerGroup[] {
 }
 
 /**
- * The entries of one repository (key: lower-case `owner/name`) with its devspaces of the signed-in account
+ * The entries of one repository (key: lower-case `owner/name`) with its devspaces of the accounts of Devspaces
  * (`devspaces`, most recently used first; empty for a repository without one): its one row when it has one possible
- * source (possibleSources), with a row per devspace when several devspaces (one per Docker host) have that source; else
+ * source (possibleSources), with a row per devspace when several devspaces (one per Docker host and account) have that source; else
  * its node with a child row per source. A repository that GitHub does not list (`info` missing) shows only the sources
  * of its devspaces (possibleSources).
  */
@@ -860,7 +890,16 @@ function devspaceRow(
   const checks: HostAccessChecks = hostAccessChecks(devspace.repository, input.settings);
   const unrestricted = checks === 'off' ? StateTexts.hostAccessUnrestricted : undefined;
   // The one row of a repository names the default image in brackets; a child row names its source in its label.
-  const left = [branch, !child && source.kind === 'defaultImage' ? `(${TreeTexts.defaultImageShort})` : undefined].filter(isText).join(' ');
+  // With several accounts, the login of the owner first: two devspaces of one source (one per account) differ by it.
+  const ownerLogin = loginOf(devspace.owner, input.accounts);
+  const several = (input.accounts?.length ?? 0) > 1;
+  const left = [
+    several && ownerLogin !== undefined ? TreeTexts.accountShort(ownerLogin) : undefined,
+    branch,
+    !child && source.kind === 'defaultImage' ? `(${TreeTexts.defaultImageShort})` : undefined,
+  ]
+    .filter(isText)
+    .join(' ');
   const kept = devspace.keepRunning === true;
   // Close and Keep Running shows like a kept devspace; the menu keeps the switch of Keep Running When Closed.
   const keptOnce = !kept && devspace.keepRunningOnce === true;
@@ -893,6 +932,7 @@ function devspaceRow(
     keptOnce ? TreeTexts.keptOnce : undefined,
     keptBySettingText,
     servicesRunning ? TreeTexts.servicesRunning : undefined,
+    ownerLogin !== undefined ? TreeTexts.account(ownerLogin, permissionText(info?.access?.find((access) => access.account.id === devspace.owner.id)?.permission)) : undefined,
     branch !== undefined ? TreeTexts.branch(branch) : undefined,
     timeValue(devspace.lastUsedAt) > 0 ? TreeTexts.lastUsed(formatTime(devspace.lastUsedAt)) : undefined,
     notOnGitHub ? TreeTexts.notListedOnGitHub : undefined,
@@ -923,23 +963,34 @@ function devspaceRow(
     tooltip,
     // While a setting keeps it running, the row offers neither Keep Running When Closed nor Close and Keep Running
     // (both would change nothing).
-    contextValue: contextValue(actions, checks, keptBySettings ? undefined : kept, state === 'connected' && !keptBySettings),
+    contextValue: contextValue(actions, checks, keptBySettings ? undefined : kept, state === 'connected' && !keptBySettings, candidatesOf(info, input).length > 1),
   };
 }
 
 /**
- * The row of a source of a repository without devspace of the signed-in account. A devspace of another account does
- * not change it: Start creates the account's own devspace.
+ * The row of a source of a repository without a devspace of an account of Devspaces; `checksName` is the name the host
+ * access checks are read under. Its tooltip names the account that Start uses (accountChoice.ts) when the merged list
+ * names the accounts that can access the repository.
  */
-/** The row of a source without a devspace; `checksName` is the name the host access checks are read under. */
-function repositoryRow(id: string, repository: string, checksName: string, info: RepositoryInfo | undefined, source: DevspaceSource, child: boolean, input: Pick<TreeInput, 'settings'>): RepositoryRow {
+function repositoryRow(
+  id: string,
+  repository: string,
+  checksName: string,
+  info: RepositoryInfo | undefined,
+  source: DevspaceSource,
+  child: boolean,
+  input: Pick<TreeInput, 'settings' | 'accounts' | 'discovery'>,
+): RepositoryRow {
   const { owner, name } = info ? { owner: info.owner, name: info.name } : splitName(repository);
   const actions = rowActions(undefined, info);
   const checks = hostAccessChecks(checksName, input.settings);
+  const candidates = candidatesOf(info, input);
+  const startAccount = chooseAccount(repository, candidates);
   const tooltip = [
     devspaceName(repository, source, child),
     sourceLine(source),
     TreeTexts.noDevspace,
+    startAccount !== undefined ? TreeTexts.account(startAccount.account.login, permissionText(startAccount.permission)) : undefined,
     !child && source.kind === 'defaultImage' && !hasConfiguration(info) ? TreeTexts.noConfiguration : undefined,
     info?.defaultBranch ? TreeTexts.defaultBranch(info.defaultBranch) : undefined,
     info?.isArchived ? TreeTexts.archived : undefined,
@@ -962,8 +1013,21 @@ function repositoryRow(id: string, repository: string, checksName: string, info:
     label: child ? sourceLabel(source) : name,
     description: checks === 'off' ? StateTexts.hostAccessUnrestricted : '',
     tooltip,
-    contextValue: contextValue(actions, checks),
+    contextValue: contextValue(actions, checks, undefined, false, candidates.length > 1),
   };
+}
+
+/** The accounts of Devspaces that can access the repository of `info`, by the merged list (listedCandidates). */
+function candidatesOf(info: RepositoryInfo | undefined, input: Pick<TreeInput, 'accounts' | 'discovery'>): AccountCandidate[] {
+  return listedCandidates(info, input.accounts ?? [], input.discovery?.accounts);
+}
+
+/**
+ * The login of `owner` for texts: the login of the account of Devspaces with its ID (the current login after a rename on
+ * GitHub), else the recorded one; `undefined` when neither is known (an owner restored from a volume label).
+ */
+function loginOf(owner: GitHubAccount, accounts: readonly GitHubAccount[] | undefined): string | undefined {
+  return nonEmpty(accounts?.find((account) => account.id === owner.id)?.login) ?? nonEmpty(owner.login);
 }
 
 function splitName(repository: string): { owner: string; name: string } {

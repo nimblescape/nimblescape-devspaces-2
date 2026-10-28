@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it } from 'vitest';
-import { availableDevspaces, isAvailableTo, ownerOf } from './ownership';
+import { availableDevspaces, isAvailableTo, ownerAmong, ownerOf } from './ownership';
 import type { Devspace, GitHubAccount } from './types';
 
 const SCALARION: GitHubAccount = { id: '1001', login: 'scalarion' };
@@ -35,11 +35,19 @@ describe('isAvailableTo', () => {
     expect(isAvailableTo(devspace, account)).toBe(expected);
   });
 
-  it('keeps only the devspaces of the account, in their order', () => {
+  it('keeps only the devspaces of the accounts, in their order', () => {
     const list = [devspace('a', 'o/a', SCALARION), devspace('b', 'o/b', STAUSSH), devspace('c', 'o/c', OTHER), devspace('d', 'o/d', SCALARION)];
-    expect(availableDevspaces(list, SCALARION).map((entry) => entry.id)).toEqual(['a', 'd']);
-    expect(availableDevspaces(list, STAUSSH).map((entry) => entry.id)).toEqual(['b']);
-    expect(availableDevspaces(list, undefined)).toEqual([]);
+    expect(availableDevspaces(list, [SCALARION]).map((entry) => entry.id)).toEqual(['a', 'd']);
+    expect(availableDevspaces(list, [STAUSSH]).map((entry) => entry.id)).toEqual(['b']);
+    expect(availableDevspaces(list, [SCALARION, STAUSSH]).map((entry) => entry.id)).toEqual(['a', 'b', 'd']);
+    expect(availableDevspaces(list, [])).toEqual([]);
+  });
+
+  it('finds the owner among the accounts by its ID, never by its login', () => {
+    expect(ownerAmong({ owner: SCALARION }, [STAUSSH, SCALARION])).toEqual(SCALARION);
+    expect(ownerAmong({ owner: { id: '1001', login: '' } }, [SCALARION])).toEqual(SCALARION);
+    expect(ownerAmong({ owner: SCALARION }, [{ id: '3003', login: 'scalarion' }])).toBeUndefined();
+    expect(ownerAmong({ owner: SCALARION }, [])).toBeUndefined();
   });
 
   it('stores the ID and the login of the account as the owner', () => {

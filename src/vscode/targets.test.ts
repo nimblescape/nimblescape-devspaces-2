@@ -97,18 +97,37 @@ describe('repositoryTarget', () => {
 });
 
 describe('ownerTrust', () => {
-  const data = discovery([], { viewerLogin: 'Me', organizations: ['Acme'] });
-
-  it('trusts the account and its organizations when the data belongs to the account', () => {
-    expect(ownerTrust(data, 'me', 'ME')).toBe('trusted');
-    expect(ownerTrust(data, 'me', 'acme')).toBe('trusted');
-    expect(ownerTrust(data, 'me', 'stranger')).toBe('untrusted');
+  const ME = { id: '1', login: 'Me' };
+  const CAT = { id: '2', login: 'cat' };
+  const data = discovery([], {
+    viewerLogin: 'Me',
+    organizations: ['Acme', 'Cats'],
+    accounts: [
+      { account: ME, organizations: ['Acme'] },
+      { account: CAT, organizations: ['Cats'] },
+    ],
   });
 
-  it('is unknown without data, without an account, or when the data belongs to another account', () => {
-    expect(ownerTrust(undefined, 'me', 'me')).toBe('unknown');
-    expect(ownerTrust(data, undefined, 'me')).toBe('unknown');
-    expect(ownerTrust(data, 'someone-else', 'acme')).toBe('unknown');
+  it('trusts the accounts of Devspaces and the organizations of each of them', () => {
+    expect(ownerTrust(data, [ME], 'ME')).toBe('trusted');
+    expect(ownerTrust(data, [ME], 'acme')).toBe('trusted');
+    expect(ownerTrust(data, [ME], 'stranger')).toBe('untrusted');
+    expect(ownerTrust(data, [ME, CAT], 'cat')).toBe('trusted');
+    expect(ownerTrust(data, [ME, CAT], 'cats')).toBe('trusted');
+    expect(ownerTrust(data, [ME, CAT], 'stranger')).toBe('untrusted');
+    expect(ownerTrust(data, [ME], '')).toBe('untrusted');
+  });
+
+  it('never trusts the organizations of an account that Devspaces does not use', () => {
+    expect(ownerTrust(data, [ME], 'cats')).toBe('untrusted');
+  });
+
+  it('is unknown without an account, or while the list of an account is not loaded', () => {
+    expect(ownerTrust(data, [], 'me')).toBe('unknown');
+    expect(ownerTrust(undefined, [ME], 'acme')).toBe('unknown');
+    expect(ownerTrust(data, [ME, { id: '3', login: 'new' }], 'stranger')).toBe('unknown');
+    // The login of an account is known without its list.
+    expect(ownerTrust(undefined, [ME], 'me')).toBe('trusted');
   });
 });
 

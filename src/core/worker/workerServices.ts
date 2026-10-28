@@ -287,7 +287,11 @@ export function workerImageChecker(deps: Pick<WorkerServicesDeps, 'host' | 'engi
   return new ImageChecker(client, deps.logger);
 }
 
-/** The GitHub sign-in of the user's computer: the account through `local account`, the token through `secret token`. */
+/**
+ * The GitHub sign-in of the user's computer for the account of the operation, which the extension chose
+ * (extensionHostSide): the account through `local account`, its token through `secret token`. The worker cannot ask for
+ * another account: the option `account` of a call is not sent.
+ */
 export function hostAuth(host: HostSide, log: Logger): Pick<GitHubAuth, 'getToken' | 'getAccount' | 'reportRejectedToken'> {
   return {
     getAccount: ({ interactive }) => host.state.account(interactive),

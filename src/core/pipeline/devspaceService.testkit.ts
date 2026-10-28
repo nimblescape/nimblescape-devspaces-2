@@ -1656,9 +1656,11 @@ export function createHarness(overrides: HarnessOverrides = {}): Harness {
     registry: h.registry,
     sessionFiles: h.sessionFiles,
     imageChecker: h.checker,
+    // One account is signed in (`account`); a question for another account gets nothing, as in VS Code.
     auth: {
-      getToken: async () => h.token,
-      getAccount: async () => (h.token === undefined ? undefined : h.account),
+      getToken: async (options?: { account?: GitHubAccount }) => (options?.account !== undefined && options.account.id !== h.account.id ? undefined : h.token),
+      getAccount: async (options?: { account?: GitHubAccount }) =>
+        h.token === undefined || (options?.account !== undefined && options.account.id !== h.account.id) ? undefined : h.account,
       reportRejectedToken: (token: string) => void h.rejectedTokens.push(token),
     },
     ui: h.ui,

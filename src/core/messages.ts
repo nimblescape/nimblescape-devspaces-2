@@ -40,6 +40,8 @@ export const Messages = {
   registrySignIn: (registry: string) => `The registry ${registry} requires a sign-in.`,
   organizationNotAuthorized: (organization: string) =>
     `Access to the organization ${organization} is not authorized.`,
+  /** The hint of an organization that refuses one of several accounts of Devspaces (SAML, OAuth app restrictions). */
+  organizationRefusesAccount: (organization: string, login: string) => `The organization ${organization} refuses the access of ${login}.`,
   /**
    * GitHub refused the refresh of the repository list for its rate limit. `time`: the local time when Devspaces loads
    * the list again (`retry`), or after which Refresh works again.
@@ -264,14 +266,16 @@ export const Messages = {
       ? `The workspace helper sets ${helperNames} to its own values (for example, HOME is /root), not to the values of your computer. The others are empty or have their default value.`
       : 'They are empty or have their default value, except variables that the workspace helper sets itself (for example, HOME is /root).'),
   /**
-   * A devspace that a command names belongs to another account, for example a row or the status bar item from
-   * before an account change, or an open during which the account changed. Never for a repository: each account has its
-   * own devspace of it.
+   * A devspace that a command names belongs to an account that Devspaces does not use, for example a row or the status
+   * bar item from before a sign-out, or an open during which the account left. `login`: the login of the owner account,
+   * when known.
    */
-  otherAccount: (repository: string) =>
-    `The devspace of ${repository} belongs to another GitHub account. Sign in with that account to use it.`,
+  otherAccount: (repository: string, login?: string) =>
+    login !== undefined && login !== ''
+      ? `The devspace of ${repository} belongs to the GitHub account ${login}, which is not signed in to Devspaces. Sign in as ${login} to use it.`
+      : `The devspace of ${repository} belongs to a GitHub account that is not signed in to Devspaces. Sign in with that account to use it.`,
   otherAccountConnection: (repository: string) =>
-    `The devspace of ${repository} does not belong to the GitHub account that is signed in. This window closes its connection.`,
+    `The devspace of ${repository} belongs to a GitHub account that is not signed in to Devspaces. This window closes its connection.`,
   gitSetupFailed: 'Git in the devspace could not be prepared. Pushing to GitHub may not work.',
   untrustedRepository: (repository: string) =>
     `${repository} does not belong to you or to one of your organizations. Opening it runs code from the repository (Dockerfile, Features, and commands) on your computer. Open it?`,

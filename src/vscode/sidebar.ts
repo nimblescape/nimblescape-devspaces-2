@@ -4,14 +4,16 @@
 
 // Data of the sidebar: the repository list of the discovery, the devspaces of the registry, and their states. Docker
 // is asked only on request (view visible, after an operation), never in the background, so that Docker Desktop's
-// Resource Saver can work; the 15-second heartbeat only reads the coordination files. Accounts: the view shows the list
-// and the devspaces of the signed-in GitHub account only; without a sign-in, it shows nothing but the sign-in.
+// Resource Saver can work; the 15-second heartbeat only reads the coordination files. Accounts: the view shows one list
+// for all accounts of Devspaces (auth.ts), merged from the list of each account (mergeDiscovery), and the devspaces of
+// these accounts; without a sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
 import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DockerTargets } from '../core/docker/dockerTargets';
 import type { MissingHelperStatus } from '../core/helper/missingHelperBuild';
 import { DISCOVERY_CONCURRENCY, type DiscoveryService, type PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError, GitHubRateLimitError } from '../core/discovery/githubApi';
+import { mergeDiscovery } from '../core/discovery/mergeDiscovery';
 import { sameScope } from '../core/discovery/scope';
 import { errorMessage } from '../core/errors';
 import { Actions, Messages } from '../core/messages';
@@ -21,9 +23,9 @@ import { systemClock, type Clock, type Logger } from '../core/ports';
 import type { DevspaceOperations } from '../core/pipeline/devspaceOperations';
 import type { DevspaceRegistry } from '../core/storage/registry';
 import type { SessionFiles } from '../core/storage/sessionFiles';
-import type { DiscoveryData, Devspace, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
+import type { AccountListing, DiscoveryData, Devspace, ExtensionSettings, GitHubAccount, RepositoryInfo, WindowStatus } from '../core/types';
 import { isProcessAlive } from '../core/session/sessionRules';
-import { SIGN_IN_AGAIN_DETAIL, type VsCodeGitHubAuth } from './auth';
+import { SIGN_IN_AGAIN_DETAIL, signInAgainDetailOf, type VsCodeGitHubAuth } from './auth';
 import { GROUP_MATCH_TIME_LIMIT_MS, type GroupMatcher, type GroupMatchRun, type GroupPlace } from './groupMatcher';
 import { showWarningMessage } from './notifications';
 import { RepositoryGroupTexts, parseRepositoryGroups, type RepositoryGroupPattern } from './repositoryGroups';
@@ -104,12 +106,31 @@ export function viewProgressLocation(view: { readonly visible: boolean } | undef
   return view?.visible ? { viewId: REPOSITORIES_VIEW_ID } : vscode.ProgressLocation.Window;
 }
 
+/** The list of one account of Devspaces in the sidebar. */
+interface AccountState {
+  account: GitHubAccount;
+  /** Its stored or fresh list of the current scope; `undefined` until one is loaded. */
+  data: DiscoveryData | undefined;
+  /**
+   * Progressive display: the part of its first load (its refresh while the view has no list of it, or a list of
+   * another scope) that the view shows as the repositories arrive (onPartialResult).
+   */
+  partial: DiscoveryData | undefined;
+  /** Its running refresh is a first load, whose parts are shown. */
+  progressive: boolean;
+  /** Its last refresh failed. */
+  failed: boolean;
+}
+
 export class Sidebar implements vscode.Disposable {
   private readonly clock: Clock;
   private readonly isAlive: (pid: number) => boolean;
+  /** The merged list of the accounts (mergeDiscovery): their lists, and the parts of their first loads. */
   private data: DiscoveryData | undefined;
-  /** The signed-in account whose list and devspaces the view shows. */
-  private account: GitHubAccount | undefined;
+  /** The accounts of Devspaces whose lists and devspaces the view shows, in the order of their logins. */
+  private accounts: GitHubAccount[] = [];
+  /** The list of each account of `accounts`, by its ID. */
+  private readonly lists = new Map<string, AccountState>();
   private signedIn = false;
   private loaded = false;
   private loadFailed = false;
@@ -122,12 +143,6 @@ export class Sidebar implements vscode.Disposable {
   private statesUnread: { dockerHost: string; reachable: boolean; removed?: true } | undefined;
   private liveBranches: ReadonlyMap<string, string> = new Map();
   private lookups: ReadonlyMap<string, RepositoryInfo | null> = new Map();
-  /**
-   * Progressive display: the refresh that runs while the view shows no list (the first load, or a list of another
-   * scope) shows the repositories as they arrive, for this account.
-   */
-  private progressiveAccountId: string | undefined;
-  private partial: DiscoveryData | undefined;
   private timer: NodeJS.Timeout | undefined;
   /** The one refresh after a rate limit of GitHub (onRateLimited): its timer and time; `undefined` while none waits. */
   private rateLimitRetry: { timer: NodeJS.Timeout; at: number } | undefined;
@@ -135,11 +150,12 @@ export class Sidebar implements vscode.Disposable {
   private retryingAfterRateLimit = false;
   /** The next refresh is one of the Refresh command (refreshDiscovery `byUser`). */
   private refreshByUser = false;
-  private signInOffered = false;
-  /** Counts the account changes of onSessionChanged: a refresh that read an older session does not use it. */
+  /** The accounts whose rejected token got the offer of a new sign-in (offerSignInAgain): each one once per window. */
+  private readonly signInOffered = new Set<string>();
+  /** Counts the changes of the accounts in onSessionChanged: a refresh that read older accounts does not use them. */
   private accountChanges = 0;
-  /** The token of the refresh that asks GitHub now; `undefined` while none does. */
-  private refreshToken: string | undefined;
+  /** The account and the token of the refresh that asks GitHub now; `undefined` while none does. */
+  private refreshToken: { accountId: string; token: string } | undefined;
   private disposed = false;
   /** Problems of the setting repositoryGroups that were shown: each distinct one once per window session. */
   private readonly shownGroupProblems = new Set<string>();
@@ -170,7 +186,7 @@ export class Sidebar implements vscode.Disposable {
     this.isAlive = deps.isAlive ?? isProcessAlive;
   }
 
-  /** Stored or fresh discovery data. */
+  /** The merged list of the accounts: stored or fresh discovery data. */
   get discoveryData(): DiscoveryData | undefined {
     return this.data;
   }
@@ -179,9 +195,19 @@ export class Sidebar implements vscode.Disposable {
     return this.signedIn;
   }
 
-  /** The account whose list and devspaces the view shows; `undefined` without a sign-in. */
-  get currentAccount(): GitHubAccount | undefined {
-    return this.account;
+  /** The accounts whose lists and devspaces the view shows; empty without a sign-in. */
+  get currentAccounts(): readonly GitHubAccount[] {
+    return this.accounts;
+  }
+
+  /** The complete list of the account `accountId` of the current scope; `undefined` while none is loaded. */
+  accountList(accountId: string): DiscoveryData | undefined {
+    return this.lists.get(accountId)?.data;
+  }
+
+  /** The accounts whose complete lists the view shows, with their organizations (DiscoveryData.accounts). */
+  accountListings(): readonly AccountListing[] {
+    return this.data?.accounts ?? [];
   }
 
   /**
@@ -207,16 +233,16 @@ export class Sidebar implements vscode.Disposable {
    * Shows the stored list at once, then updates it in the background when the user is signed in. Never throws.
    */
   async initialize(): Promise<void> {
-    const [account, signedIn] = await Promise.all([
-      this.readAccount(),
+    const [accounts, signedIn] = await Promise.all([
+      this.readAccounts(),
       this.deps.auth.updateContextKey().catch((error: unknown) => {
         this.deps.logger.warn(`The sign-in state could not be read: ${errorMessage(error)}`);
         return false;
       }),
     ]);
     if (this.disposed) return;
-    this.signedIn = signedIn && account !== undefined;
-    if (this.account?.id !== account?.id || this.data === undefined) await this.useAccount(account);
+    this.signedIn = signedIn && accounts.length > 0;
+    await this.useAccounts(accounts);
     if (this.disposed) return;
     await this.render().catch((error: unknown) => this.deps.logger.error('The sidebar could not be shown.', error));
     this.restartTimer();
@@ -257,15 +283,23 @@ export class Sidebar implements vscode.Disposable {
    * repositories outside the new scope, and a refresh with the new scope starts at once. Never rejects.
    */
   async onScopeChanged(): Promise<void> {
-    // The part of a first load of the previous scope is not shown either.
-    if (this.partial && !this.isOfCurrentScope(this.partial)) {
-      this.partial = undefined;
-      this.progressiveAccountId = undefined;
+    let changed = false;
+    for (const state of this.lists.values()) {
+      // The part of a first load of the previous scope is not shown either.
+      if (state.partial && !this.isOfCurrentScope(state.partial)) {
+        state.partial = undefined;
+        state.progressive = false;
+        changed = true;
+      }
+      if (state.data && !this.isOfCurrentScope(state.data)) {
+        state.data = undefined;
+        changed = true;
+      }
     }
-    if (this.data && !this.isOfCurrentScope(this.data)) {
-      this.data = undefined;
+    if (changed) {
       this.lookups = new Map();
-      this.setLoaded(false);
+      this.merge();
+      this.setLoaded(this.hasList());
       this.setLoadFailed(false);
     }
     this.renderInBackground();
@@ -273,33 +307,34 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /**
-   * Sign-in, sign-out, or account change: new state, then a new list. `again` starts one more refresh after a running
-   * one; `again: false` reuses a running refresh. By default, a running refresh is reused only when it loads the list
-   * of the same account with the token of the current session, for example when VS Code reports a session of other
-   * scopes (read:packages) or of another extension: the list would be the same, and the Refresh command would wait for
-   * two refreshes. Never rejects.
+   * Sign-in, sign-out, or a change of the accounts: new state, then new lists. `again` starts one more refresh after a
+   * running one; `again: false` reuses a running refresh. By default, a running refresh is reused only when the
+   * accounts are the same and it asks GitHub with the token of the current session of its account, for example when
+   * VS Code reports a session of other scopes (read:packages) or of another extension: the lists would be the same,
+   * and the Refresh command would wait for two refreshes. Never rejects.
    */
   async onSessionChanged(options: { again?: boolean } = {}): Promise<void> {
-    const account = await this.readAccount();
-    const accountChanged = account?.id !== this.account?.id;
-    // Another account: its own stored list at once, never the list of the previous one.
-    if (accountChanged) {
+    const accounts = await this.readAccounts();
+    const accountsChanged = accountIds(accounts) !== accountIds(this.accounts);
+    // Another account: its own stored list at once; an account that left: its list is not shown anymore.
+    if (accountsChanged) {
       this.accountChanges++;
-      await this.useAccount(account);
+      await this.useAccounts(accounts);
     }
     const wasSignedIn = this.signedIn;
-    this.setSignedIn(account !== undefined && (await this.authSignedIn()));
+    this.setSignedIn(accounts.length > 0 && (await this.authSignedIn()));
     this.renderInBackground();
     if (!this.signedIn) return;
-    const again = options.again ?? (accountChanged || !wasSignedIn || !(await this.refreshUsesCurrentSession()));
+    const again = options.again ?? (accountsChanged || !wasSignedIn || !(await this.refreshUsesCurrentSession()));
     await this.refreshDiscovery({ again });
   }
 
-  /** True if a refresh asks GitHub now with the token of the current session. */
+  /** True if a refresh asks GitHub now with the token of the current session of its account. */
   private async refreshUsesCurrentSession(): Promise<boolean> {
     const running = this.refreshToken;
     if (running === undefined) return false;
-    return (await this.readSession())?.token === running;
+    const account = this.lists.get(running.accountId)?.account;
+    return account !== undefined && (await this.readSession(account))?.token === running.token;
   }
 
   /** Starts the background refresh again with the interval of the settings. */
@@ -326,7 +361,7 @@ export class Sidebar implements vscode.Disposable {
 
   /** GitHub data of a repository: from the discovery (or the part of the first load), or from a single lookup. */
   repositoryInfo(repository: string): RepositoryInfo | undefined {
-    return findRepositoryInfo(repository, this.data ?? this.shownPartial(), this.lookups);
+    return findRepositoryInfo(repository, this.data, this.lookups);
   }
 
   /**
@@ -334,17 +369,32 @@ export class Sidebar implements vscode.Disposable {
    * the account; a later refresh replaces the shown list only when it is complete, so the view does not flicker.
    */
   onPartialResult(result: PartialDiscovery): void {
-    if (this.disposed || this.data !== undefined || result.accountId !== this.progressiveAccountId) return;
-    if (result.accountId !== this.account?.id || !this.isOfCurrentScope(result.data)) return;
-    this.partial = result.data;
+    const state = this.lists.get(result.accountId);
+    if (this.disposed || state === undefined || state.data !== undefined || !state.progressive) return;
+    if (!this.isOfCurrentScope(result.data)) return;
+    state.partial = result.data;
+    this.merge();
     this.renderInBackground();
   }
 
-  /** The part of the first load that the view may show: of the signed-in account and of the current scope only. */
-  private shownPartial(): DiscoveryData | undefined {
-    const partial = this.partial;
-    if (!partial || this.progressiveAccountId === undefined || this.progressiveAccountId !== this.account?.id) return undefined;
-    return this.isOfCurrentScope(partial) ? partial : undefined;
+  /**
+   * The merged list (mergeDiscovery) of the accounts: of each account its complete list, else the part of its first
+   * load; only lists of the current scope.
+   */
+  private merge(): void {
+    const lists = [];
+    for (const account of this.accounts) {
+      const state = this.lists.get(account.id);
+      if (state === undefined) continue;
+      if (state.data !== undefined) lists.push({ account, data: state.data });
+      else if (state.progressive && state.partial !== undefined && this.isOfCurrentScope(state.partial)) lists.push({ account, data: state.partial, partial: true });
+    }
+    this.data = mergeDiscovery(lists);
+  }
+
+  /** True if the view has the complete list of one account. */
+  private hasList(): boolean {
+    return [...this.lists.values()].some((state) => state.data !== undefined);
   }
 
   /** Branch read from the running container at the last state refresh. */
@@ -352,9 +402,9 @@ export class Sidebar implements vscode.Disposable {
     return this.liveBranches.get(devspaceId);
   }
 
-  /** The devspaces of the signed-in account, in the order of the registry. */
+  /** The devspaces of the accounts of Devspaces, in the order of the registry. */
   async availableDevspaces(): Promise<Devspace[]> {
-    return availableDevspaces(await this.devspacesHere(), this.account);
+    return availableDevspaces(await this.devspacesHere(), this.accounts);
   }
 
   /** The entries of the registry on the current Docker host; the others are hidden and never acted on. */
@@ -374,7 +424,7 @@ export class Sidebar implements vscode.Disposable {
 
   /**
    * Repositories for Search and the switcher: the list of the view plus the repository of every devspace of the
-   * signed-in account.
+   * accounts of Devspaces.
    */
   async repositoriesForPicker(): Promise<RepositoryInfo[]> {
     const devspaces = await this.availableDevspaces();
@@ -387,16 +437,16 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /**
-   * Security: the owner is the signed-in account or one of its organizations. The list belongs to the account that
-   * loaded it; after an account change (or without a list), the owner counts as trusted only after a refresh with the
-   * current account.
+   * Security: the owner is an account of Devspaces or one of their organizations (ownerTrust). The organizations come
+   * from the list of each account; while the list of an account is not loaded (after its sign-in, or without a list),
+   * another owner counts as trusted only after a refresh.
    */
   async trustedOwner(owner: string): Promise<boolean> {
-    const account = (await this.readAccount())?.login;
-    let trust = ownerTrust(this.data, account, owner);
-    if (trust === 'unknown' && account !== undefined) {
+    const accounts = await this.readAccounts();
+    let trust = ownerTrust(this.data, accounts, owner);
+    if (trust === 'unknown' && accounts.length > 0) {
       await this.refreshDiscovery();
-      trust = ownerTrust(this.data, account, owner);
+      trust = ownerTrust(this.data, accounts, owner);
     }
     return trust === 'trusted';
   }
@@ -426,12 +476,12 @@ export class Sidebar implements vscode.Disposable {
       coordinator.otherActiveWindows().catch((): WindowStatus[] => []),
     ]);
     if (this.disposed) return;
-    const account = this.account;
-    // Only the devspaces of the signed-in account; hidden ones are not counted or named anywhere.
-    const devspaces = availableDevspaces(entries, account);
+    // Only the devspaces of the accounts of Devspaces; hidden ones are not counted or named anywhere.
+    const devspaces = availableDevspaces(entries, this.accounts);
     const repositoryGroups = this.repositoryGroups();
     const input: TreeInput = {
-      discovery: this.data ?? this.shownPartial(),
+      discovery: this.data,
+      accounts: this.accounts,
       settings: this.deps.settings(),
       devspaces,
       runtime: this.runtime,
@@ -591,71 +641,104 @@ export class Sidebar implements vscode.Disposable {
     return { statesUnknown: { dockerHost: unread.dockerHost, reason: build === 'building' ? 'building' : build === 'failed' ? 'buildFailed' : 'notReady' } };
   }
 
+  /**
+   * The refresh of the lists: one account after the other, each with its own token, so that no more than
+   * DISCOVERY_CONCURRENCY requests run at the same time. An account whose token GitHub rejected keeps its stored list
+   * (no refresh, which would fail again, until its new sign-in); a failed refresh of one account keeps its stored list,
+   * and the other accounts still refresh. Then the repositories of the devspaces that no list has are looked up.
+   */
   private async refreshDiscoveryNow(): Promise<DiscoveryData | undefined> {
     if (this.disposed) return this.data;
     const afterRateLimit = this.retryingAfterRateLimit;
     this.retryingAfterRateLimit = false;
-    const byUser = this.refreshByUser;
+    let byUser = this.refreshByUser;
     this.refreshByUser = false;
-    // Token and account of one session: the list is stored for the account.
     const changes = this.accountChanges;
-    const session = await this.readSession();
-    // The account changed while the session was read: the refresh of that change uses the new session.
+    const accounts = await this.readAccounts();
+    // The accounts changed while they were read: the refresh of that change uses the new ones.
     if (changes !== this.accountChanges) return this.data;
-    const token = session?.token;
-    const account = session?.account;
-    if (account?.id !== this.account?.id) await this.useAccount(account);
-    // A session whose token GitHub rejected does not count as signed in (auth.ts): no refresh, which would fail again,
-    // until Sign in with GitHub replaces the token.
-    this.setSignedIn(account !== undefined && (await this.authSignedIn()));
-    if (token === undefined || account === undefined || !this.signedIn) {
+    if (accountIds(accounts) !== accountIds(this.accounts)) await this.useAccounts(accounts);
+    // A session whose token GitHub rejected does not count as signed in (auth.ts).
+    this.setSignedIn(accounts.length > 0 && (await this.authSignedIn()));
+    if (!this.signedIn) {
       this.renderInBackground();
       return this.data;
     }
-    // The part of a first load that a rate limit stopped (onRateLimited) stays shown until this refresh gives its first
-    // part (onPartialResult) or ends without a rate limit: a refresh that GitHub refuses at once keeps it.
-    const progressive = this.data === undefined ? account.id : undefined;
-    if (progressive === undefined || progressive !== this.progressiveAccountId) this.partial = undefined;
-    this.progressiveAccountId = progressive;
-    this.refreshToken = token;
     let rateLimited = false;
-    try {
-      const data = await vscode.window.withProgress({ location: viewProgressLocation(this.deps.view) }, () =>
-        this.deps.discovery.refresh(token, account.id),
-      );
-      // The account changed while the list loaded: the list is not shown (the next refresh loads the new one).
-      if (this.account?.id !== account.id) return this.data;
-      // The scope changed while the list loaded: the refresh that the change requested loads the list of the new scope.
-      if (!this.isOfCurrentScope(data)) return this.data;
-      this.data = data;
-      this.setLoadFailed(false);
-      this.clearRateLimitRetry();
-      // The complete list is shown at once. The repositories of devspaces that it lacks follow; until then their rows
-      // show what the previous refresh found.
-      this.endProgressiveDisplay();
-      this.setLoaded();
-      this.renderInBackground();
-      const lookups = await this.lookUpUnlisted(data, token);
-      if (this.account?.id === account.id) this.lookups = lookups;
-    } catch (error) {
-      if (error instanceof GitHubApiError && error.status === 401) this.offerSignInAgain();
-      // A rate limit of GitHub: the part of the first load that the view shows stays, also for the next refresh.
-      if (error instanceof GitHubRateLimitError) {
+    let failed = false;
+    for (const account of accounts) {
+      if (this.disposed || changes !== this.accountChanges) break;
+      const state = this.lists.get(account.id);
+      // Token and account of one session: the list is stored for the account.
+      const session = state === undefined ? undefined : await this.readSession(account);
+      // Security: only a session of this account gives its list (stored under its ID).
+      if (state === undefined || session?.account.id !== account.id || !(await this.authSignedIn(account))) continue;
+      const outcome = await this.refreshAccount(state, session.token, { afterRateLimit, byUser });
+      if (outcome === 'rateLimited') {
         rateLimited = true;
-        this.onRateLimited(error, afterRateLimit, byUser);
+        // One message for the Refresh of the user (onRateLimited), also when GitHub refuses several accounts.
+        byUser = false;
       }
-      // Without internet access, the view shows the stored list and skips the update. Without a stored list, the view
-      // says that the list could not be loaded (not that no repository was found).
-      const shown = this.data ? 'The stored list is shown.' : 'No stored list exists.';
-      this.deps.logger.warn(`The repository list could not be updated. ${shown} ${errorMessage(error)}`);
-      this.setLoadFailed(this.data === undefined);
-    } finally {
-      this.refreshToken = undefined;
-      if (!rateLimited) this.endProgressiveDisplay();
+      if (outcome === 'failed') failed = true;
+    }
+    if (!rateLimited) this.clearRateLimitRetry();
+    // Without any list, the view says that the list could not be loaded (not that no repository was found).
+    this.setLoadFailed(failed && !this.hasList());
+    if (changes === this.accountChanges && !this.disposed) {
+      const lookups = await this.lookUpUnlisted();
+      if (changes === this.accountChanges) this.lookups = lookups;
     }
     this.setLoaded();
     this.renderInBackground();
     return this.data;
+  }
+
+  /**
+   * The refresh of the list of one account with its token. The list replaces the shown one when it is complete and of
+   * the current scope, while the account is still one of the view.
+   */
+  private async refreshAccount(
+    state: AccountState,
+    token: string,
+    options: { afterRateLimit: boolean; byUser: boolean },
+  ): Promise<'refreshed' | 'rateLimited' | 'failed' | 'dropped'> {
+    const { account } = state;
+    // The part of a first load that a rate limit stopped (onRateLimited) stays shown until this refresh gives its first
+    // part (onPartialResult) or ends without a rate limit: a refresh that GitHub refuses at once keeps it.
+    const progressive = state.data === undefined;
+    if (!progressive) state.partial = undefined;
+    state.progressive = progressive;
+    this.refreshToken = { accountId: account.id, token };
+    let rateLimited = false;
+    try {
+      const data = await vscode.window.withProgress({ location: viewProgressLocation(this.deps.view) }, () => this.deps.discovery.refresh(token, account.id));
+      // The account left while its list loaded, or the scope changed: the list is not shown (the refresh that the
+      // change requested loads the list of the new scope).
+      if (this.lists.get(account.id) !== state || !this.isOfCurrentScope(data)) return 'dropped';
+      state.data = data;
+      state.failed = false;
+      // The complete list is shown at once. The repositories of devspaces that it lacks follow; until then their rows
+      // show what the previous refresh found.
+      this.endProgressiveDisplay(state);
+      this.setLoaded();
+      this.renderInBackground();
+      return 'refreshed';
+    } catch (error) {
+      if (error instanceof GitHubApiError && error.status === 401) this.offerSignInAgain(account);
+      // A rate limit of GitHub: the part of the first load that the view shows stays, also for the next refresh.
+      if (error instanceof GitHubRateLimitError) {
+        rateLimited = true;
+        this.onRateLimited(error, options.afterRateLimit, options.byUser);
+      }
+      // Without internet access, the view shows the stored list and skips the update.
+      const shown = state.data ? 'The stored list is shown.' : 'No stored list exists.';
+      this.deps.logger.warn(`The repository list of ${account.login} could not be updated. ${shown} ${errorMessage(error)}`);
+      state.failed = state.data === undefined;
+      return rateLimited ? 'rateLimited' : 'failed';
+    } finally {
+      this.refreshToken = undefined;
+      if (!rateLimited) this.endProgressiveDisplay(state);
+    }
   }
 
   /**
@@ -709,46 +792,54 @@ export class Sidebar implements vscode.Disposable {
     this.rateLimitRetry = undefined;
   }
 
-  /** The refresh of the progressive display ended: the view shows no part of it anymore. */
-  private endProgressiveDisplay(): void {
-    this.progressiveAccountId = undefined;
-    if (this.partial) {
-      this.partial = undefined;
-      this.renderInBackground();
-    }
+  /** The refresh of the progressive display of an account ended: the view shows no part of it anymore. */
+  private endProgressiveDisplay(state: AccountState): void {
+    const shown = state.partial !== undefined;
+    state.progressive = false;
+    state.partial = undefined;
+    this.merge();
+    if (shown) this.renderInBackground();
   }
 
   /**
    * The discovery stores the repositories of its scan, with and without a configuration. The repositories of the other
-   * devspaces are asked one by one, at most DISCOVERY_CONCURRENCY at the same time (the refresh has ended, so no other
-   * request of the list runs), so the view shows `not on GitHub` only for repositories that GitHub does not return.
-   * A failed question leaves the repository unknown.
+   * devspaces are asked one by one, each with the token of the owner account of its devspace, at most
+   * DISCOVERY_CONCURRENCY at the same time (the refreshes have ended, so no other request of the lists runs), so the
+   * view shows `not on GitHub` only for repositories that GitHub does not return to that account. A failed question
+   * leaves the repository unknown; an owner whose token GitHub rejected asks nothing.
    */
-  private async lookUpUnlisted(data: DiscoveryData, token: string): Promise<Map<string, RepositoryInfo | null>> {
+  private async lookUpUnlisted(): Promise<Map<string, RepositoryInfo | null>> {
     const result = new Map<string, RepositoryInfo | null>();
-    const devspaces = await this.availableDevspaces();
-    // GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
-    const repositories = repositoriesToLookUp(devspaces, listedRepositories(data), this.deps.settings().owners);
-    await mapLimit(repositories, DISCOVERY_CONCURRENCY, async (repository) => {
-      if (this.disposed) return;
-      try {
-        const info = await this.deps.discovery.getRepository(repository, token);
-        result.set(repositoryKey(repository), info ?? null);
-      } catch (error) {
-        this.deps.logger.info(`GitHub could not be asked for ${repository}: ${errorMessage(error)}`);
-      }
-    });
+    const listed = listedRepositories(this.data);
+    for (const account of this.accounts) {
+      const devspaces = (await this.availableDevspaces()).filter((devspace) => devspace.owner.id === account.id);
+      // GitHub is not asked about repositories outside the scan scope; their rows get no `not on GitHub`.
+      const repositories = repositoriesToLookUp(devspaces, listed, this.deps.settings().owners).filter((repository) => !result.has(repositoryKey(repository)));
+      if (repositories.length === 0 || this.disposed || !(await this.authSignedIn(account))) continue;
+      const session = await this.readSession(account);
+      if (session?.account.id !== account.id) continue;
+      const token = session.token;
+      await mapLimit(repositories, DISCOVERY_CONCURRENCY, async (repository) => {
+        if (this.disposed) return;
+        try {
+          const info = await this.deps.discovery.getRepository(repository, token);
+          result.set(repositoryKey(repository), info ?? null);
+        } catch (error) {
+          this.deps.logger.info(`GitHub could not be asked for ${repository}: ${errorMessage(error)}`);
+        }
+      });
+    }
     return result;
   }
 
-  /** GitHub rejected the token (HTTP 401): offer a new sign-in, once per window. */
-  private offerSignInAgain(): void {
-    if (this.signInOffered) return;
-    this.signInOffered = true;
-    showWarningMessage(SIGN_IN_AGAIN_DETAIL, Actions.signIn)
+  /** GitHub rejected the token of `account` (HTTP 401): offer a new sign-in of that account, once per window. */
+  private offerSignInAgain(account: GitHubAccount): void {
+    if (this.signInOffered.has(account.id)) return;
+    this.signInOffered.add(account.id);
+    showWarningMessage(this.accounts.length > 1 ? signInAgainDetailOf(account.login) : SIGN_IN_AGAIN_DETAIL, Actions.signIn)
       .then(async (choice) => {
         if (choice !== Actions.signIn) return;
-        const token = await this.deps.auth.renewToken();
+        const token = await this.deps.auth.renewToken(account);
         if (token) await this.refreshDiscovery({ again: true });
       })
       .then(undefined, (error: unknown) => this.deps.logger.error('The new GitHub sign-in failed.', error));
@@ -759,9 +850,10 @@ export class Sidebar implements vscode.Disposable {
     this.signedIn = signedIn;
   }
 
-  private async authSignedIn(): Promise<boolean> {
+  /** auth.isSignedIn: of `account`, or without one of any account of Devspaces. */
+  private async authSignedIn(account?: GitHubAccount): Promise<boolean> {
     try {
-      return await this.deps.auth.isSignedIn();
+      return await this.deps.auth.isSignedIn(account);
     } catch (error) {
       this.deps.logger.warn(`The sign-in state could not be read: ${errorMessage(error)}`);
       return false;
@@ -775,39 +867,50 @@ export class Sidebar implements vscode.Disposable {
   }
 
   /**
-   * Shows the list of `account`: its stored list at once (or none, until the refresh), and no single lookups of the
-   * previous account. Without an account, no list.
+   * Shows the lists of `accounts`: the stored list of each new account at once (or none, until the refresh); an account
+   * that left takes its list, its part of a first load and the single lookups with it.
    */
-  private async useAccount(account: GitHubAccount | undefined): Promise<void> {
-    this.account = account;
-    this.data = undefined;
-    this.lookups = new Map();
-    // The part of the first load of the previous account is never shown to this one.
-    this.partial = undefined;
-    this.progressiveAccountId = undefined;
-    this.setLoadFailed(false);
-    if (!account) return;
-    const stored = await this.deps.discovery.loadStored(account.id).catch((error: unknown) => {
-      this.deps.logger.warn(`The stored repository list could not be read: ${errorMessage(error)}`);
-      return undefined;
-    });
-    // Another change of the account meanwhile wins.
-    if (this.account?.id !== account.id) return;
-    // A list of another scan scope may contain repositories outside the current one: the view waits for the refresh.
-    if (stored && !this.isOfCurrentScope(stored)) {
-      this.deps.logger.info('The stored repository list was loaded for other organizations. It is loaded again.');
+  private async useAccounts(accounts: readonly GitHubAccount[]): Promise<void> {
+    const left = this.accounts.some((account) => !accounts.some((each) => each.id === account.id));
+    this.accounts = [...accounts];
+    for (const id of [...this.lists.keys()]) if (!accounts.some((account) => account.id === id)) this.lists.delete(id);
+    if (left) this.lookups = new Map();
+    const added = accounts.filter((account) => !this.lists.has(account.id));
+    for (const account of added) this.lists.set(account.id, { account, data: undefined, partial: undefined, progressive: false, failed: false });
+    this.merge();
+    if (accounts.length === 0) {
+      this.setLoaded(false);
+      this.setLoadFailed(false);
       return;
     }
-    this.data = stored;
-    this.setLoaded(stored !== undefined);
+    await Promise.all(
+      added.map(async (account) => {
+        const stored = await this.deps.discovery.loadStored(account.id).catch((error: unknown) => {
+          this.deps.logger.warn(`The stored repository list of ${account.login} could not be read: ${errorMessage(error)}`);
+          return undefined;
+        });
+        const state = this.lists.get(account.id);
+        // The account left meanwhile, or its refresh gave a list already.
+        if (state === undefined || state.data !== undefined || stored === undefined) return;
+        // A list of another scan scope may contain repositories outside the current one: the view waits for the refresh.
+        if (!this.isOfCurrentScope(stored)) {
+          this.deps.logger.info(`The stored repository list of ${account.login} was loaded for other organizations. It is loaded again.`);
+          return;
+        }
+        state.data = stored;
+      }),
+    );
+    this.merge();
+    this.setLoaded(this.hasList());
+    if (!this.hasList()) this.setLoadFailed(false);
   }
 
-  /** Token and account of the GitHub session, without a dialog; undefined when it cannot be read. */
-  private async readSession(): Promise<{ token: string; account: GitHubAccount } | undefined> {
+  /** Token and account of the GitHub session of `account`, without a dialog; undefined when it cannot be read. */
+  private async readSession(account: GitHubAccount): Promise<{ token: string; account: GitHubAccount } | undefined> {
     try {
-      return await this.deps.auth.getSession({ interactive: false });
+      return await this.deps.auth.getSession({ interactive: false, account });
     } catch (error) {
-      this.deps.logger.warn(`The GitHub session could not be read: ${errorMessage(error)}`);
+      this.deps.logger.warn(`The GitHub session of ${account.login} could not be read: ${errorMessage(error)}`);
       return undefined;
     }
   }
@@ -817,13 +920,13 @@ export class Sidebar implements vscode.Disposable {
     return sameScope(data.scope, this.deps.settings().owners);
   }
 
-  /** The account of the GitHub session, without a dialog. */
-  private async readAccount(): Promise<GitHubAccount | undefined> {
+  /** The accounts of Devspaces (auth.ts), without a dialog; empty when they cannot be read. */
+  private async readAccounts(): Promise<GitHubAccount[]> {
     try {
-      return await this.deps.auth.getAccount({ interactive: false });
+      return await this.deps.auth.accounts();
     } catch (error) {
-      this.deps.logger.warn(`The GitHub account could not be read: ${errorMessage(error)}`);
-      return undefined;
+      this.deps.logger.warn(`The GitHub accounts could not be read: ${errorMessage(error)}`);
+      return [];
     }
   }
 
@@ -855,4 +958,9 @@ function formatTime(isoTime: string): string {
 function localClockTime(time: number): string {
   const date = new Date(time);
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+/** The IDs of `accounts` as one text, to compare two reads of the accounts. */
+function accountIds(accounts: readonly GitHubAccount[]): string {
+  return accounts.map((account) => account.id).join(' ');
 }

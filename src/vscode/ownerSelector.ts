@@ -21,11 +21,12 @@ export const OWNERS_FILTERED_CONTEXT_KEY = 'devspaces.ownersFiltered';
 export interface OwnerSelectorDeps {
   auth: {
     isSignedIn(): Promise<boolean>;
-    getToken(options: { interactive: boolean }): Promise<string | undefined>;
-    getAccount(options: { interactive: boolean }): Promise<GitHubAccount | undefined>;
+    /** The accounts of Devspaces. */
+    accounts(): Promise<GitHubAccount[]>;
+    getToken(options: { interactive: boolean; account?: GitHubAccount }): Promise<string | undefined>;
   };
-  /** The list that the view shows, whose organizations are used when it belongs to the signed-in account. */
-  discoveryData: () => DiscoveryData | undefined;
+  /** The list of an account that the view shows (Sidebar.accountList), whose organizations are used when it is loaded. */
+  accountList: (accountId: string) => DiscoveryData | undefined;
   discovery: Pick<DiscoveryService, 'viewerOrganizations'>;
   settings: () => ExtensionSettings;
   /** Sign in with GitHub (the command of the view). */
@@ -38,7 +39,8 @@ interface OwnerItem extends vscode.QuickPickItem {
 }
 
 /**
- * Asks for the owners to scan and writes them to the setting `owners`, where its value applies (settingTarget). Not
+ * Asks for the owners to scan and writes them to the setting `owners`, where its value applies (settingTarget). The
+ * setting applies to every account of Devspaces, so the choices are the logins and organizations of all of them. Not
  * signed in: asks to sign in first. Cancel changes nothing; an empty selection writes `[]` (all repositories).
  */
 export async function selectOwners(deps: OwnerSelectorDeps): Promise<void> {
@@ -48,15 +50,12 @@ export async function selectOwners(deps: OwnerSelectorDeps): Promise<void> {
     await deps.signIn();
     if (!(await deps.auth.isSignedIn())) return;
   }
-  const [token, account] = await Promise.all([
-    deps.auth.getToken({ interactive: false }),
-    deps.auth.getAccount({ interactive: false }),
-  ]);
-  if (!token || !account) return;
+  const accounts = await deps.auth.accounts();
+  if (accounts.length === 0) return;
 
   const owners = deps.settings().owners;
-  const { login, organizations } = await accountOrganizations(deps, token, account);
-  const items: OwnerItem[] = ownerChoices({ viewerLogin: login, organizations, owners }).map((choice) => ({
+  const listed = await Promise.all(accounts.map((account) => accountOrganizations(deps, account)));
+  const items: OwnerItem[] = ownerChoices({ accounts: listed, owners }).map((choice) => ({
     label: choice.label,
     ...(choice.description ? { description: choice.description } : {}),
     picked: choice.picked,
@@ -82,20 +81,17 @@ export function updateOwnersContextKey(owners: readonly unknown[], logger: Logge
 }
 
 /**
- * The organizations of the account: from the list of the view when it belongs to the account, otherwise from GitHub
- * (a request without repositories). When GitHub cannot be asked, only the account and the owners of the setting are
- * offered.
+ * The organizations of an account: from its list in the view when it is loaded, otherwise from GitHub (a request
+ * without repositories). When GitHub cannot be asked, only the account is offered (and the owners of the setting).
  */
-async function accountOrganizations(
-  deps: OwnerSelectorDeps,
-  token: string,
-  account: GitHubAccount,
-): Promise<{ login: string; organizations: string[] }> {
-  const data = deps.discoveryData();
+async function accountOrganizations(deps: OwnerSelectorDeps, account: GitHubAccount): Promise<{ login: string; organizations: string[] }> {
+  const data = deps.accountList(account.id);
   if (data && data.viewerLogin.toLowerCase() === account.login.toLowerCase()) {
     return { login: data.viewerLogin, organizations: data.organizations };
   }
   try {
+    const token = await deps.auth.getToken({ interactive: false, account });
+    if (!token) return { login: account.login, organizations: [] };
     return await deps.discovery.viewerOrganizations(token);
   } catch (error) {
     deps.logger.warn(`The organizations of ${account.login} could not be read: ${errorMessage(error)}`);

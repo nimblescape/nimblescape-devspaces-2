@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { errorMessage } from '../errors';
-import { isAbortError, silentLogger, type Credentials, type GitHubAuth, type Logger, type ProcessRunner } from '../ports';
+import { isAbortError, silentLogger, type Credentials, type Logger, type ProcessRunner } from '../ports';
 import { credentialServerName, isDockerHub, registryDisplayName } from './reference';
 import type { CredentialsProvider } from './registryClient';
 import { isRecord } from '../valueChecks';
@@ -187,25 +187,6 @@ export class DockerCredentialStore {
  * when Docker has none.
  */
 export const GITHUB_PACKAGES_REGISTRY = 'ghcr.io';
-
-/**
- * Adds the GitHub session (scope `read:packages`) as fallback for ghcr.io. The session is only requested without a
- * dialog, and only when the registry asks for credentials.
- */
-export function withGitHubPackagesFallback(
-  primary: CredentialsProvider,
-  github: Pick<GitHubAuth, 'getPackagesCredentials'>,
-): CredentialsProvider {
-  return async (registry, signal, repository) => {
-    const found = await primary(registry, signal, repository);
-    if (found || registry.toLowerCase() !== GITHUB_PACKAGES_REGISTRY || signal?.aborted) return found;
-    try {
-      return await github.getPackagesCredentials({ interactive: false });
-    } catch {
-      return undefined;
-    }
-  };
-}
 
 function fromAuthEntry(entry: AuthEntry | undefined, keepIdentityToken = false): Credentials | undefined {
   if (!isRecord(entry)) return undefined;

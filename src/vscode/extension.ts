@@ -29,7 +29,7 @@ import { HelperChannels, openHelperChannel } from '../core/helperChannel/helperC
 import { HelperChannelError } from '../core/helperChannel/helperChannel';
 import { Messages } from '../core/messages';
 import { nodeHttpsTransport, takeUserAgentVersion } from '../core/http';
-import { DockerCredentialStore, withGitHubPackagesFallback } from '../core/imageCheck/credentials';
+import { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { isoTime, systemClock } from '../core/ports';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
@@ -59,7 +59,8 @@ import { HELPER_DOCKER_SOCKET, VSCODE_STORE_VOLUME } from '../core/names';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
 import type { ExtensionSettings } from '../core/types';
-import { VsCodeGitHubAuth, ghcrRejectionReporter, watchGitHubEnterpriseSettings } from './auth';
+import { AccountOffers } from './accountOffers';
+import { VsCodeGitHubAuth, watchGitHubEnterpriseSettings } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
@@ -71,7 +72,7 @@ import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { updateDevspacesOnlyContextKey } from './devspacesOnly';
 import { isProcessAlive } from '../core/session/sessionRules';
-import { extensionFlow, extensionHostSide } from './hostSide';
+import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { GroupMatchWorkerRunner } from './groupMatcher';
@@ -234,6 +235,7 @@ async function activateExtension(
   const disconnectRequests = new DisconnectRequests(paths.root);
   const auth = new VsCodeGitHubAuth(logger);
   context.subscriptions.push(auth);
+  const accountOffers = new AccountOffers({ auth, state: context.globalState, logger });
   // Credential helpers (docker-credential-*) are found like the Docker CLI, also with the short PATH of the extension host.
   const credentialEnv = dockerProcessEnv(env, platform, dockerPath);
   const credentials = new DockerCredentialStore(runner, {
@@ -243,11 +245,9 @@ async function activateExtension(
     findExecutable: (name) => findExecutable(name, credentialEnv, platform),
     logger,
   });
-  // The sign-in fix: a 401 of GitHub (here the token service of ghcr.io for the GitHub session) reaches auth.ts, which
-  // ignores tokens that belong to no current session (for example a token of the Docker credentials).
-  const registryClient = new RegistryClient(nodeHttpsTransport, withGitHubPackagesFallback(credentials.provider(), auth), logger, {
-    onCredentialsRejected: ghcrRejectionReporter(auth),
-  });
+  // Only the logins that Docker stored on this computer: the client has no operation, so it has no GitHub account whose
+  // ghcr.io login it could use (the GitHub sign-in is the ghcr.io login of the operations in the worker only).
+  const registryClient = new RegistryClient(nodeHttpsTransport, credentials.provider(), logger);
   const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
   // The helper image of the bootstrap, apart from the steps of the workspace helper (the worker's).
   const helper = new HelperImages({
@@ -257,7 +257,7 @@ async function activateExtension(
     // The digest of the base image is read with this registry client, with its own time limit of 5 seconds: at the
     // build of a missing tag, and by the weekly check of the maintaining ensure (the preparation of the worker for an
     // operation `open`, and the background prebuild). It asks without a login first; the credentials of this computer
-    // (for ghcr.io also the GitHub sign-in) are read only when the registry refuses that request.
+    // are read only when the registry refuses that request.
     statePath: paths.helperState,
     baseDigest: registryBaseDigest(registryClient),
     // The engine of the operation (its key: '' for the local Docker, else the host), without its socket, which only the
@@ -535,29 +535,26 @@ async function activateExtension(
   // HostSide of this computer answering their requests; one for the service (also the token removal of the controller)
   // and the calls to the Monitor. The containers that this window remembers, for its pipeline and its worker.
   const lifecycleMemory = windowLifecycleMemory();
-  const workerFlow = extensionFlow(
-    channels,
-    () => targets.current(),
-    extensionHostSide({
-      registry,
-      sessionFiles,
-      ui,
-      auth,
-      credentials,
-      windowId: sessionCoordinator.windowId,
-      // The busy marks that a flow sets for this window, as its own pipeline sets them.
-      pid: process.pid,
-      clock: systemClock,
-      isProcessAlive: (pid: number) => isProcessAlive(pid),
-      // The profile of the account and the window's memory, for the open in the worker.
-      viewer: (token, signal) => discovery.viewer(token, signal),
-      lifecycleMemory,
-      // The remembered check results of the configurations (this extension's storage).
-      configChecks,
-      logger,
-    }),
+  const hostSideDeps: HostSideDeps = {
+    registry,
+    sessionFiles,
+    ui,
+    auth,
+    credentials,
+    windowId: sessionCoordinator.windowId,
+    // The busy marks that a flow sets for this window, as its own pipeline sets them.
+    pid: process.pid,
+    clock: systemClock,
+    isProcessAlive: (pid: number) => isProcessAlive(pid),
+    // The profile of the account and the window's memory, for the open in the worker.
+    viewer: (token, signal) => discovery.viewer(token, signal),
+    lifecycleMemory,
+    // The remembered check results of the configurations (this extension's storage).
+    configChecks,
     logger,
-  );
+  };
+  // The HostSide of the account of each operation: the extension chooses that account, never the worker.
+  const workerFlow = extensionFlow(channels, () => targets.current(), (account) => extensionHostSide(hostSideDeps, account), logger);
   // The step "Docker start" of an operation (and of "Update All Images Now"): the local Docker is started when needed; a
   // remote host is only checked (never a Docker Desktop start).
   const startDocker: DockerStarter = async ({ onStarting, signal }) =>
@@ -839,9 +836,11 @@ async function activateExtension(
       background(view.visible ? sidebar.refreshStates() : sidebar.render(), 'update the sidebar');
     }),
     auth.onDidChangeSession(() => {
-      // A window of a devspace of another account closes; the view shows the list of the new account.
+      // A window of a devspace of an account that signed out closes; the view shows the lists of the accounts now.
       background(controller.onSessionChanged(), 'check the devspace of this window after the account change');
       background(sidebar.onSessionChanged(), 'update the sign-in state');
+      // A GitHub account of VS Code that Devspaces does not use yet is offered once.
+      background(accountOffers.check(), 'offer the GitHub accounts of VS Code');
     }),
     // GitHub rejected the token of the session, or accepted it again: the same account, so only the view changes.
     auth.onDidChangeSignInState(() => background(sidebar.onSessionChanged({ again: false }), 'update the sign-in state')),
@@ -873,6 +872,8 @@ async function activateExtension(
   // The stored list at once, then the background refresh.
   const listed = sidebar.initialize();
   background(listed, 'show the repository list');
+  // A GitHub account of VS Code that Devspaces does not use yet is offered once (not before the stored list shows).
+  background(listed.then(() => accountOffers.check()), 'offer the GitHub accounts of VS Code');
   if (view.visible) {
     // The view may have become visible while the activation waited above: VS Code sends that event once, before the
     // listener existed, so the setup looks at the view here too (`wsl --status` while it shows the Docker setup).

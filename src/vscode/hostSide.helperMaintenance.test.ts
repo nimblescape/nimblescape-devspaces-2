@@ -15,7 +15,7 @@ describe('extensionFlow and the helper image maintenance', () => {
     const all = { registry: {}, sessionFiles: {}, ui: {}, auth: {}, credentials: {}, windowId: 'w1', pid: 1, clock: { now: () => 0 }, isProcessAlive: () => true, logger: silentLogger } as unknown as HostSideDeps;
     const sent: Record<string, unknown>[] = [];
     const channels = { flow: vi.fn(async (_target: unknown, _op: string, _params: unknown, options: Record<string, unknown> = {}) => (sent.push(options), { ok: true })) };
-    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, extensionHostSide(all), silentLogger);
+    const flow = extensionFlow(channels as never, async () => ({ kind: 'local' }) as never, (account) => extensionHostSide(all, account), silentLogger);
     const maintenance: HelperMaintenance = { checkBaseImage: false };
     await flow(OP_OPEN, { repository: 'acme/api', dockerHost: '' }, { helperMaintenance: maintenance });
     await flow(OP_STOP, { devspaceId: 'e1' }, {});

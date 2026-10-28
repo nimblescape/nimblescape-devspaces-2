@@ -135,6 +135,8 @@ export const fakeVscode = {
   },
   authentication: {
     getSession: vi.fn(),
+    // The GitHub accounts of VS Code (also those of other extensions); none by default.
+    getAccounts: vi.fn(),
     onDidChangeSessions: sessionChanges.event,
   },
   /** Test helper: fires `authentication.onDidChangeSessions`. */
@@ -170,6 +172,7 @@ export function resetFakeVscode(): void {
     fakeVscode.commands.registerCommand,
     fakeVscode.workspace.getConfiguration,
     fakeVscode.authentication.getSession,
+    fakeVscode.authentication.getAccounts,
   ]) {
     mock.mockReset();
   }
@@ -183,6 +186,7 @@ export function resetFakeVscode(): void {
   fakeVscode.commands.executeCommand.mockResolvedValue(undefined);
   fakeVscode.commands.registerCommand.mockImplementation(() => ({ dispose() {} }));
   fakeVscode.authentication.getSession.mockResolvedValue(undefined);
+  fakeVscode.authentication.getAccounts.mockResolvedValue([]);
   window.createOutputChannel.mockImplementation((name: string) => {
     const channel: FakeOutputChannel = {
       name,

@@ -11,7 +11,9 @@ export const OwnerTexts = {
   title: 'Select Organizations',
   placeholder: 'Select the organizations and accounts to scan for repositories. Select none to scan all repositories that you can access.',
   yourAccount: 'your account',
-  /** An owner of the setting that is neither the account nor one of its organizations. */
+  /** With several accounts of Devspaces: the accounts that are members of an organization. */
+  memberOf: (logins: readonly string[]) => `member: ${logins.join(', ')}`,
+  /** An owner of the setting that is neither an account nor one of their organizations. */
   fromSettings: 'from your settings',
 } as const;
 
@@ -25,13 +27,12 @@ export interface OwnerChoice {
 }
 
 /**
- * The choices: the signed-in account first, then its organizations in alphabetical order, then the owners of the setting
- * that are in neither list, so that they can be removed. Each owner once (logins ignore case); the owners of the
- * setting are selected.
+ * The choices: the accounts of Devspaces first (in their order), then their organizations in alphabetical order (with
+ * several accounts, each names the accounts that are members), then the owners of the setting that are in neither list,
+ * so that they can be removed. Each owner once (logins ignore case); the owners of the setting are selected.
  */
 export function ownerChoices(input: {
-  viewerLogin: string;
-  organizations: readonly string[];
+  accounts: readonly { login: string; organizations: readonly string[] }[];
   owners: readonly string[];
 }): OwnerChoice[] {
   const selected = new Set(normalizeScope(input.owners));
@@ -43,9 +44,16 @@ export function ownerChoices(input: {
     seen.add(key);
     choices.push({ login: login.trim(), label: login.trim(), ...(description ? { description } : {}), picked: selected.has(key) });
   };
-  add(input.viewerLogin, OwnerTexts.yourAccount);
-  const organizations = [...input.organizations].sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
-  for (const organization of organizations) add(organization);
+  for (const account of input.accounts) add(account.login, OwnerTexts.yourAccount);
+  const several = input.accounts.length > 1;
+  const organizations = input.accounts
+    .flatMap((account) => account.organizations)
+    .sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+  for (const organization of organizations) {
+    const key = organization.trim().toLowerCase();
+    const members = input.accounts.filter((account) => account.organizations.some((each) => each.trim().toLowerCase() === key)).map((account) => account.login);
+    add(organization, several ? OwnerTexts.memberOf(members) : undefined);
+  }
   for (const owner of scopeLogins(input.owners)) add(owner, OwnerTexts.fromSettings);
   return choices;
 }
