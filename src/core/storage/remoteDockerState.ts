@@ -194,13 +194,13 @@ export class RemoteDockerState {
 }
 
 /**
- * True for the content of a valid file: a JSON object whose Docker host is a string and whose list is a list. Entries of
- * the list that are not host names, and the other fields, are only dropped (normalize).
+ * True for the content of a valid file: a JSON object whose Docker host is a string and whose lists are lists. Entries of
+ * a list that are not valid, and the fields that Devspaces does not know, are only dropped (normalize).
  */
 function isStateFile(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const { dockerHost, remoteHosts } = value as Record<string, unknown>;
-  return (dockerHost === undefined || typeof dockerHost === 'string') && (remoteHosts === undefined || Array.isArray(remoteHosts));
+  const { dockerHost, remoteHosts, offered, hosts } = value as Record<string, unknown>;
+  return (dockerHost === undefined || typeof dockerHost === 'string') && [remoteHosts, offered, hosts].every((list) => list === undefined || Array.isArray(list));
 }
 
 /** A list of host names without repeats or empty entries; undefined when none is left. */

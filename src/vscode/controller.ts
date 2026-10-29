@@ -2397,8 +2397,8 @@ export class Controller implements vscode.Disposable {
               ),
           }),
         // Try again is a Start: a repository takes the account of a session with a working token, as at the first try;
-        // it opens in the same kind of window as the first try. A devspace starts on its own Docker host (retryOn), a new
-        // one on the host that Devspaces uses then.
+        // it opens in the same kind of window as the first try. A devspace starts on its own Docker host (as retryOn), a
+        // new one on the host that Devspaces uses then (as withCommandTarget).
         {
           retry:
             retry ??
@@ -2407,8 +2407,7 @@ export class Controller implements vscode.Disposable {
                 // Nothing when the user cancels a question of the account (repositoryTargetFor).
                 const fresh = await this.refreshedTarget(target, 'start');
                 if (!fresh) return;
-                const again = () => this.startTarget(fresh, { window: options.window, source: options.source });
-                await (fresh.devspace ? this.withHostOf(fresh.devspace, again) : again());
+                await this.withTargetOf(fresh.devspace, () => this.startTarget(fresh, { window: options.window, source: options.source }));
               })),
           refused: () => (refused = true),
         },
@@ -3950,6 +3949,11 @@ export class Controller implements vscode.Disposable {
   private async withCommandTarget<T>(argument: CommandArgument, fn: () => Promise<T>): Promise<T> {
     const devspaceId = argument.kind === 'none' ? undefined : argument.devspaceId;
     const devspace = devspaceId === undefined ? undefined : await this.deps.registry.get(devspaceId).catch(() => undefined);
+    return this.withTargetOf(devspace, fn);
+  }
+
+  /** Runs `fn` as one operation on the Docker host of `devspace` (withHostOf), without one on the current host. */
+  private withTargetOf<T>(devspace: Devspace | undefined, fn: () => Promise<T>): Promise<T> {
     return devspace === undefined ? this.withDockerTarget(fn) : this.withHostOf(devspace, fn);
   }
 
