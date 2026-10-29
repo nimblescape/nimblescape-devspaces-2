@@ -14,6 +14,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Logger } from '../ports';
+import { compareVersions } from '../vscodeExtensions';
 import { extractTarGzEntry, extractZipEntry } from './archive';
 import pin from './dockerCliPin.json';
 import { downloadFile, type HttpGet } from './dockerDownload';
@@ -193,14 +194,6 @@ async function isFile(file: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/** The order of two versions x.y.z: negative when `a` is older. */
-function compareVersions(a: string, b: string): number {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i];
-  return 0;
 }
 
 /**

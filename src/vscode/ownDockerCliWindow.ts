@@ -7,7 +7,7 @@
 // Docker CLI of this computer when the download fails, and says so; and before such a window opens, where a failure is
 // only logged (that window tries again).
 import { errorMessage } from '../core/errors';
-import { installOwnDockerCli, OWN_DOCKER_CLI_VERSION } from '../core/docker/ownDockerCli';
+import { installOwnDockerCli, OWN_DOCKER_CLI_VERSION, ownDockerCliPath } from '../core/docker/ownDockerCli';
 import { isAbortError, type Logger } from '../core/ports';
 import { showErrorMessage, showWarningMessage } from './notifications';
 import { withNotificationProgress } from './progress';
@@ -39,7 +39,20 @@ export interface OwnDockerCliWindowOptions {
  * the download failed or was cancelled: then a message says which Docker CLI the window uses (shown without waiting),
  * unless `showFailure` is false.
  */
-export async function installOwnDockerCliWithProgress(options: OwnDockerCliWindowOptions): Promise<string | undefined> {
+export function installOwnDockerCliWithProgress(options: OwnDockerCliWindowOptions): Promise<string | undefined> {
+  // Calls at the same time (two opens) share one notification, with its progress and its Cancel.
+  const target = ownDockerCliPath(options.folder, options.platform);
+  const running = downloads.get(target);
+  if (running !== undefined) return running;
+  const download = downloadWithProgress(options).finally(() => downloads.delete(target));
+  downloads.set(target, download);
+  return download;
+}
+
+/** The downloads with a notification that run in this extension host, by the path of the program. */
+const downloads = new Map<string, Promise<string | undefined>>();
+
+async function downloadWithProgress(options: OwnDockerCliWindowOptions): Promise<string | undefined> {
   const { logger } = options;
   try {
     return await withNotificationProgress({ title: OwnDockerCliTexts.downloading, cancellable: true }, async (progress, token) => {

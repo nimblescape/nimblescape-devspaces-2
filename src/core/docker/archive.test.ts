@@ -168,6 +168,10 @@ describe('extractTarGzEntry', () => {
     const dotted = path.join(dir, 'dotted');
     await extractTarGzEntry(write('dotted.tgz', tarGz([{ name: './docker/docker', data: CLI, binarySize: true }])), 'docker/docker', dotted, CLI.length);
     expect(fs.readFileSync(dotted)).toEqual(CLI);
+    // An empty pax header changes nothing.
+    const afterEmpty = path.join(dir, 'after-empty');
+    await extractTarGzEntry(write('empty.tgz', tarGz([{ name: 'PaxHeaders/x', type: 'x', format: 'posix', data: Buffer.alloc(0) }, { name: 'docker/docker', data: CLI }])), 'docker/docker', afterEmpty, CLI.length);
+    expect(fs.readFileSync(afterEmpty)).toEqual(CLI);
   });
 
   it('refuses a missing entry, a link or folder of that name, a larger entry, an archive that ends in it, and an existing target', async () => {

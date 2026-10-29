@@ -170,8 +170,8 @@ export interface ControllerDeps {
    */
   windowDockerHost?: (devspace: Devspace, containerName: string) => string | undefined;
   /**
-   * Before a window with a Docker pipe (windowDockerHost) opens, and before the pending connection file of its open:
-   * installs the Docker CLI of Devspaces. Never rejects.
+   * Before a window with a Docker pipe (windowDockerHost) opens, and before the last checks of its open: installs the
+   * Docker CLI of Devspaces. Never rejects.
    */
   prepareDockerPipeWindow?: () => Promise<void>;
   /** "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
@@ -2526,13 +2526,16 @@ export class Controller implements vscode.Disposable {
   private async connect(result: OpenResult, progress: ProgressReporter, request: ConnectRequest, signal: AbortSignal): Promise<void> {
     progress.step('connecting');
     // The checks of the container come first, so Cancel, a newer request, and an account change during them still keep
-    // the window as it is. The log lines of the attach run meanwhile.
+    // the window as it is. The log lines of the attach run meanwhile, and so does the download of the Docker CLI of a
+    // window with a Docker pipe (it has its own Cancel), so that the checks below also cover its time.
+    const windowCli = this.prepareWindow(result.devspace, result.containerName);
     const diagnostics = this.logAttachDiagnostics(result.devspace, result.containerName);
     const notReady = await this.readyForWindow(result.devspace, result.containerName, signal);
     const waited = new AbortController();
     // Cancel also ends this wait.
     await Promise.race([diagnostics, this.delay(ATTACH_DIAGNOSTICS_WAIT_MS, AbortSignal.any([waited.signal, signal]))]);
     waited.abort();
+    await windowCli;
     if (!request.newWindow && [...this.activeConnectRequests].some((other) => other > request.number)) {
       this.logger.info(`${result.devspace.repository} is not connected: another devspace is opening in this window.`);
       return;
@@ -2575,8 +2578,6 @@ export class Controller implements vscode.Disposable {
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
       throw notReady;
     }
-    // A download of the Docker CLI of the window comes first: the pending connection file is fresh for 2 minutes.
-    await this.prepareWindow(result.devspace, result.containerName);
     await this.deps.coordinator.writePending(result.devspace.id);
     if (request.newWindow) {
       await this.deps.connection.openInNewWindow(...(await this.windowArgs(result.devspace, result.containerName, result.remoteWorkspaceFolder)));
@@ -3201,11 +3202,12 @@ export class Controller implements vscode.Disposable {
     if (left.reason !== 'account') return false;
     const accounts = await this.readAccounts();
     const devspace = await this.deps.registry.get(left.devspaceId).catch(() => undefined);
+    // The Docker CLI of the window first, so that the checks below cover its time.
+    if (devspace) await this.prepareWindow(devspace, left.containerName);
     if (this.left !== left || this.current || this.disposed) return false;
     if (!devspace || ownerAmong(devspace, accounts) === undefined) return false;
     this.left = undefined;
     this.logger.info(`The GitHub account of ${left.repository} is signed in again. The window reloads to open it.`);
-    await this.prepareWindow(devspace, left.containerName);
     await this.deps.connection.open(...(await this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository))));
     return true;
   }

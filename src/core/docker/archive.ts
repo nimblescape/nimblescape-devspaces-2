@@ -33,6 +33,7 @@ class ChunkReader {
 
   /** The next `count` bytes, or undefined when the stream ends before. */
   async read(count: number): Promise<Buffer | undefined> {
+    if (count === 0) return Buffer.alloc(0);
     if (!(await this.fill(count))) return undefined;
     const head = this.chunks[0];
     if (head.length >= count) {
