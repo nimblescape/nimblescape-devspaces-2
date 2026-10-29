@@ -9,7 +9,7 @@
 // these accounts; without a sign-in, it shows nothing but the sign-in.
 import * as vscode from 'vscode';
 import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
-import type { DockerTargets } from '../core/docker/dockerTargets';
+import { operationDockerTarget, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
 import type { MissingHelperStatus } from '../core/helper/missingHelperBuild';
 import { DISCOVERY_CONCURRENCY, type DiscoveryService, type PartialDiscovery } from '../core/discovery/discoveryService';
 import { GitHubApiError, GitHubRateLimitError } from '../core/discovery/githubApi';
@@ -619,9 +619,9 @@ export class Sidebar implements vscode.Disposable {
     // engine whose states are read).
     const read = async () => {
       const dockerHost = await this.currentDockerHost();
-      return { dockerHost, states: await service.refreshStates(new Set((await this.availableDevspaces()).map((devspace) => devspace.id))) };
+      return { dockerHost, target: operationDockerTarget(), states: await service.refreshStates(new Set((await this.availableDevspaces()).map((devspace) => devspace.id))) };
     };
-    const { dockerHost, states } = await (dockerTargets ? dockerTargets.withOperation(read) : read());
+    const { dockerHost, target, states } = await (dockerTargets ? dockerTargets.withOperation(read) : read());
     let runtime: ReadonlyMap<string, DevspaceRuntime> | undefined = states.runtime;
     let unread: { dockerHost: string; reachable: boolean; removed?: true } | undefined;
     if (!runtime && states.engineRemoved === true) {
@@ -631,7 +631,10 @@ export class Sidebar implements vscode.Disposable {
     } else if (!runtime) {
       // refreshStates gives `undefined` both when Docker does not run and when Docker failed. Only the first means
       // "nothing runs" (a connection that was lost must not keep showing Connected).
-      const running = docker.isInstalled() && (await docker.isRunning());
+      // Asked on the engine whose states were read: outside of an operation, `docker info` reaches the Docker of this
+      // computer, also while Devspaces uses a remote host.
+      const answers = async (): Promise<boolean> => docker.isInstalled() && (await docker.isRunning());
+      const running = await (target ? runWithDockerTarget(target, answers) : answers());
       if (!running) runtime = dockerStoppedRuntime(await registry.list());
       // The states that could not be read are shown as unknown, with the reason: an engine that answers but whose
       // worker could not read them, or a remote engine that does not answer (its containers may run). Only the local

@@ -101,7 +101,7 @@ describe('Sign in with GitHub replaces a token that GitHub rejected', () => {
       sessionFiles: new SessionFiles(paths),
       coordinator: { devspaceId: null, otherActiveWindows: async () => [] },
       service: { inspectStates: async () => undefined, currentBranch: async () => undefined },
-      docker: { isInstalled: () => true, isRunning: async () => true },
+      docker: { isInstalled: () => true, canRunOn: () => true, isRunning: async () => true },
       discovery,
       auth,
       tree: { setModel: () => {}, getModel: () => [] },

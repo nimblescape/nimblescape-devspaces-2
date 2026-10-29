@@ -182,6 +182,7 @@ interface Harness {
   commands: Map<string, (argument?: unknown) => Promise<void>>;
   docker: {
     isInstalled: ReturnType<typeof vi.fn>;
+    canRunOn: ReturnType<typeof vi.fn>;
     isRunning: ReturnType<typeof vi.fn>;
     containerState: ReturnType<typeof vi.fn>;
     findContainer: ReturnType<typeof vi.fn>;
@@ -315,6 +316,8 @@ function createHarness(
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn(), show: vi.fn() };
   const docker = {
     isInstalled: vi.fn(() => true),
+    // As BootstrapDocker.canRunOn with only the Docker CLI of this computer: the answer of isInstalled for every engine.
+    canRunOn: vi.fn((_target: unknown): boolean => docker.isInstalled()),
     isRunning: vi.fn(async () => true),
     containerState: vi.fn(async (_name: string) => 'running'),
     // A container of the current setup, unless a test gives another label.

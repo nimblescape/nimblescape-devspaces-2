@@ -907,8 +907,9 @@ export class Controller implements vscode.Disposable {
     }
     // reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH), then whether
     // Docker runs; no `docker info` here before that check. By the worker of the Docker host.
-    if (!docker.isInstalled()) return;
-    if (await this.restoreRefusedWhileRemoving((await this.operationTarget()).host, options.user === true)) return;
+    const target = await this.operationTarget();
+    if (!docker.canRunOn(target)) return;
+    if (await this.restoreRefusedWhileRemoving(target.host, options.user === true)) return;
     const added = await service.reconcileInWorker({ passive: options.passive });
     if (added === 0 && options.adopt !== true) return;
     await this.adoptWindowDevspace();
@@ -3234,10 +3235,11 @@ export class Controller implements vscode.Disposable {
   private async removeGitToken(left: KnownLeftDevspace): Promise<void> {
     const { containerName } = left;
     try {
-      if (!this.deps.docker.isInstalled()) return;
+      const target = await this.operationTarget();
+      if (!this.deps.docker.canRunOn(target)) return;
       // Never on another Docker host (its container is not on the current engine).
       const known = await this.deps.registry.get(left.devspaceId).catch(() => undefined);
-      if (known && !isOnDockerHost(known, await this.currentDockerHost())) {
+      if (known && !isOnDockerHost(known, target.host)) {
         this.logger.info(`The container ${containerName} is on another Docker host. Its token is not removed from here.`);
         return;
       }
@@ -3340,7 +3342,7 @@ export class Controller implements vscode.Disposable {
    * Docker cannot be asked. Never throws.
    */
   private async containerOutdated(devspace: Devspace): Promise<'version' | 'hostAccess' | undefined> {
-    if (!this.deps.docker.isInstalled()) return undefined;
+    if (!this.hasDockerCliFor(devspace)) return undefined;
     // Read by the worker; unknown (undefined) when it cannot be read.
     const value = await this.deps.service.windowStateInWorker(devspace, devspace.containerName);
     // The window stays then, and the next check of the connection that can read it leaves an outdated container
@@ -3375,7 +3377,7 @@ export class Controller implements vscode.Disposable {
     this.checkingConnection = true;
     try {
       const value = await this.windowState(current.devspace, current.containerName);
-      const runs = this.deps.docker.isInstalled() ? (value === undefined ? undefined : value.state === 'running') : false;
+      const runs = this.hasDockerCliFor(current.devspace) ? (value === undefined ? undefined : value.state === 'running') : false;
       // The window or its operation may have changed while the worker read.
       if (this.current !== current || this.disposed || this.gate.runningFor(key) !== undefined) return;
       // Whether it is outdated could not be read when the window attached; now it can.
@@ -3430,7 +3432,7 @@ export class Controller implements vscode.Disposable {
    * worker of the engine (windowStateInWorker), like every read of a container.
    */
   private async containerStateText(devspace: Devspace, containerName: string, signal: AbortSignal): Promise<string> {
-    if (!this.deps.docker.isInstalled()) return 'Docker is not installed';
+    if (!this.hasDockerCliFor(devspace)) return 'Docker is not installed';
     // Not passive (a worker lost after the open is opened again at once), bounded, and ended by the cancel of the open.
     const value = await this.deps.service.windowStateInWorker(devspace, containerName, {
       signal: AbortSignal.any([signal, AbortSignal.timeout(WINDOW_STATE_FLOW_TIMEOUT_MS)]),
@@ -3443,7 +3445,7 @@ export class Controller implements vscode.Disposable {
    * Reconnect of the user takes unknown as "not running" and tries; its failure leaves the window disconnected.
    */
   private async containerRuns(devspace: Devspace, containerName: string): Promise<boolean | undefined> {
-    if (!this.deps.docker.isInstalled()) return false;
+    if (!this.hasDockerCliFor(devspace)) return false;
     const value = await this.deps.service.windowStateInWorker(devspace, containerName);
     return value === undefined ? undefined : value.state === 'running';
   }
@@ -3453,8 +3455,16 @@ export class Controller implements vscode.Disposable {
    * when it could not be read, or Docker is not installed.
    */
   private async windowState(devspace: Devspace, containerName: string): Promise<WindowStateValue | undefined> {
-    if (!this.deps.docker.isInstalled()) return undefined;
+    if (!this.hasDockerCliFor(devspace)) return undefined;
     return this.deps.service.windowStateInWorker(devspace, containerName);
+  }
+
+  /**
+   * Whether a Docker CLI runs the calls on the engine of `devspace` (BootstrapDocker.canRunOn): on a computer without
+   * Docker, the Docker CLI of Devspaces runs those of a remote host.
+   */
+  private hasDockerCliFor(devspace: Pick<Devspace, 'dockerHost'>): boolean {
+    return this.deps.docker.canRunOn({ kind: dockerHostOf(devspace) === '' ? 'local' : 'remote' });
   }
 
   private updateStatusBar(): void {

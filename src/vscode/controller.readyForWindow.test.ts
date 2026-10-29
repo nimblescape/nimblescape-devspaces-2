@@ -38,14 +38,16 @@ interface Probe {
   warnings: string[];
 }
 
-function probe(): Probe {
+function probe(options: { canRunOn?: (target: { kind: string }) => boolean } = {}): Probe {
   const warnings: string[] = [];
   const logger = { info: vi.fn(), warn: vi.fn((text: string) => void warnings.push(text)), error: vi.fn(), debug: vi.fn(), show: vi.fn() };
   const isInstalled = vi.fn(() => true);
   const windowStateInWorker = vi.fn(async (): Promise<WindowStateValue | undefined> => ({ state: 'running' }));
   const deps = {
     logger,
-    docker: { isInstalled },
+    docker: { isInstalled, canRunOn: options.canRunOn ?? (() => isInstalled()) },
+    // The Docker pipe of the window of a devspace on an SSH host.
+    windowDockerHost: () => 'unix:///tmp/devspaces-pipe.sock',
     service: { windowStateInWorker },
     sidebar: { repositoryInfo: () => undefined },
     timing: { readyPollMs: 0 },
@@ -54,9 +56,9 @@ function probe(): Probe {
 }
 
 /** The private check of the attach, called as the Start calls it after the pipeline. */
-function readyForWindow(p: Probe, containerName = CONTAINER, signal = new AbortController().signal): Promise<UserFacingError | undefined> {
+function readyForWindow(p: Probe, containerName = CONTAINER, signal = new AbortController().signal, entry = devspace()): Promise<UserFacingError | undefined> {
   const check = (p.controller as unknown as { readyForWindow(e: Devspace, c: string, s: AbortSignal): Promise<UserFacingError | undefined> }).readyForWindow;
-  return check.call(p.controller, devspace(), containerName, signal);
+  return check.call(p.controller, entry, containerName, signal);
 }
 
 beforeEach(() => resetFakeVscode());
@@ -92,6 +94,17 @@ describe('readyForWindow', () => {
     expect(refusal).toBeInstanceOf(UserFacingError);
     expect(p.windowStateInWorker).not.toHaveBeenCalled();
     expect(p.warnings.some((text) => text.includes('(state: Docker is not installed)'))).toBe(true);
+  });
+
+  // A computer without Docker that uses a remote host: the Docker CLI of Devspaces runs the calls there
+  // (BootstrapDocker.canRunOn), so the worker reads the container of a remote devspace.
+  it('asks the worker on a remote host with only the Docker CLI of Devspaces', async () => {
+    const p = probe({ canRunOn: (target) => target.kind === 'remote' });
+    p.isInstalled.mockReturnValue(false);
+    expect(await readyForWindow(p, CONTAINER, new AbortController().signal, { ...devspace(), dockerHost: 'build-box' })).toBeUndefined();
+    expect(p.windowStateInWorker).toHaveBeenCalledTimes(1);
+    expect(await readyForWindow(p)).toBeInstanceOf(UserFacingError);
+    expect(p.windowStateInWorker).toHaveBeenCalledTimes(1);
   });
 
   it.each(['stopped', 'missing'] as const)('refuses the connect to a %s container after every check', async (state) => {

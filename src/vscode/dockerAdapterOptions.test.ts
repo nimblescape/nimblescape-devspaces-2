@@ -4,6 +4,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { findDockerCli } from '../core/docker/dockerCli';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../core/docker/dockerHost';
+import { runWithDockerTarget } from '../core/docker/dockerTargets';
 import { dockerAdapterOptions } from './dockerAdapterOptions';
 
 /** A Docker setup with the methods that look the CLI up, so that a wiring that calls them fails the tests. */
@@ -36,6 +38,16 @@ describe('dockerAdapterOptions (the BootstrapDocker options of extension.ts)', (
     options.onDaemonStatus?.(false);
     expect(setup.reportDaemonStatus.mock.calls).toEqual([[true], [false]]);
     expect(setup.checkCli).not.toHaveBeenCalled();
+  });
+
+  // A computer without Docker that uses a remote host: an engine that answers there is no Docker CLI of this computer.
+  it('reports no docker info of an operation on a remote engine, only those of the local Docker', async () => {
+    const setup = fakeSetup();
+    const options = dockerAdapterOptions(() => setup);
+    await runWithDockerTarget(remoteDockerTarget('build-box'), async () => options.onDaemonStatus?.(true));
+    expect(setup.reportDaemonStatus).not.toHaveBeenCalled();
+    await runWithDockerTarget(LOCAL_DOCKER_TARGET, async () => options.onDaemonStatus?.(true));
+    expect(setup.reportDaemonStatus.mock.calls).toEqual([[true]]);
   });
 
   it('looks a missing CLI up again with findDockerCli', () => {

@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { silentLogger } from '../core/ports';
 import type { Devspace } from '../core/types';
 import { resourceName } from '../core/names';
-import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../core/docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget, type DockerTarget } from '../core/docker/dockerHost';
 import { operationDockerTarget } from '../core/docker/dockerTargets';
 import type { RunResult } from '../core/ports';
 import {
@@ -24,14 +24,15 @@ import {
 
 const ENTRY = { id: 'e1', containerName: 'devspaces-acme-api-x' } as Devspace;
 
-function deps(options: { found?: Devspace[]; needsRestore?: boolean; installed?: boolean; added?: number | Error } = {}) {
+function deps(options: { found?: Devspace[]; needsRestore?: boolean; installed?: boolean; added?: number | Error; target?: DockerTarget } = {}) {
   const found = [...(options.found ?? [])];
   const errors: string[] = [];
   const warnings: string[] = [];
   const all = {
     registry: { findByContainerName: vi.fn(async () => found.shift()) },
     needsRestore: vi.fn(async () => options.needsRestore ?? true),
-    docker: { isInstalled: () => options.installed ?? true },
+    docker: { canRunOn: vi.fn((_target: Pick<DockerTarget, 'kind'>) => options.installed ?? true) },
+    current: async () => options.target ?? LOCAL_DOCKER_TARGET,
     service: {
       reconcileInWorker: vi.fn(async (_options: { passive: boolean; signal?: AbortSignal }) => {
         if (options.added instanceof Error) throw options.added;
@@ -70,6 +71,14 @@ describe('the devspace of the window at its activation', () => {
     const noDocker = deps({ installed: false });
     expect(await findWindowDevspace('c', noDocker.all)).toBeUndefined();
     expect(noDocker.all.service.reconcileInWorker).not.toHaveBeenCalled();
+  });
+
+  // On a computer without Docker, the Docker CLI of Devspaces runs the calls on a remote host (BootstrapDocker.canRunOn).
+  it('asks for a Docker CLI of the current engine before the restore', async () => {
+    const remote = remoteDockerTarget('build-box');
+    const { all } = deps({ found: [undefined as unknown as Devspace, ENTRY], added: 1, target: remote });
+    expect(await findWindowDevspace('devspaces-acme-api-x', all)).toBe(ENTRY);
+    expect(all.docker.canRunOn).toHaveBeenCalledWith(remote);
   });
 
   it('restores nothing when the activation may not (before the first use of Devspaces)', async () => {
@@ -292,7 +301,7 @@ describe('the devspace of the window by the labels of its container', () => {
     });
     const all = (options: { lost?: boolean; removed?: boolean; installed?: boolean } = {}) => ({
       needsRestore: async () => options.lost ?? true,
-      docker: { isInstalled: () => options.installed ?? true, run },
+      docker: { canRunOn: (target: Pick<DockerTarget, 'kind'>) => target === remote && (options.installed ?? true), run },
       current: async () => remote,
       removed: vi.fn(async () => options.removed ?? true),
       now: () => NOW,

@@ -27,7 +27,7 @@ import { dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './do
 import { isSshClosedBeforeLogin, sshEndpoint, type DockerTarget } from './dockerHost';
 import type { ImageInfo } from './dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
-import { operationDockerTarget } from './dockerTargets';
+import { operationDockerTarget, outsideOperation } from './dockerTargets';
 import { isRecord } from '../valueChecks';
 
 /** Result of `docker info`. */
@@ -321,6 +321,17 @@ export class BootstrapDocker {
   canRunRemote(): boolean {
     this.lookUpCliIfMissing();
     return this.ownCliPath() !== undefined || this.path !== undefined;
+  }
+
+  /**
+   * True if a Docker CLI runs the calls on an engine of the kind of `target`, also outside of an operation: on a remote
+   * engine canRunRemote, else the Docker CLI of this computer. For the checks before a flow on that engine, for example
+   * the worker's read of a container of a remote devspace on a computer without Docker.
+   */
+  canRunOn(target: Pick<DockerTarget, 'kind'>): boolean {
+    if (target.kind === 'remote') return this.canRunRemote();
+    this.lookUpCliIfMissing();
+    return this.path !== undefined;
   }
 
   /**
@@ -641,7 +652,8 @@ export class BootstrapDocker {
       check.done = true;
       if (this.cliCheck === check) this.cliCheck = undefined;
     };
-    check.answer = this.podmanCheckCall(['--version'], undefined).then(
+    // With the CLI at `path`, the one of this computer, also within an operation on a remote engine.
+    check.answer = outsideOperation(() => this.podmanCheckCall(['--version'], undefined)).then(
       (result) => {
         if (result === undefined || result.exitCode !== 0) {
           forget();

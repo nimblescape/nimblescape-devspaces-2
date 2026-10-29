@@ -68,6 +68,19 @@ describe('BootstrapDocker: the Docker CLI of Devspaces', () => {
     expect(files).toEqual([OWN]);
   });
 
+  // The checks before a flow, which run outside of an operation (for example the worker's read of a container).
+  it('says for each kind of engine whether a Docker CLI runs its calls, whatever operation runs now', async () => {
+    const { runner } = recorder();
+    const ownOnly = new BootstrapDocker(runner, undefined, { PATH: '/usr/bin' }, silentLogger, 'linux', { ownCli: () => OWN });
+    expect(ownOnly.canRunOn(REMOTE)).toBe(true);
+    expect(ownOnly.canRunOn(LOCAL_DOCKER_TARGET)).toBe(false);
+    expect(await runWithDockerTarget(REMOTE, async () => ownOnly.canRunOn(LOCAL_DOCKER_TARGET))).toBe(false);
+    expect(ownOnly.canRunOn({ kind: 'unsupported' })).toBe(false);
+    const computerOnly = new BootstrapDocker(runner, COMPUTER, { PATH: '/usr/bin' }, silentLogger, 'linux', { ownCli: () => undefined });
+    expect(computerOnly.canRunOn(REMOTE)).toBe(true);
+    expect(computerOnly.canRunOn(LOCAL_DOCKER_TARGET)).toBe(true);
+  });
+
   it('has no Docker CLI for a remote engine without either', async () => {
     const { runner } = recorder();
     const docker = new BootstrapDocker(runner, undefined, { PATH: '/usr/bin' }, silentLogger, 'linux', { ownCli: () => undefined });

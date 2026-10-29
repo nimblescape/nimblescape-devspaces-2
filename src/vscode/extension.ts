@@ -723,7 +723,7 @@ async function activateExtension(
   // A remote host needs a Docker CLI for remote engines (the one of Devspaces or of this computer), the local Docker the
   // Docker CLI of this computer.
   context.subscriptions.push({
-    dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target, target.kind === 'remote' ? docker.canRunRemote() : docker.isInstalled())),
+    dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target, docker.canRunOn(target))),
   });
   // While no Docker CLI is found, the sidebar shows the Docker setup (welcome view) instead of the repositories: when
   // no remote Docker host is configured and the local Docker is not available, the repositories are not shown.
@@ -941,7 +941,7 @@ async function activateExtension(
   // mark, which this computer asks nothing by itself (the check of the worker for a passive read refuses it there too).
   const mayRestore = startWork ? async (): Promise<boolean> => !(await engineRemoved(await targets.current())) : false;
   const currentDevspace = containerName
-    ? await findWindowDevspace(containerName, { registry, needsRestore, docker, service, logger, mayRestore })
+    ? await findWindowDevspace(containerName, { registry, needsRestore, docker, current: () => targets.current(), service, logger, mayRestore })
     : undefined;
   // Nothing was restored from an engine with the removal mark: the labels of the container of this window still give its
   // devspace and its owner (one plain `docker container inspect`, no worker), so that the account rule holds there too.
