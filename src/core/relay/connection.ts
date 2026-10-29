@@ -8,10 +8,11 @@
 // bundle line for the pipe loader, and from then on both directions carry the frames of the streams (mux.ts). The
 // connection is open once the HELLO of the relay came. The error output of the transport (the messages of `ssh`, the
 // relay, and the worker) is kept as the reason of a failure, as the error output of the Docker CLI before. A stream to
-// the target `worker` is the program of a helper channel (openWorker). No `vscode`.
+// the target `worker` is the program of a helper channel (openWorker); a stream to the target `docker` is one
+// connection of the Docker pipe of the window (openDocker, dockerPipe.ts). No `vscode`.
 import { readableStderr } from '../loader/pipeLoader';
 import { decodedOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
-import { Mux } from './mux';
+import { Mux, type MuxStream } from './mux';
 
 /** The longest time from the start of the transport to the HELLO of the relay: the login, the start, the bundle. */
 export const RELAY_OPEN_TIMEOUT_MS = 120_000;
@@ -141,6 +142,20 @@ export class RelayConnection {
       },
       exited,
     };
+  }
+
+  /**
+   * A stream to the Docker socket of the container: one connection of the Docker pipe of the window (dockerPipe.ts).
+   * Throws when the connection is closed or has MAX_STREAMS streams.
+   */
+  openDocker(): MuxStream {
+    if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
+    return this.mux.open('docker');
+  }
+
+  /** The streams that are open now: the worker and the Docker streams (RelayConnections closes an idle connection). */
+  get streamCount(): number {
+    return this.closedReason === undefined ? (this.mux?.streamCount ?? 0) : 0;
   }
 
   /** Ends the connection: every stream is lost, and the transport is stopped when it does not end by itself. */

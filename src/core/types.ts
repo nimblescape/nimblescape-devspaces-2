@@ -342,6 +342,8 @@ export interface WindowStatus {
    * its URI. Missing for a window without one.
    */
   dockerContext?: string;
+  /** The same for the Docker host address in the authority (the Docker pipe of the window). */
+  dockerHost?: string;
   /**
    * The devspace that the window is attached to while it works without Devspaces on an engine with the removal mark
    * (Controller.workWithoutDevspaces): not `devspaceId`, so that no heartbeat, no release and no reopen record go to it.

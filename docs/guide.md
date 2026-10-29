@@ -303,7 +303,7 @@ Work that runs in a container after its window closed, for example a long build 
 
 ## Remote Docker host
 
-Your devspaces can run on Docker on another computer, for example a build server or a stronger machine, reached over SSH. VS Code, Devspaces, and your GitHub sign-in stay on your computer; the containers, volumes, and images are on the other computer. The remote engine is the current [Docker context](https://docs.docker.com/engine/manage-resources/contexts/), so Docker, Docker Compose, the Dev Containers extension, and Devspaces all follow it. Devspaces never sets `DOCKER_HOST` and writes no setting of the Dev Containers extension.
+Your devspaces can run on Docker on another computer, for example a build server or a stronger machine, reached over SSH. VS Code, Devspaces, and your GitHub sign-in stay on your computer; the containers, volumes, and images are on the other computer. The remote engine is the current [Docker context](https://docs.docker.com/engine/manage-resources/contexts/), so Docker, Docker Compose, and Devspaces follow it. The window of a devspace on the other computer reaches its engine through a Docker pipe of Devspaces on your computer, which the folder URI of the window names: the Dev Containers extension uses it for that window, and Devspaces carries its Docker connections over its own SSH connection. Devspaces sets no `DOCKER_HOST` of your environment and writes no setting of the Dev Containers extension.
 
 ### Set up
 
@@ -326,7 +326,8 @@ Each question before a change of the Docker host has a second button "…, Don't
 - To stop using a host, run **Devspaces: Remove Devspaces from This Docker Engine…** while it is the current engine, then **Devspaces: Use the Local Docker**. The Docker context of the host stays; [Uninstall](#uninstall) says how to remove it.
 - Published ports are bound to `127.0.0.1` of the other computer. Reach them through the port forwarding of VS Code (the Ports view, `forwardPorts`). `host.docker.internal` exists only with Docker Desktop.
 - Rootless Docker on the other computer works. Its limits: no published ports below 1024, Docker-in-Docker needs set-up there, and resource limits need cgroup v2.
-- **Use SSH connection sharing.** Devspaces keeps one SSH connection per window and engine for its work, but the Docker CLI on your computer opens a new SSH connection for each of its own calls. SSH servers limit new connections (`MaxStartups`, and in OpenSSH 9.8 and later `PerSourcePenalties`), and a dropped connection fails with a message that the SSH server closed it before the login. Connection sharing avoids this and is much faster:
+- The window of a devspace on another computer connects only while Devspaces runs in that VS Code: its folder URI names the Docker pipe of Devspaces on your computer. Such a URI does not work on another computer, or after you copied it; open the devspace there from the Devspaces view. When the window cannot serve its pipe, it closes its connection and says so.
+- **Use SSH connection sharing.** Devspaces keeps one SSH connection per window and engine for its worker and for the Docker connections of the window of a devspace, but its other Docker calls go through the Docker CLI on your computer, which opens a new SSH connection for each call. SSH servers limit new connections (`MaxStartups`, and in OpenSSH 9.8 and later `PerSourcePenalties`), and a dropped connection fails with a message that the SSH server closed it before the login. Connection sharing avoids this and is much faster:
 
   ```
   Host build-box

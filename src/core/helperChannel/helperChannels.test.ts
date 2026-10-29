@@ -137,6 +137,37 @@ describe('HelperChannels', () => {
     channels.dispose();
   });
 
+  // The worker of an SSH host runs behind the one connection of the relay to the host, which runs one worker at a time.
+  it('opens one channel per SSH host, whatever context names it, and one per context of the local Docker', async () => {
+    const remote = fakeChannel();
+    const local = fakeChannel();
+    const desktop = fakeChannel();
+    const open = vi.fn().mockResolvedValueOnce(remote).mockResolvedValueOnce(local).mockResolvedValueOnce(desktop);
+    const channels = new HelperChannels({ open, logger: silentLogger });
+    expect(await channels.get(REMOTE)).toBe(remote);
+    expect(await channels.get(dockerTargetOf('ssh://build-box', 'my-build-box'))).toBe(remote);
+    expect(await channels.get(dockerTargetOf('ssh://build-box', undefined))).toBe(remote);
+    expect(await channels.get(LOCAL_DOCKER_TARGET)).toBe(local);
+    expect(await channels.get(dockerTargetOf('unix:///Users/me/.docker/run/docker.sock', 'desktop-linux'))).toBe(desktop);
+    expect(open).toHaveBeenCalledTimes(3);
+    channels.dispose();
+  });
+
+  // The Docker pipe of the window needs the connection of the relay, which the worker opens.
+  it('ensure opens the channel as for an operation, and gives the open one as it is', async () => {
+    const channel = fakeChannel();
+    const prepare = vi.fn(async () => {});
+    const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'no answer.')).mockResolvedValueOnce(channel);
+    const channels = new HelperChannels({ open, prepare, logger: silentLogger });
+    await expect(channels.ensure(REMOTE)).rejects.toMatchObject({ code: 'unavailable', message: 'no answer.' });
+    // Also within the wait after a failed open.
+    await expect(channels.ensure(REMOTE)).resolves.toBe(channel);
+    await expect(channels.ensure(REMOTE)).resolves.toBe(channel);
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(open).toHaveBeenCalledTimes(2);
+    channels.dispose();
+  });
+
   // A context of the user pointed to another host under the same name.
   it('opens a channel of its own for the same context with another endpoint; the old one gets no new call', async () => {
     const first = fakeChannel();

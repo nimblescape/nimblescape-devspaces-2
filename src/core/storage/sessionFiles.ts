@@ -268,6 +268,7 @@ export function isWindowStatus(value: unknown): value is WindowStatus {
     (value.state === 'active' || value.state === 'closing') &&
     isTime(value.updatedAt) &&
     (value.dockerContext === undefined || isNonEmptyString(value.dockerContext)) &&
+    (value.dockerHost === undefined || isNonEmptyString(value.dockerHost)) &&
     (value.plainDevspaceId === undefined || isStorageId(value.plainDevspaceId))
   );
 }

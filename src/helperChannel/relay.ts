@@ -6,8 +6,8 @@
 // output carry the streams of src/core/relay/mux.ts. The pipe loader stores the worker's bundle and calls startRelay
 // (RELAY_ENTRY) instead of startChannel. A stream to the target `worker` starts the worker as a process of its own,
 // with the pipe loader and the same stored file, hash and environment, so the worker starts as it does without the
-// relay; at most one worker runs at a time. A stream to the target `docker` is a connection to the Docker socket of the
-// container. The relay ends when its input ends, after a frame that breaks the rules, after the silence of the
+// relay; at most one worker runs at a time, and a worker stream that comes while one still ends waits for that end. A
+// stream to the target `docker` is a connection to the Docker socket of the container. The relay ends when its input ends, after a frame that breaks the rules, after the silence of the
 // connection, and at SIGTERM, SIGINT and SIGHUP: it closes every stream, ends the worker like the end of its input, and
 // exits once the worker ended (with SIGKILL after RELAY_WORKER_STOP_MS). Loading the module starts nothing.
 import * as childProcess from 'child_process';
@@ -58,6 +58,8 @@ export interface RelayDeps {
 export class Relay {
   private readonly mux: Mux;
   private worker: RelayWorker | undefined;
+  /** The worker stream that waits for the end of the worker that runs (at most one). */
+  private waiting: MuxStream | undefined;
   private stopping: { code: number; timer?: ReturnType<typeof setTimeout>; exited?: boolean } | undefined;
 
   constructor(private readonly deps: RelayDeps) {
@@ -90,8 +92,15 @@ export class Relay {
 
   private accept(stream: MuxStream): void {
     if (stream.target === 'docker') return this.connect(stream);
-    if (this.worker !== undefined) return stream.close('a worker runs already');
-    this.startWorker(stream);
+    if (this.worker === undefined) return this.startWorker(stream);
+    // The extension opens the next worker of the connection while the last one still ends (its channel was closed or
+    // lost): the stream waits for that end (at most RELAY_WORKER_STOP_MS), so that it needs no new connection. Its data
+    // waits in the stream. A newer worker stream takes its place.
+    this.waiting?.close('a newer worker stream came');
+    this.waiting = stream;
+    stream.onClose(() => {
+      if (this.waiting === stream) this.waiting = undefined;
+    });
   }
 
   private connect(stream: MuxStream): void {
@@ -131,7 +140,10 @@ export class Relay {
       if (this.worker === worker) this.worker = undefined;
       if (error) stream.close(`the worker cannot be started: ${error.message}`);
       else stream.exit(exit);
-      if (this.stopping) this.exitNow();
+      if (this.stopping) return this.exitNow();
+      const next = this.waiting;
+      this.waiting = undefined;
+      if (next?.isOpen) this.startWorker(next);
     });
   }
 

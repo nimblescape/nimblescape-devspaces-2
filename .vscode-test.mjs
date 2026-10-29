@@ -143,6 +143,12 @@ function attachConfiguration(kind, index) {
     const pending = path.join(base.env.DEVSPACE_TEST_USER_DATA_DIR, 'User', 'globalStorage', `${manifest.publisher}.${manifest.name}`, 'pending');
     for (const name of fs.existsSync(pending) ? fs.readdirSync(pending) : []) fs.rmSync(path.join(pending, name), { force: true });
   }
+  // `remote` starts with the ID of the computer for which prepare.ts made the Docker pipe in the folder URI.
+  if (kind === 'remote' && !listsOnly) {
+    const storage = path.join(base.env.DEVSPACE_TEST_USER_DATA_DIR, 'User', 'globalStorage', `${manifest.publisher}.${manifest.name}`);
+    fs.mkdirSync(storage, { recursive: true });
+    fs.writeFileSync(path.join(storage, 'computer.id'), seed.computerId);
+  }
   // `plain` starts as after the first use of Devspaces (the empty marker `used`, src/core/storage/firstUse.ts), so that
   // the window of a container that is no devspace restores the devspaces from the volumes while it activates, as the
   // tests of test/vscode/attach/plain.test.ts expect; with a fresh user data folder alone, it would restore nothing.

@@ -14,6 +14,7 @@ import { isPodmanDockerTarget, isUnreadableDockerTarget, type DockerTarget } fro
 import type { HelperMaintenance } from '../helper/helperImages';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
 import type { RelayConnection } from '../relay/connection';
+import type { RelayAccess } from '../relay/connections';
 import { RELAY_ENTRY } from '../relay/frames';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, VSCODE_STORE_DIR, freeWorkerNumber, workerName, workerNameStart } from '../names';
 import { errorMessage, isUserFacingError } from '../errors';
@@ -126,21 +127,16 @@ export function channelRunArgs(p: {
   ];
 }
 
-/**
- * Opens a connection of the relay (ChannelOpenDeps.relay): starts `command` (`docker run …`) on the computer of the
- * engine and writes `bundle` as the first line of its pipe loader.
- */
-export type RelayConnect = (command: readonly string[], bundle: string) => Promise<RelayConnection>;
-
 export interface ChannelOpenDeps {
   /** BootstrapDocker.start: `docker <args>` with the environment of the operation (its Docker context). */
   start(args: readonly string[]): StartedProcess | undefined;
   /**
    * The connection of the relay to the engine of `target` (docs/architecture.md "The connection of the relay"), for a
-   * remote engine: its worker starts behind the relay with one login (`ssh … sh -s`), not with the Docker CLI.
-   * Undefined when the engine has no transport (a host that is no SSH alias or address, no `ssh`): `start` then.
+   * remote engine: its worker starts behind the relay, on the open connection of the engine or with one new login
+   * (`ssh … sh -s`), not with the Docker CLI. Undefined when the engine has no transport (a host that is no SSH alias or
+   * address, no `ssh`): `start` then.
    */
-  relay?(target: DockerTarget): RelayConnect | undefined;
+  relay?(target: DockerTarget): RelayAccess | undefined;
   /**
    * BootstrapDocker.run: `docker <args>` without the worker, with the environment of the operation (the engine identity
    * of the open).
@@ -206,34 +202,50 @@ function identityText(identity: EngineIdentity): string {
 }
 
 /**
- * A channel whose worker runs behind the relay: one connection for the channel, which ends when the worker ended (its
- * EXIT, or the stream was closed). A failure of the connection (also a refusal of `docker run`, in its message) is a
- * HelperChannelError('open'), so the retries of openHelperChannel (another name, no network) see it as from `start`.
- * The whole open takes about as long as without the relay (WORKER_HELLO_BEHIND_RELAY_MS).
+ * A channel on a new worker stream of `connection` (HelperChannel.open without the bundle line: the relay stored the
+ * bundle). The relay starts the worker when the last worker of the connection ended. The connection stays when the
+ * worker ends: RelayConnections closes it after a time without a stream.
  */
-async function openBehindRelay(connect: RelayConnect, command: readonly string[], script: string, logger: Logger, name: string): Promise<HelperChannel> {
-  const startedAt = performance.now();
-  let connection: RelayConnection;
-  try {
-    connection = await connect(command, script);
-  } catch (error) {
-    throw new HelperChannelError('open', errorMessage(error));
-  }
+async function openWorkerOn(connection: RelayConnection, logger: Logger, name: string, openTimeoutMs?: number): Promise<HelperChannel> {
   let worker: StartedProcess;
   try {
     worker = connection.openWorker();
   } catch (error) {
-    connection.close();
     throw new HelperChannelError('open', errorMessage(error));
   }
-  void worker.exited.then(() => connection.close('the worker ended'));
-  const openTimeoutMs = Math.max(WORKER_HELLO_BEHIND_RELAY_MS, Math.round(CHANNEL_OPEN_TIMEOUT_MS - (performance.now() - startedAt)));
   return HelperChannel.open(worker, undefined, { logger, name, openTimeoutMs });
 }
 
 /**
+ * A channel whose worker runs behind the relay on a new connection, which `opened` gets. A failure of the connection
+ * (also a refusal of `docker run`, in its message) is a HelperChannelError('open'), so the retries of openHelperChannel
+ * (another name, no network) see it as from `start`. The whole open takes about as long as without the relay
+ * (WORKER_HELLO_BEHIND_RELAY_MS).
+ */
+async function openBehindRelay(
+  relay: RelayAccess,
+  command: readonly string[],
+  script: string,
+  logger: Logger,
+  name: string,
+  opened: (connection: RelayConnection) => void,
+): Promise<HelperChannel> {
+  const startedAt = performance.now();
+  let connection: RelayConnection;
+  try {
+    connection = await relay.connect(command, script);
+  } catch (error) {
+    throw new HelperChannelError('open', errorMessage(error));
+  }
+  opened(connection);
+  const openTimeoutMs = Math.max(WORKER_HELLO_BEHIND_RELAY_MS, Math.round(CHANNEL_OPEN_TIMEOUT_MS - (performance.now() - startedAt)));
+  return openWorkerOn(connection, logger, name, openTimeoutMs);
+}
+
+/**
  * Opens a channel to the engine of `target`: starts the container with the Docker context of `target` (a remote engine
- * with a transport: behind the relay, ChannelOpenDeps.relay), then checks with
+ * with a transport: behind the relay, ChannelOpenDeps.relay; on the open connection of the engine when it has one, else
+ * on a new one, which ends again when the open fails), then checks with
  * the operation `probe` that the worker reaches its engine, and that it is the engine of `target`: the engine identity
  * of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a socket mount of another engine,
  * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). The worker reads its identity over
@@ -242,6 +254,31 @@ async function openBehindRelay(connect: RelayConnect, command: readonly string[]
  * that it answers. Throws HelperChannelError('open').
  */
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
+  const name = engineName(target);
+  const relay = target.kind === 'remote' ? deps.relay?.(target) : undefined;
+  // The new connection of the relay that this open made.
+  let opened: RelayConnection | undefined;
+  try {
+    // The open connection of the engine (the Docker pipe of the window, or an earlier worker, opened it): the worker
+    // starts in its container, without a new login, and keeps the name of that container.
+    const shared = relay?.current();
+    const channel = shared !== undefined ? await openWorkerOn(shared, deps.logger, name) : await startChannel(deps, target, name, relay, (connection) => (opened = connection));
+    await checkChannelEngine(deps, target, name, channel);
+    return channel;
+  } catch (error) {
+    opened?.close('the worker could not be opened');
+    throw error;
+  }
+}
+
+/** The start of openHelperChannel without an open connection of the relay: the name and the network of the worker. */
+async function startChannel(
+  deps: ChannelOpenDeps,
+  target: DockerTarget,
+  name: string,
+  relay: RelayAccess | undefined,
+  opened: (connection: RelayConnection) => void,
+): Promise<HelperChannel> {
   const devspaceName = async (): Promise<string | undefined> => {
     try {
       return await deps.devspaceName?.();
@@ -251,16 +288,14 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
     }
   };
   const [script, tag, socketPath, devspace] = await Promise.all([deps.script(), deps.helperTag(), deps.socketPath(target), devspaceName()]);
-  const name = engineName(target);
   const label = channelLabelValue(script);
   const scriptHash = bundleHash(script);
-  const relay = target.kind === 'remote' ? deps.relay?.(target) : undefined;
   const startNamed = async (network: 'bridge' | 'none', containerName: string): Promise<HelperChannel> => {
     // The version of this extension (activate), which the worker names in the header User-Agent and passes on.
     const version = userAgentVersion();
     const entry = relay === undefined ? CHANNEL_ENTRY : RELAY_ENTRY;
     const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, vscodeVolume: deps.vscodeVolume, containerName, label, scriptHash, network, version, entry });
-    if (relay !== undefined) return openBehindRelay(relay, ['docker', ...args], script, deps.logger, name);
+    if (relay !== undefined) return openBehindRelay(relay, ['docker', ...args], script, deps.logger, name, opened);
     const process = await runWithDockerTarget(target, async () => deps.start(args));
     if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
     return HelperChannel.open(process, script, { logger: deps.logger, name });
@@ -310,16 +345,22 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
       }
     }
   };
-  let channel: HelperChannel;
   try {
-    channel = await start('bridge');
+    return await start('bridge');
   } catch (error) {
     // A daemon without its default bridge (`"bridge": "none"`) starts the worker without network; only what needs it
     // (the image check, the downloads) fails then, and the log says why.
     if (!(error instanceof HelperChannelError) || !NO_BRIDGE.test(error.message)) throw error;
     deps.logger.warn(`The Docker engine ${name} has no default bridge network, so the worker runs without outbound network there: image checks and downloads in the worker cannot reach the network.`);
-    channel = await start('none');
+    return start('none');
   }
+}
+
+/**
+ * The checks of openHelperChannel after the start: the probe, the engine identity, and the removal of the stopped helper
+ * containers in the background. Closes the channel when a check fails.
+ */
+async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, name: string, channel: HelperChannel): Promise<void> {
   let engine: EngineIdentity | undefined;
   try {
     // The parameters of the schema of both sides (none).
@@ -365,7 +406,6 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
       deps.logger.info(`The stopped helper containers on ${name} could not be removed: ${(error as Error).message}`);
     },
   );
-  return channel;
 }
 
 interface Entry {
@@ -415,8 +455,12 @@ export interface HelperChannelsOptions {
  * by the sweep after CHANNEL_IDLE_CLOSE_MS. Not seen: an SSH alias of `~/.ssh/config` pointed to another machine (the
  * same endpoint).
  */
+/**
+ * One channel per engine: the local Docker by its context and endpoint; an SSH host by its host alone, whatever context
+ * names it, because its worker runs behind the one connection of the relay to the host, which runs one worker at a time.
+ */
 function keyOf(target: DockerTarget): string {
-  return JSON.stringify([target.context ?? null, target.endpoint]);
+  return target.kind === 'remote' ? JSON.stringify(['remote', target.host]) : JSON.stringify([target.context ?? null, target.endpoint]);
 }
 
 /** The channels of this window, one per Docker engine (local and remote). */
@@ -463,6 +507,15 @@ export class HelperChannels {
       };
       opening.then((channel) => done(() => resolve(channel)));
     });
+  }
+
+  /**
+   * The open channel to the engine of `target`, made ready now if needed, as for an operation (the helper image, then
+   * the open in full): for the Docker pipe of the window, which needs the connection of the relay that the worker
+   * opens. Throws HelperChannelError('unavailable') with the cause, and an AbortError when `signal` aborts.
+   */
+  ensure(target: DockerTarget, signal?: AbortSignal): Promise<HelperChannel> {
+    return this.ready(target, signal);
   }
 
   /** The open channel, or the shared opening of one (see get). */

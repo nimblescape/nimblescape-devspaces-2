@@ -12,12 +12,14 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
-import { describeDockerHost, dockerHostOf, isOnDockerHost, type DockerTarget } from '../core/docker/dockerHost';
+import { describeDockerHost, dockerHostOf, isOnDockerHost, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
-import { SshLoginCache, findRemoteContext, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { SshLoginCache, findRemoteContext, noPromptEnv, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { openRelayConnection, sshRelayTransport } from '../core/relay/transport';
+import { RelayConnections, relayAccess } from '../core/relay/connections';
+import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -59,7 +61,7 @@ import { defaultExtensionEntries, windowVscodeServer } from './vscodeServer';
 import { HELPER_DOCKER_SOCKET, VSCODE_STORE_VOLUME } from '../core/names';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import type { ExtensionSettings } from '../core/types';
+import type { Devspace, ExtensionSettings } from '../core/types';
 import { AccountOffers } from './accountOffers';
 import { VsCodeGitHubAuth, watchGitHubEnterpriseSettings } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
@@ -354,6 +356,8 @@ async function activateExtension(
   context.subscriptions.push(closingWork.deferred({ dispose: () => helperBuilds.dispose() }));
   // The window of an attached container, also in the names of its workers (ConnectionAdapter.windowName).
   const connection = new ConnectionAdapter(logger);
+  // The connections of the relay of this window, one per remote host: its worker channel and its Docker pipe share it.
+  const relayConnections = new RelayConnections({ logger });
   const channels = new HelperChannels({
     logger,
     // The refresh found no helper image (see helperBuilds above); never on an engine that Devspaces was removed from.
@@ -378,12 +382,13 @@ async function activateExtension(
       openHelperChannel(
         {
           start: (args) => docker.start(args),
-          // A remote engine: the worker behind the relay, with one SSH login (`ssh … sh -s`).
+          // A remote engine: the worker behind the relay, on the open connection of the host, or with one SSH login
+          // (`ssh … sh -s`).
           relay: (target) => {
             const ssh = sshPath();
             const transport = ssh === undefined ? undefined : sshRelayTransport(target, ssh, env);
             if (transport === undefined) return undefined;
-            return (command, bundle) => openRelayConnection(runner, transport, command, bundle, { logger, name: target.host });
+            return relayAccess(relayConnections, target.host, (command, bundle) => openRelayConnection(runner, transport, command, bundle, { logger, name: target.host }));
           },
           runDirect: (args, options) => docker.run(args, options),
           logger,
@@ -408,6 +413,7 @@ async function activateExtension(
     closingWork.deferred({
       dispose: () => {
         channels.dispose();
+        relayConnections.dispose();
       },
     }),
   );
@@ -445,6 +451,19 @@ async function activateExtension(
   const repairSessionMonitor = heartbeats.repair(async (target, signal) => monitorCalls.monitorEnsure(target, await monitorSettings.forTarget(target), signal));
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
+  // The engine of a devspace for its heartbeats and for the Docker pipe of its window (resolveHeartbeatEngine).
+  const engineSources = {
+    windowContext: (shown: Devspace) => (connection.currentContainerName() === shown.containerName ? connection.currentDockerContext() : undefined),
+    current: () => outsideOperation(() => targets.resolve()),
+    ofContext: (name: string) => outsideOperation(() => targets.ofContext(name)),
+    // Only an existing context; a heartbeat never creates one (a context that the user removed is not made again by a
+    // tick).
+    remoteContext: (host: string) =>
+      outsideOperation(() => findRemoteContext(docker, host)).catch((error: unknown) => {
+        logger.warn(`The Docker context of ${host} could not be had: ${errorMessage(error)}`);
+        return undefined;
+      }),
+  };
   const windowHeartbeats = new WindowHeartbeats({
     owner: () => ({ windowId: windowCoordinator?.windowId ?? '', pid: process.pid }),
     connected: () => windowCoordinator?.devspaceId ?? null,
@@ -454,19 +473,7 @@ async function activateExtension(
     // The engine of the connected devspace is the one of this window's own Docker context (its authority, which its
     // status file records as dockerContext), also for a local devspace; never the global current context when the
     // window has its own (resolveHeartbeatEngine).
-    engineFor: (devspace, use) =>
-      resolveHeartbeatEngine(devspace, use, {
-        windowContext: (shown) => (connection.currentContainerName() === shown.containerName ? connection.currentDockerContext() : undefined),
-        current: () => outsideOperation(() => targets.resolve()),
-        ofContext: (name) => outsideOperation(() => targets.ofContext(name)),
-        // Only an existing context; a heartbeat never creates one (a context that the user removed is not made again by
-        // a tick).
-        remoteContext: (host) =>
-          outsideOperation(() => findRemoteContext(docker, host)).catch((error: unknown) => {
-            logger.warn(`The Docker context of ${host} could not be had: ${errorMessage(error)}`);
-            return undefined;
-          }),
-      }),
+    engineFor: (devspace, use) => resolveHeartbeatEngine(devspace, use, engineSources),
     // In the scope of a heartbeat, the worker's preparation runs with the long signal (heartbeatPreparation). The
     // operation `heartbeat` of the worker of that engine.
     send: (target, input, signal) => heartbeatPreparation.scope(() => monitorCalls.heartbeat(target, input, signal)),
@@ -502,6 +509,7 @@ async function activateExtension(
     logger,
     settings: getSettings,
     windowDockerContext: () => connection.currentDockerContext(),
+    windowDockerHost: () => connection.currentDockerHost(),
     windowHeartbeats,
     // The release of a devspace this window leaves.
     release: (devspaceId, bounds) =>
@@ -720,6 +728,9 @@ async function activateExtension(
     revealRow: (rowId) => revealRow(view, tree, rowId),
     development: context.extensionMode === vscode.ExtensionMode.Development,
     dockerTargets: targets,
+    // The Docker pipe of the window of a devspace on an SSH host (docs/architecture.md "The Docker pipe").
+    windowDockerHost: (devspace, shownContainer) =>
+      windowDockerHost(devspace, shownContainer, { computerId, platform, env, tmpdir: os.tmpdir(), sshFound: () => sshPath() !== undefined }),
     remoteDocker: new RemoteDockerCommands({
       docker,
       runner,
@@ -764,7 +775,11 @@ async function activateExtension(
           dockerEngineAnswers(target, { daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs), ssh: remoteDeps(), logger }, signal),
         ),
       docker,
-      closeWorker: (target) => channels.close(target),
+      // The connection of the relay too: the removal removes the container of its worker next.
+      closeWorker: (target) => {
+        channels.close(target);
+        if (target.kind === 'remote') relayConnections.close(target.host, 'Devspaces is removed from the engine');
+      },
       // Neither background build of the helper image makes it again after its removal.
       stopHelperBuilds: async (target) => {
         await Promise.all([backgroundPrebuild?.stop(target), helperBuilds.stop(target)]);
@@ -936,11 +951,12 @@ async function activateExtension(
     'prepare the workspace helper image in the background',
   );
 
-  if (currentDevspace && containerName && docker.isInstalled() && !onRemovedEngine) {
+  if (currentDevspace && containerName && docker.isInstalled() && !onRemovedEngine && connection.currentDockerHost() === undefined) {
     // Which Docker the Dev Containers extension asks when it resolves this window. Only for a devspace of this
-    // extension. Its context: the one in the authority of this window, through which the Dev Containers extension
-    // attaches; for a window without one, the current context when that is on the host of the devspace, else none
-    // for the local Docker.
+    // extension, and not for a window with a Docker pipe, which logs each Docker call that comes through it. Its
+    // context: the one in the authority of this window, through which the Dev Containers extension attaches; for a
+    // window without one, the current context when that is on the host of the devspace, else none for the local
+    // Docker.
     const devspace = currentDevspace;
     const logDocker = async (): Promise<void> => {
       const host = dockerHostOf(devspace);
@@ -951,6 +967,46 @@ async function activateExtension(
       for (const line of lines) logger.info(`While this window connects: ${line}`);
     };
     background(logDocker(), 'log the Docker of this window');
+  }
+
+  // The Docker pipe in the authority of this window (docs/architecture.md "The Docker pipe"): served before activate()
+  // returns, because the Dev Containers extension reaches the engine of the devspace through it once VS Code resolves
+  // the authority. It ends after the release of the window (closingWork), like the connection of the relay.
+  const pipeHost = connection.currentDockerHost();
+  if (pipeHost !== undefined && containerName) {
+    const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
+      logger,
+      platform,
+      computerId,
+      engineRemoved: (devspace) => engineRemoved({ host: dockerHostOf(devspace) }),
+      relayConnection: async (devspace) => {
+        const host = dockerHostOf(devspace);
+        const open = relayConnections.get(host);
+        if (open !== undefined) return open;
+        // The worker of the engine opens the connection; the engine as for the heartbeats of a devspace that this
+        // window does not show: the current one when it is on the host, else the context of the host.
+        const target = await resolveHeartbeatEngine(devspace, { connected: false }, engineSources);
+        if (target === undefined) throw new Error(`Docker is set to another host, and no Docker context of ${host} was found`);
+        await channels.ensure(target);
+        const opened = relayConnections.get(host);
+        if (opened === undefined) throw new Error(`the worker on ${host} runs without the connection of the relay`);
+        return opened;
+      },
+      dialStdio: (devspace) => {
+        const ssh = sshPath();
+        const address = sshTargetOf(dockerHostOf(devspace));
+        if (ssh === undefined || address === undefined) return undefined;
+        return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
+      },
+    });
+    if (served.kind === 'served') context.subscriptions.push(closingWork.deferred({ dispose: () => served.pipe.close() }));
+    // Without its pipe, the window must not connect. The window of a container whose owner cannot be read leaves below,
+    // after the token left the container.
+    if (served.kind === 'refused' && labeled.kind !== 'unreadable') {
+      await started;
+      await controller.leaveWithoutDockerPipe(containerName, served.reason);
+      return;
+    }
   }
 
   if (windowDevspace && containerName) {

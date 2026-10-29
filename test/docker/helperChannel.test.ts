@@ -10,6 +10,9 @@
 // over. The channel starts no step container (the end of a batch helper with its worker is tested in
 // src/helperChannel/batch.e2e.test.ts). The probe and the sweep of the worker go over the Engine API of its socket (no
 // Docker CLI of the worker), so their answers are checked against what the Docker CLI of the runner reports.
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as esbuild from 'esbuild';
 import { sharedBundleOptions, workerBundleOptions } from '../../scripts/bundleOptions.mjs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -36,6 +39,10 @@ import { LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN } from '../../src/core/names';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import type { StartOptions, StartedByteProcess, StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
+import type { RelayConnection } from '../../src/core/relay/connection';
+import { RelayConnections, relayAccess } from '../../src/core/relay/connections';
+import { DockerPipe, relayDockerDial } from '../../src/core/relay/dockerPipe';
+import { dockerPipeAddress } from '../../src/core/relay/pipeAddress';
 import { openRelayConnection } from '../../src/core/relay/transport';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { Timings, dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
@@ -75,6 +82,27 @@ async function sweepThrough(channel: HelperChannel): Promise<unknown> {
   }
 }
 
+/**
+ * One request on a Docker stream of `connection`, without the end of this side (the engine ends its side after the
+ * answer of an HTTP/1.0 request): the answer as text.
+ */
+function dockerRequest(connection: RelayConnection, request: string): Promise<string> {
+  const stream = connection.openDocker();
+  const chunks: Buffer[] = [];
+  return new Promise((resolve, reject) => {
+    stream.onData((chunk) => {
+      chunks.push(chunk);
+      stream.consumed(chunk.length);
+    });
+    stream.onEnd(() => {
+      stream.end();
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    stream.onClose((reason) => reject(new Error(reason)));
+    stream.write(Buffer.from(request, 'utf8'));
+  });
+}
+
 describe('the helper channel with the real Docker engine', () => {
   const { run, env, cli, log } = dockerTestContext('helperChannel');
   const byteRunner = new NodeProcessRunner();
@@ -97,12 +125,13 @@ describe('the helper channel with the real Docker engine', () => {
 
   /**
    * Opens a channel as the extension does; `extraArgs` go before the image (for example `-e`), `process` is kept.
-   * `relay`: the worker behind the relay, on a connection whose transport is a local `sh -s` (in place of `ssh … sh
-   * -s`); `transport` is that process.
+   * `relay`: the worker behind the relay, on the connection of `relay` when it has one, else on a new connection whose
+   * transport is a local `sh -s` (in place of `ssh … sh -s`); `transport` is that process, and `name` the name of its
+   * container.
    */
   async function open(
     extraArgs: string[] = [],
-    options: { relay?: boolean } = {},
+    options: { relay?: RelayConnections } = {},
   ): Promise<{ channel: HelperChannel; process: StartedProcess; name: string; transport?: StartedByteProcess }> {
     let started: StartedProcess | undefined;
     let transport: StartedByteProcess | undefined;
@@ -125,8 +154,9 @@ describe('the helper channel with the real Docker engine', () => {
             startBytes: (file: string, args: readonly string[], startOptions?: StartOptions) => (transport = byteRunner.startBytes(file, args, startOptions)),
           };
           // The Docker CLI of the run, with the environment of the run.
-          return (command, bundle) =>
-            openRelayConnection(runner, { file: 'sh', args: ['-s'], env }, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: 'runner-engine' });
+          return relayAccess(options.relay, 'runner-engine', (command, bundle) =>
+            openRelayConnection(runner, { file: 'sh', args: ['-s'], env }, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: 'runner-engine' }),
+          );
         },
         // The engine identity of the open is compared with one call without the worker.
         runDirect: (args, options) => docker.run(args, options),
@@ -220,28 +250,84 @@ describe('the helper channel with the real Docker engine', () => {
     );
   });
 
-  it('runs the worker behind the relay: the relay container ends after the close of the channel and after a hard kill of its transport', async () => {
-    const { channel, name, transport } = await timings.measure('open a channel behind the relay', () => open([], { relay: true }));
-    expect(transport).toBeDefined();
-    const details = cli.container(name)!;
-    expect(details.State.Running).toBe(true);
-    expect(details.HostConfig.AutoRemove).toBe(true);
-    // The relay is the first program of the container; it stored the bundle, and the worker runs from that file.
-    expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, '/opt/devspace/channel.js', bundleHash(script), 'startRelay']);
-    const probe = parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: 30_000 }));
-    expect(probe?.engine).toEqual(engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS])));
-    // The close of the channel ends the worker, then the connection, then the relay.
-    channel.close();
-    await expect(transport!.exited).resolves.toEqual({ exitCode: 0 });
-    await timings.measure('end of the relay after close', () => waitUntil(() => cli.container(name) === undefined, 'the removal of the container'));
+  it('runs the worker behind the relay: the next worker on the same connection, a Docker stream, the end of the relay container at the close of the connection and after a hard kill of its transport', async () => {
+    const connections = new RelayConnections({ logger: log });
+    try {
+      const { channel, name, transport } = await timings.measure('open a channel behind the relay', () => open([], { relay: connections }));
+      expect(transport).toBeDefined();
+      const details = cli.container(name)!;
+      expect(details.State.Running).toBe(true);
+      expect(details.HostConfig.AutoRemove).toBe(true);
+      // The relay is the first program of the container; it stored the bundle, and the worker runs from that file.
+      expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, '/opt/devspace/channel.js', bundleHash(script), 'startRelay']);
+      const identity = engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS]));
+      const probe = parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: 30_000 }));
+      expect(probe?.engine).toEqual(identity);
+      // The close of the channel ends the worker; the connection stays, and the next channel starts its worker in the
+      // same container, without a new transport.
+      const connection = connections.get('runner-engine')!;
+      channel.close();
+      await waitUntil(() => connection.streamCount === 0, 'the end of the worker');
+      expect(cli.container(name)?.State.Running).toBe(true);
+      const next = await timings.measure('open a channel on the open connection', () => open([], { relay: connections }));
+      expect(next.transport).toBeUndefined();
+      expect(parseProbeValue(await next.channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: 30_000 }))?.engine).toEqual(identity);
+      // A Docker stream reaches the Docker socket of the container.
+      expect(await dockerRequest(connection, 'GET /_ping HTTP/1.0\r\nHost: docker\r\n\r\n')).toMatch(/^HTTP\/1\.[01] 200 [\s\S]*\r\n\r\nOK$/);
+      // The close of the connection ends the relay.
+      connections.close('runner-engine', 'the test closed it');
+      await expect(transport!.exited).resolves.toEqual({ exitCode: 0 });
+      await timings.measure('end of the relay after close', () => waitUntil(() => cli.container(name) === undefined, 'the removal of the container'));
+    } finally {
+      connections.dispose();
+    }
 
-    const second = await open([], { relay: true });
-    expect(cli.container(second.name)?.State.Running).toBe(true);
-    // SIGKILL of the transport, which `exec` made the `docker run` process: the engine sees its connection end.
-    process.kill(second.transport!.pid!, 'SIGKILL');
-    await timings.measure('end of the relay after a hard kill of its transport', () =>
-      waitUntil(() => cli.container(second.name) === undefined, 'the removal of the container', 120_000),
-    );
+    const killed = new RelayConnections({ logger: log });
+    try {
+      const second = await open([], { relay: killed });
+      expect(cli.container(second.name)?.State.Running).toBe(true);
+      // SIGKILL of the transport, which `exec` made the `docker run` process: the engine sees its connection end.
+      process.kill(second.transport!.pid!, 'SIGKILL');
+      await timings.measure('end of the relay after a hard kill of its transport', () =>
+        waitUntil(() => cli.container(second.name) === undefined, 'the removal of the container', 120_000),
+      );
+    } finally {
+      killed.dispose();
+    }
+  });
+
+  // The Docker pipe of a window (docs/architecture.md "The Docker pipe"): the Docker CLI with DOCKER_HOST at the pipe, as
+  // the Dev Containers extension uses it, through the connection of the relay that the worker opened.
+  it('carries the Docker CLI through the Docker pipe and the relay: the end of standard input of `run -i` and `exec -i`, and the output', async () => {
+    const connections = new RelayConnections({ logger: log });
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-'));
+    let pipe: DockerPipe | undefined;
+    const sleeper = `devspaces-pipe-test-${run.runId}`;
+    try {
+      const { channel } = await open([], { relay: connections });
+      const address = dockerPipeAddress('0123456789abcdef', process.platform, folder);
+      pipe = await DockerPipe.listen({ address, connect: relayDockerDial(async () => connections.get('runner-engine')!), logger: log, name: 'the test' });
+      const viaPipe = (args: string[], input?: string) => byteRunner.run(run.dockerPath, ['-H', address.dockerHost, ...args], { env, input, timeoutMs: 120_000 });
+      const version = await timings.measure('docker version through the pipe', () => viaPipe(['version', '--format', '{{.Server.Version}}']));
+      expect({ exitCode: version.exitCode, stdout: version.stdout.trim() }).toEqual({ exitCode: 0, stdout: cli.ok(['version', '--format', '{{.Server.Version}}']) });
+      // The end of standard input reaches the program in the container (CloseWrite of the Docker CLI): `cat` ends.
+      const ran = await timings.measure('docker run -i through the pipe', () =>
+        viaPipe(['run', '--rm', '-i', ...runLabelArgs, '--entrypoint', 'sh', helperTag, '-c', 'cat; echo " and the end"'], 'the input'),
+      );
+      expect({ exitCode: ran.exitCode, stdout: ran.stdout }).toEqual({ exitCode: 0, stdout: 'the input and the end\n' });
+      expect((await viaPipe(['run', '-d', '--name', sleeper, ...runLabelArgs, '--entrypoint', 'sleep', helperTag, '600'])).exitCode).toBe(0);
+      const executed = await viaPipe(['exec', '-i', sleeper, 'sh', '-c', 'wc -c'], 'x'.repeat(300_000));
+      expect({ exitCode: executed.exitCode, stdout: executed.stdout.trim() }).toEqual({ exitCode: 0, stdout: '300000' });
+      // Every connection of the Docker CLI ended with it; the worker stream stays.
+      await waitUntil(() => pipe!.connectionCount === 0, 'the end of the connections of the pipe');
+      expect(connections.get('runner-engine')?.streamCount).toBe(1);
+      channel.close();
+    } finally {
+      cli.run(['rm', '-f', sleeper]);
+      pipe?.close();
+      connections.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
   });
 
   // The end after the silence.

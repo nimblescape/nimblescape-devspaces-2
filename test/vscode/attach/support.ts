@@ -26,9 +26,14 @@ export interface Seed {
   /** The devspace only: the wait of its postStartCommand when the mark exists (prepare.ts, the run `longopen`). */
   longStartSeconds?: number;
   longStartMark?: string;
-  /** The run `remote` only: the Docker context of the other computer (in the folder URI) and its host of the SSH config. */
+  /**
+   * The run `remote` only: the Docker context of the other computer, its host of the SSH config, the Docker pipe of the
+   * window (in the folder URI), and the ID of the computer of the test VS Code, for which the pipe was made.
+   */
   dockerContext?: string;
   remoteHost?: string;
+  dockerHost?: string;
+  computerId?: string;
   /**
    * The run `remote` only: the container of the other computer on the Docker engine of the runner, and the time (ISO
    * 8601) after the last SSH login of the preparation, from which remote.test.ts counts the logins of the open.

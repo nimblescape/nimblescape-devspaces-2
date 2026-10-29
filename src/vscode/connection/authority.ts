@@ -14,7 +14,10 @@
 // For a container on another Docker host, Dev Containers' own "Attach to Running Container" writes
 // `{"containerName":"/<name>","settings":{"context":"<Docker context>"}}`. Without `settings.context`, its first
 // `docker inspect` of the attach asks the local Docker (Docker Desktop), not the current Docker context, and reports
-// the container as one that "no longer exists". So the authority names the context of a remote devspace.
+// the container as one that "no longer exists". So the authority names how the Docker engine of a remote devspace is
+// reached: its context, or `settings.host`, the address of the Docker pipe of the window (docs/architecture.md "The
+// Docker pipe"). Assumption (Dev Containers 0.470.0): its Docker calls get DOCKER_CONTEXT from `settings.context`, else
+// DOCKER_HOST from `settings.host`.
 import { ATTACHED_CONTAINER } from '../../core/devContainers';
 
 /** URI scheme of remote folders. */
@@ -25,6 +28,19 @@ const HEX_PATTERN = /^(?:[0-9a-f]{2})+$/i;
 /** Container names that Docker accepts (`[a-zA-Z0-9][a-zA-Z0-9_.-]+`), with the optional leading `/` of `docker inspect`. */
 const CONTAINER_NAME_PATTERN = /^\/?[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 
+/**
+ * How the Dev Containers extension reaches the Docker engine of a window: a Docker context (`settings.context`), or a
+ * Docker host address (`settings.host`: the Docker pipe of the window).
+ */
+export type WindowDocker = { context: string } | { host: string };
+
+/** The parts of the authority of an attached container. */
+export interface AuthorityParts {
+  containerName: string;
+  dockerContext?: string;
+  dockerHost?: string;
+}
+
 /** Container name without the leading `/` of `docker inspect`. */
 function withoutLeadingSlash(name: string): string {
   return name.startsWith('/') ? name.slice(1) : name;
@@ -32,14 +48,22 @@ function withoutLeadingSlash(name: string): string {
 
 /**
  * Authority for the container `containerName` (with or without a leading `/`):
- * `attached-container+` + hex(JSON.stringify({ containerName: '/' + name, settings: { context } })), without `settings`
- * when no Docker context is given (the local Docker). Throws for an empty name or context.
+ * `attached-container+` + hex(JSON.stringify({ containerName: '/' + name, settings: { context } })), or with
+ * `settings: { host }` for a Docker host address, without `settings` when neither is given (the local Docker). Throws
+ * for an empty name, context, or host.
  */
-export function encodeAuthority(containerName: string, dockerContext?: string): string {
+export function encodeAuthority(containerName: string, docker?: WindowDocker): string {
   const name = withoutLeadingSlash(containerName.trim());
   if (!name) throw new Error('The container name is empty.');
-  if (dockerContext !== undefined && !dockerContext.trim()) throw new Error('The Docker context is empty.');
-  const value = dockerContext === undefined ? { containerName: `/${name}` } : { containerName: `/${name}`, settings: { context: dockerContext.trim() } };
+  let settings: WindowDocker | undefined;
+  if (docker !== undefined && 'context' in docker) {
+    if (!docker.context.trim()) throw new Error('The Docker context is empty.');
+    settings = { context: docker.context.trim() };
+  } else if (docker !== undefined) {
+    if (!docker.host.trim()) throw new Error('The Docker host is empty.');
+    settings = { host: docker.host.trim() };
+  }
+  const value = settings === undefined ? { containerName: `/${name}` } : { containerName: `/${name}`, settings };
   return `${AUTHORITY_PREFIX}${Buffer.from(JSON.stringify(value), 'utf8').toString('hex')}`;
 }
 
@@ -56,10 +80,11 @@ export function decodeAuthority(authority: string): string | undefined {
 }
 
 /**
- * Container name and Docker context (`settings.context`, if any) of an `attached-container+…` authority, as
- * decodeAuthority reads it. The older plain-name form has no context.
+ * Container name, Docker context (`settings.context`, if any), and Docker host (`settings.host`, if any, and only
+ * without a context, which Dev Containers prefers) of an `attached-container+…` authority, as decodeAuthority reads it.
+ * The older plain-name form has neither.
  */
-export function decodeAuthorityParts(authority: string): { containerName: string; dockerContext?: string } | undefined {
+export function decodeAuthorityParts(authority: string): AuthorityParts | undefined {
   let text = authority;
   if (text.includes('%')) {
     try {
@@ -87,12 +112,11 @@ export function decodeAuthorityParts(authority: string): { containerName: string
   if (typeof containerName !== 'string') return undefined;
   const name = withoutLeadingSlash(containerName);
   if (!name) return undefined;
-  const settings = record.settings;
-  const context =
-    typeof settings === 'object' && settings !== null && typeof (settings as Record<string, unknown>).context === 'string'
-      ? ((settings as Record<string, unknown>).context as string)
-      : undefined;
-  return context ? { containerName: name, dockerContext: context } : { containerName: name };
+  const settings = typeof record.settings === 'object' && record.settings !== null ? (record.settings as Record<string, unknown>) : {};
+  const context = typeof settings.context === 'string' ? settings.context : undefined;
+  const host = typeof settings.host === 'string' ? settings.host : undefined;
+  if (context) return { containerName: name, dockerContext: context };
+  return host ? { containerName: name, dockerHost: host } : { containerName: name };
 }
 
 /** The folder inside the container as a URI path: POSIX, with a leading `/`. */
@@ -105,11 +129,11 @@ function normalizeFolder(remoteWorkspaceFolder: string): string {
 export function folderUriParts(
   containerName: string,
   remoteWorkspaceFolder: string,
-  dockerContext?: string,
+  docker?: WindowDocker,
 ): { scheme: string; authority: string; path: string } {
   return {
     scheme: REMOTE_SCHEME,
-    authority: encodeAuthority(containerName, dockerContext),
+    authority: encodeAuthority(containerName, docker),
     path: normalizeFolder(remoteWorkspaceFolder),
   };
 }

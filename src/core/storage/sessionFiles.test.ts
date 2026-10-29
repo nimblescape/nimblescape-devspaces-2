@@ -362,6 +362,10 @@ describe('validators', () => {
     expect(isWindowStatus({ ...status(WIN_1), dockerContext: 'devspaces-remote-5709ff28' })).toBe(true);
     expect(isWindowStatus({ ...status(WIN_1), dockerContext: '' })).toBe(false);
     expect(isWindowStatus({ ...status(WIN_1), dockerContext: 3 })).toBe(false);
+    // An optional, non-empty Docker host (the Docker pipe of the window).
+    expect(isWindowStatus({ ...status(WIN_1), dockerHost: 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock' })).toBe(true);
+    expect(isWindowStatus({ ...status(WIN_1), dockerHost: '' })).toBe(false);
+    expect(isWindowStatus({ ...status(WIN_1), dockerHost: [] })).toBe(false);
     // The devspace of a window that works without Devspaces: an optional devspace ID.
     expect(isWindowStatus({ ...status(WIN_1, { devspaceId: null }), plainDevspaceId: ENV_A })).toBe(true);
     for (const plainDevspaceId of ['', '../x', 3, null]) expect(isWindowStatus({ ...status(WIN_1), plainDevspaceId })).toBe(false);

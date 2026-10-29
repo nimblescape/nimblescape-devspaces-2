@@ -189,6 +189,9 @@ export const ControllerTexts = {
    * The window of a devspace container on an engine with the removal mark, after the registry lost its content: the
    * labels of the container do not say which account owns it (Controller.leaveUnknownOwner).
    */
+  /** The window of a devspace on another computer whose Docker pipe this window does not serve (windowPipe.ts). */
+  dockerPipeNotServed: (containerName: string) =>
+    `This window cannot reach the Docker engine of the container ${containerName}: Devspaces does not serve its Docker connection here (the log says why). The window closes its connection. Start the devspace from the Devspaces view.`,
   unknownOwnerConnection: (containerName: string) =>
     `Devspaces cannot tell which GitHub account owns the container ${containerName}. This window closes its connection to it.`,
   /** The window kept its connection after it left a devspace that it must not use (for example Cancel on unsaved files). */
