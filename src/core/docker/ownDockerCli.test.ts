@@ -131,7 +131,7 @@ describe('dockerCliPlatformKey and ownDockerCliDownload', () => {
   });
 
   it('names the archive type and the program in it', () => {
-    expect(ownDockerCliDownload('win32', 'arm64', undefined, '10.0.26100')).toMatchObject({ kind: 'zip', entry: 'docker/docker.exe', version: pin.version, url: pin.files['windows-x86_64'].url });
+    expect(ownDockerCliDownload('win32', 'arm64', { release: '10.0.26100' })).toMatchObject({ kind: 'zip', entry: 'docker/docker.exe', version: pin.version, url: pin.files['windows-x86_64'].url });
     expect(ownDockerCliDownload('darwin', 'arm64')).toMatchObject({ kind: 'tgz', entry: 'docker/docker', sha256: pin.files['mac-aarch64'].sha256 });
     expect(ownDockerCliDownload('linux', 'arm')).toBeUndefined();
     expect(ownDockerCliPath('/s/docker-cli', 'linux', '1.2.3')).toBe(path.join('/s/docker-cli', '1.2.3', 'docker'));
@@ -170,11 +170,14 @@ describe('installOwnDockerCli', () => {
     expect(urls).toEqual([url]);
   });
 
-  it('takes the program out of the zip archive on Windows', async () => {
+  it('takes the program out of the zip archive on Windows 11 on Arm, and refuses Windows 10 on Arm', async () => {
     const windows = zip('docker/docker.exe', PROGRAM);
     const windowsPin = pinOf('1.2.3', 'windows-x86_64', windows, 'zip');
-    const { get } = serving({ [windowsPin.files['windows-x86_64'].url]: windows });
-    const target = await installOwnDockerCli({ folder, platform: 'win32', arch: 'x64', logger: silentLogger, pin: windowsPin, get });
+    const { get, urls } = serving({ [windowsPin.files['windows-x86_64'].url]: windows });
+    const arm = { folder, platform: 'win32' as const, arch: 'arm64', logger: silentLogger, pin: windowsPin, get };
+    await expect(installOwnDockerCli({ ...arm, release: '10.0.19045' })).rejects.toThrow('Docker publishes no Docker CLI for win32 on arm64');
+    expect(urls).toEqual([]);
+    const target = await installOwnDockerCli({ ...arm, release: '10.0.22631' });
     expect(target).toBe(path.join(folder, '1.2.3', 'docker.exe'));
     expect(fs.readFileSync(target)).toEqual(PROGRAM);
   });
@@ -229,6 +232,10 @@ describe('presentOwnDockerCli', () => {
     fs.writeFileSync(target, PROGRAM);
     expect(presentOwnDockerCli(folder, 'linux', 'x64')).toBe(target);
     expect(presentOwnDockerCli(folder, 'linux', 'arm')).toBeUndefined();
+    const windows = ownDockerCliPath(folder, 'win32');
+    fs.writeFileSync(windows, PROGRAM);
+    expect(presentOwnDockerCli(folder, 'win32', 'arm64', { release: '10.0.22631' })).toBe(windows);
+    expect(presentOwnDockerCli(folder, 'win32', 'arm64', { release: '10.0.19045' })).toBeUndefined();
     if (process.platform !== 'win32') {
       fs.rmSync(target);
       fs.symlinkSync('/bin/sh', target);

@@ -143,10 +143,8 @@ export async function extractTarGzEntry(archive: string, entry: string, target: 
         if (size > maxSize) throw new Error(`${entry} in the archive ${archive} has ${size} bytes, more than ${maxSize}.`);
         const file = await fs.promises.open(target, 'wx', 0o755);
         try {
-          const complete = await reader.pass(size, async (chunk) => {
-            // A write may take only a part of the chunk.
-            for (let at = 0; at < chunk.length; ) at += (await file.write(chunk, at)).bytesWritten;
-          });
+          // writeFile writes the whole chunk at the current position, also after a short write.
+          const complete = await reader.pass(size, (chunk) => file.writeFile(chunk));
           if (!complete) throw new Error(`The archive ${archive} ends in ${entry}.`);
         } finally {
           await file.close();

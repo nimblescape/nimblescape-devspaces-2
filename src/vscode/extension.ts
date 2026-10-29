@@ -902,13 +902,17 @@ async function activateExtension(
   };
 
   // The Docker CLI of Devspaces that this window needs and does not have yet: downloaded now, with a progress notification
-  // (its link Show details needs the commands above), before the Docker calls below and before activate() returns. On a
-  // computer without a Docker CLI, the Docker calls of Devspaces take it at once.
+  // (its link Show details needs the commands above), before the window looks up its devspace and serves its pipe, and
+  // before activate() returns. On a computer without a Docker CLI, the Docker calls of Devspaces and the Docker setup in
+  // the sidebar take it at once.
   if (ownCliBuild && ownCli === undefined) {
     const cli = await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli });
     if (cli !== undefined) {
       useOwnDockerCli(cli);
-      if (installedCli === undefined) docker.lookUpCliNow();
+      if (installedCli === undefined) {
+        docker.lookUpCliNow();
+        dockerSetup?.checkCli();
+      }
     }
   }
 

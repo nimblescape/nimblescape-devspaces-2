@@ -73,9 +73,16 @@ export function dockerCliPlatformKey(platform: NodeJS.Platform, arch: string, re
   return undefined;
 }
 
-/** The download of the Docker CLI for the platform from `current` (the pin by default), or undefined (none). */
-export function ownDockerCliDownload(platform: NodeJS.Platform, arch: string, current: DockerCliPin = pin, release?: string): DockerCliDownload | undefined {
-  const key = dockerCliPlatformKey(platform, arch, release);
+/** For tests: another pin than dockerCliPin.json, and another os.release() (dockerCliPlatformKey). */
+export interface DockerCliPlatformOptions {
+  pin?: DockerCliPin;
+  release?: string;
+}
+
+/** The download of the Docker CLI for the platform from the pin, or undefined (none). */
+export function ownDockerCliDownload(platform: NodeJS.Platform, arch: string, options: DockerCliPlatformOptions = {}): DockerCliDownload | undefined {
+  const current: DockerCliPin = options.pin ?? pin;
+  const key = dockerCliPlatformKey(platform, arch, options.release);
   const file = key === undefined ? undefined : current.files[key];
   if (file === undefined) return undefined;
   const zip = platform === 'win32';
@@ -88,8 +95,8 @@ export function ownDockerCliPath(folder: string, platform: NodeJS.Platform, vers
 }
 
 /** The Docker CLI of Devspaces when it was installed (installOwnDockerCli), else undefined. */
-export function presentOwnDockerCli(folder: string, platform: NodeJS.Platform, arch: string): string | undefined {
-  if (ownDockerCliDownload(platform, arch) === undefined) return undefined;
+export function presentOwnDockerCli(folder: string, platform: NodeJS.Platform, arch: string, options: Pick<DockerCliPlatformOptions, 'release'> = {}): string | undefined {
+  if (ownDockerCliDownload(platform, arch, options) === undefined) return undefined;
   const file = ownDockerCliPath(folder, platform);
   try {
     return fs.lstatSync(file).isFile() ? file : undefined;
@@ -98,7 +105,7 @@ export function presentOwnDockerCli(folder: string, platform: NodeJS.Platform, a
   }
 }
 
-export interface InstallOwnDockerCliOptions {
+export interface InstallOwnDockerCliOptions extends DockerCliPlatformOptions {
   /** The folder of the Docker CLI of Devspaces (StoragePaths.dockerCliDir). */
   folder: string;
   platform: NodeJS.Platform;
@@ -109,8 +116,6 @@ export interface InstallOwnDockerCliOptions {
   onProgress?: (received: number, total: number | undefined) => void;
   /** For tests. Default: 30 seconds without a byte stop the download. */
   stalledAfterMs?: number;
-  /** For tests. Default: the pin of this version. */
-  pin?: DockerCliPin;
   /** For tests. Default: nodeHttpsGet. */
   get?: HttpGet;
 }
@@ -126,7 +131,7 @@ const installing = new Map<string, Promise<string>>();
  * came for 30 seconds, and with an AbortError when the signal aborts.
  */
 export function installOwnDockerCli(options: InstallOwnDockerCliOptions): Promise<string> {
-  const current = options.pin ?? pin;
+  const current: DockerCliPin = options.pin ?? pin;
   const target = ownDockerCliPath(options.folder, options.platform, current.version);
   const running = installing.get(target);
   if (running !== undefined) return running;
@@ -137,7 +142,7 @@ export function installOwnDockerCli(options: InstallOwnDockerCliOptions): Promis
 
 async function installNow(options: InstallOwnDockerCliOptions, current: DockerCliPin, target: string): Promise<string> {
   const { folder, platform, arch, logger } = options;
-  const download = ownDockerCliDownload(platform, arch, current);
+  const download = ownDockerCliDownload(platform, arch, { pin: current, release: options.release });
   if (download === undefined) throw new Error(`Docker publishes no Docker CLI for ${platform} on ${arch}.`);
   if (await isFile(target)) return target;
   const versionFolder = path.dirname(target);
