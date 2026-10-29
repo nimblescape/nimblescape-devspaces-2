@@ -856,8 +856,12 @@ async function activateExtension(
       logger,
       platform,
       computerId,
-      knownHosts: async () =>
-        (await listContextInfos(docker)).map((info) => classifyDockerEndpoint(info.endpoint)).filter((endpoint) => endpoint.kind === 'remote').map((endpoint) => endpoint.host),
+      // The SSH hosts of the Docker contexts, and of the current Docker (DOCKER_HOST=ssh://… names no context).
+      knownHosts: async () => {
+        const [contexts, current] = await Promise.all([listContextInfos(docker), engineSources.current()]);
+        const endpoints = [...contexts.map((info) => classifyDockerEndpoint(info.endpoint)), current];
+        return endpoints.filter((endpoint) => endpoint.kind === 'remote').map((endpoint) => endpoint.host);
+      },
       engineRemoved: (host) => engineRemoved({ host }),
       openRelayConnection: (host) => relayConnections.get(host),
       relayConnection: async (host) => {

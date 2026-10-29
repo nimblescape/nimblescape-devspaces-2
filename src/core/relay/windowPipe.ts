@@ -33,8 +33,8 @@ export interface WindowPipeDeps {
   /** The ID of this computer (computer.id). */
   computerId(): string;
   /**
-   * The SSH hosts that this computer knows (of its Docker contexts), to find the host of a pipe whose devspace is not
-   * known (the registry lost it): the one for which this computer made the address.
+   * The SSH hosts that this computer knows (of its Docker contexts and its current Docker), to find the host of a pipe
+   * whose devspace is not known (the registry lost it): the one for which this computer made the address.
    */
   knownHosts(): Promise<string[]>;
   /** True while the engine on the SSH host `host` has the removal mark ("Remove Devspaces from This Docker Engine…"). */
