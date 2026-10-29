@@ -12,8 +12,9 @@
 // the remote mode, the open pipeline of a seeded devspace through the context (every Docker call goes through SSH:
 // the SSH server logs each connection), the containers and volumes on the engine reached through SSH, the token file in
 // the tmpfs, and the Docker host recorded in the registry. The operations are the flows of the worker, as the window
-// sends them (workerWindow.ts): the worker on the remote engine is started through SSH and talks to its socket there
-// (so not every Docker call is an SSH connection). The open makes sure of the real Monitor.
+// sends them (workerWindow.ts): the worker on the remote engine runs behind the relay, started with one SSH login (`ssh
+// … sh -s` and the start script, as extension.ts), and talks to its socket there (so not every Docker call is an SSH
+// connection). The open makes sure of the real Monitor.
 import * as fs from 'fs';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
@@ -48,6 +49,7 @@ import {
 } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
+import { sshRelayTransport } from '../../src/core/relay/transport';
 import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, createDockerConfig, removeRunObjects } from './dockerRun';
 import {
@@ -254,6 +256,8 @@ describe('Docker on another computer through the Docker context', () => {
       windowId: 'docker-test-remote-window',
       settings: { updateImagesOnConnect: true },
       socketPath: async (target) => (target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? HELPER_DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint)),
+      // As extension.ts: the worker behind the relay, with one SSH login (the wrapper `ssh`).
+      relay: (target) => (sshPath === undefined ? undefined : sshRelayTransport(target, sshPath, env)),
       startDocker: async ({ onStarting, signal }) =>
         startDockerFor(
           await targets.current(),
@@ -315,7 +319,10 @@ describe('Docker on another computer through the Docker context', () => {
     expect(acceptedConnections() - beforeOpen).toBeGreaterThan(0);
     expect(sshLog).toContain('Starting session: command for root');
     expect(window.locks.workerNames).toHaveLength(1);
-    expect(fs.readFileSync(log.file, 'utf8').slice(logBeforeOpen)).toContain(`Helper channel to ${ALIAS} is open`);
+    // The worker runs behind the relay, on the connection of one SSH login (`sh -s` with the start script of busybox).
+    const openLog = fs.readFileSync(log.file, 'utf8').slice(logBeforeOpen);
+    expect(openLog).toContain(`The connection to ${ALIAS} is open.`);
+    expect(openLog).toContain(`Helper channel to ${ALIAS} is open`);
     // The objects are on the engine that the SSH server reaches (the engine of the runner).
     expect(localCli.volume(volumeName)).toBeDefined();
     const container = localCli.container(containerName);

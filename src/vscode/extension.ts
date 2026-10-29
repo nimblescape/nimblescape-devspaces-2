@@ -17,6 +17,7 @@ import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '.
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, findRemoteContext, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { openRelayConnection, sshRelayTransport } from '../core/relay/transport';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -377,6 +378,13 @@ async function activateExtension(
       openHelperChannel(
         {
           start: (args) => docker.start(args),
+          // A remote engine: the worker behind the relay, with one SSH login (`ssh … sh -s`).
+          relay: (target) => {
+            const ssh = sshPath();
+            const transport = ssh === undefined ? undefined : sshRelayTransport(target, ssh, env);
+            if (transport === undefined) return undefined;
+            return (command, bundle) => openRelayConnection(runner, transport, command, bundle, { logger, name: target.host });
+          },
           runDirect: (args, options) => docker.run(args, options),
           logger,
           script: workerScript,
