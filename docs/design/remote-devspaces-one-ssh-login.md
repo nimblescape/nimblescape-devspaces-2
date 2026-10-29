@@ -225,14 +225,16 @@ These five choices are open. The design above uses the recommended one of each.
 
 ## Plan
 
-Seven pull requests, in this order. Work starts when Hannes asks for it.
+Nine pull requests, in this order. Hannes agreed to this plan on 2026-10-29 and chose the order: the remote host over SSH first, then the own WSL distribution.
 
-1. **Measure today (test only).** The CI job "vscode attach remote" counts the SSH logins and the time of one open. This gives the number to compare with.
-2. **Hosts list.** Devspaces's own list of SSH hosts, no global context switch, existing `ssh://` contexts offered once.
-3. **Docker CLI download.** Pinned version and SHA-256, `PATH` only in remote windows.
-4. **Relay and frames.** The new entry, the frames and the flow control, with unit tests. The worker stays unchanged.
-5. **One login.** The start script, the Docker pipe, and `settings.host` in the window address. The CI job shows 1 login per open.
-6. **Login without setup.** Password, host key and the key offer, tested on Windows 10, Windows 11, macOS and Linux.
-7. **Docs.** `architecture.md`, `security.md`, `guide.md`, and the behaviors at the top of the README.
+1. **Measure today** (test only). The CI job "vscode attach remote" counts the SSH logins and the time of one open. This gives the number to compare with.
+2. **Relay and frames.** The new entry, the frames and the flow control, and their partner in the extension, with unit tests. Nothing uses them yet.
+3. **One connection.** `ssh -T -- <host> sh -s` with the start script starts the worker behind the relay, and the worker channel runs on stream 0. The transport is one small part, so that step 8 can add `wsl.exe`.
+4. **Docker pipe.** One pipe per window, `settings.host` in the window address, and the other Docker calls of the extension through the pipe. The CI job shows 1 login per open. Dev Containers 0.470.0 turns `settings.host` into `DOCKER_HOST` (checked in its code).
+5. **Docker CLI download.** Pinned version and SHA-256, PATH only in remote windows.
+6. **Hosts list.** Devspaces's own list of SSH hosts, no global context switch, existing `ssh://` contexts offered once.
+7. **Login without setup.** Password, host key and the key offer, tested on Windows 10, Windows 11, macOS and Linux.
+8. **Own WSL distribution.** The setup (download, register, Docker Engine inside) and the transport `wsl.exe -d devspaces -u root -- sh -s`.
+9. **WSL lifetime.** The idle session, and the start entry and the keeper after the existing Monitor settings.
 
-Each pull request gets review rounds until no serious finding is left, and is merged when CI is green. Nothing is published until Hannes says so.
+Each pull request updates architecture.md and security.md for its part, and the guide and the behaviors at the top of the README when users see a change. Each one gets review rounds until no serious finding is left, and is merged when CI is green. Nothing is published until Hannes says so. The five decisions above use the recommended choice unless Hannes says otherwise.
