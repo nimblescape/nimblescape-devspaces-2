@@ -113,7 +113,7 @@ function roundTrip(socketPath: string, text: string): Promise<string> {
 }
 
 describe('windowDockerHost', () => {
-  const sources = { computerId: () => COMPUTER, platform: 'linux' as const, env: { XDG_RUNTIME_DIR: '/run/user/1000' }, tmpdir: '/tmp', sshFound: () => true };
+  const sources = { computerId: () => COMPUTER, platform: 'linux' as const, env: { XDG_RUNTIME_DIR: '/run/user/1000' }, tmpdir: '/tmp', sshFound: () => true, isFolder: () => true };
 
   it('gives a devspace on an SSH host the pipe of this computer for its container', () => {
     const address = windowDockerHost(devspace('me@build-box:2222'), CONTAINER, sources);
@@ -222,6 +222,25 @@ describe('serveWindowPipe', () => {
     await expect(roundTrip(address.path, 'fourth')).resolves.toBe('fourth');
     expect(log.lines.filter((line) => line.startsWith('warn'))).toEqual([`warn A Docker connection of ${CONTAINER} goes without the connection of the relay: The connection to build-box has no stream left.`]);
     await expect(roundTrip(address.path, 'fifth')).resolves.toBe('relay: fifth');
+  });
+
+  it('goes without the connection of the relay after an open that failed when no connection waited for it any more', async () => {
+    const runner = new NodeProcessRunner();
+    const dialStdio = vi.fn<WindowPipeDeps['dialStdio']>(() => runner.startBytes('cat', []));
+    const log = logger();
+    const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
+    let fail: (error: Error) => void = () => {};
+    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(() => new Promise((_, reject) => (fail = reject)));
+    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, relayConnection, dialStdio, relayWaitMs: 50 }));
+    await expect(roundTrip(address.path, 'first')).resolves.toBe('first');
+    fail(new Error('the helper image could not be prepared: it is missing'));
+    await vi.waitFor(() =>
+      expect(log.lines).toContain(
+        `warn The Docker pipe of ${CONTAINER} goes without the connection of the relay, with an SSH login for each Docker connection: the helper image could not be prepared: it is missing`,
+      ),
+    );
+    await expect(roundTrip(address.path, 'second')).resolves.toBe('second');
+    expect(relayConnection).toHaveBeenCalledTimes(1);
   });
 
   it('goes without the connection of the relay while it cannot be had, and tries it again after a while', async () => {

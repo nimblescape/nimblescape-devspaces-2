@@ -154,17 +154,22 @@ describe('HelperChannels', () => {
   });
 
   // The Docker pipe of the window needs the connection of the relay, which the worker opens.
-  it('ensure opens the channel as for an operation, and gives the open one as it is', async () => {
+  it('ensure opens the channel as a passive read: the helper image only checked, and the wait after a failed open kept', async () => {
     const channel = fakeChannel();
     const prepare = vi.fn(async () => {});
+    const checkPresent = vi.fn(async () => {});
     const open = vi.fn().mockRejectedValueOnce(new HelperChannelError('open', 'no answer.')).mockResolvedValueOnce(channel);
-    const channels = new HelperChannels({ open, prepare, logger: silentLogger });
+    const channels = new HelperChannels({ open, prepare, checkPresent, logger: silentLogger, retryAfterFailureMs: 60_000 });
     await expect(channels.ensure(REMOTE)).rejects.toMatchObject({ code: 'unavailable', message: 'no answer.' });
-    // Also within the wait after a failed open.
+    // Not again within the wait after a failed open; an operation opens it again.
+    await expect(channels.ensure(REMOTE)).rejects.toMatchObject({ code: 'unavailable', message: 'no answer.' });
+    expect(open).toHaveBeenCalledTimes(1);
+    await channels.flow(REMOTE, 'op', {}).catch(() => undefined);
     await expect(channels.ensure(REMOTE)).resolves.toBe(channel);
-    await expect(channels.ensure(REMOTE)).resolves.toBe(channel);
-    expect(prepare).toHaveBeenCalledTimes(2);
     expect(open).toHaveBeenCalledTimes(2);
+    // Never a build for the pipe: only the operation prepared the helper image.
+    expect(checkPresent).toHaveBeenCalledTimes(2);
+    expect(prepare).toHaveBeenCalledTimes(1);
     channels.dispose();
   });
 

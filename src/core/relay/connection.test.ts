@@ -341,7 +341,7 @@ describe('RelayConnection', () => {
     // A listener after the end is called at once; no new stream.
     connection.onClose((reason) => reasons.push(`late: ${reason}`));
     expect(reasons).toEqual(['the window closed', 'late: the window closed']);
-    expect(() => connection.openWorker()).toThrow('The connection to build-box is closed.');
+    expect(() => connection.openWorker()).toThrow('The connection to build-box is closed (the window closed).');
   });
 
   it('ends when the transport ends, with its error output as the reason', async () => {

@@ -50,9 +50,8 @@ export function relayAccess(
     current: () => connections.forWorker(host),
     connect: async (command, bundle) => {
       const connection = await connect(command, bundle);
-      connections.add(host, connection);
       // The window closed meanwhile: `add` stopped it.
-      if (!connection.isOpen) throw new Error('The window closes.');
+      if (!connections.add(host, connection)) throw new Error('The window closes.');
       return connection;
     },
     use: (connection) => connections.use(host, connection),
@@ -90,18 +89,19 @@ export class RelayConnections {
 
   /**
    * Keeps `connection` to `host` (a new one that the worker channel opened) until it ends, for `close`, the sweeps and
-   * `dispose`; it is not the current one before `use`. After `dispose`, it is stopped at once.
+   * `dispose`; it is not the current one before `use`. After `dispose`, it is stopped at once (false).
    */
-  add(host: string, connection: RelayConnection): void {
+  add(host: string, connection: RelayConnection): boolean {
     if (this.disposed) {
       connection.killNow();
-      return;
+      return false;
     }
     this.all.set(connection, { host, opened: connection.streamsOpened, retired: false });
     connection.onClose(() => {
       this.all.delete(connection);
       if (this.current.get(host) === connection) this.current.delete(host);
     });
+    return true;
   }
 
   /**

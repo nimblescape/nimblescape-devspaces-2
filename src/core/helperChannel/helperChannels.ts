@@ -245,7 +245,8 @@ async function openBehindRelay(
 /**
  * Opens a channel to the engine of `target`: starts the container with the Docker context of `target` (a remote engine
  * with a transport: behind the relay, ChannelOpenDeps.relay; on the open connection of the engine when it has one, else
- * on a new one, which ends again when the open fails, and which the engine uses only after the checks), then checks with
+ * or when the worker fails there on a new one, which ends again when the open fails, and which the engine uses only
+ * after the checks), then checks with
  * the operation `probe` that the worker reaches its engine, and that it is the engine of `target`: the engine identity
  * of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a socket mount of another engine,
  * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). The worker reads its identity over
@@ -259,20 +260,28 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   // The open connection of the engine (an earlier worker opened it, and the Docker pipe of the window keeps it): the
   // worker starts in its container, without a new login, and keeps the name of that container.
   const shared = relay?.current();
+  if (shared !== undefined) {
+    try {
+      const channel = await openWorkerOn(shared, deps.logger, name);
+      await checkChannelEngine(deps, target, name, channel);
+      return channel;
+    } catch (error) {
+      // The open connection keeps its streams and stays the one of the Docker pipe (its engine passed the checks when
+      // it was opened, and the container of the window runs there); the worker opens a new connection at once.
+      relay?.retire(shared);
+      deps.logger.warn(`The worker on ${name} could not be opened on the open connection of the relay, so it opens a new connection: ${errorMessage(error)}`);
+    }
+  }
   // The new connection of the relay that this open made: the current one of the engine only after the checks, so that
   // no Docker stream of the window goes to a new connection whose engine the checks refuse.
   let opened: RelayConnection | undefined;
   try {
-    const channel = shared !== undefined ? await openWorkerOn(shared, deps.logger, name) : await startChannel(deps, target, name, relay, (connection) => (opened = connection));
+    const channel = await startChannel(deps, target, name, relay, (connection) => (opened = connection));
     await checkChannelEngine(deps, target, name, channel);
     if (opened !== undefined) relay?.use(opened);
     return channel;
   } catch (error) {
     opened?.close('the worker could not be opened');
-    // The open connection keeps its streams and stays the one of the Docker pipe (its engine passed the checks when it
-    // was opened, and the container of the window runs there); the next worker opens a new connection instead of
-    // failing on this one again.
-    if (shared !== undefined) relay?.retire(shared);
     throw error;
   }
 }
@@ -513,12 +522,13 @@ export class HelperChannels {
   }
 
   /**
-   * The open channel to the engine of `target`, made ready now if needed, as for an operation (the helper image, then
-   * the open in full): for the Docker pipe of the window, which needs the connection of the relay that the worker
-   * opens. Throws HelperChannelError('unavailable') with the cause, and an AbortError when `signal` aborts.
+   * The open channel to the engine of `target`, opened now if needed as for a passive read (the helper image only
+   * checked, never built; the wait after a failed open kept): for the Docker pipe of the window, which needs the
+   * connection of the relay that the worker opens, and which logs in by itself without it. Throws
+   * HelperChannelError('unavailable') with the cause, and an AbortError when `signal` aborts.
    */
   ensure(target: DockerTarget, signal?: AbortSignal): Promise<HelperChannel> {
-    return this.ready(target, signal);
+    return this.ready(target, signal, true);
   }
 
   /** The open channel, or the shared opening of one (see get). */

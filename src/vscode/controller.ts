@@ -4032,8 +4032,8 @@ export class Controller implements vscode.Disposable {
    * - outside an operation, the one in the authority of this window when it shows the same container;
    * - the current context, when that is on the devspace's host (read outside any operation);
    * - else the one that "Use a Remote Docker Host…" creates for the host (ensureRemoteContext: created when missing).
-   * Also for a window with the Docker pipe, the context is created when missing: the heartbeats of the devspace and the
-   * worker that opens the connection of the relay find the engine of the host through it.
+   * Also for a window with the Docker pipe, the context is created when missing, as far as it can be: the heartbeats of
+   * the devspace and the worker that opens the connection of the relay find the engine of the host through it.
    */
   private async windowArgs(
     devspace: Devspace,
@@ -4042,10 +4042,17 @@ export class Controller implements vscode.Disposable {
   ): Promise<[containerName: string, folder: string, docker?: WindowDocker]> {
     const host = dockerHostOf(devspace);
     if (host === '') return [containerName, folder];
-    const context = await this.windowContext(devspace, containerName, host);
     const pipe = this.deps.windowDockerHost?.(devspace, containerName);
-    if (pipe !== undefined) return [containerName, folder, { host: pipe }];
-    return context === undefined ? [containerName, folder] : [containerName, folder, { context }];
+    if (pipe === undefined) {
+      const context = await this.windowContext(devspace, containerName, host);
+      return context === undefined ? [containerName, folder] : [containerName, folder, { context }];
+    }
+    try {
+      await this.windowContext(devspace, containerName, host);
+    } catch (error) {
+      this.logger.warn(`The Docker context of ${host} could not be made (${errorMessage(error)}). The window connects through its Docker pipe.`);
+    }
+    return [containerName, folder, { host: pipe }];
   }
 
   /** The Docker context of the window of `devspace` on `host` (see windowArgs); undefined when DOCKER_HOST decides. */

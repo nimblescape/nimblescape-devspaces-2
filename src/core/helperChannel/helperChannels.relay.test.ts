@@ -139,12 +139,36 @@ describe('openHelperChannel with the connection of the relay', () => {
     });
     expect(fresh.closes).toEqual(['the worker could not be opened']);
     expect(freshAccess.use).not.toHaveBeenCalled();
-    // The open connection keeps its streams (the Docker pipe of the window); the next worker opens a new one.
+    // The open connection keeps its streams (the Docker pipe of the window) and is retired for workers; the worker
+    // tries a new connection at once, which the checks refuse here too.
     const shared = fakeConnection(fakeWorker());
-    const sharedAccess = access(vi.fn<RelayAccess['connect']>(), shared);
+    const next = fakeConnection(fakeWorker());
+    const connect = vi.fn<RelayAccess['connect']>(async () => next as unknown as RelayConnection);
+    const sharedAccess = access(connect, shared);
     await expect(openHelperChannel(deps({ relay: () => sharedAccess, runDirect: otherEngine }), REMOTE)).rejects.toMatchObject({ code: 'open' });
     expect(shared.closes).toEqual([]);
     expect(sharedAccess.retire).toHaveBeenCalledWith(shared);
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(next.closes).toEqual(['the worker could not be opened']);
+    expect(sharedAccess.use).not.toHaveBeenCalled();
+  });
+
+  it('opens a new connection at once when the worker cannot be opened on the open connection of the engine', async () => {
+    const shared = fakeConnection(fakeWorker());
+    shared.openWorker.mockImplementation(() => {
+      throw new Error('The connection to build-box is closed (the transport ended).');
+    });
+    const next = fakeConnection(fakeWorker());
+    const relayAccess = access(async () => next as unknown as RelayConnection, shared);
+    const log: string[] = [];
+    const channel = await openHelperChannel(deps({ relay: () => relayAccess, logger: { ...silentLogger, warn: (message) => log.push(message) } }), REMOTE);
+    expect(channel.isOpen).toBe(true);
+    expect(relayAccess.retire).toHaveBeenCalledWith(shared);
+    expect(relayAccess.use).toHaveBeenCalledWith(next);
+    expect(log).toEqual([
+      'The worker on build-box could not be opened on the open connection of the relay, so it opens a new connection: The connection to build-box is closed (the transport ended).',
+    ]);
+    channel.close();
   });
 
   it('takes the next name when `docker run` refused the name in use, and starts without network on a daemon without bridge', async () => {

@@ -6570,6 +6570,20 @@ describe('the Docker host of the current Docker context', () => {
       expect(h.connection.open).toHaveBeenCalledWith('devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: pipe });
     });
 
+    it('opens a window with the Docker pipe also when the context of the host cannot be made', async () => {
+      const pipe = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
+      recreateHarness({ leaveCheckMs: 100, windowDockerHost: () => pipe });
+      const pair = remoteContextNames('build-box')[1];
+      // Both names point elsewhere: no context can be made.
+      contextsAre([
+        { Name: 'build-box', Description: 'mine', DockerEndpoint: 'ssh://me@elsewhere' },
+        { Name: pair, Description: 'mine', DockerEndpoint: 'ssh://me@elsewhere' },
+      ]);
+      expect(await reopen()).toEqual([]);
+      expect(h.connection.open).toHaveBeenCalledWith('devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: pipe });
+      expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('The Docker context of build-box could not be made ('));
+    });
+
     it('creates the name with the pair of the host when a context with the name points elsewhere', async () => {
       recreateHarness({ leaveCheckMs: 100 });
       contextsAre([{ Name: 'build-box', Description: 'mine', DockerEndpoint: 'ssh://me@elsewhere' }]);

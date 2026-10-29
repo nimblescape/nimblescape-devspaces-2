@@ -99,8 +99,7 @@ export class RelayConnection {
    * or the close of the stream or of the connection. `kill` closes the stream, and the relay stops the worker.
    */
   openWorker(): StartedProcess {
-    if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
-    const stream = this.mux.open('worker');
+    const stream = this.openMux().open('worker');
     this.opened++;
     const stdout = decodedOutput();
     let settle: (result: { exitCode: number | null; error?: Error }) => void = () => {};
@@ -151,10 +150,16 @@ export class RelayConnection {
    * Throws when the connection is closed or has MAX_STREAMS streams.
    */
   openDocker(): MuxStream {
-    if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
-    const stream = this.mux.open('docker');
+    const stream = this.openMux().open('docker');
     this.opened++;
     return stream;
+  }
+
+  /** The mux of the open connection; throws when the connection is closed, with its reason. */
+  private openMux(): Mux {
+    if (this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed (${this.closedReason}).`);
+    if (this.mux === undefined) throw new Error(`The connection to ${this.options.name} is not open yet.`);
+    return this.mux;
   }
 
   /** The streams that are open now: the worker and the Docker streams (RelayConnections closes an idle connection). */

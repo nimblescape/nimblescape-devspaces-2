@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as os from 'os';
 import { describe, expect, it } from 'vitest';
 import { MAX_SOCKET_PATH_BYTES, dockerPipeAddress, dockerPipeBase, dockerPipeId, parseDockerPipeHost } from './pipeAddress';
 
@@ -32,17 +33,22 @@ describe('the address of the Docker pipe', () => {
     expect(() => dockerPipeAddress('../x', 'linux', '/tmp')).toThrow('is not valid');
   });
 
-  it('lies in XDG_RUNTIME_DIR, else in the temporary folder, else in /tmp, wherever the path of the socket fits', () => {
+  it('lies in XDG_RUNTIME_DIR, else in the temporary folder, else in /tmp, wherever the path of the socket fits and the folder is one', () => {
+    const folders = () => true;
     const macTemp = '/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/';
-    expect(dockerPipeBase({ XDG_RUNTIME_DIR: '/run/user/1000/' }, macTemp)).toBe('/run/user/1000');
-    expect(dockerPipeBase({}, macTemp)).toBe('/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T');
-    expect(dockerPipeBase({ XDG_RUNTIME_DIR: 'relative/dir' }, '/tmp')).toBe('/tmp');
+    expect(dockerPipeBase({ XDG_RUNTIME_DIR: '/run/user/1000/' }, macTemp, folders)).toBe('/run/user/1000');
+    expect(dockerPipeBase({}, macTemp, folders)).toBe('/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T');
+    expect(dockerPipeBase({ XDG_RUNTIME_DIR: 'relative/dir' }, '/tmp', folders)).toBe('/tmp');
     const long = `/home/${'x'.repeat(80)}`;
-    expect(dockerPipeBase({ XDG_RUNTIME_DIR: long }, long)).toBe('/tmp');
+    expect(dockerPipeBase({ XDG_RUNTIME_DIR: long }, long, folders)).toBe('/tmp');
     const base = `/${'y'.repeat(MAX_SOCKET_PATH_BYTES - '/devspaces-0123456789abcdef/docker.sock'.length - 1)}`;
     expect(Buffer.byteLength(dockerPipeAddress(ID, 'darwin', base).path)).toBe(MAX_SOCKET_PATH_BYTES);
-    expect(dockerPipeBase({}, base)).toBe(base);
-    expect(dockerPipeBase({}, `${base}y`)).toBe('/tmp');
+    expect(dockerPipeBase({}, base, folders)).toBe(base);
+    expect(dockerPipeBase({}, `${base}y`, folders)).toBe('/tmp');
+    // XDG_RUNTIME_DIR of a session that is gone (after `su`): the temporary folder.
+    expect(dockerPipeBase({ XDG_RUNTIME_DIR: '/run/user/1000' }, '/tmp/user', (folder) => folder !== '/run/user/1000')).toBe('/tmp/user');
+    // On this computer, without a test of its own: a folder that does not exist is never taken.
+    expect(dockerPipeBase({ XDG_RUNTIME_DIR: '/nonexistent-devspaces-test' }, os.tmpdir())).toBe(os.tmpdir().replace(/\/+$/, ''));
   });
 
   it('is read back from the host in the authority of a window, and nothing else is', () => {

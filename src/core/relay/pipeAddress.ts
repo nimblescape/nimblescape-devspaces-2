@@ -9,6 +9,7 @@
 // computer, the Docker host, and the container: the same window URI at each open of the devspace (so VS Code finds an
 // open window of it), and an address that no other user of the computer can know beforehand. No `vscode`.
 import { createHash } from 'crypto';
+import * as fs from 'fs';
 import * as path from 'path';
 
 /** The start of the name of the pipe, or of its folder. */
@@ -48,12 +49,21 @@ export function dockerPipeId(computerId: string, host: string, containerName: st
 
 /**
  * The folder for the folders of the Unix sockets: XDG_RUNTIME_DIR (private to the user on Linux), else the temporary
- * folder of Node.js (private to the user on macOS), else /tmp; the first that is an absolute path and gives a socket
- * path of at most MAX_SOCKET_PATH_BYTES.
+ * folder of Node.js (private to the user on macOS), else /tmp; the first that is an absolute path, gives a socket path
+ * of at most MAX_SOCKET_PATH_BYTES, and is a folder (`isFolder`; XDG_RUNTIME_DIR can name a folder that does not exist,
+ * for example after `su`).
  */
-export function dockerPipeBase(env: NodeJS.ProcessEnv, tmpdir: string): string {
+export function dockerPipeBase(env: NodeJS.ProcessEnv, tmpdir: string, isFolder: (folder: string) => boolean = existingFolder): string {
   const candidates = [env.XDG_RUNTIME_DIR, tmpdir].map((value) => value?.trim().replace(/\/+$/, '')).filter((value): value is string => !!value);
-  return candidates.find((base) => path.posix.isAbsolute(base) && socketPathFits(base)) ?? FALLBACK_BASE;
+  return candidates.find((base) => path.posix.isAbsolute(base) && socketPathFits(base) && isFolder(base)) ?? FALLBACK_BASE;
+}
+
+function existingFolder(folder: string): boolean {
+  try {
+    return fs.statSync(folder).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function socketPathFits(base: string): boolean {
