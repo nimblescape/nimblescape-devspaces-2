@@ -316,11 +316,11 @@ describe('settings', () => {
       .split('\n')
       .filter((line) => /^#{1,6} /.test(line))
       .map((line) => line.replace(/^#+ /, '').trim().toLowerCase().replace(/[^\w\s-]/g, '').replace(/\s/g, '-'));
-    const GUIDE = 'https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#';
+    const GUIDE = 'https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#';
     for (const [key, property] of Object.entries(properties)) {
       const text = property.markdownDescription ?? property.description ?? '';
       expect(text.length, key).toBeLessThan(450);
-      for (const [, anchor] of text.matchAll(/\(https:\/\/github\.com\/nimblescape\/nimblescape-devspaces-2\/blob\/main\/docs\/guide\.md#([\w-]+)\)/g)) {
+      for (const [, anchor] of text.matchAll(/\(https:\/\/github\.com\/nimblescape\/devspaces-vscode-2\/blob\/main\/docs\/guide\.md#([\w-]+)\)/g)) {
         expect(anchors, `${key}: #${anchor}`).toContain(anchor);
       }
       if (property.enum) expect(property.enumDescriptions, key).toHaveLength(property.enum.length);

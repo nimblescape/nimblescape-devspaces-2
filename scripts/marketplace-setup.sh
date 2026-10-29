@@ -14,10 +14,13 @@
 #   scripts/marketplace-setup.sh
 #
 # The repository is the GitHub repository of the remote `origin` of the clone
-# that holds the script, and the extension ID is publisher.name of its
-# package.json; by the naming scheme, name and repository are the same. The
-# script shows what it sets up and asks before it changes anything. It changes
-# nothing that already exists, so it can run again. The app is the one of the
+# that holds the script, with its current name on GitHub, and the extension ID
+# is publisher.name of its package.json. By the naming scheme, the name
+# nimblescape-<name>[-<n>] of the extension has the repository
+# <name>-vscode[-<n>]. The script shows what it sets up and asks before it
+# changes anything. It changes nothing that already exists, so it can run
+# again; after a rename of the repository, it adds the credential of the new
+# name and names the credentials of the old names. The app is the one of the
 # variable AZURE_CLIENT_ID, or the app named by APP_NAME (default
 # vscode-marketplace-publisher, the app of the publisher nimblescape).
 set -euo pipefail
@@ -33,20 +36,32 @@ repo="${url#*github.com[:/]}"
 repo="${repo%/}"
 repo="${repo%.git}"
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "The remote origin ($url) is no GitHub repository." >&2; exit 1; }
+# The current name: GitHub forwards the old name of a renamed repository, and
+# the token of a job holds the current name.
+current=$(gh api "repos/$repo" --jq '"\(.full_name) \(.id)"')
+read -r repo repo_id <<<"$current"
 owner="${repo%%/*}"
 name="${repo#*/}"
 environment="marketplace"
 
-# The extension ID from package.json; its name must be the name of the repository.
+# The extension ID from package.json; its name nimblescape-<name>[-<n>] gives
+# the name of the repository, <name>-vscode[-<n>] (CONTRIBUTING.md, "Naming").
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 extension=$(node -p 'const p = require(process.argv[1]); `${p.publisher}.${p.name}`' "$root/package.json")
-[ "${extension#*.}" = "$name" ] || { echo "The extension $extension in package.json does not match the repository $repo." >&2; exit 1; }
+base="${extension#*.}"
+[[ "$base" == nimblescape-* ]] || { echo "The name of the extension $extension does not start with nimblescape-." >&2; exit 1; }
+base="${base#nimblescape-}"
+if [[ "$base" =~ ^(.+)-([0-9]+)$ ]]; then
+  expected="${BASH_REMATCH[1]}-vscode-${BASH_REMATCH[2]}"
+else
+  expected="$base-vscode"
+fi
+[ "$name" = "$expected" ] || { echo "The extension $extension needs the repository $owner/$expected, not $repo." >&2; exit 1; }
 
 # The subject of the token that GitHub Actions issues to a job of the
 # environment: owner and repository with their IDs, as GitHub writes it for
 # repositories created after 15 July 2026.
 owner_id=$(gh api "users/$owner" --jq .id)
-repo_id=$(gh api "repos/$repo" --jq .id)
 subject="repo:${owner}@${owner_id}/${name}@${repo_id}:environment:${environment}"
 
 app_id="${AZURE_CLIENT_ID:-$(az ad app list --display-name "${APP_NAME:-vscode-marketplace-publisher}" --query '[0].appId' --output tsv)}"
@@ -88,6 +103,13 @@ JSON
 else
   echo "Federated credential exists: $subject"
 fi
+# The credentials of the old names of the repository, which no token matches any more.
+az ad app federated-credential list --id "$app_id" \
+  --query "[?subject!='$subject' && ends_with(subject, '@$repo_id:environment:$environment')].[id, name]" --output tsv |
+  while read -r id old; do
+    echo "Federated credential of an old name: $old. Delete it with:"
+    echo "  az ad app federated-credential delete --id $app_id --federated-credential-id $id"
+  done
 
 # Step 5: the environment, which only the tags v* and the branch main reach.
 gh api --method PUT "repos/$repo/environments/$environment" --input - >/dev/null <<JSON

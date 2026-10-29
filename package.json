@@ -12,12 +12,12 @@
   "homepage": "https://nimblescape.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nimblescape/nimblescape-devspaces-2.git"
+    "url": "https://github.com/nimblescape/devspaces-vscode-2.git"
   },
   "bugs": {
-    "url": "https://github.com/nimblescape/nimblescape-devspaces-2/issues"
+    "url": "https://github.com/nimblescape/devspaces-vscode-2/issues"
   },
-  "qna": "https://github.com/nimblescape/nimblescape-devspaces-2/issues",
+  "qna": "https://github.com/nimblescape/devspaces-vscode-2/issues",
   "engines": {
     "vscode": "^1.125.0"
   },
@@ -715,7 +715,7 @@
           "type": "string",
           "scope": "application",
           "default": "",
-          "markdownDescription": "An image, for example `ghcr.io/majikmate/devcontainer-base:latest`, that a devspace can start from. A repository with a Dev Container configuration gets a `default` row, its own devspace; one without is listed too and starts from the image. Empty: no default image; only repositories with a configuration are listed.\n\n[Default image in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#default-image)"
+          "markdownDescription": "An image, for example `ghcr.io/majikmate/devcontainer-base:latest`, that a devspace can start from. A repository with a Dev Container configuration gets a `default` row, its own devspace; one without is listed too and starts from the image. Empty: no default image; only repositories with a configuration are listed.\n\n[Default image in the user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#default-image)"
         },
         "devspaces.startWithDefaultImage": {
           "order": 4,
@@ -753,14 +753,14 @@
             "7 */6 * * *",
             "60"
           ],
-          "markdownDescription": "When the Monitor on each Docker engine updates the images, the VS Code server and the extensions of your devspaces: a cron expression in your time zone, with at least 5 minutes between two of its times, for example `7 6 * * *` (daily at 06:07, the default), or the minutes between two runs (5 to 1440).\n\n[The background run in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#the-background-run)"
+          "markdownDescription": "When the Monitor on each Docker engine updates the images, the VS Code server and the extensions of your devspaces: a cron expression in your time zone, with at least 5 minutes between two of its times, for example `7 6 * * *` (daily at 06:07, the default), or the minutes between two runs (5 to 1440).\n\n[The background run in the user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#the-background-run)"
         },
         "devspaces.stopMonitorWhenIdle": {
           "order": 10,
           "type": "boolean",
           "scope": "application",
           "default": false,
-          "markdownDescription": "End the Monitor container of a Docker engine, local or remote, when no devspace has run there for 5 minutes; the next start starts it again. Off: the first Start or Rebuild on an engine, or **Update All Images Now** there, asks whether the Monitor keeps running there; until you answer, it ends when idle.\n\n[The background run in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#the-background-run)"
+          "markdownDescription": "End the Monitor container of a Docker engine, local or remote, when no devspace has run there for 5 minutes; the next start starts it again. Off: the first Start or Rebuild on an engine, or **Update All Images Now** there, asks whether the Monitor keeps running there; until you answer, it ends when idle.\n\n[The background run in the user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#the-background-run)"
         },
         "devspaces.updateImagesOnConnect": {
           "order": 7,
@@ -777,7 +777,7 @@
             "ask"
           ],
           "default": "notify",
-          "markdownDescription": "What a start does when a newer image is available for the existing container of a devspace. The update creates the container again; your files in the workspace are kept.\n\n[The update at a start in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#the-update-at-a-start)",
+          "markdownDescription": "What a start does when a newer image is available for the existing container of a devspace. The update creates the container again; your files in the workspace are kept.\n\n[The update at a start in the user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#the-update-at-a-start)",
           "enumDescriptions": [
             "Say that the container is updated now, with Continue or Cancel. Cancel leaves the devspace closed.",
             "Ask first, with Update Now or Later. Later opens the current container without the update."
@@ -872,14 +872,14 @@
               }
             ]
           },
-          "markdownDescription": "Regular expressions on the repository name, without the owner, that filter the repositories of each owner in the sidebar and group them in levels. **[Edit Repository Groups…](command:devspaces.editRepositoryGroups)** opens an editor with a preview.\n\n[Repository groups in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#repository-groups)"
+          "markdownDescription": "Regular expressions on the repository name, without the owner, that filter the repositories of each owner in the sidebar and group them in levels. **[Edit Repository Groups…](command:devspaces.editRepositoryGroups)** opens an editor with a preview.\n\n[Repository groups in the user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#repository-groups)"
         },
         "devspaces.confirmOpenFromLink": {
           "order": 19,
           "type": "boolean",
           "scope": "application",
           "default": true,
-          "markdownDescription": "Ask before a link, for example on a website or a course page, creates a devspace of a repository of your account or of one of your organizations. **Always Open** in that question turns this off. A repository of another owner is always confirmed.\n\n[Open from a link in the user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#open-from-a-link)"
+          "markdownDescription": "Ask before a link, for example on a website or a course page, creates a devspace of a repository of your account or of one of your organizations. **Always Open** in that question turns this off. A repository of another owner is always confirmed.\n\n[Open from a link in the user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#open-from-a-link)"
         }
       }
     }

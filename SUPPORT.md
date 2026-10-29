@@ -1,6 +1,6 @@
 # Support
 
-Devspaces is free and open source. Ask questions and report problems in the [issues on GitHub](https://github.com/nimblescape/nimblescape-devspaces-2/issues). Search the open and closed issues first. The [user guide](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#troubleshooting) has a section "Troubleshooting".
+Devspaces is free and open source. Ask questions and report problems in the [issues on GitHub](https://github.com/nimblescape/devspaces-vscode-2/issues). Search the open and closed issues first. The [user guide](https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#troubleshooting) has a section "Troubleshooting".
 
 ## What to include in a report
 
