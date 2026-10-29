@@ -213,18 +213,19 @@ describe('RelayConnection.open', () => {
 
   it('rejects when the output ends and the transport keeps running, before and after the marker', async () => {
     const before = new FakeTransport();
-    const beforeOpening = open(before);
+    const beforeOpening = open(before, { exitReasonWaitMs: 20 });
     before.printError('Welcome\n');
     before.endOutput();
     await expect(beforeOpening).rejects.toThrow(new RelayConnectionError('The connection to build-box could not be opened: its output ended (Welcome)'));
     expect(before.inputEnded).toBe(true);
 
     const after = new FakeTransport();
-    const afterOpening = open(after);
+    const afterOpening = open(after, { exitReasonWaitMs: 20 });
     after.print(`${after.marker()}\n`);
     after.printError('docker: Error response from daemon: Conflict. The container name "/w-worker1" is already in use by container "abc".\n');
     after.endOutput();
     await expect(afterOpening).rejects.toThrow('could not be opened: its output ended (docker: Error response from daemon: Conflict. The container name "/w-worker1" is already in use by container "abc".)');
+    expect(after.inputEnded).toBe(true);
   });
 
   it('rejects with the refusal of `docker run` after the marker, and with the exit code without error output', async () => {
