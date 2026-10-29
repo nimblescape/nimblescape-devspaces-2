@@ -86,7 +86,6 @@ export class Relay {
   }
 
   private accept(stream: MuxStream): void {
-    if (this.stopping) return stream.close('the relay stops');
     if (stream.target === 'docker') return this.connect(stream);
     if (this.worker !== undefined) return stream.close('a worker runs already');
     this.startWorker(stream);
@@ -151,7 +150,7 @@ export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
     result = [exit, error];
     listener?.(exit, error);
   };
-  child.once('error', (error) => {
+  child.on('error', (error) => {
     // An error after the start (a failed kill) is no end of the process.
     if (child.pid === undefined) settle({ code: null, signal: null }, error);
   });
@@ -170,10 +169,11 @@ export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
 }
 
 /**
- * The entry of the relay (RELAY_ENTRY) for the pipe loader: `initial` is the input that the loader read after the
- * bundle, which must be empty (the extension writes nothing more before the HELLO of the relay). The relay reads its
- * input as bytes: the loader set it to UTF-8, which `latin1` replaces (one character per byte, so no byte is changed).
- * The worker runs the stored file of the loader with its hash (the command line of this process).
+ * The entry of the relay (RELAY_ENTRY) for the pipe loader: `initial` is the input that the loader read together with
+ * the bundle line, decoded as UTF-8, which must be empty (the extension writes nothing more before the HELLO of the
+ * relay). The relay reads its input as bytes: the loader set it to UTF-8, which `latin1` replaces here, before any
+ * later read (one character per byte, so no byte is changed). The worker runs the stored file of the loader with its
+ * hash (the command line of this process).
  */
 export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER_SOCKET): void {
   const [, file, hash] = process.argv;
@@ -197,14 +197,21 @@ export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER
   });
   process.stdout.on('error', (error) => relay.shutdown(`the output cannot be written (${error.message})`));
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(signal, () => relay.shutdown(`stopped by ${signal}`));
-  // A defect of the relay never leaves the container running: a timer ends it in any case.
-  process.on('uncaughtException', (error) => {
+  // A defect of the relay never leaves the container running: a timer ends it in any case, and at once when the
+  // shutdown itself fails (as fatalHandler of main.ts).
+  const fatal = (error: unknown) => {
     setTimeout(() => process.exit(RELAY_FAILURE_EXIT_CODE), RELAY_WORKER_STOP_MS + 5_000);
-    relay.shutdown(`an error of the relay: ${error.message}`, true);
-  });
+    try {
+      relay.shutdown(`an error of the relay: ${error instanceof Error ? error.message : String(error)}`, true);
+    } catch {
+      process.exit(RELAY_FAILURE_EXIT_CODE);
+    }
+  };
+  process.on('uncaughtException', fatal);
+  process.on('unhandledRejection', fatal);
   process.stdin.on('data', (chunk: string) => relay.input(Buffer.from(chunk, 'latin1')));
   process.stdin.on('end', () => relay.inputEnded());
   process.stdin.on('close', () => relay.inputEnded());
-  process.stdin.on('error', () => relay.inputEnded());
+  process.stdin.on('error', (error) => relay.shutdown(`the input cannot be read (${error.message})`, true));
   process.stdin.resume();
 }

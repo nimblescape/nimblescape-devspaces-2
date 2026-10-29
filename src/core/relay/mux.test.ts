@@ -227,9 +227,15 @@ describe('the streams of a connection of the relay', () => {
     expect(up.ended).toBe(true);
     const cut = new Mux({ side: 'extension', link: new Pipe().link, onClose: (reason, failed) => closes.push({ side: 'cut', reason, failed }) });
     muxes.push(cut);
-    cut.input(encodeFrame('hello', 0, encodeHello()).subarray(0, 4));
+    cut.input(encodeFrame('hello', 0, encodeHello()));
+    cut.input(encodeFrame('ping', 0).subarray(0, 4));
     cut.inputEnded();
     expect(closes).toContainEqual({ side: 'cut', reason: 'the connection ended within a frame', failed: true });
+    // The relay never started (the loader refused the bundle): no HELLO came.
+    const early = new Mux({ side: 'extension', link: new Pipe().link, onClose: (reason, failed) => closes.push({ side: 'early', reason, failed }) });
+    muxes.push(early);
+    early.inputEnded();
+    expect(closes).toContainEqual({ side: 'early', reason: 'the connection ended before the hello of the relay', failed: true });
   });
 
   it('refuse a stream beyond MAX_STREAMS at once and keep the others', async () => {
@@ -274,6 +280,21 @@ describe('a connection of the relay that breaks the rules', () => {
 });
 
 describe('the pings of a connection of the relay', () => {
+  it('wait while the link holds frames', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    const down = new Pipe();
+    down.highWater = 1;
+    down.held = true;
+    const relay = new Mux({ side: 'relay', link: down.link, pingIntervalMs: 1_000, silenceMs: 100_000 });
+    muxes.push(relay);
+    vi.advanceTimersByTime(10_000);
+    expect(down.frames.map((frame) => frame.kind)).toEqual(['hello']);
+    down.release();
+    await settle();
+    vi.advanceTimersByTime(1_400);
+    expect(down.frames.map((frame) => frame.kind)).toEqual(['hello', 'ping']);
+  });
+
   it('do not limit the wait of the extension for the HELLO (its caller does)', () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
     const up = new Pipe();
