@@ -6823,6 +6823,22 @@ describe('the Docker host of the current Docker context', () => {
     const logged = h.logger.info.mock.calls.map(([line]) => String(line));
     expect(logged.some((line) => line.startsWith('Before the window connects: Current Docker context:'))).toBe(true);
   });
+
+  // The Dev Containers extension asks the Docker pipe of such a window, not a context; an inspect through the context
+  // would only log in to the host once more.
+  it('logs only the Docker pipe before a window with a Docker pipe connects', async () => {
+    const pipe = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
+    windowDockerHost.mockImplementation((shown) => (shown.dockerHost === undefined ? undefined : pipe));
+    current = dockerTargetOf('ssh://build-box', 'devspaces-remote-11111111');
+    await h.registry.add(remoteDevspace());
+    await run('start', row('acme/api', remoteDevspace()));
+    expect(h.connection.open).toHaveBeenCalledWith('devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: pipe });
+    const calls = h.docker.run.mock.calls.map(([args]) => (args as string[]).join(' '));
+    expect(calls.filter((call) => call.includes('inspect --type container'))).toEqual([]);
+    expect(calls).not.toContain('context show');
+    const logged = h.logger.info.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith('Before the window connects:'));
+    expect(logged).toEqual([`Before the window connects: the Dev Containers extension reaches build-box through the Docker pipe ${pipe} of the window.`]);
+  });
 });
 
 // Close and Keep Running closes the window; the container keeps running this time.

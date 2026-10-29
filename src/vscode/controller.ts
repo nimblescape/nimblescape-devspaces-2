@@ -2522,7 +2522,7 @@ export class Controller implements vscode.Disposable {
     progress.step('connecting');
     // The checks of the container come first, so Cancel, a newer request, and an account change during them still keep
     // the window as it is. The log lines of the attach run meanwhile.
-    const diagnostics = this.logAttachDiagnostics(result.containerName);
+    const diagnostics = this.logAttachDiagnostics(result.devspace, result.containerName);
     const notReady = await this.readyForWindow(result.devspace, result.containerName, signal);
     const waited = new AbortController();
     // Cancel also ends this wait.
@@ -4085,10 +4085,19 @@ export class Controller implements vscode.Disposable {
 
   /**
    * Logs which Docker the Dev Containers extension will ask when the window switches to `containerName`
-   * (attachDiagnostics.ts), with the context of the running operation. Only log lines; never rejects.
+   * (attachDiagnostics.ts), with the context of the running operation. A window of `devspace` with a Docker pipe
+   * (windowDockerHost) gets one line instead: the Dev Containers extension asks no Docker context there, and its pipe
+   * logs the Docker calls that come through it, so no inspect logs in to the host for this. Only log lines; never
+   * rejects.
    */
-  private async logAttachDiagnostics(containerName: string): Promise<void> {
+  private async logAttachDiagnostics(devspace: Devspace, containerName: string): Promise<void> {
     try {
+      const host = dockerHostOf(devspace);
+      const pipe = host === '' ? undefined : this.deps.windowDockerHost?.(devspace, containerName);
+      if (pipe !== undefined) {
+        this.logger.info(`Before the window connects: the Dev Containers extension reaches ${host} through the Docker pipe ${pipe} of the window.`);
+        return;
+      }
       if (!this.deps.docker.isInstalled()) return;
       const context = operationDockerTarget()?.context;
       const lines = await attachDiagnostics(this.deps.docker, this.deps.docker.processEnv(), containerName, context);
