@@ -439,7 +439,7 @@ describe('RemoteDockerState', () => {
   });
 
   it('ignores invalid content', async () => {
-    fs.writeFileSync(state.file, JSON.stringify({ previousContext: 3, dockerHost: 7, hosts: [{ host: 'a', rootlessSocket: 'relative' }, 'x', { host: '' }] }));
+    fs.writeFileSync(state.file, JSON.stringify({ other: 3, dockerHost: 7, hosts: [{ host: 'a', rootlessSocket: 'relative' }, 'x', { host: '' }] }));
     expect(await state.read()).toEqual({ hosts: [{ host: 'a' }] });
   });
 });

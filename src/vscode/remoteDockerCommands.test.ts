@@ -360,6 +360,16 @@ describe('Use the Local Docker', () => {
     expect(onDidSwitch).not.toHaveBeenCalled();
   });
 
+  // Not "already uses the local Docker" for a local Docker that Devspaces cannot use.
+  it('says why the local Docker is not supported when Devspaces uses it already', async () => {
+    cli.contexts.set('tcp', 'tcp://192.0.2.10:2376');
+    cli.current = 'tcp';
+    await commands.useLocalDocker();
+    expect(window.showInformationMessage).not.toHaveBeenCalledWith(RemoteDockerTexts.alreadyLocal);
+    expect(window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerEndpointUnsupported('tcp://192.0.2.10:2376'), 'Show details');
+    expect(onDidSwitch).not.toHaveBeenCalled();
+  });
+
   it('never says "local" when the current Docker context does not point to the local Docker', async () => {
     await listed(['build-box'], 'build-box');
     cli.contexts.set('tcp', 'tcp://192.0.2.10:2376');
@@ -435,7 +445,7 @@ describe('the offer of the SSH host of a Docker context of the user', () => {
     await commands.offerDockerContextHost(MINE);
     expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.offer('me@mybox', 'mine'), 'Use me@mybox', 'No');
     expect(await state.dockerHost()).toBe('me@mybox');
-    expect(await state.wasOffered('me@mybox')).toBe(true);
+    expect((await state.read()).offered).toEqual(['me@mybox']);
     expect(cli.changes).toEqual([]);
     await state.setDockerHost(undefined);
     window.showInformationMessage.mockClear();
@@ -448,7 +458,7 @@ describe('the offer of the SSH host of a Docker context of the user', () => {
     expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.offer('me@other', undefined), 'Use me@other', 'No');
     expect(RemoteDockerTexts.offer('me@other', undefined)).toContain('(DOCKER_HOST)');
     expect(await state.dockerHost()).toBeUndefined();
-    expect(await state.wasOffered('me@other')).toBe(true);
+    expect((await state.read()).offered).toEqual(['me@other']);
   });
 
   it('does not offer a host of the list, another target, or an address that Devspaces cannot use', async () => {
@@ -460,6 +470,14 @@ describe('the offer of the SSH host of a Docker context of the user', () => {
     await commands.offerDockerContextHost(dockerTargetOf('ssh://-oProxyCommand=x', 'evil'));
     expect(window.showInformationMessage).not.toHaveBeenCalled();
     expect((await state.read()).offered).toBeUndefined();
+  });
+
+  // Several windows read the same Docker context at their start: only one of them asks.
+  it('asks in one window only when several read the context at the same time', async () => {
+    const windows = [commands, create(), create()];
+    await Promise.all(windows.map((each) => each.offerDockerContextHost(MINE)));
+    expect(window.showInformationMessage.mock.calls.filter((call) => call[0] === RemoteDockerTexts.offer('me@mybox', 'mine'))).toHaveLength(1);
+    expect((await state.read()).offered).toEqual(['me@mybox']);
   });
 
   it('shows one offer at a time', async () => {

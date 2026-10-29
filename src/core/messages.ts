@@ -390,7 +390,7 @@ export const Messages = {
    * reaches `host` over SSH: Devspaces reaches remote hosts only through its own list (isDockerContextHostTarget).
    */
   dockerContextHost: (host: string, context: string | undefined) =>
-    `Docker on this computer is set to ${host} over SSH (${context === undefined ? 'DOCKER_HOST' : `Docker context ${context}`}). Devspaces uses a remote host only from its own list: choose "Devspaces: Use a Remote Docker Host…" and ${host}, or set Docker on this computer to its local engine.`,
+    `Docker on this computer is set to ${host} over SSH (${context === undefined ? 'DOCKER_HOST' : `Docker context ${context}`}). Devspaces uses a remote host only from its own list: choose "Devspaces: Use a Remote Docker Host…" and ${host}, or set Docker on this computer to its local engine${context === undefined ? '' : ' (for example with "docker context use default" in a terminal)'}.`,
   /**
    * The current Docker context could not be read (`docker context inspect` failed, and DOCKER_HOST is not set): the
    * Docker calls could reach another computer than the one that the devspaces record, so nothing is done.

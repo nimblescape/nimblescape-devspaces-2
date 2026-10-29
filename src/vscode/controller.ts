@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark, isFreshPending, statusNamesDevspace, type WindowMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, sshTargetOf, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
 import { dockerEndpointUnsupported } from '../core/docker/remoteDocker';
 import { engineInventory, inventoryIsEmpty, removalEndedNote, removeEngineInfrastructure, type EngineInventory, type RemovalResult } from '../core/docker/engineRemoval';
 import { operationDockerTarget, outsideOperation, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
@@ -519,10 +519,11 @@ export class Controller implements vscode.Disposable {
       rowActivated: (argument) => this.rowActivated(argument),
       rowEnter: () => this.rowEnter(),
     };
-    // Each command is one operation on the Docker host that is current when it starts; the two commands that change the
-    // host read it themselves. A click or Enter on a row is no operation: only the Start of a double-click or of Enter
-    // is one. Show Log reads no Docker host, so the log opens at once also while the Docker CLI does not answer (the
-    // link Show details of a running operation).
+    // Each command is one operation: on the Docker host of the devspace that it names (a row, the status bar item), else
+    // on the Docker host that is current when it starts (withCommandTarget); the commands that change the host read it
+    // themselves. A click or Enter on a row is no operation: only the Start of a double-click or of Enter is one. Show
+    // Log reads no Docker host, so the log opens at once also while the Docker CLI does not answer (the link Show
+    // details of a running operation).
     const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'chooseDockerHost', 'rowActivated', 'rowEnter', 'showLog']);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       // Enter on a row whose command is another command of Devspaces (the Sign in row, the Docker host row) ends with
@@ -530,7 +531,7 @@ export class Controller implements vscode.Disposable {
       if (name !== 'rowEnter' && name !== 'rowActivated') this.rowActivations.forgetEnter();
       try {
         if (ownTarget.has(name)) await handlers[name](argument);
-        else await this.withDockerTarget(() => handlers[name](argument));
+        else await this.withCommandTarget(parseCommandArgument(argument), () => handlers[name](argument));
       } catch (error) {
         this.showError(error);
       }
@@ -729,7 +730,7 @@ export class Controller implements vscode.Disposable {
               await this.deps.service.openDevspaceInWorker(devspace.id, { progress, signal, source: sourceOf(devspace, this.deps.settings()) });
             },
           }),
-        { retry: () => this.start({ kind: 'devspace', devspaceId: devspace.id }) },
+        { retry: () => this.withHostOf(devspace, () => this.start({ kind: 'devspace', devspaceId: devspace.id })) },
       );
       if (!succeeded) {
         // "Delete devspace" for missing files removed the devspace of this window.
@@ -815,9 +816,11 @@ export class Controller implements vscode.Disposable {
         );
         continue;
       }
-      // Nor one of a devspace of another Docker host; it expires.
-      if (target && !isOnDockerHost(target, dockerHost)) {
-        this.logger.info(`The pending ${operation.operation} of ${operation.devspaceId} is for another Docker host. It is not run.`);
+      // It runs on the Docker host of its devspace, whatever host Devspaces uses now; not when that host is not supported
+      // now (the local Docker set to an endpoint that Devspaces does not use), and it expires.
+      const engine = target ? await this.hostTargetOf(target) : undefined;
+      if (target && engine && !isOnDockerHost(target, engine.host)) {
+        this.logger.info(`The pending ${operation.operation} of ${operation.devspaceId} is for ${describeDockerHost(dockerHostOf(target))}, which is not supported now. It is not run.`);
         continue;
       }
       let claimed: PendingOperation | undefined;
@@ -827,7 +830,10 @@ export class Controller implements vscode.Disposable {
         this.logger.warn(`The pending operation of ${operation.devspaceId} could not be claimed: ${errorMessage(error)}`);
         continue;
       }
-      if (claimed) await this.runPendingOperation(claimed);
+      if (claimed) {
+        const pending = claimed;
+        await (engine ? runWithDockerTarget(engine, () => this.runPendingOperation(pending)) : this.runPendingOperation(pending));
+      }
     }
     // Not known whether an operation is pending: the window is not opened again.
     if (runnable.length > 0 || known.unreadable.length > 0) return;
@@ -995,7 +1001,7 @@ export class Controller implements vscode.Disposable {
     if (parsed.devspaceId !== undefined && this.current?.devspace.id === parsed.devspaceId && !this.current.lost) return;
     // A row that the view no longer has is not shown; the start does not wait for the view.
     if (row.childId !== undefined) void this.deps.revealRow?.(row.childId).catch(() => undefined);
-    await this.withDockerTarget(() => this.start(parsed));
+    await this.withCommandTarget(parsed, () => this.start(parsed));
   }
 
   /**
@@ -1118,8 +1124,13 @@ export class Controller implements vscode.Disposable {
       return;
     }
     const devspace = current.devspace;
+    // On the engine of the devspace, whatever host Devspaces uses now: a window knows its host from its devspace.
+    await this.withHostOf(devspace, () => this.closeAndKeepRunningOn(devspace));
+  }
+
+  private async closeAndKeepRunningOn(devspace: Devspace): Promise<void> {
     const repository = this.shownName(this.devspaceTarget(devspace));
-    // On every engine; the heartbeat goes to the engine of the devspace, so Docker must still be set to it.
+    // On every engine; the heartbeat goes to the engine of the devspace, which must be the one of this operation.
     const host = dockerHostOf(devspace);
     const currentHost = await this.currentDockerHost();
     if (currentHost !== host) {
@@ -2697,7 +2708,7 @@ export class Controller implements vscode.Disposable {
    */
   private async handOff(target: Target, devspace: Devspace, request: HandOffRequest, busy?: BusyOperation): Promise<void> {
     const repository = this.shownName(target);
-    await this.operation(this.operationKey(target), request.operation, () => this.handOffNow(repository, devspace, request, busy));
+    await this.withHostOf(devspace, () => this.operation(this.operationKey(target), request.operation, () => this.handOffNow(repository, devspace, request, busy)));
   }
 
   private async handOffNow(
@@ -2707,8 +2718,9 @@ export class Controller implements vscode.Disposable {
     busy?: BusyOperation,
   ): Promise<void> {
     const { sessionFiles, coordinator, connection } = this.deps;
-    // The empty window runs the operation only on the Docker host of the devspace (runEmptyWindowTasksNow), and drops
-    // it there without a message. So the hand-off is refused here, as the pipeline refuses it (requireCurrentHost).
+    // The empty window runs the operation on the Docker host of the devspace (runEmptyWindowTasksNow), and drops it
+    // without a message when that host is not supported there. So the hand-off is refused here when it is not supported
+    // now, as the pipeline refuses it (requireCurrentHost).
     const currentHost = await this.currentDockerHost();
     if (!isOnDockerHost(devspace, currentHost)) {
       throw new UserFacingError('otherDockerHost', Messages.otherDockerHost(repository, dockerHostOf(devspace), currentHost));
@@ -3893,15 +3905,32 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * Runs `fn` as one operation on the Docker host of `devspace` (DockerTargets.ofHost), whatever host Devspaces uses now;
-   * an operation that runs already keeps its own.
+   * Runs `fn` as one operation on the Docker host of `devspace` (DockerTargets.ofHost), whatever host Devspaces uses now:
+   * a window knows its host from its devspace. An operation that runs on that host already keeps its target.
    */
   private async withHostOf<T>(devspace: Devspace, fn: () => Promise<T>): Promise<T> {
-    const targets = this.deps.dockerTargets;
-    if (targets === undefined || operationDockerTarget() !== undefined) return fn();
-    const target = await outsideOperation(() => targets.ofHost(dockerHostOf(devspace)));
-    if (!isOnDockerHost(devspace, target.host)) this.logger.info(`This window's devspace is on ${describeDockerHost(dockerHostOf(devspace))}, and ${target.kind === 'unsupported' ? unsupportedTargetReason(target) : `Docker is set to ${describeDockerHost(target.host)}.`}`);
+    const running = operationDockerTarget();
+    if (running !== undefined && isOnDockerHost(devspace, running.host)) return fn();
+    const target = await this.hostTargetOf(devspace);
+    if (target === undefined) return fn();
+    if (!isOnDockerHost(devspace, target.host)) this.logger.info(`The devspace ${devspace.repository} is on ${describeDockerHost(dockerHostOf(devspace))}, which is not supported now. ${unsupportedTargetReason(target)}`);
     return runWithDockerTarget(target, fn);
+  }
+
+  /** The target of the Docker host of `devspace` (DockerTargets.ofHost); undefined without Docker targets. */
+  private async hostTargetOf(devspace: Devspace): Promise<DockerTarget | undefined> {
+    const targets = this.deps.dockerTargets;
+    return targets === undefined ? undefined : outsideOperation(() => targets.ofHost(dockerHostOf(devspace)));
+  }
+
+  /**
+   * Runs the command `fn` as one operation: on the Docker host of the devspace that `argument` names (a row, the status
+   * bar item; withHostOf), else on the Docker host that is current now (withDockerTarget).
+   */
+  private async withCommandTarget<T>(argument: CommandArgument, fn: () => Promise<T>): Promise<T> {
+    const devspaceId = argument.kind === 'none' ? undefined : argument.devspaceId;
+    const devspace = devspaceId === undefined ? undefined : await this.deps.registry.get(devspaceId).catch(() => undefined);
+    return devspace === undefined ? this.withDockerTarget(fn) : this.withHostOf(devspace, fn);
   }
 
   /** The Docker target of the operation (outside of one, the current one); the local Docker without dockerTargets. */
@@ -4015,7 +4044,7 @@ export class Controller implements vscode.Disposable {
     const host = dockerHostOf(devspace);
     if (host === '') return [containerName, folder];
     const pipe = this.deps.windowDockerHost?.(devspace, containerName);
-    if (pipe === undefined) throw new UserFacingError('dockerHostUnreachable', Messages.dockerHostUnreachable(host, dockerHostReason('sshMissing', host)), 'The window has no Docker pipe.');
+    if (pipe === undefined) throw noWindowPipe(host);
     return [containerName, folder, { host: pipe }];
   }
 
@@ -4066,6 +4095,12 @@ export class Controller implements vscode.Disposable {
    */
   private async readyForWindow(devspace: Devspace, containerName: string, signal: AbortSignal): Promise<UserFacingError | undefined> {
     const repository = this.displayName({ repository: devspace.repository });
+    // A devspace on an SSH host needs the Docker pipe of its window (windowArgs).
+    const host = dockerHostOf(devspace);
+    if (host !== '' && this.deps.windowDockerHost?.(devspace, containerName) === undefined) {
+      this.logger.warn(`${repository} is not connected: its window can get no Docker pipe for ${host}.`);
+      return noWindowPipe(host);
+    }
     const targets = this.deps.dockerTargets;
     if (targets && dockerHostOf(devspace) === '') {
       // The current context itself, not the one this operation is pinned to (DOCKER_CONTEXT).
@@ -4122,3 +4157,15 @@ function uniqueNames(names: readonly string[]): string[] {
  */
 const usesDevspace = statusNamesDevspace;
 
+/**
+ * The window of a devspace on the SSH host `host` can get no Docker pipe (windowDockerHost): `ssh` is missing on this
+ * computer, or `host` is no SSH address that Devspaces can use.
+ */
+function noWindowPipe(host: string): UserFacingError {
+  const valid = sshTargetOf(host) !== undefined;
+  return new UserFacingError(
+    'dockerHostUnreachable',
+    Messages.dockerHostUnreachable(host, dockerHostReason(valid ? 'sshMissing' : 'unknown', host)),
+    valid ? 'No ssh on this computer, so the window has no Docker pipe.' : `${host} is no SSH address that Devspaces can use, so the window has no Docker pipe.`,
+  );
+}

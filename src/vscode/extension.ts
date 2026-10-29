@@ -13,11 +13,11 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
-import { classifyDockerEndpoint, describeDockerHost, devspacesOfHost, dockerHostOf, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
+import { describeDockerHost, devspacesOfHost, dockerHostOf, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
-import { SshLoginCache, listContextInfos, noPromptEnv, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
@@ -244,7 +244,7 @@ async function activateExtension(
   });
   // The Docker host of Devspaces (a host of its own list, or the local Docker, which the current Docker context names),
   // read at the start of each operation.
-  const remoteState = new RemoteDockerState(paths.remoteDocker);
+  const remoteState = new RemoteDockerState(paths.remoteDocker, logger);
   const targets = new DockerTargets(docker, env, logger, platform, remoteState);
   // What this computer remembers about each Docker engine (docker-engines.json): the answer to the question about its
   // Monitor (MonitorQuestion), and the removal mark of "Remove Devspaces from This Docker Engine…".
@@ -951,12 +951,10 @@ async function activateExtension(
       logger,
       platform,
       computerId,
-      // The hosts of the list of Devspaces, and the SSH hosts of the Docker contexts (of the versions that made one for
-      // each host).
+      // The hosts of the list of Devspaces, and the SSH hosts of the Docker contexts of the user.
       knownHosts: async () => {
-        const [listed, contexts] = await Promise.all([remoteState.remoteHosts(), listContextInfos(docker).catch(() => [])]);
-        const endpoints = contexts.map((info) => classifyDockerEndpoint(info.endpoint)).filter((endpoint) => endpoint.kind === 'remote');
-        return [...new Set([...listed, ...endpoints.map((endpoint) => endpoint.host)])];
+        const [listed, contexts] = await Promise.all([remoteState.remoteHosts(), sshHostsOfContexts(docker).catch(() => [])]);
+        return [...new Set([...listed, ...contexts.map((entry) => entry.host)])];
       },
       engineRemoved: (host) => engineRemoved({ host }),
       openRelayConnection: (host) => relayConnections.get(host),

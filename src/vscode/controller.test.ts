@@ -2770,24 +2770,25 @@ describe('the question about the Monitor of the engine', () => {
     expect(h.service.openDevspaceInWorker).toHaveBeenCalledTimes(1);
   });
 
-  it('a Start asks about the engine of the current Docker context, and not for a devspace of another host', async () => {
+  it('a Start asks about the engine of its devspace', async () => {
     const target = remoteDockerTarget('build-box');
     recreateHarness({
       dockerTargets: {
         resolve: async () => target,
         current: async () => operationDockerTarget() ?? target,
         withOperation: <T,>(fn: () => Promise<T>) => runWithDockerTarget(target, fn),
+        ofHost: async (host: string) => (host === '' ? dockerTargetOf('unix:///var/run/docker.sock', 'default') : remoteDockerTarget(host)),
       } as unknown as ControllerDeps['dockerTargets'],
     });
     const remote = devspace({ dockerHost: 'build-box' });
     await h.registry.add(remote);
     await run('start', row('acme/api', remote));
     expect(asked()).toEqual(['build-box']);
-    // A local devspace: its open is refused on this host, and nothing is asked.
+    // A local devspace, while Devspaces uses build-box: its Start runs on the local Docker and asks about that engine.
     const local = devspace({ id: OTHER_ENV_ID, repository: 'acme/web', containerName: 'devspaces-acme-web-7c1d2e3f' });
     await h.registry.add(local);
     await run('start', row('acme/web', local));
-    expect(asked()).toEqual(['build-box']);
+    expect(asked()).toEqual(['build-box', '']);
   });
 
   // The newest request wins (connect): a Start of the user takes its connect request before its question, so the
@@ -2965,6 +2966,7 @@ describe('Remove Devspaces from This Docker Engine…', () => {
         resolve: async () => target,
         current: async () => operationDockerTarget() ?? target,
         withOperation: <T,>(fn: () => Promise<T>) => runWithDockerTarget(target, fn),
+        ofHost: async (host: string) => (host === '' ? dockerTargetOf('unix:///var/run/docker.sock', 'default') : remoteDockerTarget(host)),
       } as unknown as ControllerDeps['dockerTargets'],
       engineRemoval: fake.deps as unknown as ControllerDeps['engineRemoval'],
       ...options,
@@ -6264,7 +6266,7 @@ describe('the Docker host of Devspaces', () => {
         return current;
       }),
       // As DockerTargets.current: the target of the running operation, else a fresh read.
-      current: vi.fn(async () => (depth > 0 ? operations[operations.length - 1] : current)),
+      current: vi.fn(async () => operationDockerTarget() ?? current),
       // As DockerTargets.withOperation: a nested operation keeps the target of the outer one, and the calls of the
       // operation see its target (runWithDockerTarget).
       withOperation: vi.fn(async <T,>(fn: () => Promise<T>): Promise<T> => {
@@ -6359,11 +6361,25 @@ describe('the Docker host of Devspaces', () => {
     expect(manifest.contributes.menus.commandPalette).toContainEqual({ command: 'devspaces.chooseDockerHost', when: 'false' });
   });
 
-  it('runs every other command as one operation on the host that is current when it starts', async () => {
+  // A window knows its host from its devspace: a command on a row or the status bar item runs on that host.
+  it('runs a command that names a devspace on the host of that devspace, whatever host Devspaces uses', async () => {
+    current = remoteDockerTarget('build-box');
     await h.registry.add(devspace());
+    const seen: Array<string | undefined> = [];
+    h.service.stop.mockImplementation(async () => {
+      seen.push(operationDockerTarget()?.host);
+    });
     await run('stop', row('acme/api', devspace()));
-    expect(operations).toHaveLength(1);
+    await run('stop', { devspaceId: ENV_ID });
     expect(h.service.stop).toHaveBeenCalledWith(ENV_ID);
+    expect(seen).toEqual(['', '']);
+    expect(operations).toEqual([]);
+  });
+
+  it('runs every other command as one operation on the host that is current when it starts', async () => {
+    current = remoteDockerTarget('build-box');
+    await run('updateImagesNow');
+    expect(operations.map((target) => target.host)).toEqual(['build-box']);
   });
 
   it('Start of a repository uses the devspace of the current host only', async () => {
@@ -6414,7 +6430,7 @@ describe('the Docker host of Devspaces', () => {
     h.logger.info.mockClear();
     await h.controller.openAttachedWindow(env, env.containerName, undefined);
     expect(h.logger.info).toHaveBeenCalledWith(
-      "This window's devspace is on the local Docker, and The current Docker context box reaches me@box over SSH, which is not a host of the list of Devspaces.",
+      'The devspace acme/api is on the local Docker, which is not supported now. The current Docker context box reaches me@box over SSH, which is not a host of the list of Devspaces.',
     );
   });
 
@@ -6491,13 +6507,15 @@ describe('the Docker host of Devspaces', () => {
     expect(h.connection.open).toHaveBeenCalledWith('devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: PIPE });
   });
 
-  // Without ssh on this computer, a devspace on an SSH host has no Docker pipe, and its window does not open.
+  // Without ssh on this computer, a devspace on an SSH host has no Docker pipe, and its window does not open: the check
+  // comes before the pending connection file.
   it('does not open the window of a devspace on an SSH host without its Docker pipe', async () => {
     windowDockerHost.mockReturnValue(undefined);
     current = remoteDockerTarget('build-box');
     await h.registry.add(remoteDevspace());
     await run('start', row('acme/api', remoteDevspace()));
     expect(h.connection.open).not.toHaveBeenCalled();
+    expect(h.coordinator.writePending).not.toHaveBeenCalled();
     expect(fakeVscode.window.showErrorMessage.mock.calls[0]?.[0]).toBe(Messages.dockerHostUnreachable('build-box', dockerHostReason('sshMissing', 'build-box')));
   });
 
@@ -6511,7 +6529,7 @@ describe('the Docker host of Devspaces', () => {
     expect(calls.filter((call) => call.startsWith('context ') || call.startsWith('--context '))).toEqual([]);
   });
 
-  it('role B: a pending operation of another host is not run; the reopen rule skips its devspace', async () => {
+  it('role B: a pending operation runs on the host of its devspace; the reopen rule skips a devspace of another host', async () => {
     await h.registry.add(remoteDevspace());
     h.connection.isEmptyWindow.mockReturnValue(true);
     await h.sessionFiles.writeOperation({
@@ -6521,9 +6539,13 @@ describe('the Docker host of Devspaces', () => {
       requestedBy: 'old-window',
       reason: 'manual',
     });
+    const seen: Array<string | undefined> = [];
+    h.service.stop.mockImplementation(async () => {
+      seen.push(operationDockerTarget()?.host);
+    });
     await h.controller.runEmptyWindowTasks();
-    expect(h.service.stop).not.toHaveBeenCalled();
-    expect(h.logger.info).toHaveBeenCalledWith(`The pending stop of ${REMOTE_ENV_ID} is for another Docker host. It is not run.`);
+    expect(h.service.stop).toHaveBeenCalledWith(REMOTE_ENV_ID);
+    expect(seen).toEqual(['build-box']);
 
     await h.sessionFiles.removeOperation(REMOTE_ENV_ID).catch(() => {});
     h.sessionFiles.writeReopenSync({ devspaceId: REMOTE_ENV_ID, closedAt: iso(NOW - 60_000) });
@@ -6532,32 +6554,24 @@ describe('the Docker host of Devspaces', () => {
     expect(h.connection.open).not.toHaveBeenCalled();
   });
 
-  // The empty window would not run the operation (the test above), so the connected window does not hand it off.
-  it('refuses Stop and Rebuild of the connected devspace while Docker is set to another host, and keeps the connection', async () => {
+  // The empty window runs the operation on the host of the devspace (the test above), so the connected window hands it
+  // off also while Devspaces uses another host.
+  it('hands off Stop of the connected devspace on its own host while Devspaces uses another host', async () => {
     current = remoteDockerTarget('build-box');
     const env = remoteDevspace();
     await h.registry.add(env);
     await connectHere(env);
     current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     await run('stop', row('acme/api', env));
-    await run('rebuild', row('acme/api', env));
-    const message = Messages.otherDockerHost('acme/api', 'build-box', '');
-    expect(fakeVscode.window.showWarningMessage.mock.calls).toEqual([
-      [message, Actions.showDetails],
-      [message, Actions.showDetails],
-    ]);
-    expect(h.connection.closeRemoteConnection).not.toHaveBeenCalled();
-    expect(await h.sessionFiles.readOperations()).toEqual([]);
-    expect((await h.registry.get(REMOTE_ENV_ID))?.busy).toBeUndefined();
-    expect(h.service.stop).not.toHaveBeenCalled();
-    expect(h.service.openDevspaceInWorker).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(h.connection.closeRemoteConnection).toHaveBeenCalled();
+    expect(await h.sessionFiles.readOperations()).toEqual([expect.objectContaining({ devspaceId: REMOTE_ENV_ID, operation: 'stop' })]);
   });
 
   it('reads the Docker host again for the next operation (a switch while VS Code runs takes effect)', async () => {
-    await h.registry.add(devspace());
-    await run('stop', row('acme/api', devspace()));
+    await run('updateImagesNow');
     current = remoteDockerTarget('build-box');
-    await run('stop', row('acme/api', devspace()));
+    await run('updateImagesNow');
     expect(operations.map((target) => target.host)).toEqual(['', 'build-box']);
   });
 
@@ -6745,8 +6759,8 @@ describe('Close and Keep Running', () => {
     });
     const dockerTargets = {
       resolve: vi.fn(async () => current),
-      current: vi.fn(async () => current),
-      withOperation: vi.fn(async <T,>(fn: () => Promise<T>): Promise<T> => fn()),
+      current: vi.fn(async () => operationDockerTarget() ?? current),
+      withOperation: vi.fn(async <T,>(fn: () => Promise<T>): Promise<T> => (operationDockerTarget() !== undefined ? fn() : runWithDockerTarget(current, fn))),
       ofHost: vi.fn(async (host: string) => (host === '' ? LOCAL_TARGET : remoteDockerTarget(host))),
     };
     recreateHarness({
@@ -6818,17 +6832,16 @@ describe('Close and Keep Running', () => {
     expect(h.logger.warn).toHaveBeenCalledWith(expect.stringContaining('Connection timed out'));
   });
 
-  it('remote devspace while Docker is set to another host: refused, nothing changed', async () => {
+  // A window knows its host from its devspace.
+  it('remote devspace while Devspaces uses the local Docker: the heartbeat goes to its own host, then the window closes', async () => {
     remoteHarness();
     const env = devspace({ dockerHost: 'build-box' });
     await h.registry.add(env);
     await connectHere(env);
     current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     await run('closeAndKeepRunning');
-    expect(warningMessages()).toContain(Messages.otherDockerHost('acme/api', 'build-box', ''));
-    expect(sendHeartbeat).not.toHaveBeenCalled();
-    expect(h.connection.closeWindow).not.toHaveBeenCalled();
-    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+    expect(warningMessages()).toEqual([]);
+    expect(order).toEqual([`heartbeat ${ENV_ID} kept`, 'close']);
   });
 
   // The same rules on the local Docker.
@@ -6846,17 +6859,15 @@ describe('Close and Keep Running', () => {
     );
   });
 
-  it('local devspace while Docker is set to a remote host: refused, nothing changed', async () => {
+  it('local devspace while Devspaces uses a remote host: the heartbeat goes to the local Docker, then the window closes', async () => {
     monitorHarness(LOCAL_TARGET);
     const env = devspace();
     await h.registry.add(env);
     await connectHere(env);
     current = REMOTE_TARGET;
     await run('closeAndKeepRunning');
-    expect(warningMessages()).toContain(Messages.otherDockerHost('acme/api', '', 'build-box'));
-    expect(sendHeartbeat).not.toHaveBeenCalled();
-    expect(h.connection.closeWindow).not.toHaveBeenCalled();
-    expect(await h.registry.get(ENV_ID)).not.toHaveProperty('keepRunningOnce');
+    expect(warningMessages()).toEqual([]);
+    expect(order).toEqual([`heartbeat ${ENV_ID} kept`, 'close']);
   });
 
   it('refuses without a Monitor in this window, and clears the flag', async () => {

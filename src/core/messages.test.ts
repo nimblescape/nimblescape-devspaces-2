@@ -119,9 +119,10 @@ describe('the messages of a remote Docker host', () => {
 
   it('names the SSH host of the Docker context of the user, and how Devspaces uses it', () => {
     expect(Messages.dockerContextHost('build-box', 'box')).toBe(
-      'Docker on this computer is set to build-box over SSH (Docker context box). Devspaces uses a remote host only from its own list: choose "Devspaces: Use a Remote Docker Host…" and build-box, or set Docker on this computer to its local engine.',
+      'Docker on this computer is set to build-box over SSH (Docker context box). Devspaces uses a remote host only from its own list: choose "Devspaces: Use a Remote Docker Host…" and build-box, or set Docker on this computer to its local engine (for example with "docker context use default" in a terminal).',
     );
     expect(Messages.dockerContextHost('me@192.0.2.10', undefined)).toContain('(DOCKER_HOST)');
+    expect(Messages.dockerContextHost('me@192.0.2.10', undefined)).not.toContain('docker context use');
   });
 });
 

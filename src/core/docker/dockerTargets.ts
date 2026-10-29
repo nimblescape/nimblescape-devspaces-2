@@ -122,7 +122,7 @@ export class DockerTargets {
   async resolve(): Promise<DockerTarget> {
     const read = ++this.readsStarted;
     const host = await this.chosenHost();
-    const target = host === undefined ? await this.readLocal() : remoteDockerTarget(host);
+    const target = host === undefined ? await outsideOperation(() => this.readLocal()) : remoteDockerTarget(host);
     // A read that started before a newer one finished (overlapping reads) does not overwrite what that one found.
     if (read < this.readApplied) return target;
     this.readApplied = read;
@@ -171,7 +171,7 @@ export class DockerTargets {
    * for '' the local Docker (readLocal). Does not change `last` and tells no listener. Never throws.
    */
   async ofHost(host: string): Promise<DockerTarget> {
-    return host === '' ? this.readLocal() : remoteDockerTarget(host);
+    return host === '' ? outsideOperation(() => this.readLocal()) : remoteDockerTarget(host);
   }
 
   /**The target of the Docker context `name` (for example `default`), whatever context is current. With DOCKER_HOST set
@@ -209,7 +209,8 @@ export class DockerTargets {
    * The local Docker of Devspaces: DOCKER_HOST of VS Code's environment if set, else the current Docker context (which
    * DOCKER_CONTEXT may name); one that reaches a host over SSH is not supported (isDockerContextHostTarget). Without a
    * Docker CLI, the local Docker. When the context cannot be read: DOCKER_HOST when it is set, else podmanDockerTarget
-   * for a docker command that is Podman, else UNREADABLE_DOCKER_TARGET (logged). Never throws.
+   * for a docker command that is Podman, else UNREADABLE_DOCKER_TARGET (logged). Never throws. Its callers run it
+   * outside of any operation: inside one on a remote host, its Docker calls would get DOCKER_HOST of that host.
    */
   private async readLocal(): Promise<DockerTarget> {
     if (!this.docker.isInstalled()) return LOCAL_DOCKER_TARGET;

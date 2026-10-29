@@ -35,6 +35,7 @@ import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner,
 import type { RemoteDockerState } from '../storage/remoteDockerState';
 import {
   RUNTIME_DIR_COMMAND,
+  classifyDockerEndpoint,
   dockerHostProblem,
   isDockerContextHostTarget,
   isRootlessEngine,
@@ -440,6 +441,20 @@ export async function listContextInfos(docker: RemoteDockerCli): Promise<Context
     });
   }
   return contexts;
+}
+
+/**
+ * The SSH hosts of the Docker contexts of the user that Devspaces can use (sshTargetOf), each once with the name of the
+ * first context that reaches it (`docker context ls`). Throws when the contexts cannot be listed.
+ */
+export async function sshHostsOfContexts(docker: RemoteDockerCli): Promise<Array<{ host: string; context: string }>> {
+  const hosts: Array<{ host: string; context: string }> = [];
+  for (const context of await listContextInfos(docker)) {
+    const endpoint = classifyDockerEndpoint(context.endpoint);
+    if (endpoint.kind !== 'remote' || sshTargetOf(endpoint.host) === undefined || hosts.some((known) => known.host === endpoint.host)) continue;
+    hosts.push({ host: endpoint.host, context: context.name });
+  }
+  return hosts;
 }
 
 /**

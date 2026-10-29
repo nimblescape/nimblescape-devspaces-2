@@ -53,21 +53,28 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
     await expect(state.removeHost('b')).resolves.toBe(false);
   });
 
-  it('remembers each offered host once', async () => {
-    expect(await state.wasOffered('build-box')).toBe(false);
-    await state.setOffered('build-box');
-    await state.setOffered('build-box');
-    expect(await state.wasOffered('build-box')).toBe(true);
+  it('claims the offer of a host once, and never for a host of the list', async () => {
+    await expect(state.claimOffer('build-box')).resolves.toBe(true);
+    await expect(state.claimOffer('build-box')).resolves.toBe(false);
+    expect((await state.read()).offered).toEqual(['build-box']);
+    await state.setDockerHost('listed');
+    await expect(state.claimOffer('listed')).resolves.toBe(false);
     expect((await state.read()).offered).toEqual(['build-box']);
   });
 
-  it('drops the fields of the versions that switched the Docker context, and puts a Docker host that is not listed into the list', async () => {
-    fs.writeFileSync(
-      state.file,
-      JSON.stringify({ previousContext: 'desktop-linux', dontAsk: ['switchBack'], dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: 'x' }),
-    );
+  // Several windows start at the same time: only one of them asks, and no change of another window is lost.
+  it('gives the offer to one of several windows at the same time, and loses no change', async () => {
+    const windows = Array.from({ length: 5 }, () => new RemoteDockerState(state.file));
+    const claims = await Promise.all([...windows.map((window) => window.claimOffer('me@box')), windows[0].setDockerHost('a'), windows[1].setRootlessSocket('a', '/run/user/1000/docker.sock')]);
+    expect(claims.slice(0, 5).filter((claimed) => claimed === true)).toHaveLength(1);
+    expect(await state.read()).toEqual({ dockerHost: 'a', remoteHosts: ['a'], offered: ['me@box'], hosts: [{ host: 'a', rootlessSocket: '/run/user/1000/docker.sock' }] });
+    expect(fs.existsSync(state.lockDir)).toBe(false);
+  });
+
+  it('drops the fields that it does not know, and puts a Docker host that is not listed into the list', async () => {
+    fs.writeFileSync(state.file, JSON.stringify({ other: 'x', dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: 'x' }));
     expect(await state.read()).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'] });
-    await state.setOffered('x');
+    await state.claimOffer('x');
     expect(JSON.parse(fs.readFileSync(state.file, 'utf8'))).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'], offered: ['x'] });
   });
 });

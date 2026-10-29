@@ -6,8 +6,13 @@
 // of SSH hosts, the Docker host of Devspaces (one host of the list, or none for the local Docker), the hosts of Docker
 // contexts that it offered once, and per host the socket of a rootless engine there (the source of the helper's socket
 // mount on that computer). Devspaces creates and changes no Docker context (docs/architecture.md "Remote Docker
-// hosts").
+// hosts"). Every window of this computer changes the file: each change reads and writes it under the lock folder
+// `remote-docker.lock` (lockFolder.ts), so that a change of another window between the read and the write is not lost.
+import * as path from 'path';
+import { silentLogger, type Logger } from '../ports';
 import { readJson, writeJsonAtomic } from './atomicJson';
+import { DEFAULT_LOCK_STALE_MS, DEFAULT_LOCK_TIMEOUT_MS, LockLostError, withLockFolder, type LockTimings } from './lockFolder';
+import { retryTransient } from './paths';
 
 export interface RemoteDockerHostRecord {
   host: string;
@@ -20,14 +25,24 @@ export interface RemoteDockerStateFile {
   dockerHost?: string;
   /** The list of SSH hosts of Devspaces (an alias of the SSH config, or `user@host[:port]`), in the order they were added. */
   remoteHosts?: string[];
-  /** The hosts of a Docker context or of DOCKER_HOST that Devspaces offered once for the list (offerDockerContextHost). */
+  /** The hosts of a Docker context or of DOCKER_HOST that Devspaces offered once for the list (claimOffer). */
   offered?: string[];
   hosts?: RemoteDockerHostRecord[];
 }
 
 export class RemoteDockerState {
-  constructor(readonly file: string) {}
+  /** The lock folder of the changes: `<name>.lock` next to the file (`remote-docker.lock`). */
+  readonly lockDir: string;
+  private readonly lockTimings: LockTimings = { staleMs: DEFAULT_LOCK_STALE_MS, timeoutMs: DEFAULT_LOCK_TIMEOUT_MS };
 
+  constructor(
+    readonly file: string,
+    private readonly logger: Logger = silentLogger,
+  ) {
+    this.lockDir = path.join(path.dirname(file), `${path.basename(file, '.json')}.lock`);
+  }
+
+  /** The file as it is now; a missing file or one that is not valid knows nothing. A read needs no lock (atomic writes). */
   async read(): Promise<RemoteDockerStateFile> {
     return normalize(await readJson<unknown>(this.file));
   }
@@ -47,14 +62,15 @@ export class RemoteDockerState {
    * the local Docker. Writes only when something changes.
    */
   async setDockerHost(host: string | undefined): Promise<void> {
-    const state = await this.read();
-    const hosts = state.remoteHosts ?? [];
-    const listed = host === undefined || hosts.includes(host);
-    if (state.dockerHost === host && listed) return;
-    if (host === undefined) delete state.dockerHost;
-    else state.dockerHost = host;
-    if (!listed) state.remoteHosts = [...hosts, host];
-    await writeJsonAtomic(this.file, state);
+    await this.change((state) => {
+      const hosts = state.remoteHosts ?? [];
+      const listed = host === undefined || hosts.includes(host);
+      if (state.dockerHost === host && listed) return false;
+      if (host === undefined) delete state.dockerHost;
+      else state.dockerHost = host;
+      if (!listed) state.remoteHosts = [...hosts, host];
+      return true;
+    });
   }
 
   /**
@@ -62,28 +78,35 @@ export class RemoteDockerState {
    * socket and the devspaces on it stay. True when it was in the list.
    */
   async removeHost(host: string): Promise<boolean> {
-    const state = await this.read();
-    const hosts = state.remoteHosts ?? [];
-    if (!hosts.includes(host) && state.dockerHost !== host) return false;
-    const rest = hosts.filter((entry) => entry !== host);
-    if (rest.length > 0) state.remoteHosts = rest;
-    else delete state.remoteHosts;
-    if (state.dockerHost === host) delete state.dockerHost;
-    await writeJsonAtomic(this.file, state);
-    return true;
+    let removed = false;
+    await this.change((state) => {
+      // Set on each run: after a lost lock, the second run counts (change).
+      const hosts = state.remoteHosts ?? [];
+      removed = hosts.includes(host) || state.dockerHost === host;
+      if (!removed) return false;
+      const rest = hosts.filter((entry) => entry !== host);
+      if (rest.length > 0) state.remoteHosts = rest;
+      else delete state.remoteHosts;
+      if (state.dockerHost === host) delete state.dockerHost;
+      return true;
+    });
+    return removed;
   }
 
-  /** True when Devspaces offered `host` of a Docker context or of DOCKER_HOST once already. */
-  async wasOffered(host: string): Promise<boolean> {
-    return (await this.read()).offered?.includes(host) ?? false;
-  }
-
-  /** Remembers that `host` was offered (wasOffered). */
-  async setOffered(host: string): Promise<void> {
-    const state = await this.read();
-    if (state.offered?.includes(host)) return;
-    state.offered = [...(state.offered ?? []), host];
-    await writeJsonAtomic(this.file, state);
+  /**
+   * The offer of `host` of a Docker context or of DOCKER_HOST (offerDockerContextHost), once on this computer: true, and
+   * `host` is remembered, when it is neither in the list nor offered before; false otherwise. The check and the write
+   * run under the lock, so that of several windows that start at the same time only one asks.
+   */
+  async claimOffer(host: string): Promise<boolean> {
+    let claimed = false;
+    await this.change((state) => {
+      claimed = !(state.remoteHosts ?? []).includes(host) && !(state.offered ?? []).includes(host);
+      if (!claimed) return false;
+      state.offered = [...(state.offered ?? []), host];
+      return true;
+    });
+    return claimed;
   }
 
   /** The socket of the rootless engine on `host`, or undefined for a rootful engine (the default socket). */
@@ -93,19 +116,51 @@ export class RemoteDockerState {
 
   /** Records (or with `undefined` forgets) the rootless socket of `host`. Writes only when it changes. */
   async setRootlessSocket(host: string, socket: string | undefined): Promise<void> {
-    const state = await this.read();
-    const hosts = state.hosts ?? [];
-    const record = hosts.find((entry) => entry.host === host);
-    if (record?.rootlessSocket === socket) return;
-    if (socket === undefined) {
-      if (!record) return;
-      state.hosts = hosts.filter((entry) => entry !== record);
-    } else if (record) {
-      record.rootlessSocket = socket;
-    } else {
-      state.hosts = [...hosts, { host, rootlessSocket: socket }];
+    await this.change((state) => {
+      const hosts = state.hosts ?? [];
+      const record = hosts.find((entry) => entry.host === host);
+      if (record?.rootlessSocket === socket) return false;
+      if (socket === undefined) {
+        if (!record) return false;
+        state.hosts = hosts.filter((entry) => entry !== record);
+      } else if (record) {
+        record.rootlessSocket = socket;
+      } else {
+        state.hosts = [...hosts, { host, rootlessSocket: socket }];
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Changes the file: `update` changes the state that was read and returns whether to write it. The read and the write
+   * run under the lock folder `lockDir`. If another process took over the lock meanwhile (this process stalled longer
+   * than the stale time, see withLockFolder), nothing is written and the whole change runs once more on the current
+   * file, as for registry.json: `update` can run twice, and its last run counts. Throws, and writes nothing, when the
+   * lock is not free within the wait.
+   */
+  private async change(update: (state: RemoteDockerStateFile) => boolean): Promise<void> {
+    const run = () =>
+      withLockFolder(
+        this.lockDir,
+        async (held) => {
+          const state = await this.read();
+          if (!update(state)) return;
+          const checkHeld = async (): Promise<void> => {
+            if (!(await held())) throw new LockLostError(this.lockDir);
+          };
+          await checkHeld();
+          await retryTransient(() => writeJsonAtomic(this.file, state, { beforeRename: checkHeld }));
+        },
+        this.lockTimings,
+      );
+    try {
+      await run();
+    } catch (error) {
+      if (!(error instanceof LockLostError)) throw error;
+      this.logger.warn(`${error.message} The change of the remote Docker hosts runs again on the current file.`);
+      await run();
     }
-    await writeJsonAtomic(this.file, state);
   }
 }
 
@@ -117,8 +172,8 @@ function hostNames(value: unknown): string[] | undefined {
 }
 
 /**
- * The fields of the file that Devspaces knows; others (for example `previousContext` and `dontAsk` of the versions that
- * switched the Docker context) are dropped at the next write. A Docker host that is not in the list is added to it.
+ * The fields of the file that Devspaces knows; others are dropped at the next write. A Docker host that is not in the
+ * list is added to it.
  */
 function normalize(value: unknown): RemoteDockerStateFile {
   const result: RemoteDockerStateFile = {};

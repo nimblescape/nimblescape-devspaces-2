@@ -33,7 +33,7 @@ export interface WindowPipeDeps {
   /** The ID of this computer (computer.id). */
   computerId(): string;
   /**
-   * The SSH hosts that this computer knows (of its Docker contexts and its current Docker), to find the host of a pipe
+   * The SSH hosts that this computer knows (of the list of Devspaces and of the Docker contexts), to find the host of a pipe
    * whose devspace is not known (the registry lost it): the one for which this computer made the address.
    */
   knownHosts(): Promise<string[]>;
@@ -116,7 +116,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
       }
     } else {
       const known = await deps.knownHosts().catch((error: unknown) => {
-        logger.warn(`The Docker contexts could not be read for the Docker pipe ${dockerHost}: ${errorMessage(error)}`);
+        logger.warn(`The known SSH hosts could not be read for the Docker pipe ${dockerHost}: ${errorMessage(error)}`);
         return [];
       });
       const found = known.find((candidate) => address.id === dockerPipeId(deps.computerId(), candidate, containerName));

@@ -12,7 +12,6 @@
 // for the list (offerDockerContextHost).
 import * as vscode from 'vscode';
 import {
-  classifyDockerEndpoint,
   describeDockerHost,
   isDockerContextHostTarget,
   parseSshAddress,
@@ -22,8 +21,8 @@ import {
 } from '../core/docker/dockerHost';
 import type { DockerTargets } from '../core/docker/dockerTargets';
 import {
-  listContextInfos,
   recordRootlessSocket,
+  sshHostsOfContexts,
   testRemoteDockerHost,
   unsupportedTargetMessage,
   type RemoteDockerCli,
@@ -134,8 +133,8 @@ const LOCAL_CHOICE = Symbol('local Docker');
 const REMOVE_CHOICE = Symbol('remove a host');
 
 export class RemoteDockerCommands {
-  /** The host whose offer (offerDockerContextHost) is shown now. */
-  private offering: string | undefined;
+  /** The offer that runs now (offerDockerContextHost): its host, and whether this window asks (claimOffer). */
+  private offering: { host: string; claimed: Promise<boolean> } | undefined;
 
   constructor(private readonly deps: RemoteDockerDeps) {}
 
@@ -167,7 +166,7 @@ export class RemoteDockerCommands {
   async chooseDockerHost(): Promise<void> {
     try {
       const current = await this.deps.state.dockerHost();
-      // The hosts right away, the current one marked, and the local Docker last.
+      // One choice: the hosts, the current one marked, and the local Docker last.
       const picked = await this.pickHost({
         title: RemoteDockerTexts.chooseTitle(describeDockerHost(current ?? '')),
         placeHolder: RemoteDockerTexts.choosePlaceholder,
@@ -194,11 +193,14 @@ export class RemoteDockerCommands {
     }
   }
 
-  /** "Use the Local Docker": Devspaces uses the Docker of this computer again. Never throws. */
+  /**
+   * "Use the Local Docker": Devspaces uses the Docker of this computer again. While it uses it already, it says so, or
+   * why that Docker is not supported now. Never throws.
+   */
   async useLocalDocker(): Promise<void> {
     try {
       if ((await this.deps.state.dockerHost()) === undefined) {
-        this.inform(RemoteDockerTexts.alreadyLocal);
+        await this.reportLocal(await this.deps.targets.resolve(), RemoteDockerTexts.alreadyLocal);
         return;
       }
       await this.switchToLocal();
@@ -210,16 +212,17 @@ export class RemoteDockerCommands {
   /**
    * The offer of the host of a Docker context, or of DOCKER_HOST, of the user that reaches a host over SSH while
    * Devspaces uses the local Docker (isDockerContextHostTarget): once per host on this computer (remembered before the
-   * question, so that another window does not ask it too), "Use <host>" makes it the Docker host of Devspaces as "Use a
-   * Remote Docker Host…" does. A host of the list is not offered. Never throws.
+   * question, under the lock of the file, so that another window does not ask it too: RemoteDockerState.claimOffer),
+   * "Use <host>" makes it the Docker host of Devspaces as "Use a Remote Docker Host…" does. A host of the list is not
+   * offered. Never throws.
    */
   async offerDockerContextHost(target: DockerTarget): Promise<void> {
     if (!isDockerContextHostTarget(target) || this.offering !== undefined) return;
     const host = target.sshHost;
-    this.offering = host;
+    const claimed = this.claimOffer(host);
+    this.offering = { host, claimed };
     try {
-      if (!(await this.offerable(host))) return;
-      await this.deps.state.setOffered(host);
+      if (!(await claimed)) return;
       this.deps.logger.info(`Docker on this computer is set to ${host} over SSH, which is not in the list of Devspaces; Devspaces offers it once.`);
       const use = RemoteDockerTexts.useHost(host);
       const choice = await showInformationMessage(RemoteDockerTexts.offer(host, target.context), use, RemoteDockerTexts.notNow);
@@ -232,10 +235,18 @@ export class RemoteDockerCommands {
     }
   }
 
-  /** Whether offerDockerContextHost asks about `host`: one that Devspaces can use, not in the list, not offered yet. */
-  private async offerable(host: string): Promise<boolean> {
+  /**
+   * Whether offerDockerContextHost asks about `host`: one that Devspaces can use, and that is neither in the list nor
+   * offered before (RemoteDockerState.claimOffer, which remembers it). False when the file cannot be changed (logged).
+   */
+  private async claimOffer(host: string): Promise<boolean> {
     if (sshTargetOf(host) === undefined) return false;
-    return !(await this.deps.state.remoteHosts()).includes(host) && !(await this.deps.state.wasOffered(host));
+    try {
+      return await this.deps.state.claimOffer(host);
+    } catch (error) {
+      this.deps.logger.warn(`The offer of ${host} could not be remembered, so it is not shown: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   /** Test, rootless socket, use. True when Devspaces uses `host` afterwards. */
@@ -282,21 +293,27 @@ export class RemoteDockerCommands {
     return true;
   }
 
-  /**
-   * Devspaces uses the local Docker again; a current Docker context that is not local is said (with its message), except
-   * the SSH host of a context of the user that is offered now (the read of the target starts the offer, extension.ts).
-   */
+  /** Devspaces uses the local Docker again (reportLocal). */
   private async switchToLocal(): Promise<void> {
     await this.deps.state.setDockerHost(undefined);
     this.deps.logger.info('Devspaces uses the local Docker again.');
-    const now = await this.deps.targets.resolve();
-    if (now.kind === 'local') {
-      this.inform(RemoteDockerTexts.nowLocal);
-    } else {
-      this.deps.logger.warn(`The local Docker of Devspaces is not supported now: ${now.endpoint || now.host}`);
-      if (!isDockerContextHostTarget(now) || !(await this.offerable(now.sshHost))) this.showWarning(unsupportedTargetMessage(now));
-    }
+    await this.reportLocal(await this.deps.targets.resolve(), RemoteDockerTexts.nowLocal);
     await this.afterSwitch();
+  }
+
+  /**
+   * Says `local` when the local Docker of Devspaces, as read in `now`, is supported; else its message, except for the
+   * SSH host of a context of the user that this window offers now (the read of `now` started the offer, extension.ts).
+   */
+  private async reportLocal(now: DockerTarget, local: string): Promise<void> {
+    if (now.kind === 'local') {
+      this.inform(local);
+      return;
+    }
+    this.deps.logger.warn(`The local Docker of Devspaces is not supported now: ${now.endpoint || now.host}`);
+    const offering = this.offering;
+    const offered = isDockerContextHostTarget(now) && offering?.host === now.sshHost && (await offering.claimed);
+    if (!offered) this.showWarning(unsupportedTargetMessage(now));
   }
 
   /**
@@ -304,7 +321,7 @@ export class RemoteDockerCommands {
    * place. Its devspaces stay on that computer, and nothing there is changed.
    */
   private async removeHost(): Promise<void> {
-    const [hosts, current] = await Promise.all([this.deps.state.remoteHosts(), this.deps.state.dockerHost()]);
+    const { remoteHosts: hosts = [], dockerHost: current } = await this.deps.state.read();
     if (hosts.length === 0) return;
     const picked = await vscode.window.showQuickPick(
       hosts.map((host) => (host === current ? { label: host, description: RemoteDockerTexts.current, host } : { label: host, host })),
@@ -346,8 +363,7 @@ export class RemoteDockerCommands {
     } catch (error) {
       this.deps.logger.warn(`The SSH config could not be read: ${errorMessage(error)}`);
     }
-    const listed = await this.deps.state.remoteHosts();
-    const contextHosts = await this.contextHosts();
+    const [listed, contextHosts] = await Promise.all([this.deps.state.remoteHosts(), this.contextHosts()]);
     const shown = new Set<string>();
     const item = (host: string, description: string | undefined): HostItem => {
       shown.add(host);
@@ -363,7 +379,7 @@ export class RemoteDockerCommands {
       { label: RemoteDockerTexts.sshConfigGroup, items: entries.filter((entry) => !shown.has(entry.alias)).map((entry) => item(entry.alias, describeEntry(entry))) },
       {
         label: RemoteDockerTexts.contextGroup,
-        items: contextHosts.filter((context) => !shown.has(context.host)).map((context) => item(context.host, RemoteDockerTexts.dockerContext(context.name))),
+        items: contextHosts.filter((entry) => !shown.has(entry.host)).map((entry) => item(entry.host, RemoteDockerTexts.dockerContext(entry.context))),
       },
     ];
     const items: HostItem[] = [];
@@ -411,20 +427,11 @@ export class RemoteDockerCommands {
     return parsed.address;
   }
 
-  /**
-   * The SSH hosts of the Docker contexts of the user that Devspaces can use (sshTargetOf), each once; none when the
-   * contexts cannot be listed (logged).
-   */
-  private async contextHosts(): Promise<Array<{ host: string; name: string }>> {
+  /** The SSH hosts of the Docker contexts of the user (sshHostsOfContexts); none when they cannot be listed (logged). */
+  private async contextHosts(): Promise<Array<{ host: string; context: string }>> {
     if (!this.deps.docker.isInstalled()) return [];
     try {
-      const hosts: Array<{ host: string; name: string }> = [];
-      for (const context of await listContextInfos(this.deps.docker)) {
-        const endpoint = classifyDockerEndpoint(context.endpoint);
-        if (endpoint.kind !== 'remote' || sshTargetOf(endpoint.host) === undefined || hosts.some((known) => known.host === endpoint.host)) continue;
-        hosts.push({ host: endpoint.host, name: context.name });
-      }
-      return hosts;
+      return await sshHostsOfContexts(this.deps.docker);
     } catch (error) {
       this.deps.logger.warn(`The Docker contexts could not be listed: ${errorMessage(error)}`);
       return [];
