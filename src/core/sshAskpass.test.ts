@@ -17,6 +17,7 @@ import {
   askpassEnv,
   askpassLauncher,
   askpassProgram,
+  currentSshPromptFlow,
   hostKeyFingerprint,
   isPasswordPrompt,
   parseAskpassRequest,
@@ -142,6 +143,21 @@ describe('the flows of the user', () => {
     expect(inside).toBe(cancel.signal);
     expect(await later).toBeUndefined();
     expect(await withSshPrompts(async () => sshPromptSignal())).toBeUndefined();
+  });
+
+  // For example a progress notification within an operation: its logins belong to the operation.
+  it('keeps the flow and the signal of the outer flow in a flow within it', async () => {
+    const cancel = new AbortController();
+    const [outer, inner, signal] = await withSshPrompts(async () => {
+      const outerFlow = currentSshPromptFlow();
+      return withSshPrompts(async () => [outerFlow, currentSshPromptFlow(), sshPromptSignal()] as const);
+    }, cancel.signal);
+    expect(outer).toBeDefined();
+    expect(inner).toBe(outer);
+    expect(signal).toBe(cancel.signal);
+    const [first, second] = await Promise.all([withSshPrompts(async () => currentSshPromptFlow()), withSshPrompts(async () => currentSshPromptFlow())]);
+    expect(first).not.toBe(second);
+    expect(currentSshPromptFlow()).toBeUndefined();
   });
 });
 

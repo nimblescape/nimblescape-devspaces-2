@@ -27,7 +27,7 @@ export interface RemoteShellsOptions {
 /** A shell of `RemoteShells`: open, or still logging in on `process`. */
 interface Entry {
   process: StartedByteProcess;
-  /** The flow of the user whose login this is, when it may ask in VS Code (currentSshPromptFlow); its Cancel ends it. */
+  /** The flow of the user that started this login (currentSshPromptFlow), or none (the background). */
   flow?: object;
   shell?: RemoteShell;
   opening?: Promise<RemoteShell>;
@@ -56,8 +56,9 @@ export class RemoteShells {
    * Undefined when the host has no transport, and after `dispose`. Rejects with RemoteShellError when the login failed,
    * and with an AbortError when `signal` aborts (the login goes on for the others). A flow of the user whose login may
    * ask (currentSshPromptFlow) that finds a login of the background or of another flow in progress waits for it, and
-   * logs in anew when it was refused: a login without questions fails for a host that needs a password or an unknown
-   * host key, and the Cancel of the other flow ends the questions of its login.
+   * logs in anew when it failed: a login without questions fails for a host that needs a password or an unknown host
+   * key, and the Cancel of the other flow ends the questions of its login. After the time limit of the login of another
+   * flow, which could ask, it does not log in anew.
    */
   open(host: string, signal?: AbortSignal): Promise<RemoteShell | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
@@ -68,8 +69,7 @@ export class RemoteShells {
       if (flow === undefined || current.flow === flow) return untilAborted(current.opening, signal);
       return untilAborted(
         current.opening.catch((error: unknown) => {
-          // A host that did not answer in time does not answer a second login either.
-          if (!(error instanceof RemoteShellError) || error.timedOut || signal?.aborted) throw error;
+          if (!(error instanceof RemoteShellError) || (error.timedOut && current.flow !== undefined) || signal?.aborted) throw error;
           return this.open(host, signal);
         }),
         signal,
@@ -78,7 +78,7 @@ export class RemoteShells {
     const started = this.options.start(host);
     if (started === undefined) return Promise.resolve(undefined);
     const { process, prompts } = started;
-    const entry: Entry = { process, flow: prompts === undefined ? undefined : currentSshPromptFlow() };
+    const entry: Entry = { process, flow: currentSshPromptFlow() };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };

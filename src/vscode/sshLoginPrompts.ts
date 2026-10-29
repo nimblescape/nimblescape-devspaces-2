@@ -187,6 +187,7 @@ export class SshAskpassServer implements vscode.Disposable {
       env: (base) => askpassEnv(base, files, token, platform),
       onPrompt: (listener) => {
         state.listeners.add(listener);
+        if (state.open > 0) listener(true);
         return () => state.listeners.delete(listener);
       },
       dispose: () => {

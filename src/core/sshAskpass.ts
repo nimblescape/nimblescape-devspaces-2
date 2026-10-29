@@ -180,30 +180,40 @@ export function hostKeyFingerprint(prompt: string): string | undefined {
 /** The questions of one login that may ask: while one is open, the login does not time out (RemoteShell, RelayConnection). */
 export interface SshLoginPrompts {
   /**
-   * Calls `listener` with true when the first open question of this login opens, and with false when the last one
-   * closes. Returns its end.
+   * Calls `listener` with true when the first open question of this login opens (at once when one is open), and with
+   * false when the last one closes. Returns its end.
    */
   onPrompt(listener: (open: boolean) => void): () => void;
 }
 
 /**
- * The flow of the user that runs now: its logins may ask, until `signal` aborts (the Cancel of its progress). Timers and
- * listeners that a flow creates keep its store after it ended; `active` is false then, so their logins ask nothing (as
- * the scope of an operation in dockerTargets.ts).
+ * The flow of the user that runs now: its logins may ask, until `signal` aborts (the Cancel of its progress). `flow`
+ * names the flow; a flow within a flow (a progress notification within an operation) keeps the name of the outer one.
+ * Timers and listeners that a flow creates keep its store after it ended; `active` is false then, so their logins ask
+ * nothing (as the scope of an operation in dockerTargets.ts).
  */
 interface PromptScope {
   active: boolean;
+  flow: object;
   signal?: AbortSignal;
 }
 
 const promptScopes = new AsyncLocalStorage<PromptScope>();
 
+/** The scope of the flow of the user that runs now, or undefined outside of one and after its end. */
+function activeScope(): PromptScope | undefined {
+  const scope = promptScopes.getStore();
+  return scope?.active === true ? scope : undefined;
+}
+
 /**
  * Runs `fn` as a flow of the user (a command with its progress notification, the test of a remote host): an SSH login
- * that it starts may ask in VS Code. When `signal` aborts, the questions of those logins close (sshPromptSignal).
+ * that it starts may ask in VS Code. When `signal` aborts, the questions of those logins close (sshPromptSignal); a
+ * flow within a flow without a signal of its own takes the signal of the outer flow.
  */
 export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const scope: PromptScope = { active: true, signal };
+  const outer = activeScope();
+  const scope: PromptScope = { active: true, flow: outer?.flow ?? {}, signal: signal ?? outer?.signal };
   try {
     return await promptScopes.run(scope, fn);
   } finally {
@@ -213,17 +223,15 @@ export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSign
 
 /** True within withSshPrompts: an SSH login that starts now may ask. */
 export function sshPromptsAllowed(): boolean {
-  return currentSshPromptFlow() !== undefined;
+  return activeScope() !== undefined;
 }
 
 /** The flow of the user that runs now (withSshPrompts), as an object that only it has; undefined outside of one. */
 export function currentSshPromptFlow(): object | undefined {
-  const scope = promptScopes.getStore();
-  return scope?.active === true ? scope : undefined;
+  return activeScope()?.flow;
 }
 
 /** The signal of the flow of the user that runs now (withSshPrompts): when it aborts, its logins ask nothing more. */
 export function sshPromptSignal(): AbortSignal | undefined {
-  const scope = promptScopes.getStore();
-  return scope?.active === true ? scope.signal : undefined;
+  return activeScope()?.signal;
 }

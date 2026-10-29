@@ -103,6 +103,25 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
+  it('logs in anew for a flow of the user also after the time limit of a login of the background', async () => {
+    const logins: string[] = [];
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 500,
+      start: () => {
+        const asks = sshPromptsAllowed();
+        logins.push(asks ? 'asks' : 'quiet');
+        return { process: runner.startBytes('sh', ['-c', asks ? 'exec sh -s' : 'sleep 30']), ...(asks ? { prompts: { onPrompt: () => () => undefined } } : {}) };
+      },
+    });
+    const background = registry.login('box');
+    const flow = withSshPrompts(() => registry.login('box'));
+    await expect(background).resolves.toMatchObject({ ok: false, timedOut: true });
+    await expect(flow).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['quiet', 'asks']);
+    registry.dispose();
+  });
+
   // Two flows of the user: the Cancel of the first ends the questions of its login, and the second asks itself.
   it('logs in anew for a flow of the user after the login of another flow was cancelled, but not after a time limit', async () => {
     const logins: string[] = [];
@@ -110,7 +129,7 @@ describeUnix('RemoteShells', () => {
     let script = '';
     const registry = new RemoteShells({
       logger: silentLogger,
-      loginTimeoutMs: 300,
+      loginTimeoutMs: 5_000,
       start: () => {
         const signal = sshPromptSignal();
         logins.push(sshPromptsAllowed() ? 'flow' : 'background');
