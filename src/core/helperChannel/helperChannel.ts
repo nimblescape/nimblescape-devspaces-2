@@ -397,8 +397,8 @@ export class HelperChannel {
     });
     // The loader limits the escaped line, so the same is checked here (the memory guard of the pipe loader,
     // MAX_BUNDLE_LINE_LENGTH).
-    const scriptLine = script === undefined ? '' : encodeBundle(script);
-    if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
+    const scriptLine = script === undefined ? undefined : encodeBundle(script);
+    if (scriptLine !== undefined && scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
       this.lose('the script is too long');
       throw new HelperChannelError('open', `The script of the helper channel is too long (${scriptLine.length - 1} characters as JSON).`);
     }
@@ -410,7 +410,7 @@ export class HelperChannel {
       openTimer = setTimeout(() => reject(new Error(`no answer within ${openTimeoutMs / 1000} seconds`)), openTimeoutMs);
       removeCloseListener = this.onClose((reason) => reject(new Error(reason)));
     });
-    if (scriptLine !== '') this.process.write(scriptLine);
+    if (scriptLine !== undefined) this.process.write(scriptLine);
     this.send({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION });
     let answer: Extract<ServerMessage, { t: 'hello' }>;
     try {

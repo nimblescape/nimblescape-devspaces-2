@@ -19,7 +19,7 @@ import { HELPER_DOCKER_SOCKET, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, VSCODE_ST
 import { errorMessage, isUserFacingError } from '../errors';
 import { VERSION_ENV, isDevspacesVersion, userAgentVersion } from '../http';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedProcess } from '../ports';
-import { HelperChannel, HelperChannelError } from './helperChannel';
+import { CHANNEL_OPEN_TIMEOUT_MS, HelperChannel, HelperChannelError } from './helperChannel';
 import {
   CHANNEL_ENTRY,
   CHANNEL_IDLE_CLOSE_MS,
@@ -177,6 +177,13 @@ export interface ChannelOpenDeps {
   devspaceName?(): Promise<string | undefined>;
 }
 
+/**
+ * Behind the relay, the answer of the worker to `hello` comes within what is left of CHANNEL_OPEN_TIMEOUT_MS after the
+ * open of the connection (RELAY_OPEN_TIMEOUT_MS, the same limit), and gets at least this long: the relay started the
+ * container already, so only the worker starts.
+ */
+const WORKER_HELLO_BEHIND_RELAY_MS = 15_000;
+
 /** Docker's refusal of `--network bridge` on a daemon without it. */
 const NO_BRIDGE = /network "?bridge"? not found/i;
 /** Docker's refusal of a container name that another container on the engine has. */
@@ -202,8 +209,10 @@ function identityText(identity: EngineIdentity): string {
  * A channel whose worker runs behind the relay: one connection for the channel, which ends when the worker ended (its
  * EXIT, or the stream was closed). A failure of the connection (also a refusal of `docker run`, in its message) is a
  * HelperChannelError('open'), so the retries of openHelperChannel (another name, no network) see it as from `start`.
+ * The whole open takes about as long as without the relay (WORKER_HELLO_BEHIND_RELAY_MS).
  */
 async function openBehindRelay(connect: RelayConnect, command: readonly string[], script: string, logger: Logger, name: string): Promise<HelperChannel> {
+  const startedAt = performance.now();
   let connection: RelayConnection;
   try {
     connection = await connect(command, script);
@@ -218,7 +227,8 @@ async function openBehindRelay(connect: RelayConnect, command: readonly string[]
     throw new HelperChannelError('open', errorMessage(error));
   }
   void worker.exited.then(() => connection.close('the worker ended'));
-  return HelperChannel.open(worker, undefined, { logger, name });
+  const openTimeoutMs = Math.max(WORKER_HELLO_BEHIND_RELAY_MS, Math.round(CHANNEL_OPEN_TIMEOUT_MS - (performance.now() - startedAt)));
+  return HelperChannel.open(worker, undefined, { logger, name, openTimeoutMs });
 }
 
 /**

@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { LOCAL_DOCKER_TARGET, dockerTargetOf } from '../docker/dockerHost';
+import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
 import { RelayConnectionError } from './connection';
 import { RELAY_SHELL_COMMAND, openRelayConnection, sshRelayTransport } from './transport';
@@ -66,6 +67,18 @@ describe('openRelayConnection', () => {
     expect(written[0]).toMatch(/^printf '%s\\n' devspaces-start-[0-9a-f]{32}; exec 'docker' 'run' 'it'\\''s'\n$/);
     finish({ exitCode: 255 });
     await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
+  });
+
+  it('refuses a bundle longer than the pipe loader takes, before any start', async () => {
+    const runner = {
+      startBytes: (): StartedByteProcess => {
+        throw new Error('started');
+      },
+    };
+    const transport = { file: 'ssh', args: [], env: {} };
+    const opening = openRelayConnection(runner, transport, ['docker'], 'x'.repeat(MAX_BUNDLE_LINE_LENGTH - 1), { logger: silentLogger, name: 'x' });
+    await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
+    await expect(opening).rejects.toThrow(`The connection to x could not be opened: the bundle is too long (${MAX_BUNDLE_LINE_LENGTH + 1} characters as JSON).`);
   });
 
   it('refuses a command that the start script cannot carry, before any start', async () => {

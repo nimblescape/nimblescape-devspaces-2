@@ -8,8 +8,9 @@
 // No `vscode`.
 import { sshCommandArgs, sshTargetOf, type DockerTarget } from '../docker/dockerHost';
 import { noPromptEnv } from '../docker/remoteDocker';
+import { MAX_BUNDLE_LINE_LENGTH, encodeBundle } from '../loader/pipeLoader';
 import type { Logger, ProcessRunner } from '../ports';
-import { RelayConnection } from './connection';
+import { RelayConnection, RelayConnectionError } from './connection';
 import { relayStartScript, startMarker } from './startScript';
 
 /** The program that carries a connection of the relay: started with `args` and `env`. */
@@ -37,7 +38,8 @@ export function sshRelayTransport(target: DockerTarget, sshPath: string, env: No
 /**
  * Opens a connection of the relay over `transport` (RelayConnection.open): the start script with a new marker runs
  * `command` (`docker run … startRelay`, channelRunArgs with RELAY_ENTRY), and `bundle` is the first line of its pipe
- * loader. Rejects with RelayConnectionError, or with an Error for a command that the start script cannot carry.
+ * loader. Rejects with RelayConnectionError (also, before the start, for a bundle longer than the pipe loader takes), or
+ * with an Error for a command that the start script cannot carry.
  */
 export async function openRelayConnection(
   runner: Required<Pick<ProcessRunner, 'startBytes'>>,
@@ -46,6 +48,9 @@ export async function openRelayConnection(
   bundle: string,
   options: { logger: Logger; name: string },
 ): Promise<RelayConnection> {
+  // The loader limits the escaped line (the memory guard of the pipe loader), so the same is checked here.
+  const length = encodeBundle(bundle).length - 1;
+  if (length > MAX_BUNDLE_LINE_LENGTH) throw new RelayConnectionError(`The connection to ${options.name} could not be opened: the bundle is too long (${length} characters as JSON).`);
   const marker = startMarker();
   const startScript = relayStartScript(marker, command);
   const process = runner.startBytes(transport.file, transport.args, { env: transport.env });

@@ -6,7 +6,7 @@
 // login before the marker, the bundle line after it, the HELLO of a relay mux of the test, the failures of the open,
 // and a worker stream as the program of a helper channel.
 import { afterEach, describe, expect, it } from 'vitest';
-import { MAX_BUNDLE_LINE_LENGTH, encodeBundle } from '../loader/pipeLoader';
+import { encodeBundle } from '../loader/pipeLoader';
 import { silentLogger, type Logger, type StartedByteProcess } from '../ports';
 import { MAX_OUTPUT_BEFORE_MARKER, RelayConnection, RelayConnectionError, type RelayConnectionOptions } from './connection';
 import { settle } from './memoryPipe.testkit';
@@ -166,9 +166,8 @@ describe('RelayConnection.open', () => {
     });
     const marker = transport.marker();
     expect(transport.text()).toBe(relayStartScript(marker, ['docker', 'run', '--rm', '-i', 'image']));
-    // The login prints a greeting and a line that ends with the marker (not the marker line); the marker line comes in
-    // two pieces.
-    transport.print(`Welcome to build-box\r\nthe text ${marker}\n${marker.slice(0, 10)}`);
+    // The login prints a greeting, the last line without a line feed; the marker comes in two pieces.
+    transport.print(`Welcome to build-box\r\nno line feed${marker.slice(0, 10)}`);
     await settle();
     expect(transport.written).toHaveLength(1);
     transport.print(`${marker.slice(10)}\n`);
@@ -180,7 +179,7 @@ describe('RelayConnection.open', () => {
     const connection = await opening;
     expect(connection.isOpen).toBe(true);
     expect(lines).toEqual([
-      `The login on build-box printed ${Buffer.byteLength(`Welcome to build-box\r\nthe text ${marker}\n`)} bytes before the start; they are ignored.`,
+      `The login on build-box printed ${Buffer.byteLength('Welcome to build-box\r\nno line feed')} bytes before the start; they are ignored.`,
       'The connection to build-box is open.',
     ]);
   });
@@ -229,6 +228,9 @@ describe('RelayConnection.open', () => {
     transport.print('x'.repeat(MAX_OUTPUT_BEFORE_MARKER));
     await expect(opening).rejects.toThrow('the login printed more than 64 KiB before the start');
     expect(transport.inputEnded).toBe(true);
+    // What comes after the failure is not read: the marker writes no bundle.
+    transport.print(`${transport.marker()}\n`);
+    expect(transport.written).toHaveLength(1);
     await transport.exited;
     expect(transport.kills).toBe(1);
   });
@@ -249,15 +251,6 @@ describe('RelayConnection.open', () => {
     // A frame of an unknown kind.
     transport.print(Buffer.from([99, 0, 0, 0, 0, 0, 0, 0, 0]));
     await expect(opening).rejects.toThrow('could not be opened: the other side sent a frame of the unknown kind 99');
-  });
-
-  it('refuses a bundle longer than the pipe loader takes, before the transport gets anything', async () => {
-    const transport = new FakeTransport();
-    await expect(open(transport, { bundle: 'x'.repeat(MAX_BUNDLE_LINE_LENGTH - 1) })).rejects.toThrow(
-      `the bundle is too long (${MAX_BUNDLE_LINE_LENGTH + 1} characters as JSON)`,
-    );
-    expect(transport.written).toEqual([]);
-    expect(transport.inputEnded).toBe(true);
   });
 });
 
@@ -332,11 +325,11 @@ describe('RelayConnection', () => {
     connection.onClose((reason) => reasons.push(reason));
     transport.printError('Connection to build-box closed by remote host.\n');
     transport.exit(255);
-    const exit = await worker.exited;
-    expect(exit.exitCode).toBeNull();
+    const reason = 'the connection ended (Connection to build-box closed by remote host.)';
+    await expect(worker.exited).resolves.toEqual({ exitCode: null, error: new Error(reason) });
     await transport.exited;
     await settle();
-    expect(reasons).toHaveLength(1);
+    expect(reasons).toEqual([reason]);
     expect(connection.isOpen).toBe(false);
     expect(transport.kills).toBe(0);
   });
