@@ -308,15 +308,6 @@ export class RemoteShell {
     return taking;
   }
 
-  /**
-   * Ends the shell after the commands and the takeover that wait for it now (`close`); a command after this call gets
-   * ShellGoneError.
-   */
-  closeWhenIdle(): void {
-    const closing = this.queue.then(() => this.close());
-    this.queue = closing.catch(() => undefined);
-  }
-
   /** Ends the shell (its input), unless the relay took it over; a shell that does not end is stopped. */
   close(): void {
     if (this.stage === 'taken' || this.stage === 'ended') return;

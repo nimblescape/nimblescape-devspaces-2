@@ -249,9 +249,10 @@ export class SshAskpassServer implements vscode.Disposable {
       address = `\\\\.\\pipe\\devspaces-askpass-${id}`;
     } else {
       // The same length as the folder of a Docker pipe (pipeAddress.ts), so the path fits the limit of a Unix socket.
-      this.socketFolder = path.posix.join(this.options.base(), `devspaces-${id.slice(0, 16)}`);
-      await fs.promises.mkdir(this.socketFolder, { mode: 0o700 });
-      address = path.posix.join(this.socketFolder, 'askpass');
+      const folder = path.posix.join(this.options.base(), `devspaces-${id.slice(0, 16)}`);
+      await fs.promises.mkdir(folder, { mode: 0o700 });
+      this.socketFolder = folder;
+      address = path.posix.join(folder, 'askpass');
     }
     const server = net.createServer((socket) => this.accept(socket));
     try {
@@ -265,7 +266,7 @@ export class SshAskpassServer implements vscode.Disposable {
       if (this.options.platform !== 'win32') await fs.promises.chmod(address, 0o600);
     } catch (error) {
       // The next prepare listens on a new pipe in a new folder.
-      server.close();
+      if (server.listening) server.close();
       const folder = this.socketFolder;
       this.socketFolder = undefined;
       if (folder !== undefined) await fs.promises.rm(folder, { recursive: true, force: true }).catch(() => undefined);

@@ -103,57 +103,6 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
-  // The test of a host sees the SSH configuration of now; the open shell ends after the command that runs on it.
-  it('logs in anew with fresh, and ends the shell before after its command', async () => {
-    const { registry, logins, processes } = shells();
-    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
-    const running = registry.run('box', 'sleep 0.3; printf two');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await expect(registry.login('box', undefined, { fresh: true })).resolves.toEqual({ ok: true });
-    expect(logins).toEqual(['box', 'box']);
-    // The command on the shell before ends as it is, then that shell ends; the calls after use the new login.
-    await expect(running).resolves.toMatchObject({ exitCode: 0, stdout: 'two' });
-    await expect(processes[0].exited).resolves.toMatchObject({ exitCode: 0 });
-    await expect(registry.run('box', 'printf three')).resolves.toMatchObject({ stdout: 'three' });
-    expect(logins).toEqual(['box', 'box']);
-    // Without fresh, the open shell.
-    await expect(registry.login('box')).resolves.toEqual({ ok: true });
-    expect(logins).toHaveLength(2);
-    registry.dispose();
-  });
-
-  it('keeps the open shell when a fresh login fails', async () => {
-    const logins: string[] = [];
-    let script = 'exec sh -s';
-    const registry = new RemoteShells({
-      logger: silentLogger,
-      loginTimeoutMs: 5_000,
-      start: () => {
-        logins.push('login');
-        return { process: runner.startBytes('sh', ['-c', script]) };
-      },
-    });
-    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
-    script = 'echo "me@box: Permission denied (password)." >&2; exit 255';
-    await expect(registry.login('box', undefined, { fresh: true })).resolves.toMatchObject({ ok: false });
-    await expect(registry.run('box', 'printf two')).resolves.toMatchObject({ stdout: 'two' });
-    expect(logins).toEqual(['login', 'login']);
-    registry.dispose();
-  });
-
-  it('stops a shell that a fresh login replaced at the end of the window', async () => {
-    const { registry, processes } = shells();
-    await registry.login('box');
-    const running = registry.run('box', 'sleep 30');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await registry.login('box', undefined, { fresh: true });
-    registry.dispose();
-    // The end of the shell during the command is its result.
-    expect((await running)?.exitCode).not.toBe(0);
-    await processes[0].exited;
-    await processes[1].exited;
-  });
-
   it('shares the login of a flow with the other calls of the same flow, also after a failure', async () => {
     const logins: string[] = [];
     const registry = new RemoteShells({

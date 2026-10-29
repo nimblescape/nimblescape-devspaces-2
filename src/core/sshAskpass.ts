@@ -204,7 +204,6 @@ function activeScope(): PromptScope | undefined {
   return scope?.active === true ? scope : undefined;
 }
 
-
 /**
  * Runs `fn` as a flow of the user (a command with its progress notification, the test of a remote host): an SSH login
  * that it starts may ask in VS Code. When `signal` aborts, or the signal of a flow that this one runs in, the questions
