@@ -116,6 +116,23 @@ export class DockerPipe {
     return this.options.address;
   }
 
+  /**
+   * True while a connection to the address reaches this pipe: it is not closed, and a Unix socket is still its own file
+   * (not removed by a cleanup of temporary folders, not replaced by another file; refresh repairs only the first). One
+   * lstat of the socket; never throws.
+   */
+  isServing(): boolean {
+    if (this.closed || this.server === undefined) return false;
+    const { address } = this.options;
+    if (address.folder === undefined) return true;
+    try {
+      const stat = fs.lstatSync(address.path);
+      return stat.dev === this.socketFile?.dev && stat.ino === this.socketFile.ino;
+    } catch {
+      return false;
+    }
+  }
+
   /** The connections that are open now (for the tests). */
   get connectionCount(): number {
     return this.sockets.size;

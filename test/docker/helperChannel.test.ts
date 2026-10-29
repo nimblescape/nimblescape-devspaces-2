@@ -178,6 +178,16 @@ describe('the helper channel with the real Docker engine', () => {
     return { channel, process: started!, name, transport };
   }
 
+  /**
+   * Closes the connection of the relay and waits until `--rm` removed its container `name`, so that no later check of
+   * the leftovers (afterAll) sees it, also when the test runs alone.
+   */
+  async function endRelay(connections: RelayConnections, transport: StartedByteProcess | undefined, name: string): Promise<void> {
+    connections.close('runner-engine', 'the test closed it');
+    await transport?.exited;
+    await waitUntil(() => cli.container(name) === undefined, 'the removal of the container');
+  }
+
   beforeAll(async () => {
     script = await timings.measure('bundle the script', bundleScript);
     // The helper image through the harness.
@@ -306,7 +316,7 @@ describe('the helper channel with the real Docker engine', () => {
     let pipe: DockerPipe | undefined;
     const sleeper = `devspaces-pipe-test-${run.runId}`;
     try {
-      const { channel } = await open([], { relay: connections });
+      const { channel, name, transport } = await open([], { relay: connections });
       const address = dockerPipeAddress('0123456789abcdef', process.platform, folder);
       pipe = await DockerPipe.listen({ address, connect: async (socket) => relayDockerDial(connections.get('runner-engine')!, socket), logger: log, name: 'the test' });
       const viaPipe = (args: string[], input?: string) => byteRunner.run(run.dockerPath, ['-H', address.dockerHost, ...args], { env, input, timeoutMs: 120_000 });
@@ -326,6 +336,7 @@ describe('the helper channel with the real Docker engine', () => {
       // The worker stream and at least one Docker stream for each of the four calls.
       expect(connections.get('runner-engine')?.streamsOpened).toBeGreaterThanOrEqual(5);
       channel.close();
+      await endRelay(connections, transport, name);
     } finally {
       cli.run(['rm', '-f', sleeper]);
       pipe?.close();
@@ -347,7 +358,7 @@ describe('the helper channel with the real Docker engine', () => {
     const context = fs.mkdtempSync(path.join(os.tmpdir(), 'host-pipe-build-'));
     const tag = `devspaces-pipe-build-test:${run.runId}`;
     try {
-      const { channel } = await open([], { relay: connections });
+      const { channel, name, transport } = await open([], { relay: connections });
       await waitUntil(() => pipes.dockerHost('runner-engine') !== undefined, 'the Docker pipe of the extension');
       const connection = connections.get('runner-engine')!;
       const opened = connection.streamsOpened;
@@ -362,6 +373,7 @@ describe('the helper channel with the real Docker engine', () => {
       // The inspect, the build, and the list of the image by its build label went over Docker streams of the connection.
       expect(connection.streamsOpened - opened).toBeGreaterThanOrEqual(3);
       channel.close();
+      await endRelay(connections, transport, name);
     } finally {
       hostPipes.dispose();
       connections.dispose();

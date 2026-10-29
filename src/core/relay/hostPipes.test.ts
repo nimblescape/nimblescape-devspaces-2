@@ -114,6 +114,10 @@ describe('HostPipes', () => {
     // A socket that a cleanup of temporary folders removed: the calls use the Docker context.
     fs.renameSync(address.path, `${address.path}.away`);
     expect(hostPipes.dockerHost('build-box')).toBeUndefined();
+    // Another file at the address: the calls use the Docker context.
+    fs.writeFileSync(address.path, '');
+    expect(hostPipes.dockerHost('build-box')).toBeUndefined();
+    fs.rmSync(address.path);
     fs.renameSync(`${address.path}.away`, address.path);
     expect(hostPipes.dockerHost('build-box')).toBe(address.dockerHost);
     // The pipe closes with the window, and its socket and folder are removed.

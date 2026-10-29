@@ -9,7 +9,6 @@
 // need no SSH login of their own. Each connection of the pipe becomes a Docker stream of that connection
 // (relayDockerDial); when it ended meanwhile, the connection runs its own `ssh … docker system dial-stdio`. No `vscode`.
 import { randomBytes } from 'crypto';
-import * as fs from 'fs';
 import type * as net from 'net';
 import { sshTargetOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
@@ -41,17 +40,14 @@ export class HostPipes {
 
   /**
    * DOCKER_HOST for a Docker call of Devspaces to the engine on `host`: the address of the pipe of the host while it
-   * listens, its socket exists, and a connection of the relay to the host is open; undefined otherwise (the call uses
-   * the Docker context, as before). Never throws.
+   * serves its address (DockerPipe.isServing: a socket that a cleanup of temporary folders removed, until the pipe
+   * listens again at its next refresh, or that another file replaced, does not) and a connection of the relay to the
+   * host is open; undefined otherwise (the call uses the Docker context, as before). Never throws.
    */
   dockerHost(host: string): string | undefined {
     const pipe = this.pipes.get(host)?.pipe;
-    if (pipe === undefined || this.deps.relayConnection(host) === undefined) return undefined;
-    const { address } = pipe;
-    // A socket that a cleanup of temporary folders removed: the calls log in themselves until the pipe listens again
-    // (at its next refresh).
-    if (address.folder !== undefined && !fs.existsSync(address.path)) return undefined;
-    return address.dockerHost;
+    if (pipe === undefined || this.deps.relayConnection(host) === undefined || !pipe.isServing()) return undefined;
+    return pipe.address.dockerHost;
   }
 
   /**

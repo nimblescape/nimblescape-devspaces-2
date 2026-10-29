@@ -19,9 +19,11 @@
 // (checkSshLogin), on every platform: BatchMode makes ssh fail at once instead of asking, and its error names the
 // reason (host key, login, unreachable, closed before the login). It is one connection instead of the several of the
 // Docker CLI, which also lowers the risk of a lock-out by PerSourcePenalties. A success is kept for SSH_CHECK_CACHE_MS
-// per host (SshLoginCache), a failure never. While a connection of the relay to the host is open, the check is
-// skipped: that connection logged in without questions, and the Docker calls of an operation go through it (the Docker
-// pipe of the extension, BootstrapDocker), so the Docker CLI starts no ssh.
+// per host (SshLoginCache), a failure never. While the Docker calls of the extension to the host go through its Docker
+// pipe (HostPipes, BootstrapDocker), the check is skipped: the Docker CLI starts no ssh for them, and the connection of
+// the relay behind the pipe logged in with the options of this check. The few calls of such an operation that still log
+// in with the Docker context come right after such a login to the same host: the checks of a new connection after the
+// login of its transport, and the calls after the connection ended.
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
