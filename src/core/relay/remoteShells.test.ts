@@ -103,22 +103,20 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
-  it('logs in anew for a flow of the user also after the time limit of a login of the background', async () => {
+  it('shares the login of a flow with the other calls of the same flow, also after a failure', async () => {
     const logins: string[] = [];
     const registry = new RemoteShells({
       logger: silentLogger,
-      loginTimeoutMs: 500,
+      loginTimeoutMs: 5_000,
       start: () => {
-        const asks = sshPromptsAllowed();
-        logins.push(asks ? 'asks' : 'quiet');
-        return { process: runner.startBytes('sh', ['-c', asks ? 'exec sh -s' : 'sleep 30']), ...(asks ? { prompts: { onPrompt: () => () => undefined } } : {}) };
+        logins.push('login');
+        // A login that cannot ask (the pipe of the questions is not ready yet) and is refused.
+        return { process: runner.startBytes('sh', ['-c', 'sleep 0.2; echo "me@box: Permission denied (password)." >&2; exit 255']) };
       },
     });
-    const background = registry.login('box');
-    const flow = withSshPrompts(() => registry.login('box'));
-    await expect(background).resolves.toMatchObject({ ok: false, timedOut: true });
-    await expect(flow).resolves.toEqual({ ok: true });
-    expect(logins).toEqual(['quiet', 'asks']);
+    const results = await withSshPrompts(() => Promise.all([registry.login('box'), registry.login('box')]));
+    expect(results).toEqual([expect.objectContaining({ ok: false }), expect.objectContaining({ ok: false })]);
+    expect(logins).toEqual(['login']);
     registry.dispose();
   });
 

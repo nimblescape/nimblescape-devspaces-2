@@ -187,14 +187,12 @@ export interface SshLoginPrompts {
 }
 
 /**
- * The flow of the user that runs now: its logins may ask, until `signal` aborts (the Cancel of its progress). `flow`
- * names the flow; a flow within a flow (a progress notification within an operation) keeps the name of the outer one.
- * Timers and listeners that a flow creates keep its store after it ended; `active` is false then, so their logins ask
- * nothing (as the scope of an operation in dockerTargets.ts).
+ * The flow of the user that runs now: its logins may ask, until `signal` aborts (the Cancel of its progress, or of an
+ * outer flow). Timers and listeners that a flow creates keep its store after it ended; `active` is false then, so their
+ * logins ask nothing (as the scope of an operation in dockerTargets.ts).
  */
 interface PromptScope {
   active: boolean;
-  flow: object;
   signal?: AbortSignal;
 }
 
@@ -206,14 +204,25 @@ function activeScope(): PromptScope | undefined {
   return scope?.active === true ? scope : undefined;
 }
 
+/** A signal that aborts when one of `signals` aborts; undefined for none. */
+function eitherSignal(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const given = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (given.length < 2) return given[0];
+  const controller = new AbortController();
+  for (const signal of given) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  return controller.signal;
+}
+
 /**
  * Runs `fn` as a flow of the user (a command with its progress notification, the test of a remote host): an SSH login
- * that it starts may ask in VS Code. When `signal` aborts, the questions of those logins close (sshPromptSignal); a
- * flow within a flow without a signal of its own takes the signal of the outer flow.
+ * that it starts may ask in VS Code. When `signal` aborts, or the signal of a flow that this one runs in, the questions
+ * of those logins close (sshPromptSignal).
  */
 export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const outer = activeScope();
-  const scope: PromptScope = { active: true, flow: outer?.flow ?? {}, signal: signal ?? outer?.signal };
+  const scope: PromptScope = { active: true, signal: eitherSignal(signal, activeScope()?.signal) };
   try {
     return await promptScopes.run(scope, fn);
   } finally {
@@ -226,9 +235,12 @@ export function sshPromptsAllowed(): boolean {
   return activeScope() !== undefined;
 }
 
-/** The flow of the user that runs now (withSshPrompts), as an object that only it has; undefined outside of one. */
+/**
+ * The flow of the user that runs now (withSshPrompts), as an object that only it has (also a flow within it has its
+ * own); undefined outside of one.
+ */
 export function currentSshPromptFlow(): object | undefined {
-  return activeScope()?.flow;
+  return activeScope();
 }
 
 /** The signal of the flow of the user that runs now (withSshPrompts): when it aborts, its logins ask nothing more. */

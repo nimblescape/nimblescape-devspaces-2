@@ -57,8 +57,8 @@ export class RemoteShells {
    * and with an AbortError when `signal` aborts (the login goes on for the others). A flow of the user whose login may
    * ask (currentSshPromptFlow) that finds a login of the background or of another flow in progress waits for it, and
    * logs in anew when it failed: a login without questions fails for a host that needs a password or an unknown host
-   * key, and the Cancel of the other flow ends the questions of its login. After the time limit of the login of another
-   * flow, which could ask, it does not log in anew.
+   * key, and the Cancel of the other flow ends the questions of its login. After the time limit of that login it does
+   * not: a login without questions fails at once instead of waiting, so the host did not answer in time.
    */
   open(host: string, signal?: AbortSignal): Promise<RemoteShell | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
@@ -69,7 +69,7 @@ export class RemoteShells {
       if (flow === undefined || current.flow === flow) return untilAborted(current.opening, signal);
       return untilAborted(
         current.opening.catch((error: unknown) => {
-          if (!(error instanceof RemoteShellError) || (error.timedOut && current.flow !== undefined) || signal?.aborted) throw error;
+          if (!(error instanceof RemoteShellError) || error.timedOut || signal?.aborted) throw error;
           return this.open(host, signal);
         }),
         signal,
