@@ -29,7 +29,6 @@ export function bridgeStream(stream: MuxStream, readable: Readable, writable: Wr
   const pipeEndsStream = options.pipeEndsStream ?? true;
   // A socket is both.
   const oneObject = (writable as unknown) === readable;
-  let readableEnded = false;
   const destroy = () => {
     readable.destroy();
     if (!oneObject) writable.destroy();
@@ -46,11 +45,10 @@ export function bridgeStream(stream: MuxStream, readable: Readable, writable: Wr
     }
   });
   readable.on('end', () => {
-    readableEnded = true;
     if (pipeEndsStream) stream.end();
   });
   readable.on('close', () => {
-    if (!readableEnded) fail('the connection closed');
+    if (!readable.readableEnded) fail('the connection closed');
   });
   readable.on('error', (error: Error) => fail(error.message));
   if (!oneObject) writable.on('error', (error: Error) => fail(error.message));

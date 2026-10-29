@@ -175,7 +175,9 @@ describe('the streams of a connection of the relay', () => {
     stream.write(Buffer.from('a'));
     await settle();
     expect(reasons).toEqual(['connect ENOENT /var/run/docker.sock']);
-    expect(stream.write(Buffer.from('b'))).toBe(false);
+    // Dropped: nothing waits.
+    expect(stream.write(Buffer.from('b'))).toBe(true);
+    expect(stream.isOpen).toBe(false);
     // The extension closes a stream the relay closed already: its CLOSE comes after the relay's.
     const late = extension.open('docker');
     late.write(Buffer.from('c'));
@@ -183,6 +185,24 @@ describe('the streams of a connection of the relay', () => {
     await settle();
     expect(closes).toEqual([]);
     expect(extension.streamCount).toBe(0);
+  });
+
+  it('wake a writer that waits for the drain when the stream closes', async () => {
+    const accepted: MuxStream[] = [];
+    const { extension } = pair((stream) => {
+      accepted.push(stream);
+      stream.onData(() => {});
+    });
+    const stream = extension.open('docker');
+    expect(stream.write(Buffer.alloc(2 * STREAM_WINDOW))).toBe(false);
+    let woke = false;
+    stream.onDrain(() => (woke = true));
+    await settle();
+    expect(woke).toBe(false);
+    accepted[0].close('gone');
+    await settle();
+    expect(woke).toBe(true);
+    expect(stream.isOpen).toBe(false);
   });
 
   it('end a worker stream with the exit of its worker after its last output', async () => {

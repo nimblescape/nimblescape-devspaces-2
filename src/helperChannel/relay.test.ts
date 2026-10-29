@@ -195,6 +195,17 @@ describeUnix('the relay', () => {
     expect(lines).toEqual([]);
   });
 
+  it('exits with RELAY_FAILURE_EXIT_CODE when a failure comes while it waits for the worker', async () => {
+    const { relay, extension, workers, exits, lines } = start();
+    watch(extension.open('worker'));
+    await until(() => workers.length === 1, 'the worker');
+    relay.inputEnded();
+    relay.shutdown('an error of the relay: boom', true);
+    workers[0].end({ code: 0, signal: null });
+    expect(exits).toEqual([RELAY_FAILURE_EXIT_CODE]);
+    expect(lines).toEqual(['devspace relay: an error of the relay: boom']);
+  });
+
   it('stops a worker that does not end with SIGKILL after the stop time, and exits', async () => {
     const { relay, extension, workers, exits } = start({ workerStopMs: 50 });
     watch(extension.open('worker'));

@@ -86,6 +86,16 @@ export function startBatchHelper(initial: string): void {
   serve(initial, batchHelperOperations({ spawnStep: spawnStepProcess, runQuiet: runQuietProcess, fs, env: process.env, unsafe }));
 }
 
+/**
+ * `input` as text: UTF-8, so that a character whose bytes come in two reads stays whole. The loader sets it when it
+ * reads the bundle from the input; it sets nothing when it starts a stored file without reading the input (the worker
+ * that the relay starts, relay.ts). An input that is UTF-8 already keeps its decoder (it may hold the first bytes of a
+ * character).
+ */
+export function readAsText(input: Pick<NodeJS.ReadStream, 'readableEncoding' | 'setEncoding'>): void {
+  if (input.readableEncoding !== 'utf8') input.setEncoding('utf8');
+}
+
 function serve(initial: string, operations: Readonly<Record<string, OperationHandler>>): void {
   const server = new ChannelServer({
     write: (text) => {
@@ -110,7 +120,8 @@ function serve(initial: string, operations: Readonly<Record<string, OperationHan
   process.on('unhandledRejection', fatal);
   server.start();
   if (initial !== '') server.input(initial);
-  process.stdin.on('data', (chunk: string | Buffer) => server.input(typeof chunk === 'string' ? chunk : chunk.toString('utf8')));
+  readAsText(process.stdin);
+  process.stdin.on('data', (chunk: string) => server.input(chunk));
   process.stdin.on('end', () => server.inputEnded());
   process.stdin.on('close', () => server.inputEnded());
   process.stdin.on('error', () => server.inputEnded());
