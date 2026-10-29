@@ -6,8 +6,10 @@
 // container runs PIPE_LOADER, a short `node -e` program, with three arguments: the path of the bundle in the
 // container's own file system, the sha256 of the bundle, and the name of the exported function to start. The extension
 // writes the bundle (a file of the `.vsix`) as the first line of the standard input, as a JSON string (encodeBundle).
-// The loader checks its hash, stores it atomically (a temporary file, then a rename), and calls the entry with the rest
-// of the input that it read already; the standard input stays paused (UTF-8) and belongs to the bundle from then on.
+// The loader checks its hash, stores it atomically (a temporary file, then a rename), puts the rest of the input that it
+// read already back in front of the standard input, and calls the entry without arguments. The standard input stays
+// paused and without an encoding (bytes) and belongs to the bundle from then on: each entry reads it as text or as
+// bytes.
 //
 // When the file at the path exists already and has the expected hash (a container that was restarted: `docker start`,
 // `docker restart`, a restart policy), the loader starts it without reading the standard input at all. A stored file
@@ -43,29 +45,30 @@ export const LOADER_BUNDLE_TIMEOUT_MS = 60_000;
 
 /**
  * The program of the container (`node -e PIPE_LOADER <path> <sha256> <entry>`). Only Node.js built-ins, one line.
- * `x`: fail; `h`: sha256 hex over UTF-8; `go`: load the stored file and call its entry with the rest of the input.
+ * `x`: fail; `h`: sha256 hex over UTF-8; `go`: load the stored file and call its entry. The first line is decoded as
+ * UTF-8 (`D`, a StringDecoder) up to its line feed, the byte 10, which is never a part of another character in UTF-8.
  */
 export const PIPE_LOADER = [
   `const fs=require('fs'),c=require('crypto'),p=require('path'),[,P,H,E]=process.argv,M=${MAX_BUNDLE_LINE_LENGTH},`,
   `x=t=>{process.stderr.write('devspace loader: '+t+'\\n');process.exit(${LOADER_EXIT_CODE})},`,
   `h=t=>c.createHash('sha256').update(t,'utf8').digest('hex'),`,
-  `go=r=>{let f;try{f=require(P)[E]}catch(e){x('the bundle cannot be loaded: '+e.message)}`,
-  `if(typeof f!=='function')x('the bundle has no function '+E);try{f(r)}catch(e){x('the entry failed: '+(e&&e.message))}};`,
+  `go=()=>{let f;try{f=require(P)[E]}catch(e){x('the bundle cannot be loaded: '+e.message)}`,
+  `if(typeof f!=='function')x('the bundle has no function '+E);try{f()}catch(e){x('the entry failed: '+(e&&e.message))}};`,
   `if(!/^[0-9a-f]{64}$/.test(H||'')||!P||!p.isAbsolute(P)||!/^[A-Za-z]+$/.test(E||''))x('invalid arguments');`,
   `let o;try{o=fs.readFileSync(P,'utf8')}catch{}`,
-  `if(o!==undefined&&h(o)===H)go('');else{`,
+  `if(o!==undefined&&h(o)===H)go();else{`,
   `try{if(fs.existsSync(P+'.started'))x('started before without its bundle');`,
   `fs.mkdirSync(p.dirname(P),{recursive:true});fs.writeFileSync(P+'.started','')}catch(e){x('the bundle cannot be stored: '+e.message)}`,
-  `let b='';const s=process.stdin;s.setEncoding('utf8');`,
+  `let b='';const s=process.stdin,D=new(require('string_decoder').StringDecoder);`,
   `const t=setTimeout(()=>x('no bundle within ${LOADER_BUNDLE_TIMEOUT_MS / 1000} s'),${LOADER_BUNDLE_TIMEOUT_MS}),`,
   `e=()=>x('the input ended before the bundle'),`,
-  `f=d=>{const n=b.length;b+=d;const i=b.indexOf('\\n',n);if(i<0?b.length>M:i>M)x('the bundle is too long');if(i<0)return;`,
+  `f=d=>{const i=d.indexOf(10);b+=i<0?D.write(d):D.write(d.subarray(0,i))+D.end();if(b.length>M)x('the bundle is too long');if(i<0)return;`,
   `s.off('data',f);s.off('end',e);s.pause();clearTimeout(t);`,
-  `let v;try{v=JSON.parse(b.slice(0,i))}catch{}`,
+  `let v;try{v=JSON.parse(b)}catch{}`,
   `if(typeof v!=='string'||h(v)!==H)x('the bundle does not match its hash');`,
   `try{fs.writeFileSync(P+'.tmp',v);fs.renameSync(P+'.tmp',P)}`,
   `catch(e){x('the bundle cannot be stored: '+e.message)}`,
-  `go(b.slice(i+1))};`,
+  `s.unshift(d.subarray(i+1));go()};`,
   `s.on('data',f);s.on('end',e)}`,
 ].join('');
 

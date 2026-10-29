@@ -35,7 +35,7 @@ describe('the pipe loader', () => {
     expect(PIPE_LOADER).toContain(`${LOADER_BUNDLE_TIMEOUT_MS})`);
     expect(PIPE_LOADER).toContain("'devspace loader: '");
     // Only built-ins; never a fixed path, a hash or an entry name (they are its arguments).
-    expect(PIPE_LOADER.match(/require\('([^']+)'\)/g)).toEqual(["require('fs')", "require('crypto')", "require('path')"]);
+    expect(PIPE_LOADER.match(/require\('([^']+)'\)/g)).toEqual(["require('fs')", "require('crypto')", "require('path')", "require('string_decoder')"]);
     expect(PIPE_LOADER).not.toMatch(/\/opt\/devspace|startChannel|startMonitor/);
     // It parses as a program.
     expect(() => new Function(PIPE_LOADER)).not.toThrow();

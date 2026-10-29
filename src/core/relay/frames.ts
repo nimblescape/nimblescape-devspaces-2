@@ -55,7 +55,12 @@ export const FRAME_HEADER_LENGTH = 9;
 export const MAX_FRAME_PAYLOAD = 64 * 1024;
 /** The credit of each direction of a stream at its start: the most bytes that the receiver holds without taking them. */
 export const STREAM_WINDOW = 256 * 1024;
-/** The most streams of one connection at a time (the relay closes each further stream at once). */
+/**
+ * Each DATA frame counts this many bytes more against the credit than its payload, so that many small frames cannot
+ * hold more memory than the window (each one is a buffer and a write of its own).
+ */
+export const FRAME_CHARGE = 256;
+/** The most streams of one connection at a time (an OPEN beyond them breaks the rules). */
 export const MAX_STREAMS = 256;
 /** The longest reason of CLOSE, in characters. */
 export const MAX_CLOSE_REASON_LENGTH = 500;

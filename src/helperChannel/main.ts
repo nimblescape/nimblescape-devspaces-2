@@ -4,8 +4,8 @@
 
 // Entry point of the script of the helper channel (src/core/helperChannel/protocol.ts), bundled to
 // dist/helperChannel.js. The pipe loader of the container (src/core/loader/pipeLoader.ts) checks its hash, stores it at
-// CHANNEL_SCRIPT_PATH, and calls startChannel (CHANNEL_ENTRY) with the input that it read after the script; the rest of
-// the standard input comes as text (the loader set its encoding and paused it). Only Node.js built-ins and small
+// CHANNEL_SCRIPT_PATH, and calls startChannel (CHANNEL_ENTRY); the standard input after the script comes as bytes,
+// which the channel reads as UTF-8 text. Only Node.js built-ins and small
 // modules of src/core. The worker starts no `docker` process: its operations act on the engine through the port over
 // the Engine API.
 //
@@ -67,36 +67,25 @@ export function fatalHandler(server: Pick<ChannelServer, 'shutdown'>, exit: (cod
 }
 
 /**
- * Runs the channel on the standard input and output of this process. `initial`: input that the loader read already.
- * The version of Devspaces comes from the program that started the worker (VERSION_ENV: the extension, channelRunArgs;
+ * Runs the channel on the standard input and output of this process. The version of Devspaces comes from the program that started the worker (VERSION_ENV: the extension, channelRunArgs;
  * the Monitor for its prepares): the header User-Agent of its HTTPS requests, and the version of the Monitor that it
  * creates. Without a version x.y.z, the header has none (the worker has no log of its own to say so).
  */
-export function startChannel(initial: string): void {
+export function startChannel(): void {
   setUserAgentVersion(process.env[VERSION_ENV]);
-  serve(initial, OPERATIONS);
+  serve(OPERATIONS);
 }
 
 /**
  * The entry of the batch helper (BATCH_ENTRY), in the same script as the worker: the same server and the same ways to
  * end, with the step kinds as its operations (batchHelper.ts).
  */
-export function startBatchHelper(initial: string): void {
+export function startBatchHelper(): void {
   const unsafe = prepareBatchHelper();
-  serve(initial, batchHelperOperations({ spawnStep: spawnStepProcess, runQuiet: runQuietProcess, fs, env: process.env, unsafe }));
+  serve(batchHelperOperations({ spawnStep: spawnStepProcess, runQuiet: runQuietProcess, fs, env: process.env, unsafe }));
 }
 
-/**
- * `input` as text: UTF-8, so that a character whose bytes come in two reads stays whole. The loader sets it when it
- * reads the bundle from the input; it sets nothing when it starts a stored file without reading the input (the worker
- * that the relay starts, relay.ts). An input that is UTF-8 already keeps its decoder (it may hold the first bytes of a
- * character).
- */
-export function readAsText(input: Pick<NodeJS.ReadStream, 'readableEncoding' | 'setEncoding'>): void {
-  if (input.readableEncoding !== 'utf8') input.setEncoding('utf8');
-}
-
-function serve(initial: string, operations: Readonly<Record<string, OperationHandler>>): void {
+function serve(operations: Readonly<Record<string, OperationHandler>>): void {
   const server = new ChannelServer({
     write: (text) => {
       if (process.stdout.destroyed || !process.stdout.writable) return false;
@@ -119,8 +108,9 @@ function serve(initial: string, operations: Readonly<Record<string, OperationHan
   process.on('uncaughtException', fatal);
   process.on('unhandledRejection', fatal);
   server.start();
-  if (initial !== '') server.input(initial);
-  readAsText(process.stdin);
+  // Text: UTF-8, so that a character whose bytes come in two reads stays whole (also the bytes that the loader read
+  // after the script and put back).
+  process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk: string) => server.input(chunk));
   process.stdin.on('end', () => server.inputEnded());
   process.stdin.on('close', () => server.inputEnded());

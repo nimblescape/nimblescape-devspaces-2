@@ -1639,10 +1639,9 @@ export function runEntry(argv: readonly string[], deps: EntryDeps = processEntry
 
 /**
  * Pipe loading: the function that the pipe loader of the container starts (REMOTE_MONITOR_ENTRY), at the first start
- * and after each restart: the loop (`run`). `_input`: what the loader read after the script (nothing is expected; the
- * standard input is not read).
+ * and after each restart: the loop (`run`). The standard input is not read.
  */
-export function startMonitor(_input = '', deps: EntryDeps = processEntryDeps()): void {
+export function startMonitor(deps: EntryDeps = processEntryDeps()): void {
   void runEntry(['run'], deps);
 }
 

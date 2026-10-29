@@ -4,7 +4,7 @@
 
 import * as crypto from 'crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MAX_FRAME_PAYLOAD, MAX_STREAMS, STREAM_WINDOW, encodeCredit, encodeFrame, encodeHello, encodeTarget } from './frames';
+import { FRAME_CHARGE, MAX_FRAME_PAYLOAD, MAX_STREAMS, STREAM_WINDOW, encodeCredit, encodeFrame, encodeHello, encodeTarget } from './frames';
 import { MemoryPipe as Pipe, settle } from './memoryPipe.testkit';
 import { Mux, type MuxOptions, type MuxStream } from './mux';
 
@@ -135,15 +135,18 @@ describe('the streams of a connection of the relay', () => {
     stream.onDrain(() => (drained = true));
     await settle();
     const held = () => chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    expect(held()).toBe(STREAM_WINDOW);
-    // 344 KiB wait.
+    // A window holds four frames, each with its charge.
+    const perWindow = STREAM_WINDOW - 4 * FRAME_CHARGE;
+    expect(chunks).toHaveLength(4);
+    expect(held()).toBe(perWindow);
+    // More than a window waits.
     expect(drained).toBe(false);
     accepted[0].consumed(held());
     await settle();
-    expect(held()).toBe(2 * STREAM_WINDOW);
-    // 88 KiB wait.
+    expect(held()).toBe(2 * perWindow);
+    // Less than a window waits.
     expect(drained).toBe(true);
-    accepted[0].consumed(held() - STREAM_WINDOW);
+    accepted[0].consumed(held() - perWindow);
     await settle();
     expect(held()).toBe(600 * 1024);
     expect(Buffer.concat(chunks).equals(Buffer.concat([1, 2, 3].map((value) => Buffer.alloc(200 * 1024, value))))).toBe(true);
@@ -163,6 +166,42 @@ describe('the streams of a connection of the relay', () => {
     await settle(100);
     const order = up.frames.filter((frame) => frame.kind === 'data').map((frame) => frame.stream);
     expect(order).toEqual([worker.id, first.id, second.id, first.id, second.id, first.id, second.id]);
+  });
+
+  it('send a frame of another stream after each frame of the worker, so that a long answer of the worker stops no stream', async () => {
+    const { extension, up } = pair((stream) => stream.onData((chunk) => stream.consumed(chunk.length)));
+    await settle();
+    up.highWater = 1;
+    const docker = extension.open('docker');
+    const worker = extension.open('worker');
+    docker.write(Buffer.alloc(2 * MAX_FRAME_PAYLOAD));
+    worker.write(Buffer.alloc(3 * MAX_FRAME_PAYLOAD));
+    await settle(100);
+    const order = up.frames.filter((frame) => frame.kind === 'data').map((frame) => frame.stream);
+    expect(order).toEqual([worker.id, docker.id, worker.id, docker.id, worker.id]);
+  });
+
+  it('give the credit of many small frames back, with their charge', async () => {
+    const received: Buffer[] = [];
+    let accepted: MuxStream | undefined;
+    const { extension } = pair((stream) => {
+      accepted = stream;
+      stream.onData((chunk) => received.push(chunk));
+    });
+    await settle();
+    const stream = extension.open('docker');
+    // Each write goes as a frame of its own while the link takes it at once.
+    for (let i = 0; i < 2000; i++) {
+      stream.write(Buffer.from([i % 256]));
+      await settle(1);
+    }
+    await settle();
+    // The credit ends after STREAM_WINDOW / (1 + FRAME_CHARGE) frames, though far fewer bytes came.
+    const perWindow = Math.floor(STREAM_WINDOW / (1 + FRAME_CHARGE));
+    expect(received).toHaveLength(perWindow);
+    accepted?.consumed(received.reduce((sum, chunk) => sum + chunk.length, 0));
+    await settle();
+    expect(Buffer.concat(received).length).toBeGreaterThan(perWindow);
   });
 
   it('close a stream at once with a reason, drop what waits, and ignore its frames that still come', async () => {
@@ -287,7 +326,8 @@ describe('a connection of the relay that breaks the rules', () => {
 
   it.each([
     ['a frame of a stream that was never opened', [encodeFrame('data', 5, Buffer.from('x'))], 'the other side sent a frame data on the stream 5, which was never opened'],
-    ['an open of a lower number', [open(2), open(1)], 'the other side sent an invalid open of the stream 1'],
+    ['an open that skips a number', [open(1), open(3)], 'the other side sent an invalid open of the stream 3'],
+    ['an open of a lower number', [open(1), open(2), open(1)], 'the other side sent an invalid open of the stream 1'],
     ['an open of the stream 0', [open(0)], 'the other side sent an invalid open of the stream 0'],
     ['an open of an unknown target', [encodeFrame('open', 1, Buffer.from([9]))], 'the other side sent an invalid open of the stream 1'],
     ['a hello of the extension', [encodeFrame('hello', 0, encodeHello())], 'the other side sent a second hello'],

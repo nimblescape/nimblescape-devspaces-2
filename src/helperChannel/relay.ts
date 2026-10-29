@@ -47,6 +47,7 @@ export interface RelayDeps {
   spawnWorker(): RelayWorker;
   /** One line of the standard error. */
   log(line: string): void;
+  /** Exits with `code`; again with RELAY_FAILURE_EXIT_CODE when a failure comes while the exit waits for the output. */
   exit(code: number): void;
   pingIntervalMs?: number;
   silenceMs?: number;
@@ -57,7 +58,7 @@ export interface RelayDeps {
 export class Relay {
   private readonly mux: Mux;
   private worker: RelayWorker | undefined;
-  private stopping: { code: number; timer?: ReturnType<typeof setTimeout> } | undefined;
+  private stopping: { code: number; timer?: ReturnType<typeof setTimeout>; exited?: boolean } | undefined;
 
   constructor(private readonly deps: RelayDeps) {
     this.mux = new Mux({
@@ -140,8 +141,11 @@ export class Relay {
    */
   private stop(reason: string | undefined, failed: boolean): void {
     if (this.stopping) {
-      if (failed) this.stopping.code = RELAY_FAILURE_EXIT_CODE;
-      if (failed && reason !== undefined) this.deps.log(`devspace relay: ${reason}`);
+      if (!failed) return;
+      if (reason !== undefined) this.deps.log(`devspace relay: ${reason}`);
+      if (this.stopping.code === RELAY_FAILURE_EXIT_CODE) return;
+      this.stopping.code = RELAY_FAILURE_EXIT_CODE;
+      if (this.stopping.exited) this.deps.exit(this.stopping.code);
       return;
     }
     this.stopping = { code: failed ? RELAY_FAILURE_EXIT_CODE : 0 };
@@ -153,8 +157,9 @@ export class Relay {
   }
 
   private exitNow(): void {
-    if (this.stopping === undefined) return;
+    if (this.stopping === undefined || this.stopping.exited) return;
     clearTimeout(this.stopping.timer);
+    this.stopping.exited = true;
     this.deps.exit(this.stopping.code);
   }
 }
@@ -196,36 +201,35 @@ export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
 }
 
 /**
- * Exits with `code` once the frames that wait in the standard output went, within RELAY_EXIT_MARGIN_MS: process.exit
- * drops what waits in a pipe.
+ * An exit of the process once the frames that wait in the standard output went, within RELAY_EXIT_MARGIN_MS
+ * (process.exit drops what waits in a pipe). A later call while it waits changes only the exit code.
  */
-function exitAfterOutput(code: number): void {
-  const exit = () => process.exit(code);
-  if (process.stdout.writableFinished || process.stdout.destroyed) return exit();
-  setTimeout(exit, RELAY_EXIT_MARGIN_MS);
-  process.stdout.once('finish', exit);
-  process.stdout.once('close', exit);
-  process.stdout.end();
+function exitAfterOutput(): (code: number) => void {
+  let waiting = false;
+  return (code) => {
+    process.exitCode = code;
+    if (waiting) return;
+    waiting = true;
+    const exit = () => process.exit();
+    if (process.stdout.writableFinished || process.stdout.destroyed) return exit();
+    setTimeout(exit, RELAY_EXIT_MARGIN_MS);
+    process.stdout.once('finish', exit);
+    process.stdout.once('close', exit);
+    process.stdout.end();
+  };
 }
 
 /**
- * The entry of the relay (RELAY_ENTRY) for the pipe loader: `initial` is the input that the loader read together with
- * the bundle line, decoded as UTF-8, which must be empty (the extension writes nothing more before the HELLO of the
- * relay). The relay reads its input as bytes: the loader set it to UTF-8, which `latin1` replaces here, before any
- * later read (one character per byte, so no byte is changed). The worker runs the stored file of the loader with its
- * hash (the command line of this process).
+ * The entry of the relay (RELAY_ENTRY) for the pipe loader, which hands the input over as bytes. The worker runs the
+ * stored file of the loader with its hash (the command line of this process).
  */
-export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER_SOCKET): void {
+export function startRelay(dockerSocket: string = HELPER_DOCKER_SOCKET): void {
   const [, file, hash] = process.argv;
   const fail = (reason: string) => {
     process.stderr.write(`devspace relay: ${reason}\n`);
     process.exit(RELAY_FAILURE_EXIT_CODE);
   };
-  if (initial !== '') return fail('input came before the hello of the relay');
   if (!file || !/^[0-9a-f]{64}$/.test(hash ?? '')) return fail('the command line names no stored file of the pipe loader');
-  process.stdin.setEncoding('latin1');
-  // Input that came in a later read before this point waits as UTF-8 text, whose bytes are lost.
-  if (process.stdin.readableLength > 0) return fail('input came before the hello of the relay');
   const relay = new Relay({
     link: {
       write: (chunk) => process.stdout.write(chunk),
@@ -235,7 +239,7 @@ export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER
     connectDocker: () => net.createConnection({ path: dockerSocket, allowHalfOpen: true }),
     spawnWorker: () => spawnLoaderWorker(file, hash),
     log: (line) => process.stderr.write(`${line}\n`),
-    exit: exitAfterOutput,
+    exit: exitAfterOutput(),
   });
   process.stdout.on('error', (error) => relay.shutdown(`the output cannot be written (${error.message})`, true));
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(signal, () => relay.shutdown(`stopped by ${signal}`));
@@ -251,7 +255,7 @@ export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER
   };
   process.on('uncaughtException', fatal);
   process.on('unhandledRejection', fatal);
-  process.stdin.on('data', (chunk: string) => relay.input(Buffer.from(chunk, 'latin1')));
+  process.stdin.on('data', (chunk: Buffer) => relay.input(chunk));
   process.stdin.on('end', () => relay.inputEnded());
   process.stdin.on('close', () => relay.inputEnded());
   process.stdin.on('error', (error) => relay.shutdown(`the input cannot be read (${error.message})`, true));
