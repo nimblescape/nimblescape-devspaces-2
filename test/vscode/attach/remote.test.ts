@@ -12,20 +12,62 @@
 // window must not use. The current context is the one of the URI, so these tests do not tell whether Dev Containers
 // reads the context from the URI or follows the current context; the window of another Docker host than the current
 // one closes before it attaches (controller.ts, onWindowHost).
+// The first test counts the SSH logins of the open on the other computer and writes them to the log of the test and to
+// the summary of the CI job; it sets no limit yet.
 import * as assert from 'assert';
+import * as childProcess from 'child_process';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { DEFAULT_CONTEXT_NAME } from '../../../src/core/docker/dockerHost';
 import { LABEL_DEVSPACE_ID, LABEL_HELPER } from '../../../src/core/names';
 import { LABEL_MONITOR } from '../../../src/core/remoteMonitor/protocol';
 import { decodeAuthorityParts } from '../../../src/vscode/connection/authority';
-import { EXTENSION_ID, channelLog, connectedFolder, docker, printLogs, seed, serverDataFolder } from './support';
+import { loginsUntil, sshLogEvents } from './sshLogins';
+import { EXTENSION_ID, channelLog, connectedFolder, docker, printLogs, printLong, seed, serverDataFolder } from './support';
 
 /** A file that the window writes into its container. */
 const WINDOW_MARK = '/tmp/devspaces-test-window-mark';
+/**
+ * The count of the logins of the open ends when no login came for LOGINS_QUIET_MS after the connection of the window
+ * and after the last login, at the latest LOGINS_WAIT_MS after the connection.
+ */
+const LOGINS_QUIET_MS = 15_000;
+const LOGINS_WAIT_MS = 90_000;
+/** The longest command of a session in the timeline. */
+const SESSION_TEXT_LENGTH = 200;
+
+/**
+ * The log of the container of the other computer since `since` (ISO 8601), with the time of each line: its standard
+ * output and standard error, where sshd writes. The container runs on the Docker engine of the runner (the context
+ * `default`), so this read is no SSH login.
+ */
+function remoteHostLog(container: string, since: string): string {
+  const result = childProcess.spawnSync('docker', ['--context', DEFAULT_CONTEXT_NAME, 'logs', '--timestamps', '--since', since, container], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  assert.strictEqual(result.status, 0, `docker logs ${container}: ${result.stderr}`);
+  return `${result.stdout}\n${result.stderr}`;
+}
+
+/**
+ * The time of the first line of `log` (the Devspaces log, `[HH:MM:SS] <level> <message>` in local time) that matches
+ * `pattern`, on the day of `near`, or of the day before when it would be later than `near`. Undefined without such a
+ * line.
+ */
+function logLineTime(log: string, pattern: RegExp, near: number): number | undefined {
+  const line = log.split('\n').find((text) => pattern.test(text));
+  const match = line === undefined ? undefined : /^\[(\d\d):(\d\d):(\d\d)\]/.exec(line);
+  if (!match) return undefined;
+  const date = new Date(near);
+  date.setHours(Number(match[1]), Number(match[2]), Number(match[3]), 0);
+  if (date.getTime() > near) date.setDate(date.getDate() - 1);
+  return date.getTime();
+}
 
 describe('the window of a devspace on a Docker engine over SSH', () => {
-  const { containerName, dockerContext = '', remoteHost = '' } = seed();
+  const { containerName, dockerContext = '', remoteHost = '', remoteHostContainer = '', preparedAt = '' } = seed();
   let failed = false;
 
   afterEach(function () {
@@ -34,6 +76,70 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
 
   after(() => {
     if (failed) printLogs();
+  });
+
+  // The first test: the tests after it run Docker over SSH themselves.
+  it('counts the SSH logins of the open on that engine (measured, without a limit yet)', async () => {
+    // The tests start once the window has connected, so the age of the extension host is the time of the connection.
+    const connected = Date.now();
+    const started = connected - process.uptime() * 1000;
+    await connectedFolder();
+    assert.ok(remoteHostContainer && preparedAt, 'The seed names no container of the other computer and no time of the preparation (prepare.ts)');
+    let output = remoteHostLog(remoteHostContainer, preparedAt);
+    let events = sshLogEvents(output);
+    const quietSince = () => Math.max(connected, events.filter((event) => event.kind === 'login').at(-1)?.time ?? connected);
+    while (Date.now() - quietSince() < LOGINS_QUIET_MS && Date.now() - connected < LOGINS_WAIT_MS) {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      output = remoteHostLog(remoteHostContainer, preparedAt);
+      events = sshLogEvents(output);
+    }
+    const settled = Date.now() - quietSince() >= LOGINS_QUIET_MS;
+    assert.ok(loginsUntil(events) > 0, `The log of ${remoteHostContainer} shows no SSH login since ${preparedAt}:\n${output.slice(-4_000)}`);
+    assert.ok(
+      events.some((event) => event.kind === 'session'),
+      `The log of ${remoteHostContainer} shows no command of a session since ${preparedAt} (REMOTE_HOST_SESSION of prepare.ts):\n${output.slice(-4_000)}`,
+    );
+
+    // The worker of the open starts before Dev Containers attaches: the logins until the devspace was ready are those
+    // of Devspaces (the log of Devspaces has whole seconds, so this count may include the logins of one more second).
+    const ready = logLineTime(channelLog('Devspaces'), / is ready in the container /, connected);
+    const seconds = (time: number) => ((time - started) / 1000).toFixed(1);
+    const lastLogin = events.filter((event) => event.kind === 'login').at(-1)?.time;
+    const rows: [string, string, string][] = [
+      ['the devspace was ready (log of Devspaces, whole seconds)', ready === undefined ? '?' : String(loginsUntil(events, ready + 999)), ready === undefined ? '?' : seconds(ready)],
+      ['the window was connected (the tests started)', String(loginsUntil(events, connected)), seconds(connected)],
+      [
+        settled ? `the last login (no login for ${LOGINS_QUIET_MS / 1000} s after it)` : `the last login (logins still came ${LOGINS_WAIT_MS / 1000} s after the connection)`,
+        String(loginsUntil(events)),
+        lastLogin === undefined ? '-' : seconds(lastLogin),
+      ],
+    ];
+    const timeline = [
+      ...events.filter((event) => event.kind === 'session').map((event) => ({ time: event.time, text: event.text.slice(0, SESSION_TEXT_LENGTH) })),
+      ...(ready === undefined ? [] : [{ time: ready, text: '(Devspaces: the devspace is ready)' }]),
+      { time: connected, text: '(the window is connected, the tests start)' },
+    ]
+      .sort((a, b) => a.time - b.time)
+      .map((entry) => `${seconds(entry.time).padStart(7)} s  ${entry.text}`);
+    printLong(
+      [
+        `    SSH logins on ${remoteHost} for the open of the devspace (seconds after the start of the extension host of the window):`,
+        ...rows.map(([until, logins, at]) => `      until ${until}: ${logins} logins, at ${at} s`),
+        '    the sessions:',
+        ...timeline.map((line) => `      ${line}`),
+      ].join('\n'),
+    );
+    // The summary of the CI job (GitHub Actions); without it, only the log of the test has the numbers.
+    const summary = process.env.GITHUB_STEP_SUMMARY;
+    if (summary) {
+      const table = ['| Until | SSH logins | Seconds after the start of the extension host |', '| --- | ---: | ---: |', ...rows.map((row) => `| ${row.join(' | ')} |`)];
+      const text = [`### SSH logins of one open on a remote Docker host`, '', ...table, '', '<details><summary>The sessions</summary>', '', '```text', ...timeline, '```', '', '</details>', ''];
+      try {
+        fs.appendFileSync(summary, `${text.join('\n')}\n`);
+      } catch (error) {
+        console.log(`    the summary of the job could not be written: ${String(error)}`);
+      }
+    }
   });
 
   it('connects after the extension restored the devspace on that engine and ran its open pipeline there', async () => {

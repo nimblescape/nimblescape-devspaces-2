@@ -72,26 +72,42 @@ const POST_START_COMMAND = `if [ -f ${LONG_START_MARK} ]; then rm -f ${LONG_STAR
  * its data in a volume of the runner, where its storage driver works) and an SSH server for root with key
  * authentication. MaxStartups, MaxSessions and PerSourcePenalties are set as in test/docker/sshd/Dockerfile, because the
  * Docker CLI opens a new SSH connection for each call (OpenSSH of docker:28-dind knows PerSourcePenalties). The host
- * REMOTE_HOST of the SSH config of the runner points to it.
+ * REMOTE_HOST of the SSH config of the runner points to it. sshd logs each login (LogLevel VERBOSE), and its
+ * ForceCommand REMOTE_HOST_SESSION writes the command of each session into the log of the container before it runs it as
+ * sshd would, so that remote.test.ts can count the SSH logins of the open.
  */
 const REMOTE_HOST = 'devspaces-test-remote';
-const REMOTE_HOST_IMAGE = 'devspaces-attach-test-remote:1';
+const REMOTE_HOST_IMAGE = 'devspaces-attach-test-remote:2';
 const REMOTE_HOST_CONTAINER = 'attach-test-remote-host';
 const REMOTE_HOST_DOCKER_VOLUME = 'attach-test-remote-docker';
+/** The ForceCommand of sshd on the other computer (REMOTE_HOST_START writes it). */
+const REMOTE_HOST_SESSION = '/usr/local/bin/devspaces-test-session';
 const REMOTE_HOST_DOCKERFILE = `FROM mirror.gcr.io/library/docker:28-dind
 RUN apk add --no-cache openssh-server \\
  && ssh-keygen -A \\
  && sed -i 's/^root:[^:]*:/root:*:/' /etc/shadow \\
- && printf '%s\\n' 'PermitRootLogin prohibit-password' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'PubkeyAuthentication yes' 'LogLevel VERBOSE' 'MaxStartups 100:30:200' 'MaxSessions 100' >> /etc/ssh/sshd_config \\
+ && printf '%s\\n' 'PermitRootLogin prohibit-password' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'PubkeyAuthentication yes' 'LogLevel VERBOSE' 'MaxStartups 100:30:200' 'MaxSessions 100' 'ForceCommand ${REMOTE_HOST_SESSION}' >> /etc/ssh/sshd_config \\
  && if /usr/sbin/sshd -t -o PerSourcePenalties=no; then echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config; fi \\
  && /usr/sbin/sshd -t
 `;
-/** The start of the other computer: the public key of the runner for root, sshd, and the Docker engine (unix socket only). */
+/**
+ * The start of the other computer: the public key of the runner for root, the ForceCommand REMOTE_HOST_SESSION, sshd,
+ * and the Docker engine (unix socket only). REMOTE_HOST_SESSION writes `devspaces-test-ssh: <command>` (`(shell)` for a
+ * session without a command) to the standard error of the first process of the container, which `docker logs
+ * --timestamps` shows with its time, and then runs the command with `sh -c`, as sshd runs it with the shell of root.
+ */
 const REMOTE_HOST_START = `set -eu
 mkdir -p /root/.ssh
 printf '%s\\n' "$AUTHORIZED_KEY" > /root/.ssh/authorized_keys
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
+cat > ${REMOTE_HOST_SESSION} <<'SESSION'
+#!/bin/sh
+printf 'devspaces-test-ssh: %s\\n' "\${SSH_ORIGINAL_COMMAND:-(shell)}" >> /proc/1/fd/2 2>/dev/null || true
+if [ -n "\${SSH_ORIGINAL_COMMAND:-}" ]; then exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"; fi
+exec /bin/sh -l
+SESSION
+chmod 755 ${REMOTE_HOST_SESSION}
 /usr/sbin/sshd -D -e &
 exec dockerd-entrypoint.sh dockerd --host=unix:///var/run/docker.sock
 `;
@@ -248,8 +264,20 @@ async function prepareRemote(local: BootstrapDocker, dockerPath: string, started
   await local.runChecked(['run', '-d', '--name', name, '--entrypoint', 'sh', REMOTE_HOST_IMAGE, '-c', 'exec tail -f /dev/null']);
   await useContext(local, context);
   log.info(`The current Docker context is ${context}.`);
+  // After the last SSH login of the preparation: remote.test.ts counts the logins from this time.
+  const preparedAt = new Date().toISOString();
   return {
-    remote: { containerName: name, folder, folderUri: folderUri(name, folder, context), user: 'node', devspaceId, dockerContext: context, remoteHost: REMOTE_HOST },
+    remote: {
+      containerName: name,
+      folder,
+      folderUri: folderUri(name, folder, context),
+      user: 'node',
+      devspaceId,
+      dockerContext: context,
+      remoteHost: REMOTE_HOST,
+      remoteHostContainer: REMOTE_HOST_CONTAINER,
+      preparedAt,
+    },
   };
 }
 
