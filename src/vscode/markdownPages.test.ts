@@ -159,8 +159,15 @@ describe('the Markdown pages', () => {
     expect(docs).toEqual(expect.arrayContaining(['architecture.md', 'guide.md', 'security.md']));
   });
 
-  // The pages that only GitHub shows, where a relative link works: the pages of docs/ and CONTRIBUTING.md.
-  const githubPages = [...docs.map((file) => `docs/${file}`), 'CONTRIBUTING.md'];
+  const designs = fs.readdirSync(path.join(ROOT, 'docs', 'design')).filter((file) => file.endsWith('.md'));
+
+  it('finds the pages of docs/design/', () => {
+    expect(designs).toEqual(expect.arrayContaining(['remote-devspaces-one-ssh-login.md', 'remote-host-for-many-students.md']));
+  });
+
+  // The pages that only GitHub shows, where a relative link works: the pages of docs/, of docs/design/ and
+  // CONTRIBUTING.md.
+  const githubPages = [...docs.map((file) => `docs/${file}`), ...designs.map((file) => `docs/design/${file}`), 'CONTRIBUTING.md'];
 
   it.each(githubPages)('%s has no raw tag, so that GitHub shows each placeholder such as `<host>`', (file) => {
     expect(problems(read(file), { links: false })).toEqual([]);
