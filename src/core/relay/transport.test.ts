@@ -2,7 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { LOCAL_DOCKER_TARGET, dockerTargetOf } from '../docker/dockerHost';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
@@ -71,6 +71,50 @@ describe('openRelayConnection', () => {
     await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
   });
 
+  it('writes the start script into the shell before the relay that it takes over, without a new login', async () => {
+    const written: string[] = [];
+    let finish: (result: { exitCode: number | null }) => void = () => {};
+    const shell: StartedByteProcess = {
+      write: (chunk) => written.push(chunk.toString('utf8')) > 0,
+      onDrain: () => {},
+      end: () => {},
+      kill: () => {},
+      onStdout: () => {},
+      pauseStdout: () => {},
+      resumeStdout: () => {},
+      onStderr: () => {},
+      exited: new Promise((resolve) => (finish = resolve)),
+    };
+    const runner = {
+      startBytes: (): StartedByteProcess => {
+        throw new Error('a new login');
+      },
+    };
+    const lines: string[] = [];
+    const logger = { ...silentLogger, info: (line: string) => lines.push(line) };
+    const transport = { file: '/usr/bin/ssh', args: ['--', 'build-box', 'sh -s'], env: {} };
+    const opening = openRelayConnection(runner, transport, ['docker', 'run'], 'bundle', { logger, name: 'build-box', takeOver: async () => shell });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/^printf '%s\\n' devspaces-start-[0-9a-f]{32}; exec 'docker' 'run'\n$/);
+    expect(lines).toEqual(['The connection to build-box starts on the SSH login of the shell before the relay.']);
+    finish({ exitCode: 255 });
+    await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
+  });
+
+  it('logs in anew when there is no shell to take over', async () => {
+    const starts: string[] = [];
+    const runner = {
+      startBytes: (file: string): StartedByteProcess => {
+        starts.push(file);
+        throw new Error('started');
+      },
+    };
+    const transport = { file: '/usr/bin/ssh', args: [], env: {} };
+    await expect(openRelayConnection(runner, transport, ['docker'], 'bundle', { logger: silentLogger, name: 'x', takeOver: async () => undefined })).rejects.toThrow('started');
+    expect(starts).toEqual(['/usr/bin/ssh']);
+  });
+
   it('refuses a bundle longer than the pipe loader takes, before any start', async () => {
     const runner = {
       startBytes: (): StartedByteProcess => {
@@ -78,9 +122,12 @@ describe('openRelayConnection', () => {
       },
     };
     const transport = { file: 'ssh', args: [], env: {} };
-    const opening = openRelayConnection(runner, transport, ['docker'], 'x'.repeat(MAX_BUNDLE_LINE_LENGTH - 1), { logger: silentLogger, name: 'x' });
+    const takeOver = vi.fn(async () => undefined);
+    const opening = openRelayConnection(runner, transport, ['docker'], 'x'.repeat(MAX_BUNDLE_LINE_LENGTH - 1), { logger: silentLogger, name: 'x', takeOver });
     await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
     await expect(opening).rejects.toThrow(`The connection to x could not be opened: the bundle is too long (${MAX_BUNDLE_LINE_LENGTH + 1} characters as JSON).`);
+    // The shell before the relay stays the window's.
+    expect(takeOver).not.toHaveBeenCalled();
   });
 
   it('refuses a command that the start script cannot carry, before any start', async () => {

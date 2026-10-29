@@ -23,6 +23,7 @@ import { silentLogger, type Logger, type StartOptions, type StartedByteProcess }
 import { NodeProcessRunner } from '../core/process';
 import { RelayConnectionError } from '../core/relay/connection';
 import { RELAY_ENTRY } from '../core/relay/frames';
+import { RemoteShells } from '../core/relay/remoteShells';
 import { openRelayConnection, type RelayTransport } from '../core/relay/transport';
 import { engineSocketPlugin } from './engineSocket.testkit';
 
@@ -135,6 +136,33 @@ describeUnix('the connection of the relay through sh -s', () => {
     await expect(process.exited).resolves.toEqual({ exitCode: 0 });
     expect(connection.isOpen).toBe(false);
     expect(alive(workers[0])).toBe(false);
+  });
+
+  it('starts on the login of the shell before the relay, after the checks on that shell', { timeout: SLOW_TEST_MS }, async () => {
+    logLines.length = 0;
+    const startsBefore = started.length;
+    const shells = new RemoteShells({ logger, start: () => runner.startBytes(transport.file, transport.args, { env: transport.env }) });
+    // The checks before the relay: commands of the shell on the one login.
+    await expect(shells.run('fake-host', `printf '%s' "$PPID" >/dev/null; printf checked`)).resolves.toMatchObject({ exitCode: 0, stdout: 'checked' });
+    await expect(shells.run('fake-host', 'cat', { input: 'input of a check\n' })).resolves.toMatchObject({ exitCode: 0, stdout: 'input of a check\n' });
+    const connection = await openRelayConnection(runner, transport, relayCommand(), script, { logger, name: 'fake-host', takeOver: () => shells.takeOver('fake-host') });
+    // One login for the checks and the connection.
+    expect(started.length - startsBefore).toBe(1);
+    expect(logLines).toEqual([
+      'The login on fake-host printed 20 bytes before the shell answered; they are ignored.',
+      'The shell on fake-host is open: one SSH login for the checks before the relay.',
+      'The connection to fake-host starts on the SSH login of the shell before the relay.',
+      'The connection to fake-host is open.',
+    ]);
+    const worker = connection.openWorker();
+    const channel = await HelperChannel.open(worker, undefined, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
+    const probe = parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({})));
+    expect(probe?.engine).toEqual({ id: ENGINE_ID, rootDir: '/var/lib/docker' });
+    channel.close();
+    await expect(worker.exited).resolves.toEqual({ exitCode: 0 });
+    connection.close('the test ended');
+    await expect(started.at(-1)!.exited).resolves.toEqual({ exitCode: 0 });
+    shells.dispose();
   });
 
   it('a closed window stops the relay and its worker at once', { timeout: SLOW_TEST_MS }, async () => {

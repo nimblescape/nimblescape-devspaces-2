@@ -284,9 +284,12 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   let opened: RelayConnection | undefined;
   // Its calls without the worker use the Docker context (withContext), not the open connection of the engine.
   const ownDeps: ChannelOpenDeps = { ...deps, runDirect: (args, options) => deps.runDirect(args, options, true) };
+  // The engine identity without the worker, read before the start: on an SSH host, on the shell before the relay, whose
+  // login the new connection then takes over (no login after it).
+  const direct = await readEngineIdentity(ownDeps, target);
   try {
     const channel = await startChannel(ownDeps, target, name, relay, (connection) => (opened = connection));
-    await checkChannelEngine(ownDeps, target, name, channel);
+    await checkChannelEngine(ownDeps, target, name, channel, direct);
     if (opened !== undefined) relay?.use(opened);
     return channel;
   } catch (error) {
@@ -380,11 +383,27 @@ async function startChannel(
   }
 }
 
+/** The engine identity that ENGINE_IDENTITY_ARGS reads without the worker, or why it could not be read. */
+interface DirectIdentity {
+  identity?: EngineIdentity;
+  detail: string;
+}
+
+/** ENGINE_IDENTITY_ARGS with one call without the worker (ChannelOpenDeps.runDirect). Never throws. */
+async function readEngineIdentity(deps: ChannelOpenDeps, target: DockerTarget): Promise<DirectIdentity> {
+  try {
+    const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
+    return { identity: result.exitCode === 0 ? engineIdentity(result.stdout) : undefined, detail: result.stderr.trim().slice(-500) };
+  } catch (error) {
+    return { detail: (error as Error).message };
+  }
+}
+
 /**
- * The checks of openHelperChannel after the start: the probe, the engine identity, and the removal of the stopped helper
- * containers in the background. Closes the channel when a check fails.
+ * The checks of openHelperChannel after the start: the probe, the engine identity (`direct`, or read now), and the
+ * removal of the stopped helper containers in the background. Closes the channel when a check fails.
  */
-async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, name: string, channel: HelperChannel): Promise<void> {
+async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, name: string, channel: HelperChannel, direct?: DirectIdentity): Promise<void> {
   let engine: EngineIdentity | undefined;
   try {
     // The parameters of the schema of both sides (none).
@@ -396,23 +415,15 @@ async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, n
     throw new HelperChannelError('open', `The helper channel to ${name} does not reach Docker: ${(error as Error).message}`);
   }
   // The engine identity, compared as values with one call without the worker.
-  let direct: EngineIdentity | undefined;
-  let directDetail = '';
-  try {
-    const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
-    direct = result.exitCode === 0 ? engineIdentity(result.stdout) : undefined;
-    directDetail = result.stderr.trim().slice(-500);
-  } catch (error) {
-    directDetail = (error as Error).message;
-  }
-  if (engine === undefined || direct === undefined || !sameEngine(engine, direct)) {
+  const { identity, detail } = direct ?? (await readEngineIdentity(deps, target));
+  if (engine === undefined || identity === undefined || !sameEngine(engine, identity)) {
     channel.close();
     const why =
       engine === undefined
         ? 'the helper did not name its Docker engine'
-        : direct === undefined
-          ? `the Docker engine could not be identified without it${directDetail ? ` (${directDetail})` : ''}`
-          : `it reaches another Docker engine (${identityText(engine)}) than the Docker calls without it (${identityText(direct)})`;
+        : identity === undefined
+          ? `the Docker engine could not be identified without it${detail ? ` (${detail})` : ''}`
+          : `it reaches another Docker engine (${identityText(engine)}) than the Docker calls without it (${identityText(identity)})`;
     throw new HelperChannelError('open', `The helper channel to ${name} was closed: ${why}.`);
   }
   // Channel containers that an earlier open created but never started are removed, in the background (a failure is

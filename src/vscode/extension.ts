@@ -17,10 +17,11 @@ import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '.
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, findRemoteContext, listContextInfos, noPromptEnv, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
-import { openRelayConnection, sshRelayTransport } from '../core/relay/transport';
+import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { HostPipes } from '../core/relay/hostPipes';
+import { RemoteShells } from '../core/relay/remoteShells';
 import { dockerPipeBase } from '../core/relay/pipeAddress';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
@@ -201,14 +202,17 @@ async function activateExtension(
   let backgroundPrebuild: HelperPrebuild | undefined;
   let daemonRunning = false;
   const adapterOptions = dockerAdapterOptions(() => dockerSetup);
-  // The Docker pipes of the extension, one per SSH host, set below.
+  // The Docker pipes of the extension, one per SSH host, and the shells before the relay; both set below.
   let hostPipes: HostPipes | undefined;
+  let remoteShells: RemoteShells | undefined;
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload. The
   // Docker CLI of the extension is only the bootstrap's (BootstrapDocker). Its calls of an operation on an SSH host go
   // through the Docker pipe of the extension for the host while a connection of the relay to it is open.
   const docker = new BootstrapDocker(runner, dockerPath, env, logger, platform, {
     ...adapterOptions,
     dockerPipe: (target) => hostPipes?.dockerHost(target.host),
+    // A call of an operation that only reads, while the host has no pipe: on the shell before the relay of the host.
+    remoteShell: (target, args, options) => remoteShells?.docker(target.host, args, options) ?? Promise.resolve(undefined),
     // Only for the log line of a call outside an operation that logs in to an SSH host (targets is set right below).
     lastTarget: () => targets.last,
     onCliFound: shareDockerFolder,
@@ -257,8 +261,20 @@ async function activateExtension(
     relayConnection: (host) => relayConnections.get(host),
     dialStdio,
   });
-  // The SSH check before the Docker calls to a remote host; a success counts for a minute per host, and the Docker pipe
-  // of the extension for the host makes it needless while the calls go through it (they start no `ssh`).
+  // The shells before the relay, one per SSH host: the checks before a connection of the relay run on one login, which
+  // the connection then takes over (`ssh … sh -s`, as its transport).
+  remoteShells = new RemoteShells({
+    logger,
+    start: (host) => {
+      const ssh = sshPath();
+      const transport = ssh === undefined ? undefined : sshHostTransport(host, ssh, env);
+      return transport === undefined ? undefined : runner.startBytes(transport.file, transport.args, { env: transport.env });
+    },
+  });
+  const shells = remoteShells;
+  // The SSH check before the Docker calls to a remote host: the login of its shell before the relay. A success counts
+  // for a minute per host, and the Docker pipe of the extension for the host makes it needless while the calls go
+  // through it (they start no `ssh`).
   const sshLogins = new SshLoginCache();
   const remoteDeps = (): RemoteReachabilityDeps => ({
     docker,
@@ -269,6 +285,7 @@ async function activateExtension(
     env,
     sshLogins,
     viaDockerPipe: (host) => hostPipes?.dockerHost(host) !== undefined,
+    shells,
   });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
@@ -428,7 +445,10 @@ async function activateExtension(
             const ssh = sshPath();
             const transport = ssh === undefined ? undefined : sshRelayTransport(target, ssh, env);
             if (transport === undefined) return undefined;
-            return relayAccess(relayConnections, target.host, (command, bundle) => openRelayConnection(runner, transport, command, bundle, { logger, name: target.host }));
+            // The login of the shell before the relay, when its checks left one open; else a new one.
+            return relayAccess(relayConnections, target.host, (command, bundle) =>
+              openRelayConnection(runner, transport, command, bundle, { logger, name: target.host, takeOver: () => shells.takeOver(target.host) }),
+            );
           },
           runDirect: (args, options, withContext) => (withContext === true ? docker.runWithContext(args, options) : docker.run(args, options)),
           logger,
@@ -454,6 +474,7 @@ async function activateExtension(
       dispose: () => {
         channels.dispose();
         relayConnections.dispose();
+        shells.dispose();
         hostPipes?.dispose();
       },
     }),

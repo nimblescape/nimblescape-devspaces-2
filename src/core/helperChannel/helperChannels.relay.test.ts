@@ -9,12 +9,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
 import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
-import { silentLogger, type StartedProcess } from '../ports';
+import { silentLogger, type RunOptions, type StartedProcess } from '../ports';
 import { RelayConnectionError, type RelayConnection } from '../relay/connection';
 import type { RelayAccess } from '../relay/connections';
 import { HelperChannelError, type HelperChannel } from './helperChannel';
 import { openHelperChannel, type ChannelOpenDeps } from './helperChannels';
-import { CHANNEL_PROTOCOL_VERSION, encodeMessage, parseClientMessage } from './protocol';
+import { CHANNEL_PROTOCOL_VERSION, ENGINE_IDENTITY_ARGS, encodeMessage, parseClientMessage } from './protocol';
 
 const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
@@ -112,6 +112,24 @@ describe('openHelperChannel with the connection of the relay', () => {
     expect(connection.closes).toEqual([]);
   });
 
+  it('reads the engine identity of a new connection before it opens, so that the connection takes over the shell of that read', async () => {
+    const events: string[] = [];
+    const worker = fakeWorker();
+    const connection = fakeConnection(worker);
+    const relay = () =>
+      access(async () => {
+        events.push('connect');
+        return connection as unknown as RelayConnection;
+      });
+    const runDirect = vi.fn(async (args: readonly string[], _options?: RunOptions, withContext?: boolean) => {
+      events.push(`${args.join(' ')} ${withContext === true ? 'with the context' : 'through the pipe'}`);
+      return { exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false };
+    });
+    const channel = await openHelperChannel(deps({ relay, runDirect }), REMOTE);
+    expect(events).toEqual([`${ENGINE_IDENTITY_ARGS.join(' ')} with the context`, 'connect']);
+    channel.close();
+  });
+
   it('starts the worker on the open connection of the engine, without a new connection and without the checks of a start', async () => {
     const worker = fakeWorker();
     const connection = fakeConnection(worker);
@@ -191,10 +209,11 @@ describe('openHelperChannel with the connection of the relay', () => {
       });
     const runDirect = vi.fn(deps({}).runDirect);
     const channel = await openHelperChannel(deps({ relay, runDirect }), REMOTE);
-    // The list of the names after the refusal, and the identity: with the Docker context.
+    // The identity before the start (on the shell before the relay, which the connection takes over), and the list of
+    // the names after the refusal: with the Docker context.
     expect(runDirect.mock.calls.map(([args, , withContext]) => [args[0], withContext])).toEqual([
-      ['ps', true],
       ['info', true],
+      ['ps', true],
     ]);
     expect(commands.map((command) => [command[command.indexOf('--name') + 1], command[command.indexOf('--network') + 1]])).toEqual([
       ['devspaces-api-worker1', 'bridge'],

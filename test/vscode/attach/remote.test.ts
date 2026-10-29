@@ -12,8 +12,8 @@
 // through the connection of the relay of its worker. The engine of the runner has a container with the name of the
 // devspace container, which the window must not use. The window of another Docker host than the current one closes
 // before it attaches (controller.ts, onWindowHost).
-// The first test counts the SSH logins of the open on the other computer and writes them to the log of the test and to
-// the summary of the CI job; it sets no limit yet.
+// The first test counts the SSH logins of the open on the other computer, writes them to the log of the test and to the
+// summary of the CI job, and allows one: the checks before the relay run on the shell whose login the relay takes over.
 import * as assert from 'assert';
 import * as childProcess from 'child_process';
 import * as crypto from 'crypto';
@@ -36,11 +36,14 @@ const LOGINS_QUIET_MS = 15_000;
 const LOGINS_WAIT_MS = 90_000;
 /** The longest command of a session in the timeline. */
 const SESSION_TEXT_LENGTH = 200;
+/** The most SSH logins of the open of the devspace on the other computer, until the last one. */
+const MAX_OPEN_LOGINS = 1;
 /**
  * The lines of the Devspaces log that the timeline shows next to the logins: the Docker calls that log in with the
- * Docker context, the connections of the relay, and the Docker pipes (also the requests that they log).
+ * Docker context, the shell before the relay, the connections of the relay, and the Docker pipes (also the requests
+ * that the pipe of the extension logs).
  */
-const LOGIN_LOG_LINE = /logs? in|SSH login|without the connection of the relay|The connection to \S+ (is open|could not be opened)|Docker pipe of /;
+const LOGIN_LOG_LINE = /logs? in|SSH login|The shell on|without the connection of the relay|The connection to \S+ (is open|could not be opened)|Docker pipe of (the extension|.* listens)/;
 /** The most lines of the Devspaces log in the timeline. */
 const LOGIN_LOG_LINES = 60;
 
@@ -97,7 +100,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
   });
 
   // The first test: the tests after it run Docker over SSH themselves.
-  it('counts the SSH logins of the open on that engine (measured, without a limit yet)', async () => {
+  it('logs in to that engine once for the open', async () => {
     // The tests start once the window has connected, so the age of the extension host is the time of the connection.
     const connected = Date.now();
     const started = connected - process.uptime() * 1000;
@@ -167,6 +170,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
         console.log(`    the summary of the job could not be written: ${String(error)}`);
       }
     }
+    assert.ok(loginsUntil(events) <= MAX_OPEN_LOGINS, `The open logged in ${loginsUntil(events)} times to ${remoteHost}, at most ${MAX_OPEN_LOGINS} expected (see the sessions above).`);
   });
 
   it('connects after the extension restored the devspace on that engine and ran its open pipeline there', async () => {
