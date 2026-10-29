@@ -3,8 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The helper channel against the real Docker engine of the runner: the container of a channel with the workspace helper
-// image, as openHelperChannel starts it on a remote host (here without a Docker context, so on the engine of the
-// runner). The script is bundled from src/helperChannel/main.ts like dist/helperChannel.js. Checked above all: the
+// image, as openHelperChannel starts it on a remote host (here with the Docker CLI and the environment of the run, so on
+// the engine of the runner). The script is bundled from src/helperChannel/main.ts like dist/helperChannel.js. Checked above all: the
 // container ends and is removed by itself when its connection is lost (the extension closes it, the `docker run`
 // process of the computer is killed, or the connection stays silent). `afterAll` fails when a channel container is left
 // over. The channel starts no step container (the end of a batch helper with its worker is tested in
@@ -18,8 +18,8 @@ import { sharedBundleOptions, workerBundleOptions } from '../../scripts/bundleOp
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // The Docker CLI of the extension (BootstrapDocker).
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { dockerTargetOf } from '../../src/core/docker/dockerHost';
-import { runWithDockerTarget } from '../../src/core/docker/dockerTargets';
+import { remoteDockerTarget } from '../../src/core/docker/dockerHost';
+import { outsideOperation, runWithDockerTarget } from '../../src/core/docker/dockerTargets';
 import { HelperChannel } from '../../src/core/helperChannel/helperChannel';
 import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import {
@@ -111,8 +111,10 @@ describe('the helper channel with the real Docker engine', () => {
   const docker = new BootstrapDocker(byteRunner, run.dockerPath, env, log);
   const timings = new Timings();
   const socket = helperDockerSocket(env, process.platform, run.dockerHost);
-  // A remote target without a context name: the calls go to the engine of the runner.
-  const target = dockerTargetOf('ssh://runner-engine', undefined);
+  // A host of the list of Devspaces. An operation on it would run its Docker calls with DOCKER_HOST=ssh://runner-engine
+  // (BootstrapDocker); the open of this file runs them with the environment of the run instead, so on the engine of the
+  // runner, and the calls through the Docker pipe of the extension go there through the relay.
+  const target = remoteDockerTarget('runner-engine');
   let script = '';
   let helperTag = '';
 
@@ -146,8 +148,9 @@ describe('the helper channel with the real Docker engine', () => {
     };
     const channel = await openHelperChannel(
       {
+        // `docker run` of the computer, as BootstrapDocker.start without an operation.
         start: (args) => {
-          started = docker.start(testArgs(args));
+          started = byteRunner.start(run.dockerPath, testArgs(args), { env });
           return started;
         },
         relay: () => {
@@ -161,7 +164,7 @@ describe('the helper channel with the real Docker engine', () => {
           );
         },
         // The engine identity of the open is compared with one call without the worker.
-        runDirect: (args, options) => docker.run(args, options),
+        runDirect: (args, options) => outsideOperation(() => docker.run(args, options)),
         logger: log,
         script: async () => script,
         helperTag: async () => helperTag,
