@@ -348,8 +348,11 @@ describe('SessionCoordinator', () => {
     expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, state: 'active' });
     expect(isWindowStatus(readStatus(h))).toBe(true);
     h.clock.time = T0 + 20;
-    await nextHeartbeat(coordinator);
-    expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, updatedAt: iso(T0 + 20) });
+    // A heartbeat that began before the new time can end after it: the next ones write the new time.
+    await vi.waitFor(async () => {
+      await nextHeartbeat(coordinator);
+      expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, updatedAt: iso(T0 + 20) });
+    });
     // The devspace of the window, which the heartbeats send (WindowHeartbeatsDeps.connected), stays none.
     expect(coordinator.devspaceId).toBeNull();
     await coordinator.setPlainDevspace(null);
