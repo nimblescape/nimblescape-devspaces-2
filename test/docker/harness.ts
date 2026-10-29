@@ -66,7 +66,7 @@ export function runInVolume(docker: Pick<BootstrapDocker, 'run'>, volume: string
  * so without the maintenance). WorkspaceHelper builds no image: a test runs it from this image as its own
  * (testWorkspaceHelper), as the worker runs from its own image. Each test file calls it once, in its `beforeAll`.
  */
-export async function testHelperImage(docker: HelperImageDocker, log: Logger, env: NodeJS.ProcessEnv): Promise<HelperImageUse> {
+export async function testHelperImage(docker: HelperImageDocker, log: Logger, _env: NodeJS.ProcessEnv): Promise<HelperImageUse> {
   const use = await new HelperImages({ docker, logger: log, dockerfilePath: HELPER_DOCKERFILE }).ensureImageUse();
   if (use.id === undefined) throw new Error(`The ID of the helper image ${use.tag} could not be read.`);
   return use;

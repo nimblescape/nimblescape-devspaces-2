@@ -3685,7 +3685,7 @@ export class DevspaceService extends OperationBase {
    * container (isDamagedContainer), otherwise `undefined`, also when the remote user is not known or the check itself
    * fails (the open goes on).
    */
-  private async runningContainerFault(ctx: PipelineContext, container: ContainerInfo, loaded: LoadedConfiguration | undefined): Promise<string | undefined> {
+  private async runningContainerFault(ctx: PipelineContext, container: ContainerInfo, _loaded: LoadedConfiguration | undefined): Promise<string | undefined> {
     // The user of the container itself (its label devcontainer.metadata, by which the Dev Containers extension
     // attaches), never the user that the registry recorded (it can be of an earlier container) or that the
     // configuration names now; when the label does not tell it, there is no check, and no offer.

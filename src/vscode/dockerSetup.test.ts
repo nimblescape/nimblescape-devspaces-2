@@ -828,7 +828,7 @@ describe('DockerSetup: WSL 2 (sidebar button Install WSL 2, Windows)', () => {
       findDocker: () => found,
       onCliLost: () => dockerSetup?.reportCliLost(),
     });
-    let visible = true;
+    const visible = true;
     dockerSetup = new DockerSetup({
       docker,
       runner,

@@ -396,8 +396,8 @@ export async function ensureExtension(deps: ExtensionStoreDeps, chosen: ChosenEx
       release();
     }
   } catch (error) {
-    if (signal.aborted) throw new Error('the run was ended');
-    if (limit.aborted) throw new Error(`the download took longer than ${Math.round(timeoutMs / 1000)} s`);
+    if (signal.aborted) throw new Error('the run was ended', { cause: error });
+    if (limit.aborted) throw new Error(`the download took longer than ${Math.round(timeoutMs / 1000)} s`, { cause: error });
     throw error;
   }
 }

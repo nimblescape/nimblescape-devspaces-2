@@ -27,6 +27,11 @@ updates:
       # which Docker Compose accepts; the two tests that parse that text stay on js-yaml 4.
       - dependency-name: 'js-yaml'
         update-types: ['version-update:semver-major']
+      # TypeScript stays at 6.0.3 in every nimblescape extension: typescript-eslint supports TypeScript only up to 6.0,
+      # and TypeScript 7 has no language service for the plugin of nimblescape TypeScript. A move to another version of
+      # TypeScript is one decision for all extensions together.
+      - dependency-name: 'typescript'
+        update-types: ['version-update:semver-major', 'version-update:semver-minor', 'version-update:semver-patch']
   - package-ecosystem: github-actions
     directory: /
     schedule:

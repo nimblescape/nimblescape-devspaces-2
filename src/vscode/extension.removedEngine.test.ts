@@ -37,6 +37,6 @@ describe('the gates of extension.ts on an engine with the removal mark', () => {
   // (HelperPrebuild.stop and MissingHelperBuild.stop, tested in src/core/helper).
   it('the removal stops the background prebuild and the build of a missing helper image on its engine', () => {
     expect(source).toMatch(/stopHelperBuilds: async \(target\) => \{\s*await Promise\.all\(\[backgroundPrebuild\?\.stop\(target\), helperBuilds\.stop\(target\)\]\);\s*\}/);
-    expect(source).toMatch(/const helperPrebuild = new HelperPrebuild\(\{[\s\S]*?\n  context\.subscriptions\.push\(helperPrebuild\);\n  backgroundPrebuild = helperPrebuild;\n/);
+    expect(source).toMatch(/const helperPrebuild = new HelperPrebuild\(\{[\s\S]*?\n {2}context\.subscriptions\.push\(helperPrebuild\);\n {2}backgroundPrebuild = helperPrebuild;\n/);
   });
 });

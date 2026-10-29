@@ -180,7 +180,6 @@ function vendoredIw(): Iw {
     cliFunction(bundle, 'iW', 'async function '),
     'return iW;',
   ].join('\n');
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval
   return new Function(source)() as Iw;
 }
 

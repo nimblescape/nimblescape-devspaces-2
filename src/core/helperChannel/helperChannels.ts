@@ -280,7 +280,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   }
   // The engine identity, compared as values with one call without the worker.
   let direct: EngineIdentity | undefined;
-  let directDetail = '';
+  let directDetail: string;
   try {
     const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
     direct = result.exitCode === 0 ? engineIdentity(result.stdout) : undefined;
@@ -409,7 +409,7 @@ export class HelperChannels {
         wait.signal?.removeEventListener('abort', onAbort);
         settle();
       };
-      opening.then((channel) => done(() => resolve(channel)));
+      void opening.then((channel) => done(() => resolve(channel)));
     });
   }
 

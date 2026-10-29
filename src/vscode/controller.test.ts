@@ -6206,7 +6206,6 @@ describe('the Docker host of the current Docker context', () => {
   const REMOTE_ENV_ID = 'a1b2c3d4-0000-4000-8000-00000000000b';
   let current: DockerTarget;
   let operations: DockerTarget[];
-  let resolves: number;
   let depth = 0;
   let remote: {
     useRemoteHost: Mock<RemoteDockerCommands['useRemoteHost']>;
@@ -6221,7 +6220,6 @@ describe('the Docker host of the current Docker context', () => {
     fs.rmSync(h.root, { recursive: true, force: true });
     current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     operations = [];
-    resolves = 0;
     depth = 0;
     remote = {
       useRemoteHost: vi.fn(async () => {}),
@@ -6231,10 +6229,7 @@ describe('the Docker host of the current Docker context', () => {
       offerSwitchBack: vi.fn(async () => false),
     };
     const dockerTargets = {
-      resolve: vi.fn(async () => {
-        resolves++;
-        return current;
-      }),
+      resolve: vi.fn(async () => current),
       // As DockerTargets.current: the target of the running operation, else a fresh read.
       current: vi.fn(async () => (depth > 0 ? operations[operations.length - 1] : current)),
       // As DockerTargets.withOperation: a nested operation keeps the target of the outer one, and the calls of the

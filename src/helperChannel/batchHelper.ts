@@ -267,6 +267,8 @@ async function asGitUser<T>(deps: BatchHelperDeps, state: GitUserState, step: Ba
       }
     }
     await removeGitUserLeftovers(deps, uid);
+    // A failed restore is the error of the step, also when the step itself failed.
+    // eslint-disable-next-line no-unsafe-finally
     if (failure !== undefined) throw failure.error;
   }
 }
@@ -353,6 +355,8 @@ async function asRepositoryOwner<T>(deps: BatchHelperDeps, step: BatchStepComman
         failure ??= { error };
       }
     }
+    // A failed restore is the error of the step, also when the step itself failed.
+    // eslint-disable-next-line no-unsafe-finally
     if (failure !== undefined) throw failure.error;
   }
 }

@@ -19,7 +19,7 @@ import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
 // The links that VS Code renders in the text of a notification: the regular expression of
 // src/vs/base/common/linkedText.ts of VS Code (parseLinkedText), which the notifications use.
-const VSCODE_LINK = /\[([^\]]+)\]\(((?:https?:\/\/|command:|file:)[^\)\s]+)(?: (["'])(.+?)(\3))?\)/gi;
+const VSCODE_LINK = /\[([^\]]+)\]\(((?:https?:\/\/|command:|file:)[^)\s]+)(?: (["'])(.+?)(\3))?\)/gi;
 const links = (text: string) => [...text.matchAll(VSCODE_LINK)].map((match) => match[2]);
 
 // A link that types a command into the terminal of the window.
