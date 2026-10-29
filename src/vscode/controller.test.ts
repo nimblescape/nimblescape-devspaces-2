@@ -777,34 +777,38 @@ describe('Controller commands', () => {
       '2. Install Docker Desktop with winget or Docker\'s installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)';
     const installLinux =
       'Install Docker Engine from Docker\'s package repository. You see the commands before anything runs.\n[Install Docker](command:devspaces.dockerSetup.install)';
+    // The last step on every platform: Docker on another computer, without Docker on this one.
+    const remote =
+      'Or use Docker on another computer that you reach over SSH, without Docker on this computer. Devspaces downloads the Docker CLI that it needs into its own folder; this needs no administrator permission.\n[Use a Remote Docker Host…](command:devspaces.useRemoteDockerHost)';
 
     it('shows the steps of macOS, then the sign-in', () => {
-      expect(shownWelcome({ ...setup, isMac: true })).toEqual([intro, installMac, after, signIn]);
+      expect(shownWelcome({ ...setup, isMac: true })).toEqual([intro, installMac, after, remote, signIn]);
     });
 
     it('shows the steps of Windows with WSL 2 first, and a check mark instead of its button once WSL 2 is ready', () => {
-      expect(shownWelcome({ ...setup, isWindows: true })).toEqual([intro, installWsl, installWindows, after, signIn]);
+      expect(shownWelcome({ ...setup, isWindows: true })).toEqual([intro, installWsl, installWindows, after, remote, signIn]);
       expect(shownWelcome({ ...setup, isWindows: true, [DockerContextKeys.wslReady]: true })).toEqual([
         intro,
         wslInstalled,
         installWindows,
         after,
+        remote,
         signIn,
       ]);
     });
 
     it('shows the steps of Linux', () => {
-      expect(shownWelcome({ ...setup, isLinux: true })).toEqual([intro, installLinux, afterLinux, signIn]);
+      expect(shownWelcome({ ...setup, isLinux: true })).toEqual([intro, installLinux, afterLinux, remote, signIn]);
     });
 
     // The settings of VS Code name a GitHub Enterprise instance (devspaces.githubEnterprise): a note after the sign-in.
     it('shows the note on GitHub Enterprise after the sign-in, only while not signed in, also under the setup', () => {
       const enterprise = { [GITHUB_ENTERPRISE_CONTEXT_KEY]: true };
       expect(shownWelcome({ ...enterprise })).toEqual([signIn, githubEnterprise]);
-      expect(shownWelcome({ ...setup, isMac: true, ...enterprise })).toEqual([intro, installMac, after, signIn, githubEnterprise]);
+      expect(shownWelcome({ ...setup, isMac: true, ...enterprise })).toEqual([intro, installMac, after, remote, signIn, githubEnterprise]);
       expect(shownWelcome({})).toEqual([signIn]);
       expect(shownWelcome({ ...enterprise, [SIGNED_IN_CONTEXT_KEY]: true })).toEqual(['Loading your repositories…']);
-      expect(shownWelcome({ ...enterprise, ...setup, isMac: true, [SIGNED_IN_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
+      expect(shownWelcome({ ...enterprise, ...setup, isMac: true, [SIGNED_IN_CONTEXT_KEY]: true })).toEqual([intro, installMac, after, remote]);
     });
 
     // Numbers only where there is more than one step (Windows: WSL 2, then Docker Desktop).
@@ -827,10 +831,10 @@ describe('Controller commands', () => {
 
     it('shows no list entry under the setup, also when signed in, loaded, or after a failed load', () => {
       const signedIn = { ...setup, isMac: true, [SIGNED_IN_CONTEXT_KEY]: true };
-      expect(shownWelcome(signedIn)).toEqual([intro, installMac, after]);
-      expect(shownWelcome({ ...signedIn, [LOADED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
-      expect(shownWelcome({ ...signedIn, [LOADED_CONTEXT_KEY]: true, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
-      expect(shownWelcome({ ...signedIn, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after]);
+      expect(shownWelcome(signedIn)).toEqual([intro, installMac, after, remote]);
+      expect(shownWelcome({ ...signedIn, [LOADED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after, remote]);
+      expect(shownWelcome({ ...signedIn, [LOADED_CONTEXT_KEY]: true, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after, remote]);
+      expect(shownWelcome({ ...signedIn, [LOAD_FAILED_CONTEXT_KEY]: true })).toEqual([intro, installMac, after, remote]);
       // Every entry but the sign-in and its note on GitHub Enterprise either belongs to the setup or is hidden under it.
       for (const view of welcomeManifest().contributes.viewsWelcome) {
         if (view.when === `!${SIGNED_IN_CONTEXT_KEY}` || view.when === `!${SIGNED_IN_CONTEXT_KEY} && ${GITHUB_ENTERPRISE_CONTEXT_KEY}`) continue;

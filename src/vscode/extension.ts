@@ -69,7 +69,7 @@ import type { ExtensionSettings } from '../core/types';
 import { AccountOffers } from './accountOffers';
 import { VsCodeGitHubAuth, watchGitHubEnterpriseSettings } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
-import { installOwnDockerCliWithProgress } from './ownDockerCliWindow';
+import { installOwnDockerCliWithProgress, OwnDockerCliTexts } from './ownDockerCliWindow';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
 import { dockerAdapterOptions } from './dockerAdapterOptions';
@@ -180,21 +180,25 @@ async function activateExtension(
   const connection = new ConnectionAdapter(logger);
   const installedCli = findDockerCli(env, platform);
   logger.info(installedCli ? `Docker CLI: ${installedCli}` : 'The Docker CLI was not found.');
-  // The window of a devspace on another computer (its authority names a Docker pipe) runs the Dev Containers extension
-  // with the Docker CLI of Devspaces, one tested version (docs/architecture.md "The Docker CLI of Devspaces"): its folder
-  // goes first in PATH of this extension host, before the Dev Containers extension resolves the window. Devspaces itself
-  // keeps the Docker CLI of this computer when it has one. A CLI that is not installed yet is downloaded below, before
-  // the window looks up its devspace and serves its pipe.
+  // The Docker CLI of Devspaces, one tested version (docs/architecture.md "The Docker CLI of Devspaces"), where Docker
+  // publishes one that runs here. In every window, the Docker calls of Devspaces on a remote host take it when it is
+  // installed, also on a computer without a Docker CLI (BootstrapDocker option ownCli); the other calls keep the Docker
+  // CLI of this computer. The window of a devspace on another computer (its authority names a Docker pipe) runs the Dev
+  // Containers extension with it too: its folder goes first in PATH of this extension host, before the Dev Containers
+  // extension resolves the window. A CLI that this window needs and is not installed yet is downloaded below, before the
+  // window looks up its devspace and serves its pipe; "Use a Remote Docker Host…" downloads it on a computer without a
+  // Docker CLI.
   const pipeWindow = connection.currentDockerHost() !== undefined;
-  const ownCliBuild = pipeWindow && ownDockerCliDownload(platform, process.arch) !== undefined;
+  const ownCliBuild = ownDockerCliDownload(platform, process.arch) !== undefined;
   if (pipeWindow && !ownCliBuild) {
     logger.info(`Docker publishes no Docker CLI for ${platform} on ${process.arch} that runs here, so this window uses the Docker CLI of this computer.`);
   }
+  const presentOwnCli = (): string | undefined => (ownCliBuild ? presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) : undefined);
   const useOwnDockerCli = (cli: string): void => {
     putFolderFirstInPath(process.env, platform, path.dirname(cli));
     logger.info(`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces is first in PATH of this window: ${cli}`);
   };
-  const ownCli = ownCliBuild ? presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) : undefined;
+  const ownCli = pipeWindow ? presentOwnCli() : undefined;
   if (ownCli !== undefined) useOwnDockerCli(ownCli);
   const dockerPath = installedCli ?? ownCli;
   // Windows: the Dev Containers extension, which connects the windows to the containers, runs in this extension host and
@@ -235,6 +239,8 @@ async function activateExtension(
     dockerPipe: (target) => hostPipes?.dockerHost(target.host),
     // A call of an operation that only reads, while the host has no pipe: on the shell before the relay of the host.
     remoteShell: (target, args, options) => remoteShells?.docker(target.host, args, options) ?? Promise.resolve(undefined),
+    // The calls of an operation on a remote host: the Docker CLI of Devspaces when it is installed.
+    ownCli: presentOwnCli,
     onCliFound: shareDockerFolder,
     onDaemonStatus: (running) => {
       if (running && !daemonRunning) helperChannels?.clearFailures();
@@ -714,7 +720,11 @@ async function activateExtension(
   context.subscriptions.push(tree, view, statusBar);
   // The view's title and its first row name the Docker host (also the local Docker).
   const dockerHostIndicator = new DockerHostIndicator(view, logger, (host) => tree.setDockerHost(host));
-  context.subscriptions.push({ dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target, docker.isInstalled())) });
+  // A remote host needs a Docker CLI for remote engines (the one of Devspaces or of this computer), the local Docker the
+  // Docker CLI of this computer.
+  context.subscriptions.push({
+    dispose: targets.onDidResolve((target) => dockerHostIndicator.update(target, target.kind === 'remote' ? docker.canRunRemote() : docker.isInstalled())),
+  });
   // While no Docker CLI is found, the sidebar shows the Docker setup (welcome view) instead of the repositories: when
   // no remote Docker host is configured and the local Docker is not available, the repositories are not shown.
   const setup = new DockerSetup({
@@ -728,8 +738,8 @@ async function activateExtension(
     onDidChangeInstalled: () => {
       sidebar.render().catch((error: unknown) => logger.error('Could not update the sidebar.', error));
     },
-    // The current Docker context points to another computer (as last read). Without a Docker CLI no context can be
-    // read, so the setup shows.
+    // Devspaces uses a host of its list (as last read; onDockerHostChanged below). Without a Docker CLI for remote
+    // engines, the read gives the local Docker, so the setup shows.
     remoteDockerHostConfigured: () => targets.last?.kind === 'remote',
     // Windows: `wsl --status` only while the view shows the setup (also onViewShown below).
     viewVisible: () => view.visible,
@@ -744,6 +754,8 @@ async function activateExtension(
   });
   dockerSetup = setup;
   context.subscriptions.push(setup);
+  // A change of the Docker host of Devspaces, also by another window, shows or hides the Docker setup.
+  context.subscriptions.push({ dispose: targets.onDidResolve(() => setup.onDockerHostChanged()) });
   // The worker thread of the repository groups (the regular expressions of the setting run there, with a time limit).
   const groupsWorkerScript = context.asAbsolutePath(path.join('dist', 'groupsPreviewWorker.js'));
   const groupMatcher = new GroupMatchWorkerRunner(groupsWorkerScript);
@@ -795,6 +807,10 @@ async function activateExtension(
       await sidebar.render();
       if (view.visible) await sidebar.refreshStates();
     },
+    // A computer without a Docker CLI: the Docker CLI of Devspaces for the remote host.
+    installOwnCli: ownCliBuild
+      ? () => installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: undefined, failed: OwnDockerCliTexts.failedForRemoteHost })
+      : undefined,
   });
   // A Docker context or DOCKER_HOST of the user that reaches a host over SSH while Devspaces uses the local Docker: its
   // host is offered once for the list (in the background; the read that found it goes on).
@@ -904,7 +920,7 @@ async function activateExtension(
   // (its link Show details needs the commands above), before the window looks up its devspace and serves its pipe, and
   // before activate() returns. On a computer without a Docker CLI, the Docker calls of Devspaces and the Docker setup in
   // the sidebar take it at once.
-  if (ownCliBuild && ownCli === undefined) {
+  if (pipeWindow && ownCliBuild && ownCli === undefined) {
     const cli = await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli });
     if (cli !== undefined) {
       useOwnDockerCli(cli);

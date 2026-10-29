@@ -12,8 +12,11 @@
 // of an operation on an SSH host goes through the Docker pipe of the extension for the host while a connection of the
 // relay to it is open (BootstrapDockerOptions.dockerPipe), without an SSH login of its own, else with
 // DOCKER_HOST=ssh://<host>; before that connection, a call that only reads runs on the shell before the relay (BootstrapDockerOptions.remoteShell, isShellCall), whose
-// login the connection then takes over. A call that does not only read is logged with its command (directCommandName),
-// never its arguments. Output is read as JSON (`docker --version` as its one line), never as a table. No `vscode`.
+// login the connection then takes over. The calls of an operation on an SSH host run with the Docker CLI of Devspaces
+// when it is installed (BootstrapDockerOptions.ownCli, one tested version), also on a computer without a Docker CLI of
+// its own; the other calls with the Docker CLI of this computer. A call that does not only read is logged with its
+// command (directCommandName), never its arguments. Output is read as JSON (`docker --version` as its one line), never
+// as a table. No `vscode`.
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
@@ -183,6 +186,11 @@ export interface BootstrapDockerOptions {
    * Undefined when the host has no shell (the call logs in with `ssh://<host>`).
    */
   remoteShell?: (target: DockerTarget, args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'>) => Promise<RunResult | undefined>;
+  /**
+   * The Docker CLI of Devspaces when it is installed (presentOwnDockerCli), else undefined: the CLI of the calls of an
+   * operation on a remote engine, in place of the Docker CLI of this computer, which such calls take only without it.
+   */
+  ownCli?: () => string | undefined;
   /** Only for tests. Default: SSH_DROP_RETRY_DELAY_MS. */
   sshDropRetryDelayMs?: number;
   /** Only for tests. Default: cliFileIdentity. */
@@ -250,6 +258,7 @@ export class BootstrapDocker {
   private readonly onCliFound: BootstrapDockerOptions['onCliFound'];
   private readonly dockerPipe: BootstrapDockerOptions['dockerPipe'];
   private readonly remoteShell: BootstrapDockerOptions['remoteShell'];
+  private readonly ownCli: BootstrapDockerOptions['ownCli'];
   private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
   private readonly fileIdentity: (path: string) => Promise<string | undefined>;
@@ -284,21 +293,53 @@ export class BootstrapDocker {
     this.onCliFound = options.onCliFound;
     this.dockerPipe = options.dockerPipe;
     this.remoteShell = options.remoteShell;
+    this.ownCli = options.ownCli;
     this.sshDropRetryDelayMs = options.sshDropRetryDelayMs ?? SSH_DROP_RETRY_DELAY_MS;
     this.fileIdentity = options.fileIdentity ?? cliFileIdentity;
     // The caller has just looked the CLI up.
     this.lookedUpAt = this.clock.now();
   }
 
-  /** Full path of the Docker CLI, or `undefined` while it is not found. */
+  /** Full path of the Docker CLI of this computer, or `undefined` while it is not found. */
   get dockerPath(): string | undefined {
     return this.path;
   }
 
-  /** True if the Docker CLI was found. With `findDocker`, a missing CLI is looked up again first. */
+  /**
+   * True if a Docker CLI runs the calls here: within an operation on a remote engine the Docker CLI of Devspaces or of
+   * this computer (canRunRemote), else the Docker CLI of this computer. With `findDocker`, a missing CLI is looked up
+   * again first.
+   */
   isInstalled(): boolean {
+    return this.cliPath() !== undefined;
+  }
+
+  /**
+   * True if a Docker CLI runs the calls of an operation on a remote engine: the Docker CLI of Devspaces (ownCli) or of
+   * this computer. With `findDocker`, a missing CLI of this computer is looked up again first.
+   */
+  canRunRemote(): boolean {
     this.lookUpCliIfMissing();
-    return this.path !== undefined;
+    return this.ownCliPath() !== undefined || this.path !== undefined;
+  }
+
+  /**
+   * The Docker CLI of the calls here: within an operation on a remote engine the Docker CLI of Devspaces when it is
+   * installed, else the Docker CLI of this computer (looked up again first while it is missing, with `findDocker`).
+   */
+  private cliPath(): string | undefined {
+    this.lookUpCliIfMissing();
+    return (operationDockerTarget()?.kind === 'remote' ? this.ownCliPath() : undefined) ?? this.path;
+  }
+
+  /** The Docker CLI of Devspaces (ownCli), or undefined (also when its lookup fails, logged). */
+  private ownCliPath(): string | undefined {
+    try {
+      return this.ownCli?.();
+    } catch (error) {
+      this.logger.warn(`The Docker CLI of Devspaces could not be looked up: ${errorMessage(error)}`);
+      return undefined;
+    }
   }
 
   /**
@@ -350,8 +391,7 @@ export class BootstrapDocker {
   }
 
   private async runOnce(args: readonly string[], options: RunOptions, viaPipe: boolean): Promise<RunResult> {
-    this.lookUpCliIfMissing();
-    const dockerPath = this.path;
+    const dockerPath = this.cliPath();
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
     try {
       // The environment after the lookup: a CLI that was found again has its own (dockerProcessEnv).
@@ -383,8 +423,7 @@ export class BootstrapDocker {
    * start such a program.
    */
   start(args: readonly string[]): StartedProcess | undefined {
-    this.lookUpCliIfMissing();
-    const dockerPath = this.path;
+    const dockerPath = this.cliPath();
     if (dockerPath === undefined || this.runner.start === undefined) return undefined;
     return this.runner.start(dockerPath, args, { env: this.operationEnv(false) });
   }

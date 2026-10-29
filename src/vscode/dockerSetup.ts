@@ -14,6 +14,7 @@ import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { findExecutable } from '../core/docker/dockerCli';
 import { downloadFile, type DownloadOptions } from '../core/docker/dockerDownload';
 import {
+  DockerContextKeys,
   DockerSetupTexts,
   INITIAL_DOCKER_SETUP_STATE,
   INSTALL_WATCH_INTERVAL_MS,
@@ -96,7 +97,10 @@ export interface DockerSetupDeps {
   showLog: () => void;
   platform: NodeJS.Platform;
   env: NodeJS.ProcessEnv;
-  /** The CLI was found or lost: the sidebar shows the repositories or the Docker setup (`setupRequired`). */
+  /**
+   * The CLI was found or lost, or the Docker host of Devspaces changed whether the setup shows (onDockerHostChanged):
+   * the sidebar shows the repositories or the Docker setup (`setupRequired`).
+   */
   onDidChangeInstalled: () => void;
   /** True when a remote Docker host is configured: a missing local CLI then needs no setup (see `dockerSetupRequired`). */
   remoteDockerHostConfigured: () => boolean;
@@ -294,6 +298,18 @@ export class DockerSetup implements vscode.Disposable {
   /** The result of a `docker info` that ran anyway (BootstrapDocker option `onDaemonStatus`). */
   reportDaemonStatus(running: boolean): void {
     this.apply({ kind: 'engine', running });
+  }
+
+  /**
+   * A read of the Docker host of Devspaces (DockerTargets.onDidResolve): the context keys follow `setupRequired`, which
+   * depends on it (a remote host needs no Docker of this computer), and the sidebar renders again when it changed. Asks
+   * nothing. Before `initialize`, nothing.
+   */
+  onDockerHostChanged(): void {
+    if (this.shown === undefined) return;
+    const before = this.shown[DockerContextKeys.setupRequired];
+    this.apply({ kind: 'cli', found: this.state.cliFound });
+    if (this.shown[DockerContextKeys.setupRequired] !== before) this.deps.onDidChangeInstalled();
   }
 
   /**

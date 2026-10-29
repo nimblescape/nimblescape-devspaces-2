@@ -88,4 +88,23 @@ describe('installOwnDockerCliWithProgress', () => {
     expect(warnings).toEqual([`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be installed: ${OwnDockerCliTexts.cancelled}`]);
     expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(OwnDockerCliTexts.failedWithFallback(OwnDockerCliTexts.cancelled));
   });
+
+  // "Use a Remote Docker Host…" on a computer without a Docker CLI: its own message, and none after a Cancel.
+  it('shows the message of the caller when the download fails, and none when it is cancelled', async () => {
+    const runs = scriptWithProgress();
+    install.mockRejectedValueOnce(new Error('offline'));
+    const failed = { ...options, logger: silentLogger, fallback: undefined, failed: OwnDockerCliTexts.failedForRemoteHost };
+    await expect(installOwnDockerCliWithProgress(failed)).resolves.toBeUndefined();
+    expect(fakeVscode.window.showErrorMessage.mock.calls).toEqual([[OwnDockerCliTexts.failedForRemoteHost('offline')]]);
+    install.mockImplementationOnce(
+      (given: InstallOwnDockerCliOptions) =>
+        new Promise((_resolve, reject) => {
+          given.signal?.addEventListener('abort', () => reject(abortError()));
+          runs[1].cancel();
+        }),
+    );
+    await expect(installOwnDockerCliWithProgress(failed)).resolves.toBeUndefined();
+    expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledTimes(1);
+    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
 });

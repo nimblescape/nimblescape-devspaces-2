@@ -41,6 +41,7 @@ import {
   isRootlessEngine,
   isPodmanDockerTarget,
   isUnreadableDockerTarget,
+  remoteDockerTarget,
   rootlessSocketPath,
   sshCommandArgs,
   sshEndpoint,
@@ -49,6 +50,7 @@ import {
   type DockerHostProblem,
   type DockerTarget,
 } from './dockerHost';
+import { runWithDockerTarget } from './dockerTargets';
 
 /** Time limit of `docker info` on a remote host: an SSH connection plus the question (the CLI gives ssh 30 s to connect). */
 export const REMOTE_INFO_TIMEOUT_MS = 45_000;
@@ -62,6 +64,8 @@ export const ENGINE_INFO_FORMAT = '{"version":{{json .ServerVersion}},"securityO
 /** The part of BootstrapDocker used here. */
 export interface RemoteDockerCli {
   isInstalled(): boolean;
+  /** Whether a Docker CLI runs the calls on a remote engine (BootstrapDocker.canRunRemote). Without it: isInstalled. */
+  canRunRemote?(): boolean;
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;
   /** The environment of the Docker calls outside of an operation. */
   processEnv(): NodeJS.ProcessEnv;
@@ -137,7 +141,10 @@ export async function testRemoteDockerHost(
   const env = noPromptEnv(docker.processEnv());
   // -H decides the endpoint; DOCKER_CONTEXT would conflict with it.
   for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT' || key.toUpperCase() === 'DOCKER_HOST') delete env[key];
-  return runEngineInfo(docker, ['-H', sshEndpoint(host), 'info', '--format', ENGINE_INFO_FORMAT], { env, signal: options.signal }, timeoutMs);
+  // As a call on the remote engine: with the Docker CLI of Devspaces when it is installed (BootstrapDocker.ownCli).
+  return runWithDockerTarget(remoteDockerTarget(host), () =>
+    runEngineInfo(docker, ['-H', sshEndpoint(host), 'info', '--format', ENGINE_INFO_FORMAT], { env, signal: options.signal }, timeoutMs),
+  );
 }
 
 /** `docker info` of the Docker host of the operation. */

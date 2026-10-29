@@ -166,6 +166,11 @@
       },
       {
         "view": "devspaces.repositories",
+        "contents": "Or use Docker on another computer that you reach over SSH, without Docker on this computer. Devspaces downloads the Docker CLI that it needs into its own folder; this needs no administrator permission.\n[Use a Remote Docker Host…](command:devspaces.useRemoteDockerHost)",
+        "when": "devspaces.dockerSetupRequired"
+      },
+      {
+        "view": "devspaces.repositories",
         "contents": "Sign in with GitHub to see your repositories that have a Dev Container configuration.\nDevspaces asks for the scopes repo (read and change the repositories that you can access, also the private ones) and read:org (read your organization memberships). It works only with accounts on github.com.\n[Sign in with GitHub](command:devspaces.signIn)",
         "when": "!devspaces.signedIn"
       },

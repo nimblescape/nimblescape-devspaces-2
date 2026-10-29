@@ -878,6 +878,10 @@ describe('BootstrapDocker: every call runs directly', () => {
       'constructor',
       'dockerPath',
       'isInstalled',
+      // The choice of the Docker CLI of a call (the one of Devspaces for a remote engine, ownCli), no Docker call.
+      'canRunRemote',
+      'cliPath',
+      'ownCliPath',
       // `run` is the one method of a call; runVia, runRepeated and runOnce run it, and runWithoutPipe passes it through.
       'runVia',
       'runRepeated',
