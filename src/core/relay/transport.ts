@@ -25,14 +25,20 @@ export interface RelayTransport {
 export const RELAY_SHELL_COMMAND = 'sh -s';
 
 /**
- * The SSH transport to the engine of `target`: `ssh -o BatchMode=yes -o ConnectTimeout=15 -T [-p port] [-l user] --
- * <host> 'sh -s'` with SSH_ASKPASS_REQUIRE=never, as the SSH check (checkSshLogin). With `prompts` (a login of a flow
- * of the user), without BatchMode and with the environment of the helper that asks in VS Code (askpassEnv), so the
- * login asks for a password or an unknown host key. Undefined for a target that is not remote and for a host that is no
+ * The SSH transport to the engine of `target`: `ssh -o BatchMode=yes -o ConnectTimeout=15 -T [-i key] [-p port] [-l
+ * user] -- <host> 'sh -s'` with SSH_ASKPASS_REQUIRE=never, as the SSH check (checkSshLogin). With `prompts` (a login of
+ * a flow of the user), without BatchMode and with the environment of the helper that asks in VS Code (askpassEnv), so
+ * the login asks for a password or an unknown host key. `identity`: the key of Devspaces (sshKey.ts). Undefined for a target that is not remote and for a host that is no
  * SSH alias or address (sshTargetOf): its worker starts with the Docker CLI.
  */
-export function sshRelayTransport(target: DockerTarget, sshPath: string, env: NodeJS.ProcessEnv, prompts?: TransportPrompts): RelayTransport | undefined {
-  return target.kind === 'remote' ? sshHostTransport(target.host, sshPath, env, prompts) : undefined;
+export function sshRelayTransport(target: DockerTarget, sshPath: string, env: NodeJS.ProcessEnv, options: SshLoginOptions = {}): RelayTransport | undefined {
+  return target.kind === 'remote' ? sshHostTransport(target.host, sshPath, env, options) : undefined;
+}
+
+/** How an SSH login of Devspaces runs: with the questions of a flow of the user, and with the key of Devspaces (`-i`). */
+export interface SshLoginOptions {
+  prompts?: TransportPrompts;
+  identity?: string;
 }
 
 /** The questions of a login of a flow of the user: the environment of its `ssh` (askpassEnv of the login). */
@@ -41,11 +47,12 @@ export interface TransportPrompts {
 }
 
 /** sshRelayTransport for the SSH host `host` (DockerTarget.host); undefined for a host that is no SSH alias or address. */
-export function sshHostTransport(host: string, sshPath: string, env: NodeJS.ProcessEnv, prompts?: TransportPrompts): RelayTransport | undefined {
+export function sshHostTransport(host: string, sshPath: string, env: NodeJS.ProcessEnv, options: SshLoginOptions = {}): RelayTransport | undefined {
   const address = sshTargetOf(host);
   if (address === undefined) return undefined;
-  if (prompts !== undefined) return { file: sshPath, args: sshCommandArgs(address, RELAY_SHELL_COMMAND, undefined, { prompts: true }), env: prompts.env(env) };
-  return { file: sshPath, args: sshCommandArgs(address, RELAY_SHELL_COMMAND), env: noPromptEnv(env) };
+  const { prompts, identity } = options;
+  const args = sshCommandArgs(address, RELAY_SHELL_COMMAND, undefined, { prompts: prompts !== undefined, identity });
+  return { file: sshPath, args, env: prompts !== undefined ? prompts.env(env) : noPromptEnv(env) };
 }
 
 /**

@@ -86,6 +86,7 @@ import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide'
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
 import { SshAskpassServer, vscodeSshLoginDialogs, type SshLogin } from './sshLoginPrompts';
+import { SshKeyOffer, vscodeSshKeyDialogs } from './sshKeyOffer';
 import { GroupMatchWorkerRunner } from './groupMatcher';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
@@ -234,6 +235,8 @@ async function activateExtension(
   // The Docker pipes of the extension, one per SSH host, and the shells before the relay; both set below.
   let hostPipes: HostPipes | undefined;
   let remoteShells: RemoteShells | undefined;
+  // The key of Devspaces for its SSH logins (the key offer), set below; the `ssh` of the Docker CLI uses it too.
+  let keyOffer: SshKeyOffer | undefined;
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload. The
   // Docker CLI of the extension is only the bootstrap's (BootstrapDocker). Its calls of an operation on an SSH host go
   // through the Docker pipe of the extension for the host while a connection of the relay to it is open.
@@ -242,6 +245,8 @@ async function activateExtension(
     dockerPipe: (target) => hostPipes?.dockerHost(target.host),
     // A call of an operation that only reads, while the host has no pipe: on the shell before the relay of the host.
     remoteShell: (target, args, options) => remoteShells?.docker(target.host, args, options) ?? Promise.resolve(undefined),
+    // A call with `ssh://<host>`: the `ssh` of the Docker CLI with the key of Devspaces when the host has it.
+    sshEnv: (host, callEnv) => keyOffer?.dockerSshEnv(host, callEnv),
     // The calls of an operation on a remote host: the Docker CLI of Devspaces when it is installed.
     ownCli: presentOwnCli,
     onCliFound: shareDockerFolder,
@@ -271,6 +276,23 @@ async function activateExtension(
     }
   };
   const sshPath = (): string | undefined => findExecutable('ssh', env, platform);
+  // After a login with a password in a flow of the user, Devspaces offers once per host to log in with its own key
+  // (~/.ssh/devspaces_ed25519) next time; every later login of Devspaces to a host with the key uses it.
+  const sshKeys = new SshKeyOffer({
+    home: os.homedir(),
+    platform,
+    computerName: os.hostname(),
+    wrapperFolder: paths.sshWrapperDir,
+    runner,
+    sshPath,
+    sshKeygenPath: () => findExecutable('ssh-keygen', env, platform),
+    env,
+    state: remoteState,
+    dialogs: vscodeSshKeyDialogs(),
+    logger,
+  });
+  keyOffer = sshKeys;
+  void sshKeys.prepare();
   // `ssh … docker system dial-stdio` on an SSH host, for a connection of a Docker pipe without the relay. ssh is found
   // once: a window that works without the relay makes many short Docker connections.
   let dialSsh: string | undefined;
@@ -278,7 +300,9 @@ async function activateExtension(
     dialSsh ??= sshPath();
     const address = sshTargetOf(host);
     if (dialSsh === undefined || address === undefined) return undefined;
-    return runner.startBytes(dialSsh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
+    return runner.startBytes(dialSsh, sshCommandArgs(address, 'docker system dial-stdio', undefined, { identity: sshKeys.identityFor(host) }), {
+      env: noPromptEnv(env),
+    });
   };
   // The connections of the relay of this window, one per remote host: its worker channel, its Docker pipe and the
   // Docker pipe of the extension for the host share it. The pipe of the extension for a host listens from the first
@@ -306,20 +330,22 @@ async function activateExtension(
   /**
    * A new login `ssh … sh -s` to `host` (sshHostTransport), for a shell before the relay or a connection of the relay.
    * Within a flow of the user (withSshPrompts), it may ask in VS Code until the Cancel of the flow; its questions end
-   * with its process. Undefined without `ssh` and for a host that is no SSH alias or address.
+   * with its process. With the key of Devspaces when the host has it; after a login that asked for the password, the key
+   * offer runs on the shell (SshKeyOffer.afterLogin). Undefined without `ssh` and for a host that is no SSH alias or
+   * address.
    */
   const startLogin = (host: string): RemoteShellStart | undefined => {
     const ssh = sshPath();
     if (ssh === undefined) return undefined;
     const login: SshLogin | undefined = sshPromptsAllowed() ? askpass.login(host, sshPromptSignal()) : undefined;
-    const transport = sshHostTransport(host, ssh, env, login);
+    const transport = sshHostTransport(host, ssh, env, { prompts: login, identity: sshKeys.identityFor(host) });
     if (transport === undefined) {
       login?.dispose();
       return undefined;
     }
     const process = runner.startBytes(transport.file, transport.args, { env: transport.env });
     if (login !== undefined) void process.exited.then(() => login.dispose());
-    return { process, prompts: login };
+    return { process, prompts: login, afterLogin: login === undefined ? undefined : (shell) => sshKeys.afterLogin(host, login, shell) };
   };
   // The shells before the relay, one per SSH host: the checks before a connection of the relay run on one login, which
   // the connection then takes over (`ssh … sh -s`, as its transport).
@@ -339,6 +365,7 @@ async function activateExtension(
     sshLogins,
     viaDockerPipe: (host) => hostPipes?.dockerHost(host) !== undefined,
     shells,
+    identityFor: (host) => sshKeys.identityFor(host),
   });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
@@ -834,6 +861,7 @@ async function activateExtension(
     env,
     sshLogins,
     shells,
+    identityFor: (host) => sshKeys.identityFor(host),
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();

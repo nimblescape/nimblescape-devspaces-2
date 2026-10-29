@@ -103,6 +103,50 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
+  // The key offer (SshKeyOffer.afterLogin) asks the user and runs a command on the shell before the callers get it.
+  it('runs the step after the login once, before the callers get the shell, and keeps the shell open meanwhile', async () => {
+    const steps: string[] = [];
+    const warnings: string[] = [];
+    let release: () => void = () => undefined;
+    const answered = new Promise<void>((resolve) => (release = resolve));
+    const registry = new RemoteShells({
+      logger: { ...silentLogger, warn: (line) => warnings.push(line) },
+      loginTimeoutMs: 5_000,
+      idleCloseMs: 50,
+      start: () => ({
+        process: runner.startBytes('sh', ['-c', 'exec sh -s']),
+        afterLogin: async (shell) => {
+          steps.push('asked');
+          // Longer than the time without use of the shell: the question of the user.
+          await answered;
+          steps.push(`ran ${(await shell.run('printf key')).stdout}`);
+        },
+      }),
+    });
+    const first = registry.run('box', 'printf one').then((result) => steps.push(`call ${result?.stdout}`));
+    const second = registry.login('box').then((result) => steps.push(`login ${JSON.stringify(result)}`));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(steps).toEqual(['asked']);
+    release();
+    await Promise.all([first, second]);
+    expect(steps.slice(0, 2)).toEqual(['asked', 'ran key']);
+    expect(steps.slice(2).sort()).toEqual(['call one', 'login {"ok":true}']);
+    expect(warnings).toEqual([]);
+    registry.dispose();
+  });
+
+  it('gives out the shell after a step after the login that failed, and logs it', async () => {
+    const warnings: string[] = [];
+    const registry = new RemoteShells({
+      logger: { ...silentLogger, warn: (line) => warnings.push(line) },
+      loginTimeoutMs: 5_000,
+      start: () => ({ process: runner.startBytes('sh', ['-c', 'exec sh -s']), afterLogin: () => Promise.reject(new Error('no answer')) }),
+    });
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    expect(warnings).toEqual(['The step after the login on box failed: no answer']);
+    registry.dispose();
+  });
+
   // The test of a host sees the SSH configuration and the host of now.
   it('logs in anew with fresh, and ends the open shell at once', async () => {
     const { registry, logins, processes } = shells();

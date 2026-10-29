@@ -7,6 +7,9 @@
 // flow of the user asks for the unknown host key and the password in VS Code (fake dialogs; the real launcher, helper
 // and pipe of SshAskpassServer, run by the real `ssh` through SSH_ASKPASS), then the shell before the relay runs
 // `docker info` of the host on that one login. A login outside of a flow of the user asks nothing and fails at once.
+// The key offer after that login (docs/architecture.md "The key of Devspaces"): the real `ssh-keygen` creates the key of
+// Devspaces in a home folder of the test, the shell adds it to authorized_keys of root, and the logins after it (also
+// the `ssh` of the Docker CLI, through the wrapper) need no password.
 import { vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('../../src/vscode/testing/fakeVscode')).fakeVscode);
@@ -16,18 +19,22 @@ import * as net from 'net';
 import * as path from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { findExecutable } from '../../src/core/docker/dockerCli';
-import { testRemoteDockerHost } from '../../src/core/docker/remoteDocker';
+import { findExecutable, putFolderFirstInPath } from '../../src/core/docker/dockerCli';
+import { noPromptEnv, testRemoteDockerHost } from '../../src/core/docker/remoteDocker';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import { NodeProcessRunner } from '../../src/core/process';
 import { RemoteShells } from '../../src/core/relay/remoteShells';
 import { sshHostTransport } from '../../src/core/relay/transport';
 import { sshPromptsAllowed, withSshPrompts } from '../../src/core/sshAskpass';
+import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
+import { SshKeyOffer, type SshKeyDialogs } from '../../src/vscode/sshKeyOffer';
 import { SshAskpassServer, type SshLoginDialogs } from '../../src/vscode/sshLoginPrompts';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { dockerTestContext } from './harness';
 
 const ALIAS = 'devspaces-test-password';
+/** The same server, where a key may log in too (ALIAS allows only the password). */
+const KEY_ALIAS = 'devspaces-test-key-offer';
 const PASSWORD = 'devspaces-test-password-1';
 const SSHD_DOCKERFILE_FOLDER = path.resolve(__dirname, 'sshd');
 
@@ -74,18 +81,21 @@ describe('the login without setup: password and host key in VS Code', () => {
     notice: () => undefined,
   };
 
-  /** The shells of a window, whose logins may ask within withSshPrompts (as extension.ts). */
-  function shells(): RemoteShells {
+  /**
+   * The shells of a window, whose logins may ask within withSshPrompts (as extension.ts); with `keys`, they use the key
+   * of Devspaces for a host that has it, and offer it after a login with a password.
+   */
+  function shells(keys?: SshKeyOffer): RemoteShells {
     return new RemoteShells({
       logger: log,
       loginTimeoutMs: 30_000,
       start: (host) => {
         const login = sshPromptsAllowed() ? askpass.login(host) : undefined;
-        const transport = sshHostTransport(host, sshPath, env, login);
+        const transport = sshHostTransport(host, sshPath, env, { prompts: login, identity: keys?.identityFor(host) });
         if (transport === undefined) return undefined;
         const process = runner.startBytes(transport.file, transport.args, { env: transport.env });
         if (login !== undefined) void process.exited.then(() => login.dispose());
-        return { process, prompts: login };
+        return { process, prompts: login, afterLogin: keys !== undefined && login !== undefined ? (shell) => keys.afterLogin(host, login, shell) : undefined };
       },
     });
   }
@@ -122,7 +132,10 @@ describe('the login without setup: password and host key in VS Code', () => {
       config,
       [
         `Host ${ALIAS}`, '  HostName 127.0.0.1', `  Port ${port}`, '  User root', '  PubkeyAuthentication no', '  IdentityAgent none',
-        '  PreferredAuthentications password', `  UserKnownHostsFile ${knownHosts}`, '  StrictHostKeyChecking ask', '',
+        '  PreferredAuthentications password', `  UserKnownHostsFile ${knownHosts}`, '  StrictHostKeyChecking ask',
+        // No key of the runner (a file that is not there in place of the default files), and no agent.
+        `Host ${KEY_ALIAS}`, '  HostName 127.0.0.1', `  Port ${port}`, '  User root', '  IdentityAgent none', `  IdentityFile ${path.join(dir, 'no-key')}`,
+        '  PreferredAuthentications publickey,password', `  UserKnownHostsFile ${knownHosts}`, '  StrictHostKeyChecking ask', '',
       ].join('\n'),
     );
     const bin = path.join(dir, 'bin');
@@ -170,6 +183,59 @@ describe('the login without setup: password and host key in VS Code', () => {
     await expect(windowShells.run(ALIAS, 'printf ok')).resolves.toMatchObject({ exitCode: 0, stdout: 'ok' });
     expect(asked).toHaveLength(3);
     windowShells.dispose();
+  });
+
+  it('offers the key after the login with the password, and the logins after it need none, also the ssh of the Docker CLI', async () => {
+    asked.length = 0;
+    secrets.push(PASSWORD);
+    const keygen = findExecutable('ssh-keygen', process.env, process.platform);
+    if (!keygen) throw new Error('The Docker test of the key offer needs ssh-keygen.');
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(home, { recursive: true });
+    const offered: string[] = [];
+    const keyDialogs: SshKeyDialogs = {
+      offer: async (host) => {
+        offered.push(`offer ${host}`);
+        return 'use';
+      },
+      installed: (host) => offered.push(`installed ${host}`),
+      failed: (host, detail) => offered.push(`failed ${host}: ${detail}`),
+    };
+    const keys = new SshKeyOffer({
+      home,
+      platform: process.platform,
+      computerName: 'docker-test',
+      wrapperFolder: path.join(dir, 'ssh-wrapper'),
+      runner,
+      sshPath: () => sshPath,
+      sshKeygenPath: () => keygen,
+      env,
+      state: new RemoteDockerState(path.join(dir, 'remote-docker.json'), log),
+      dialogs: keyDialogs,
+      logger: log,
+    });
+    await keys.prepare();
+    const first = shells(keys);
+    await expect(withSshPrompts(() => first.run(KEY_ALIAS, 'printf one'))).resolves.toMatchObject({ exitCode: 0, stdout: 'one' });
+    first.dispose();
+    expect(asked.filter((line) => line.startsWith('secret'))).toHaveLength(1);
+    expect(offered).toEqual([`offer ${KEY_ALIAS}`, `installed ${KEY_ALIAS}`]);
+    expect(localCli.ok(['exec', sshdContainer, 'cat', '/root/.ssh/authorized_keys'])).toMatch(/^ssh-ed25519 \S+ devspaces@docker-test$/);
+    // A login outside of a flow of the user asks nothing, and works with the key.
+    asked.length = 0;
+    const second = shells(keys);
+    await expect(second.run(KEY_ALIAS, 'printf two')).resolves.toMatchObject({ exitCode: 0, stdout: 'two' });
+    second.dispose();
+    expect(asked).toEqual([]);
+    // The Docker CLI with ssh://: its `ssh` is the wrapper, with the key.
+    const dockerEnv: NodeJS.ProcessEnv = { ...noPromptEnv(localEnv), DOCKER_HOST: `ssh://${KEY_ALIAS}` };
+    delete dockerEnv.DOCKER_CONTEXT;
+    // The `ssh` of the test (with its config file) first, so that only the key can make the difference.
+    putFolderFirstInPath(dockerEnv, process.platform, path.dirname(sshPath));
+    keys.dockerSshEnv(KEY_ALIAS, dockerEnv);
+    const info = await runner.run(run.dockerPath, ['info', '--format', '{{json .ServerVersion}}'], { env: dockerEnv, timeoutMs: 60_000 });
+    expect(info, JSON.stringify(info)).toMatchObject({ exitCode: 0 });
+    expect(asked).toEqual([]);
   });
 
   it('fails the login of a flow of the user whose question was cancelled', async () => {

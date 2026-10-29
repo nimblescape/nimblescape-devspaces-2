@@ -5,6 +5,7 @@
 // The shells before the relay of this window (docs/architecture.md "The shell before the relay"): at most one per SSH
 // host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
 // it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
+import { errorMessage } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
 import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
 import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } from './remoteShell';
@@ -13,6 +14,12 @@ import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } fro
 export interface RemoteShellStart {
   process: StartedByteProcess;
   prompts?: SshLoginPrompts;
+  /**
+   * Runs once the shell is open, before the callers get it (the key offer of SshKeyOffer, which may ask the user and run
+   * a command on it); the shell is not closed for a time without use meanwhile. A failure is logged; the shell is given
+   * out after it as well.
+   */
+  afterLogin?: (shell: RemoteShell) => Promise<void>;
 }
 
 export interface RemoteShellsOptions {
@@ -83,14 +90,19 @@ export class RemoteShells {
     }
     const started = this.options.start(host);
     if (started === undefined) return Promise.resolve(undefined);
-    const { process, prompts } = started;
+    const { process, prompts, afterLogin } = started;
     const entry: Entry = { process, flow: currentSshPromptFlow() };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
     entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
-      (shell) => {
+      async (shell) => {
+        if (afterLogin !== undefined && !this.disposed) {
+          await shell
+            .keepOpenDuring(() => afterLogin(shell))
+            .catch((error: unknown) => logger.warn(`The step after the login on ${host} failed: ${errorMessage(error)}`));
+        }
         entry.shell = shell;
         entry.opening = undefined;
         if (this.disposed) shell.killNow();

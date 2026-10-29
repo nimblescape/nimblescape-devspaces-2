@@ -112,6 +112,8 @@ export class RemoteShell {
   private running: Running | undefined;
   private stderrTail = '';
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The calls of keepOpenDuring that did not end yet: the shell is not closed for a time without use meanwhile. */
+  private holds = 0;
   /** After the takeover: the listeners of the connection of the relay, and what came before they listened. */
   private taken: {
     stdout?: (chunk: Buffer) => void;
@@ -308,6 +310,21 @@ export class RemoteShell {
     return taking;
   }
 
+  /**
+   * Runs `work` while the shell is not closed for a time without use (SHELL_IDLE_CLOSE_MS), for example a question to
+   * the user before a command on it (the key offer). The time without use starts again when `work` ended.
+   */
+  async keepOpenDuring<T>(work: () => Promise<T>): Promise<T> {
+    this.holds++;
+    this.disarmIdle();
+    try {
+      return await work();
+    } finally {
+      this.holds--;
+      if (this.stage === 'ready') this.armIdle();
+    }
+  }
+
   /** Ends the shell (its input), unless the relay took it over; a shell that does not end is stopped. */
   close(): void {
     if (this.stage === 'taken' || this.stage === 'ended') return;
@@ -445,6 +462,7 @@ export class RemoteShell {
 
   private armIdle(): void {
     this.disarmIdle();
+    if (this.holds > 0) return;
     this.idleTimer = setTimeout(() => {
       this.options.logger.info(`The shell on ${this.options.name} was closed after a time without use.`);
       this.close();

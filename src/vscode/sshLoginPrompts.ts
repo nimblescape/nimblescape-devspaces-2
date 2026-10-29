@@ -409,7 +409,7 @@ class Cancel implements vscode.CancellationToken {
 }
 
 /** Writes `text` to `file` with `mode`, unless the file has that text already: written as a part, then renamed. */
-async function writeIfChanged(file: string, text: string, mode: number): Promise<void> {
+export async function writeIfChanged(file: string, text: string, mode: number): Promise<void> {
   try {
     if ((await fs.promises.readFile(file, 'utf8')) === text) {
       await fs.promises.chmod(file, mode);

@@ -299,10 +299,20 @@ export function sshEndpoint(host: string): string {
  * question: BatchMode (no password or passphrase prompt, no host key question: an unknown key fails), a time limit for
  * the connection, no terminal. With `prompts`, without BatchMode: a login of a flow of the user, whose questions
  * SSH_ASKPASS asks in VS Code (sshAskpass.ts); `-x` forwards no X11 to the DISPLAY of its environment (ASKPASS_DISPLAY).
- * The destination comes after `--`, so it can never be an option.
+ * `identity`: the key of Devspaces for a host that has it (sshKey.ts), with `-i`; `identityOnly` adds that the login may
+ * use only this key (the check of the key offer). The destination comes after `--`, so it can never be an option.
  */
-export function sshCommandArgs(target: SshAddress, remoteCommand: string, connectTimeoutSeconds = 15, options: { prompts?: boolean } = {}): string[] {
+export function sshCommandArgs(
+  target: SshAddress,
+  remoteCommand: string,
+  connectTimeoutSeconds = 15,
+  options: { prompts?: boolean; identity?: string; identityOnly?: boolean } = {},
+): string[] {
   const args = [...(options.prompts === true ? ['-x'] : ['-o', 'BatchMode=yes']), '-o', `ConnectTimeout=${connectTimeoutSeconds}`, '-T'];
+  if (options.identity !== undefined) {
+    args.push('-i', options.identity);
+    if (options.identityOnly === true) args.push('-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey');
+  }
   if (target.port !== undefined) args.push('-p', String(target.port));
   if (target.user !== undefined) args.push('-l', target.user);
   args.push('--', target.host, remoteCommand);

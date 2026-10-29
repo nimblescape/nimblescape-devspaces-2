@@ -141,3 +141,66 @@ describe('RemoteDockerState: rootless sockets', () => {
     expect(await state.remoteHosts()).toEqual([]);
   });
 });
+
+describe('RemoteDockerState: the SSH key of Devspaces', () => {
+  it('records the key of a host next to its rootless socket, and removes a record that knows nothing more', async () => {
+    await state.setRootlessSocket('a', '/run/user/1000/docker.sock');
+    await state.setSshKey('a', 'installed');
+    await state.setSshKey('b', 'declined');
+    expect(await state.sshKey('a')).toBe('installed');
+    expect(await state.sshKey('b')).toBe('declined');
+    expect(await state.sshKey('c')).toBeUndefined();
+    expect((await state.read()).hosts).toEqual([
+      { host: 'a', rootlessSocket: '/run/user/1000/docker.sock', sshKey: 'installed' },
+      { host: 'b', sshKey: 'declined' },
+    ]);
+    // The socket goes; the key keeps the record, at its place.
+    await state.setRootlessSocket('a', undefined);
+    expect((await state.read()).hosts).toEqual([{ host: 'a', sshKey: 'installed' }, { host: 'b', sshKey: 'declined' }]);
+    await state.setSshKey('a', undefined);
+    await state.setSshKey('b', undefined);
+    expect((await state.read()).hosts).toBeUndefined();
+    // A key is no host of the list.
+    expect(await state.remoteHosts()).toEqual([]);
+  });
+
+  it('writes only a change', async () => {
+    await state.setSshKey('a', 'installed');
+    const before = fs.statSync(state.file);
+    await state.setSshKey('a', 'installed');
+    await state.setSshKey('b', undefined);
+    const after = fs.statSync(state.file);
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+  });
+
+  it('forgets a declined key when the host leaves the list, and keeps an installed one', async () => {
+    await state.setDockerHost('a');
+    await state.setDockerHost('b');
+    await state.setSshKey('a', 'declined');
+    await state.setSshKey('b', 'installed');
+    await state.removeHost('a');
+    await state.removeHost('b');
+    expect(await state.sshKey('a')).toBeUndefined();
+    expect(await state.sshKey('b')).toBe('installed');
+  });
+
+  it('gives the key without waiting, and reads the file again after a change of another window', async () => {
+    expect(state.sshKeyNow('a')).toBeUndefined();
+    await state.setSshKey('a', 'installed');
+    expect(state.sshKeyNow('a')).toBe('installed');
+    // Another window (another object on the same file) changes it.
+    await new RemoteDockerState(state.file).setSshKey('a', 'declined');
+    expect(state.sshKeyNow('a')).toBe('declined');
+    fs.writeFileSync(state.file, 'not json');
+    expect(state.sshKeyNow('a')).toBeUndefined();
+    fs.rmSync(state.file);
+    expect(state.sshKeyNow('a')).toBeUndefined();
+  });
+
+  it('drops a key state that it does not know', async () => {
+    fs.writeFileSync(state.file, JSON.stringify({ hosts: [{ host: 'a', sshKey: 'maybe' }, { host: 'b', sshKey: 'installed' }] }));
+    expect((await state.read()).hosts).toEqual([{ host: 'a' }, { host: 'b', sshKey: 'installed' }]);
+    expect(state.sshKeyNow('a')).toBeUndefined();
+    expect(state.sshKeyNow('b')).toBe('installed');
+  });
+});

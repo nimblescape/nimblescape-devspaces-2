@@ -309,7 +309,7 @@ Your devspaces can run on Docker on another computer, for example a build server
 1. On the other computer, install Docker Engine and let your SSH user use it: add the user to the group `docker`, or use rootless Docker. Your computer needs no Docker: when it has no Docker CLI, Devspaces downloads its own after you choose the host in step 3 (see [What to know](#what-to-know)).
 2. You need the SSH address of the host (`user@host` or `user@host:port`, or a host of your SSH config) and a way to log in: a password, or a key. Nothing needs to be set up on your computer: when the login asks a question, Devspaces asks it in VS Code (see [SSH questions](#ssh-questions)).
 3. Run **Devspaces: Use a Remote Docker Host…**, or select the first row of the view. Without Docker on your computer, the Docker setup in the view offers **Use a Remote Docker Host…** too. The list shows the hosts that Devspaces used before (**Hosts of Devspaces**), the other hosts of your SSH config (`~/.ssh/config`, on Windows `%USERPROFILE%\.ssh\config`, with its `Include` files), and the SSH hosts of your Docker contexts. **Enter an SSH address…** takes `user@host` or `user@host:port` (an IPv6 address in brackets).
-4. Devspaces tests the connection with one SSH login, which may ask for the host key and your password (see [SSH questions](#ssh-questions)), adds the host to its list, and uses it: "Devspaces now uses Docker on `<host>`."
+4. Devspaces tests the connection with one SSH login, which may ask for the host key and your password (see [SSH questions](#ssh-questions)), adds the host to its list, and uses it: "Devspaces now uses Docker on `<host>`." After a login with your password, Devspaces offers to log in with a key next time (see [A key for the next logins](#a-key-for-the-next-logins)).
 5. **Devspaces: Use the Local Docker** goes back to the Docker of your computer. The host stays in the list.
 6. **Remove a Host from the List…** at the end of the list of step 3 removes a host from the list. Its devspaces stay on that computer: add the host again to show them in the sidebar. An open window of such a devspace keeps working. When Devspaces uses that host, it uses the local Docker afterwards.
 
@@ -321,6 +321,16 @@ When the login to the host asks a question, Devspaces asks it in VS Code, only i
 - **Your password**, the passphrase of your key, or a code: an input box at the top of the window, which hides what you type. When the answer was not accepted, the box asks again. Cancel ends the login. **Cancel** of the progress notification closes the box too.
 - Devspaces keeps no answer. The work of Devspaces in the background (the states in the view, the builds of its helper image) asks nothing: without a key, it waits for your next command and shows the state as unknown until then. Each window logs in once for each host.
 - This needs the OpenSSH client of your computer (Windows 10 and 11, macOS, and Linux bring it). It asks through the program in `SSH_ASKPASS`, which Devspaces sets only for these logins.
+
+### A key for the next logins
+
+After a login with your password, Devspaces asks once: "Log in to `<host>` without a password next time?"
+
+- **Use a Key**: Devspaces creates its own SSH key `~/.ssh/devspaces_ed25519` on your computer (on Windows in `%USERPROFILE%\.ssh`), when it is not there yet, and adds its public key to `~/.ssh/authorized_keys` of your account on the host, on the same login. Then it tests a login with the key. From then on, every login of Devspaces to that host uses this key and needs no password, also the work in the background. Devspaces never writes over another file in `~/.ssh` and never changes your SSH config.
+- **Not for This Host**: Devspaces keeps asking for the password on that host and does not offer the key again, until you remove the host from the list and add it again.
+- When you close the dialog, Devspaces asks again after the next login with your password.
+- The key has no passphrase, so every program of your user on this computer can use it (see [Security](security.md#remote-and-shared-engines)). One key serves all hosts. To remove it from a host, delete the line that ends with `devspaces@<name of your computer>` from `~/.ssh/authorized_keys` there.
+- When the key cannot be set up, a warning says why, for example when the SSH server of the host allows no keys. Devspaces then asks again after the next login with your password.
 
 ### What to know
 
@@ -404,7 +414,7 @@ The checks are a guard rail against mistakes and copied templates, not a sandbox
 - **The Monitor.** Its log shows each stop, each background run, and each prepare: `docker logs devspaces-monitor` on the engine, or from your computer `docker -H ssh://<host> logs devspaces-monitor`. Docker keeps at most 2 × 1 MB of it.
 - **A devspace stops too early or keeps running.** Check its row for `· kept`, and the settings `stopOnClose`, `stopAfterMinutes`, and `respectShutdownActionNone`. If the window warns that its heartbeats failed, the Monitor may stop the devspace after `stopAfterMinutes`.
 - **GitHub limits the requests.** When GitHub refuses the requests of your account for a while (its rate limit), the view keeps the repositories that it shows, and a message says at what time Devspaces loads the list again. It tries once at that time; after that, use **Refresh**.
-- **`State unknown`.** Devspaces could not read the engine. On a remote host that you log in to without a key, the work in the background asks no password, so the state stays unknown until your next command logs in (see [SSH questions](#ssh-questions)). Otherwise check that `ssh <host>` works and that Docker runs there. After the images of an engine were removed, Devspaces prepares the engine again in the background; the status bar shows "Devspaces: preparing `<host>`…".
+- **`State unknown`.** Devspaces could not read the engine. On a remote host that you log in to without a key, the work in the background asks no password, so the state stays unknown until your next command logs in (see [SSH questions](#ssh-questions)); **Use a Key** after that login ends this (see [A key for the next logins](#a-key-for-the-next-logins)). Otherwise check that `ssh <host>` works and that Docker runs there. After the images of an engine were removed, Devspaces prepares the engine again in the background; the status bar shows "Devspaces: preparing `<host>`…".
 - **Report a problem.** Open an issue on GitHub. [SUPPORT.md](../SUPPORT.md) says what to include.
 
 ## Uninstall

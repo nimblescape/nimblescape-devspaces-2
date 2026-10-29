@@ -186,6 +186,7 @@ export async function readRootlessSocket(
   env: NodeJS.ProcessEnv,
   signal?: AbortSignal,
   shells?: RemoteShellAccess,
+  identity?: string,
 ): Promise<{ ok: true; socket: string } | { ok: false; problem: DockerHostProblem; detail: string }> {
   if (sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
   const target = sshTargetOf(host);
@@ -195,7 +196,7 @@ export async function readRootlessSocket(
     // On the shell before the relay when the host has one (`shells`), else with a login of its own.
     result =
       (await shells?.run(host, RUNTIME_DIR_COMMAND, { timeoutMs: SSH_TIMEOUT_MS, signal })) ??
-      (await runner.run(sshPath, sshCommandArgs(target, RUNTIME_DIR_COMMAND), {
+      (await runner.run(sshPath, sshCommandArgs(target, RUNTIME_DIR_COMMAND, undefined, { identity }), {
         env: noPromptEnv(env),
         timeoutMs: SSH_TIMEOUT_MS,
         signal,
@@ -281,6 +282,8 @@ export interface SshCheckDeps {
    * the next connection of the relay takes it over), instead of `ssh … true`.
    */
   shells?: RemoteShellAccess;
+  /** The key of Devspaces for `host` when that host has it (sshKey.ts), for `-i`; else undefined. */
+  identityFor?(host: string): string | undefined;
 }
 
 export type SshLoginCheck =
@@ -316,7 +319,7 @@ export async function checkSshLogin(
   }
   let result: RunResult;
   try {
-    result = await deps.runner.run(deps.sshPath, sshCommandArgs(target, 'true'), {
+    result = await deps.runner.run(deps.sshPath, sshCommandArgs(target, 'true', undefined, { identity: deps.identityFor?.(host) }), {
       env: noPromptEnv(deps.env),
       timeoutMs: SSH_TIMEOUT_MS,
       signal: options.signal,
@@ -376,6 +379,8 @@ export interface RemoteReachabilityDeps {
   viaDockerPipe?(host: string): boolean;
   /** The shells before the relay (SshCheckDeps.shells), also for the runtime folder of a rootless engine. */
   shells?: RemoteShellAccess;
+  /** The key of Devspaces for `host` (SshCheckDeps.identityFor). */
+  identityFor?(host: string): string | undefined;
 }
 
 /**
@@ -416,7 +421,7 @@ export async function recordRootlessSocket(
     return;
   }
   if ((await deps.state.rootlessSocket(host)) !== undefined) return;
-  const read = await readRootlessSocket(deps.runner, deps.sshPath, host, deps.env, signal, deps.shells);
+  const read = await readRootlessSocket(deps.runner, deps.sshPath, host, deps.env, signal, deps.shells, deps.identityFor?.(host));
   if (!read.ok) {
     deps.logger.warn(`The socket of the rootless Docker engine on ${host} could not be read: ${read.detail}`);
     throw dockerHostUnreachable(host, read.problem, read.detail);

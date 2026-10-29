@@ -77,6 +77,31 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     expect(envs[1].DOCKER_HOST).toBe(PIPE);
   });
 
+  // The `ssh` of the Docker CLI with the key of Devspaces (SshKeyOffer.dockerSshEnv).
+  it('lets sshEnv change the environment of a call with ssh://<host> only, never of the base environment', async () => {
+    const { runner, envs } = recorder();
+    const base = { PATH: '/usr/bin' };
+    const sshEnv = vi.fn((host: string, env: NodeJS.ProcessEnv) => {
+      env.PATH = `/wrapper:${env.PATH}`;
+      env.DEVSPACES_SSH_IDENTITY = `key of ${host}`;
+    });
+    let pipe: string | undefined;
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', base, silentLogger, 'linux', { dockerPipe: () => pipe, sshEnv });
+    await runWithDockerTarget(REMOTE, () => docker.run(['container', 'inspect', 'x']));
+    // The wrapper stays first in PATH (the folders that BootstrapDocker adds come at the end).
+    expect(envs[0]).toMatchObject({ DOCKER_HOST: SSH, DEVSPACES_SSH_IDENTITY: 'key of build-box' });
+    expect(envs[0].PATH?.startsWith('/wrapper:/usr/bin')).toBe(true);
+    expect(sshEnv).toHaveBeenCalledTimes(1);
+    pipe = PIPE;
+    await runWithDockerTarget(REMOTE, () => docker.run(['container', 'inspect', 'x']));
+    await runWithDockerTarget(LOCAL_DOCKER_TARGET, () => docker.run(['container', 'inspect', 'x']));
+    expect(envs[1].DOCKER_HOST).toBe(PIPE);
+    expect([envs[1].PATH, envs[2].PATH].some((value) => value?.includes('/wrapper'))).toBe(false);
+    expect([envs[1].DEVSPACES_SSH_IDENTITY, envs[2].DEVSPACES_SSH_IDENTITY]).toEqual([undefined, undefined]);
+    expect(sshEnv).toHaveBeenCalledTimes(1);
+    expect(base).toEqual({ PATH: '/usr/bin' });
+  });
+
   it('logs each call of an operation on an SSH host that logs in over SSH, never a call through the pipe', async () => {
     const { runner } = recorder();
     const lines: string[] = [];
