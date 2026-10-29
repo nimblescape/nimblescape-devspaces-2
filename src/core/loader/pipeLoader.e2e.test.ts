@@ -19,7 +19,7 @@ interface Ended {
 }
 
 interface Running {
-  write(text: string): void;
+  write(input: string | Buffer): void;
   end(): void;
   ended: Promise<Ended>;
 }
@@ -35,7 +35,7 @@ function startLoader(file: string, hash: string, entry: string): Running {
   child.stdin.on('error', () => {});
   const ended = new Promise<Ended>((resolve) => child.on('close', (code) => resolve({ code, stdout, stderr })));
   return {
-    write: (text) => void child.stdin.write(text),
+    write: (input) => void child.stdin.write(input),
     end: () => child.stdin.end(),
     ended,
   };
@@ -50,22 +50,22 @@ async function load(file: string, hash: string, entry: string, input: string): P
 }
 
 /**
- * A bundle whose `start` prints what it got: the rest of the input that the loader read, all later input, the state of
- * the standard input when it was called (null: never read; false: paused), and its encoding.
+ * A bundle whose `start` prints what it got: the number of its arguments, its input after the first line (bytes, as
+ * hex), the state of the standard input when it was called (null: never read; false: paused), and its encoding.
  */
 const ECHO_BUNDLE = [
-  'exports.start = (rest) => {',
+  'exports.start = (...args) => {',
   '  const flowing = process.stdin.readableFlowing;',
   '  const encoding = process.stdin.readableEncoding;',
-  '  let later = "";',
-  '  process.stdin.on("data", (d) => (later += d));',
-  '  process.stdin.on("end", () => process.stdout.write(JSON.stringify({ rest, later, flowing, encoding })));',
+  '  const chunks = [];',
+  '  process.stdin.on("data", (d) => chunks.push(d));',
+  '  process.stdin.on("end", () => process.stdout.write(JSON.stringify({ args: args.length, input: Buffer.concat(chunks).toString("hex"), flowing, encoding })));',
   '  process.stdin.resume();',
   '};',
 ].join('\n');
 
 /** A bundle that says it was started and does not read its input. */
-const START_BUNDLE = 'exports.start = (rest) => { process.stdout.write("started " + JSON.stringify(rest) + " " + process.stdin.readableFlowing); };\n';
+const START_BUNDLE = 'exports.start = (...args) => { process.stdout.write("started " + args.length + " " + process.stdin.readableFlowing); };\n';
 
 describe('the pipe loader in a Node.js process', () => {
   let dir = '';
@@ -82,21 +82,25 @@ describe('the pipe loader in a Node.js process', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('stores the bundle, calls the entry with the rest of the input, and hands the paused input over', async () => {
+  it('stores the bundle, puts the rest of the input back, and hands the paused input over as bytes', async () => {
     const file = newPath();
     const running = startLoader(file, bundleHash(ECHO_BUNDLE), 'start');
-    running.write(`${encodeBundle(ECHO_BUNDLE)}first`);
+    // Bytes that are no UTF-8 after the first line, and a character whose bytes come in two writes.
+    const first = Buffer.concat([Buffer.from(encodeBundle(ECHO_BUNDLE), 'utf8'), Buffer.from([0x66, 0x00, 0x80, 0xff, 0xc3])]);
+    const second = Buffer.from([0xa9, 0x0a, 0x74]);
+    running.write(first);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    running.write(' second\nthird');
+    running.write(second);
     running.end();
     const ended = await running.ended;
     expect(ended.stderr).toBe('');
     expect(ended.code).toBe(0);
-    const seen = JSON.parse(ended.stdout) as { rest: string; later: string; flowing: boolean | null; encoding: string };
-    // Everything after the first line reaches the bundle once, in order, as text.
-    expect(seen.rest + seen.later).toBe('first second\nthird');
+    const seen = JSON.parse(ended.stdout) as { args: number; input: string; flowing: boolean | null; encoding: string | null };
+    // Everything after the first line reaches the bundle once, in order, every byte unchanged.
+    expect(seen.input).toBe('660080ffc3a90a74');
+    expect(seen.args).toBe(0);
     expect(seen.flowing).toBe(false);
-    expect(seen.encoding).toBe('utf8');
+    expect(seen.encoding).toBeNull();
     expect(fs.readFileSync(file, 'utf8')).toBe(ECHO_BUNDLE);
     // Atomic: no temporary file stays.
     expect(leftovers(file)).toEqual([]);
@@ -190,13 +194,13 @@ describe('the pipe loader in a Node.js process', () => {
     const file = newPath();
     const hash = bundleHash(START_BUNDLE);
     const first = await load(file, hash, 'start', encodeBundle(START_BUNDLE));
-    expect(first).toEqual({ code: 0, stdout: 'started "" false', stderr: '' });
+    expect(first).toEqual({ code: 0, stdout: 'started 0 false', stderr: '' });
     // A restart: the input stays open and holds something that is no bundle; the loader never reads it.
     const again = startLoader(file, hash, 'start');
     again.write('garbage that is not read\n');
     const ended = await again.ended;
     again.end();
-    expect(ended).toEqual({ code: 0, stdout: 'started "" null', stderr: '' });
+    expect(ended).toEqual({ code: 0, stdout: 'started 0 null', stderr: '' });
     // The marker of the first start is there and does not stop the resume.
     expect(fs.existsSync(`${file}.started`)).toBe(true);
   });
@@ -239,7 +243,7 @@ describe('the pipe loader in a Node.js process', () => {
     const again = startLoader(file, hash, 'start');
     const ended = await again.ended;
     again.end();
-    expect(ended).toEqual({ code: 0, stdout: 'started "" null', stderr: '' });
+    expect(ended).toEqual({ code: 0, stdout: 'started 0 null', stderr: '' });
   });
 
   it('exits 3 when the marker cannot be written', async () => {
@@ -338,7 +342,7 @@ describe('the pipe loader in a Node.js process', () => {
     fs.writeFileSync(other, 'old');
     fs.symlinkSync(other, file);
     const ended = await load(file, bundleHash(START_BUNDLE), 'start', encodeBundle(START_BUNDLE));
-    expect(ended).toEqual({ code: 0, stdout: 'started "" false', stderr: '' });
+    expect(ended).toEqual({ code: 0, stdout: 'started 0 false', stderr: '' });
     expect(fs.readFileSync(other, 'utf8')).toBe('old');
     expect(fs.lstatSync(file).isSymbolicLink()).toBe(false);
     expect(fs.readFileSync(file, 'utf8')).toBe(START_BUNDLE);
@@ -349,7 +353,7 @@ describe('the pipe loader in a Node.js process', () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, 'exports.start = () => process.stdout.write("tampered");');
     const ended = await load(file, bundleHash(START_BUNDLE), 'start', `${encodeBundle(START_BUNDLE)}rest`);
-    expect(ended).toEqual({ code: 0, stdout: 'started "rest" false', stderr: '' });
+    expect(ended).toEqual({ code: 0, stdout: 'started 0 false', stderr: '' });
     expect(fs.readFileSync(file, 'utf8')).toBe(START_BUNDLE);
     expect(leftovers(file)).toEqual([]);
   });
@@ -360,7 +364,7 @@ describe('the pipe loader in a Node.js process', () => {
     const bundle = `${START_BUNDLE}/*${filler}*/\n`;
     expect(bundle.length).toBeGreaterThan(2 * 1024 * 1024);
     const ended = await load(file, bundleHash(bundle), 'start', encodeBundle(bundle));
-    expect(ended).toEqual({ code: 0, stdout: 'started "" false', stderr: '' });
+    expect(ended).toEqual({ code: 0, stdout: 'started 0 false', stderr: '' });
     expect(fs.readFileSync(file, 'utf8')).toBe(bundle);
     expect(leftovers(file)).toEqual([]);
   });

@@ -41,7 +41,7 @@ function start(version: string | undefined): void {
   vi.spyOn(process.stdin, 'on').mockImplementation((() => process.stdin) as never);
   vi.spyOn(process.stdin, 'resume').mockImplementation(() => process.stdin);
   vi.stubEnv('DEVSPACES_VERSION', version);
-  startChannel('');
+  startChannel();
   expect(servers).toHaveLength(1);
   servers.length = 0;
 }

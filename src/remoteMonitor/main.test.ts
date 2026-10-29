@@ -1621,9 +1621,9 @@ describe('startMonitor and runEntry', () => {
     expect(typeof startMonitor).toBe('function');
   });
 
-  it('startMonitor runs `run` whatever the input, with SIGTERM and SIGINT ending it with 0', () => {
+  it('startMonitor runs `run`, with SIGTERM and SIGINT ending it with 0', () => {
     const { deps, signals, exits, argvs } = entryDeps(new Promise(() => {}));
-    startMonitor('input after the script', deps);
+    startMonitor(deps);
     expect(argvs).toEqual([['run']]);
     expect([...signals.keys()].sort()).toEqual(['SIGINT', 'SIGTERM']);
     signals.get('SIGTERM')!();

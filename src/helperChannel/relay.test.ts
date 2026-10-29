@@ -220,6 +220,16 @@ describeUnix('the relay', () => {
     expect(lines).toEqual(['devspace relay: an error of the relay: boom']);
   });
 
+  it('exits again with RELAY_FAILURE_EXIT_CODE when a failure comes while its exit waits for the output', () => {
+    const { relay, exits, lines } = start();
+    relay.inputEnded();
+    expect(exits).toEqual([0]);
+    relay.shutdown('the output cannot be written (write EPIPE)', true);
+    relay.shutdown('stopped by SIGTERM');
+    expect(exits).toEqual([0, RELAY_FAILURE_EXIT_CODE]);
+    expect(lines).toEqual(['devspace relay: the output cannot be written (write EPIPE)']);
+  });
+
   it('stops a worker that does not end with SIGKILL after the stop time, and exits', async () => {
     const { relay, extension, workers, exits, lines } = start({ workerStopMs: 50 });
     watch(extension.open('worker'));

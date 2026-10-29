@@ -4,13 +4,15 @@
 
 // The streams of one connection of the relay (frames.ts), the same code on both sides: the extension opens streams,
 // the relay accepts them. Each direction of a stream has a credit: the sender sends at most STREAM_WINDOW bytes that
-// the receiver did not take yet, so a stream whose reader is slow never stops the others, and neither side holds more
-// than that per stream. The frames of the connection itself (CREDIT, OPEN, CLOSE, PING) go first; then the worker
-// stream, whose answers are short and must not wait behind a large transfer of Docker; then the other streams in turn,
-// one frame each. Each side sends PING when it sent nothing else for RELAY_PING_INTERVAL_MS, and ends the connection
+// the receiver did not take yet (each DATA frame counts FRAME_CHARGE bytes more), so a stream whose reader is slow
+// never stops the others, and neither side holds more than that per stream. The frames of the connection itself
+// (CREDIT, OPEN, CLOSE, PING) go first; then a frame of the worker stream, whose answers must not wait behind a large
+// transfer of Docker, but never two in a row while another stream has a frame, so that a long answer of the worker
+// does not stop the Docker streams; then the other streams in turn, one frame each. Each side sends PING when it sent nothing else for RELAY_PING_INTERVAL_MS, and ends the connection
 // when no frame came for RELAY_SILENCE_MS; the extension from the HELLO on (until then its caller limits the wait, which
 // may include a login). No `vscode`.
 import {
+  FRAME_CHARGE,
   FRAME_HEADER_LENGTH,
   FrameParser,
   MAX_STREAMS,
@@ -163,10 +165,13 @@ class Stream implements MuxStream {
   private drainWanted = false;
   // Receiving.
   private readonly inbox: Inbox[] = [];
-  /** Received and not given back as credit (held, or taken and not yet given back). */
+  /** Received and not given back as credit (held, or taken and not yet given back), with the charge of each frame. */
   private outstanding = 0;
-  /** Taken and not yet given back. */
+  /** Taken and not yet given back, with the charge of each chunk that was taken whole. */
   private taken = 0;
+  /** The bytes of each received chunk that were not taken yet, oldest first, from `unreadHead` on. */
+  private unread: number[] = [];
+  private unreadHead = 0;
   private peerEnded = false;
   private state: 'open' | 'finished' | 'closed' = 'open';
   private dataListener: ((chunk: Buffer) => void) | undefined;
@@ -215,8 +220,25 @@ class Stream implements MuxStream {
 
   consumed(bytes: number): void {
     if (this.state !== 'open' || !(bytes > 0)) return;
-    this.taken = Math.min(this.outstanding, this.taken + bytes);
-    // A sender without credit has a whole window outstanding; once all of it was taken, this step is reached.
+    // The chunks are taken in order; each one gives its charge back once all of its bytes were taken.
+    for (let left = bytes; left > 0 && this.unreadHead < this.unread.length; ) {
+      const rest = this.unread[this.unreadHead];
+      const step = Math.min(left, rest);
+      left -= step;
+      this.taken += step;
+      if (step < rest) {
+        this.unread[this.unreadHead] = rest - step;
+      } else {
+        this.unreadHead++;
+        this.taken += FRAME_CHARGE;
+      }
+    }
+    if (this.unreadHead > 64 && this.unreadHead * 2 > this.unread.length) {
+      this.unread = this.unread.slice(this.unreadHead);
+      this.unreadHead = 0;
+    }
+    // A sender without credit for a frame has nearly a whole window outstanding (all but at most FRAME_CHARGE bytes);
+    // once all of it was taken, this step is reached.
     if (this.taken < CREDIT_STEP) return;
     const credit = this.taken;
     this.taken = 0;
@@ -251,18 +273,18 @@ class Stream implements MuxStream {
   /** True when a frame of the stream may go now. */
   hasFrame(): boolean {
     if (this.state !== 'open') return false;
-    if (this.queue.length > 0) return this.credit > 0;
+    if (this.queue.length > 0) return this.credit > FRAME_CHARGE;
     return this.last !== undefined && !this.last.sent;
   }
 
   /** The next frame of the stream (hasFrame was true). */
   takeFrame(): Buffer {
     if (this.queue.length > 0) {
-      const size = Math.min(MAX_FRAME_PAYLOAD, this.credit, this.queue.length);
+      const size = Math.min(MAX_FRAME_PAYLOAD, this.credit - FRAME_CHARGE, this.queue.length);
       // The bytes go from the queue straight into the frame.
       const frame = frameWithHeader('data', this.id, size);
       this.queue.takeInto(frame, FRAME_HEADER_LENGTH, size);
-      this.credit -= size;
+      this.credit -= size + FRAME_CHARGE;
       if (this.queue.length < STREAM_WINDOW) this.drained();
       return frame;
     }
@@ -279,8 +301,9 @@ class Stream implements MuxStream {
       case 'data': {
         if (this.peerEnded) return `data on the stream ${this.id} after its end`;
         if (frame.payload.length === 0) return `empty data on the stream ${this.id}`;
-        this.outstanding += frame.payload.length;
+        this.outstanding += frame.payload.length + FRAME_CHARGE;
         if (this.outstanding > STREAM_WINDOW) return `more data on the stream ${this.id} than its credit`;
+        this.unread.push(frame.payload.length);
         this.inbox.push({ kind: 'data', chunk: frame.payload });
         this.deliver();
         return undefined;
@@ -399,6 +422,8 @@ export class Mux implements StreamHost {
   /** The extension sends nothing before the HELLO of the relay. */
   private ready: boolean;
   private congested = false;
+  /** The last frame of a stream was one of a worker stream: the next one goes to another stream that has one. */
+  private workerWent = false;
   private pumping = false;
   private ended: string | undefined;
   // A monotonic clock (performance.now()), which a step of the wall clock does not change.
@@ -524,16 +549,21 @@ export class Mux implements StreamHost {
   private nextFrame(): Buffer | undefined {
     const control = this.controls.shift();
     if (control !== undefined) return control;
-    for (const stream of this.order) if (stream.target === 'worker' && stream.hasFrame()) return stream.takeFrame();
+    const worker = this.order.find((stream) => stream.target === 'worker' && stream.hasFrame());
+    if (worker !== undefined && !this.workerWent) {
+      this.workerWent = true;
+      return worker.takeFrame();
+    }
     for (let i = 0; i < this.order.length; i++) {
       const at = (this.turn + i) % this.order.length;
       const stream = this.order[at];
-      if (stream.hasFrame()) {
+      if (stream.target !== 'worker' && stream.hasFrame()) {
         this.turn = at + 1;
+        this.workerWent = false;
         return stream.takeFrame();
       }
     }
-    return undefined;
+    return worker?.takeFrame();
   }
 
   private onFrame(frame: Frame): void {
@@ -565,7 +595,7 @@ export class Mux implements StreamHost {
 
   private onOpen(frame: Frame): void {
     const target = decodeTarget(frame.payload);
-    if (this.side !== 'relay' || target === undefined || frame.stream <= this.lastId) return this.fail(`the other side sent an invalid open of the stream ${frame.stream}`);
+    if (this.side !== 'relay' || target === undefined || frame.stream !== this.lastId + 1) return this.fail(`the other side sent an invalid open of the stream ${frame.stream}`);
     this.lastId = frame.stream;
     // The extension opens no more (open); its count of open streams is never below this one.
     if (this.streams.size >= MAX_STREAMS) return this.fail(`the other side opened more than ${MAX_STREAMS} streams`);

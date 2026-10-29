@@ -7,8 +7,8 @@
 // run. The extension's side is the Mux of src/core/relay on the standard input and output of that process. The Docker
 // streams of the relay and the Engine API of the worker reach a fake engine on a Unix socket of the test (the bundle is
 // built with that socket in place of /var/run/docker.sock, engineSocketPlugin). Checked above all: every byte value
-// passes unchanged although the pipe loader read the input as UTF-8 first, and the worker starts from the stored file
-// without a second bundle.
+// passes unchanged (the pipe loader hands the input over as bytes), and the worker starts from the stored file without a
+// second bundle.
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
@@ -22,7 +22,6 @@ import { bundleHash, encodeBundle, loaderCommand } from '../core/loader/pipeLoad
 import { RELAY_ENTRY } from '../core/relay/frames';
 import { Mux, type MuxStream } from '../core/relay/mux';
 import { engineSocketPlugin } from './engineSocket.testkit';
-import { RELAY_FAILURE_EXIT_CODE } from './relay';
 
 /** The identity of the fake engine. */
 const ENGINE_ID = '0f6c2a8e-3b4d-4c5e-9f70-81a2b3c4d5e6';
@@ -111,7 +110,7 @@ describeUnix('the relay in a Node.js process', () => {
    * The pipe loader with RELAY_ENTRY in a process of its own (a path of its own per start, as each `docker run --rm` has
    * a file system of its own), the bundle written as its first line, and the extension's side on its output.
    */
-  function start(first: string = encodeBundle(script)) {
+  function start() {
     const [node, ...loader] = loaderCommand({ path: path.join(dir, `script-${++starts}`, 'channel.js'), hash: bundleHash(script), entry: RELAY_ENTRY });
     expect(node).toBe('node');
     const child = childProcess.spawn(process.execPath, loader, { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -131,7 +130,7 @@ describeUnix('the relay in a Node.js process', () => {
     });
     child.stdout.on('data', (chunk: Buffer) => mux.input(chunk));
     child.stdout.on('end', () => mux.inputEnded());
-    child.stdin.write(first);
+    child.stdin.write(encodeBundle(script));
     return { child, mux, exited, closes, stderr: () => stderr };
   }
 
@@ -206,13 +205,5 @@ describeUnix('the relay in a Node.js process', () => {
     // Whole frames up to the end: no frame was cut.
     expect(closes).toEqual([{ reason: 'the connection ended', failed: false }]);
     expect(stderr()).toBe('devspace relay: stopped by SIGTERM\n');
-  });
-
-  // The loader passes what it read together with the bundle line, and the relay refuses it; a later read is read as
-  // frames, which these bytes break (`x` is no kind of frame).
-  it('exits with a line when input came before its HELLO', { timeout: SLOW_TEST_MS }, async () => {
-    const { exited, stderr } = start(`${encodeBundle(script)}${'x'.repeat(16)}`);
-    expect(await exited).toEqual({ code: RELAY_FAILURE_EXIT_CODE, signal: null });
-    expect(stderr()).toMatch(/^devspace relay: (?:input came before the hello of the relay|the other side sent a frame of the unknown kind 120)\n$/);
   });
 });
