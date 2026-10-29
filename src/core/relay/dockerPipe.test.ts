@@ -10,7 +10,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NodeProcessRunner } from '../process';
-import { silentLogger, type Logger } from '../ports';
+import { silentLogger, type Logger, type StartedByteProcess } from '../ports';
 import { bridgeStream } from './bridge';
 import type { RelayConnection } from './connection';
 import { DockerPipe, PIPE_LOGGED_CONNECTIONS, processDockerDial, relayDockerDial, requestLine } from './dockerPipe';
@@ -279,6 +279,25 @@ describe('the Docker pipe', () => {
     });
     await closed;
     await vi.waitFor(() => expect(pipe.connectionCount).toBe(0));
+  });
+
+  it('ends the program when the client leaves while the program waits for it', async () => {
+    const runner = new NodeProcessRunner();
+    const address = dockerPipeAddress(ID, 'linux', base());
+    let started: StartedByteProcess | undefined;
+    const start = () => (started = runner.startBytes('head', ['-c', '80000000', '/dev/zero']));
+    await listen(address, processDockerDial(start, silentLogger, 'build-box'));
+    await new Promise<void>((resolve) => {
+      const client = net.connect({ path: address.path, allowHalfOpen: true });
+      client.pause();
+      client.on('error', () => {});
+      client.on('close', () => resolve());
+      client.write('x');
+      // The client never reads, so the program waits; then the client leaves.
+      setTimeout(() => client.destroy(), 300);
+    });
+    await vi.waitFor(() => expect(started).toBeDefined());
+    await expect(started!.exited).resolves.toBeDefined();
   });
 
   it('lets the program wait while the client reads slower than the program writes', async () => {

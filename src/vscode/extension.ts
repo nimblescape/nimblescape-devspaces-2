@@ -849,6 +849,7 @@ async function activateExtension(
   // the authority; and before the session starts, so that a window whose pipe is refused is never the window of its
   // devspace in its status file.
   let pipeRefused: string | undefined;
+  let pipeSsh: { path: string | undefined } | undefined;
   const pipeHost = connection.currentDockerHost();
   if (pipeHost !== undefined && containerName) {
     const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
@@ -870,7 +871,9 @@ async function activateExtension(
         return opened;
       },
       dialStdio: (host) => {
-        const ssh = sshPath();
+        // Found once: a window that works without the relay makes many short Docker connections.
+        pipeSsh ??= { path: sshPath() };
+        const ssh = pipeSsh.path;
         const address = sshTargetOf(host);
         if (ssh === undefined || address === undefined) return undefined;
         return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });

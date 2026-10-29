@@ -335,7 +335,14 @@ export function processDockerDial(start: () => StartedByteProcess, logger: Logge
       process.onDrain(() => socket.resume());
     });
     socket.on('end', () => process.end());
-    socket.on('close', () => process.kill());
+    socket.on('close', () => {
+      // A paused output would keep the program from ending (its output never ends): what it still writes is dropped.
+      if (waiting) {
+        waiting = false;
+        process.resumeStdout();
+      }
+      process.kill();
+    });
     void process.exited.then(({ exitCode, error }) => {
       if (error !== undefined || (exitCode !== 0 && exitCode !== null)) {
         logger.warn(`The Docker connection of ${name} ended: ${error ? error.message : stderr.trim() || `exit code ${exitCode}`}`);
