@@ -74,7 +74,7 @@ export interface MuxStream {
   readonly isOpen: boolean;
   /**
    * Sends `chunk` after what waits. False when a window of bytes waits that the other side has no credit for: the
-   * writer should wait for onDrain. Ignored after end, exit or close.
+   * writer should wait for onDrain. Dropped after end, exit or close, and the stream ended (true: nothing waits).
    */
   write(chunk: Buffer): boolean;
   /** Ends the direction of this side after what waits (END). */
@@ -94,8 +94,8 @@ export interface MuxStream {
   /** The other side closed the stream (its reason), or the connection ended. Not after `close` of this side. */
   onClose(listener: (reason: string) => void): void;
   /**
-   * Once, the next time that the bytes that wait drop below the window after a write that returned false. Set it right
-   * after that write.
+   * Once, the next time that the bytes that wait drop below the window after a write that returned false, or the
+   * stream ends. Set it right after that write.
    */
   onDrain(listener: () => void): void;
 }
@@ -193,7 +193,7 @@ class Stream implements MuxStream {
   }
 
   write(chunk: Buffer): boolean {
-    if (this.state !== 'open' || this.last !== undefined) return false;
+    if (this.state !== 'open' || this.last !== undefined) return true;
     if (chunk.length > 0) {
       this.queue.push(chunk);
       this.host.pump();
@@ -268,15 +268,7 @@ class Stream implements MuxStream {
       const size = Math.min(MAX_FRAME_PAYLOAD, this.credit, this.queue.length);
       const frame = encodeFrame('data', this.id, this.queue.take(size));
       this.credit -= size;
-      if (this.drainWanted && this.queue.length < STREAM_WINDOW) {
-        this.drainWanted = false;
-        // Later, so that a writer whose write returned false while these frames went at once has set its listener.
-        queueMicrotask(() => {
-          const listener = this.drainListener;
-          this.drainListener = undefined;
-          listener?.();
-        });
-      }
+      if (this.queue.length < STREAM_WINDOW) this.drained();
       return frame;
     }
     const last = this.last as NonNullable<Stream['last']>;
@@ -338,8 +330,25 @@ class Stream implements MuxStream {
     this.drop();
     this.inbox.length = 0;
     const listener = this.closeListener;
-    this.clearListeners();
+    this.closeListener = undefined;
+    this.dataListener = undefined;
+    this.endListener = undefined;
+    this.exitListener = undefined;
     listener?.(reason);
+  }
+
+  /**
+   * Wakes a writer that waits for onDrain. Later, so that a writer whose write returned false while these frames went
+   * at once has set its listener.
+   */
+  private drained(): void {
+    if (!this.drainWanted) return;
+    this.drainWanted = false;
+    queueMicrotask(() => {
+      const listener = this.drainListener;
+      this.drainListener = undefined;
+      listener?.();
+    });
   }
 
   private finishWith(kind: 'end' | 'exit', frame: Buffer): void {
@@ -356,20 +365,15 @@ class Stream implements MuxStream {
     this.state = 'finished';
     this.queue.clear();
     this.host.remove(this);
+    this.drained();
   }
 
+  /** Closed: what waits is dropped; a writer that waits for onDrain wakes and finds it ended. */
   private drop(): void {
     this.state = 'closed';
     this.queue.clear();
     this.host.remove(this);
-  }
-
-  private clearListeners(): void {
-    this.dataListener = undefined;
-    this.endListener = undefined;
-    this.exitListener = undefined;
-    this.closeListener = undefined;
-    this.drainListener = undefined;
+    this.drained();
   }
 
   /** Gives the inbox to its listeners, in order; a part without its listener waits for it. */

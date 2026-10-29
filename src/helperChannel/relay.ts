@@ -14,7 +14,7 @@ import * as childProcess from 'child_process';
 import * as net from 'net';
 import type { Readable, Writable } from 'stream';
 import { CHANNEL_CLEANUP_TIMEOUT_MS, CHANNEL_ENTRY, CHANNEL_KILL_GRACE_MS } from '../core/helperChannel/protocol';
-import { PIPE_LOADER } from '../core/loader/pipeLoader';
+import { loaderCommand } from '../core/loader/pipeLoader';
 import { HELPER_DOCKER_SOCKET } from '../core/names';
 import { bridgeStream } from '../core/relay/bridge';
 import type { WorkerExit } from '../core/relay/frames';
@@ -119,9 +119,16 @@ export class Relay {
     });
   }
 
-  /** Exits once the worker ended. `reason`: why, for the standard error (none for the end of the input). */
+  /**
+   * Exits once the worker ended. `reason`: why, for the standard error (none for the end of the input). A failure
+   * while it stops still changes the exit code.
+   */
   private stop(reason: string | undefined, failed: boolean): void {
-    if (this.stopping) return;
+    if (this.stopping) {
+      if (failed) this.stopping.code = RELAY_FAILURE_EXIT_CODE;
+      if (failed && reason !== undefined) this.deps.log(`devspace relay: ${reason}`);
+      return;
+    }
     this.stopping = { code: failed ? RELAY_FAILURE_EXIT_CODE : 0 };
     if (reason !== undefined) this.deps.log(`devspace relay: ${reason}`);
     // The mux lost every stream: the Docker connections are destroyed, the worker's input ended and it got SIGTERM.
@@ -140,9 +147,13 @@ export class Relay {
   }
 }
 
-/** A worker process of the pipe loader: the stored file `file` with `hash`, entry CHANNEL_ENTRY. */
+/**
+ * A worker process of the pipe loader: the stored file `file` with `hash`, entry CHANNEL_ENTRY. Throws when it has no
+ * pipes (Node.js creates none when the process has no free file descriptor; its error comes later).
+ */
 export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
-  const child = childProcess.spawn(process.execPath, ['-e', PIPE_LOADER, file, hash, CHANNEL_ENTRY], { stdio: ['pipe', 'pipe', 'inherit'] });
+  const [, ...args] = loaderCommand({ path: file, hash, entry: CHANNEL_ENTRY });
+  const child = childProcess.spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'inherit'] });
   let listener: ((exit: WorkerExit, error?: Error) => void) | undefined;
   let result: [WorkerExit, Error?] | undefined;
   const settle = (exit: WorkerExit, error?: Error) => {
@@ -155,6 +166,7 @@ export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
     if (child.pid === undefined) settle({ code: null, signal: null }, error);
   });
   child.once('close', (code, signal) => settle({ code, signal }));
+  if (!child.stdin || !child.stdout) throw new Error('it got no pipes (too many open files)');
   return {
     stdin: child.stdin,
     stdout: child.stdout,
@@ -184,6 +196,8 @@ export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER
   if (initial !== '') return fail('input came before the hello of the relay');
   if (!file || !/^[0-9a-f]{64}$/.test(hash ?? '')) return fail('the command line names no stored file of the pipe loader');
   process.stdin.setEncoding('latin1');
+  // Input that came in a later read before this point waits as UTF-8 text, whose bytes are lost.
+  if (process.stdin.readableLength > 0) return fail('input came before the hello of the relay');
   const relay = new Relay({
     link: {
       write: (chunk) => process.stdout.write(chunk),
