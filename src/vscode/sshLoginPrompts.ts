@@ -254,13 +254,20 @@ export class SshAskpassServer implements vscode.Disposable {
       address = path.posix.join(this.socketFolder, 'askpass');
     }
     const server = net.createServer((socket) => this.accept(socket));
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(address, () => {
-        server.off('error', reject);
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(address, () => {
+          server.off('error', reject);
+          resolve();
+        });
       });
-    });
+    } catch (error) {
+      // The next prepare makes a new folder.
+      if (this.socketFolder !== undefined) await fs.promises.rm(this.socketFolder, { recursive: true, force: true });
+      this.socketFolder = undefined;
+      throw error;
+    }
     server.on('error', (error: Error) => this.options.logger.warn(`The pipe of the questions of SSH logins failed: ${error.message}`));
     if (this.options.platform !== 'win32') await fs.promises.chmod(address, 0o600);
     this.server = server;

@@ -149,18 +149,22 @@ describe('the flows of the user', () => {
   it('gives a flow within a flow its own name, and closes its questions on the Cancel of either', async () => {
     const outerCancel = new AbortController();
     const innerCancel = new AbortController();
-    const [outer, inner, signal] = await withSshPrompts(async () => {
+    const [outer, inner, before, after] = await withSshPrompts(async () => {
       const outerFlow = currentSshPromptFlow();
-      return withSshPrompts(async () => [outerFlow, currentSshPromptFlow(), sshPromptSignal()] as const, innerCancel.signal);
+      return withSshPrompts(async () => {
+        const signal = sshPromptSignal();
+        const aborted = signal?.aborted;
+        outerCancel.abort();
+        return [outerFlow, currentSshPromptFlow(), aborted, signal?.aborted] as const;
+      }, innerCancel.signal);
     }, outerCancel.signal);
     expect(outer).toBeDefined();
     expect(inner).toBeDefined();
     expect(inner).not.toBe(outer);
-    expect(signal?.aborted).toBe(false);
-    outerCancel.abort();
-    expect(signal?.aborted).toBe(true);
+    expect([before, after]).toEqual([false, true]);
     // Without a signal of its own, the flow within takes the signal of the outer flow.
-    expect(await withSshPrompts(async () => withSshPrompts(async () => sshPromptSignal()), innerCancel.signal)).toBe(innerCancel.signal);
+    const own = new AbortController();
+    expect(await withSshPrompts(async () => withSshPrompts(async () => sshPromptSignal()), own.signal)).toBe(own.signal);
     expect(currentSshPromptFlow()).toBeUndefined();
   });
 });

@@ -18,6 +18,7 @@ import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '.
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { RelayConnectionError } from '../core/relay/connection';
 import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
@@ -498,7 +499,7 @@ async function activateExtension(
             // within a flow of the user.
             const start = () => {
               const started = startLogin(target.host);
-              if (started === undefined) throw new Error(`${target.host} is no SSH alias or address.`);
+              if (started === undefined) throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ssh was not found.`);
               return started;
             };
             return relayAccess(relayConnections, target.host, (command, bundle) =>

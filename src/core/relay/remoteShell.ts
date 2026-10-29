@@ -122,6 +122,8 @@ export class RemoteShell {
     stdoutEnded: boolean;
   } = { heldStdout: [], heldStderr: '', stdoutEnded: false };
   private onLogin: { stdout(chunk: Buffer): void; stderr(text: string): void; ended(): void } | undefined;
+  /** Set by closeWhenIdle: the shell ends once no command runs. */
+  private closeWhenReady = false;
 
   private constructor(
     private readonly process: StartedByteProcess,
@@ -308,6 +310,12 @@ export class RemoteShell {
     return taking;
   }
 
+  /** Ends the shell once no command runs: at once when it is idle, else after the command that runs now (`close`). */
+  closeWhenIdle(): void {
+    if (this.stage === 'ready') this.close();
+    else this.closeWhenReady = true;
+  }
+
   /** Ends the shell (its input), unless the relay took it over; a shell that does not end is stopped. */
   close(): void {
     if (this.stage === 'taken' || this.stage === 'ended') return;
@@ -445,6 +453,10 @@ export class RemoteShell {
 
   private armIdle(): void {
     this.disarmIdle();
+    if (this.closeWhenReady) {
+      this.close();
+      return;
+    }
     this.idleTimer = setTimeout(() => {
       this.options.logger.info(`The shell on ${this.options.name} was closed after a time without use.`);
       this.close();

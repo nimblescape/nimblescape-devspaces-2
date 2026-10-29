@@ -204,16 +204,21 @@ function activeScope(): PromptScope | undefined {
   return scope?.active === true ? scope : undefined;
 }
 
-/** A signal that aborts when one of `signals` aborts; undefined for none. */
-function eitherSignal(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
-  const given = signals.filter((signal): signal is AbortSignal => signal !== undefined);
-  if (given.length < 2) return given[0];
+/** A signal that aborts when `signal` or `outer` aborts (undefined for none), and the end of its listener on `outer`. */
+function eitherSignal(signal: AbortSignal | undefined, outer: AbortSignal | undefined): { signal?: AbortSignal; dispose(): void } {
+  if (signal === undefined || outer === undefined) return { signal: signal ?? outer, dispose: () => undefined };
   const controller = new AbortController();
-  for (const signal of given) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener('abort', () => controller.abort(), { once: true });
-  }
-  return controller.signal;
+  const abort = (): void => controller.abort();
+  if (signal.aborted || outer.aborted) abort();
+  signal.addEventListener('abort', abort, { once: true });
+  outer.addEventListener('abort', abort, { once: true });
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      signal.removeEventListener('abort', abort);
+      outer.removeEventListener('abort', abort);
+    },
+  };
 }
 
 /**
@@ -222,11 +227,13 @@ function eitherSignal(...signals: Array<AbortSignal | undefined>): AbortSignal |
  * of those logins close (sshPromptSignal).
  */
 export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const scope: PromptScope = { active: true, signal: eitherSignal(signal, activeScope()?.signal) };
+  const either = eitherSignal(signal, activeScope()?.signal);
+  const scope: PromptScope = { active: true, signal: either.signal };
   try {
     return await promptScopes.run(scope, fn);
   } finally {
     scope.active = false;
+    either.dispose();
   }
 }
 

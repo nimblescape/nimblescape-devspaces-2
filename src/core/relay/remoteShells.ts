@@ -47,6 +47,8 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): 
 /** The shells before the relay of this window, by the Docker host (DockerTarget.host). */
 export class RemoteShells {
   private readonly entries = new Map<string, Entry>();
+  /** Open shells that a new login replaced (`fresh`), until they end after their commands. */
+  private readonly retired = new Set<RemoteShell>();
   private disposed = false;
 
   constructor(private readonly options: RemoteShellsOptions) {}
@@ -58,13 +60,15 @@ export class RemoteShells {
    * ask (currentSshPromptFlow) that finds a login of the background or of another flow in progress waits for it, and
    * logs in anew when it failed: a login without questions fails for a host that needs a password or an unknown host
    * key, and the Cancel of the other flow ends the questions of its login. After the time limit of that login it does
-   * not: a login without questions fails at once instead of waiting, so the host did not answer in time.
+   * not: a login without questions fails at once instead of waiting, so the host did not answer in time. `fresh`: a new
+   * login also when a shell is open (the test of a host); the open shell ends after its commands (closeWhenIdle).
    */
-  open(host: string, signal?: AbortSignal): Promise<RemoteShell | undefined> {
+  open(host: string, signal?: AbortSignal, options: { fresh?: boolean } = {}): Promise<RemoteShell | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
     const current = this.entries.get(host);
-    if (current?.shell?.isOpen) return Promise.resolve(current.shell);
-    if (current?.opening) {
+    const open = current?.shell?.isOpen === true ? current.shell : undefined;
+    if (open !== undefined && options.fresh !== true) return Promise.resolve(open);
+    if (open === undefined && current?.opening) {
       const flow = currentSshPromptFlow();
       if (flow === undefined || current.flow === flow) return untilAborted(current.opening, signal);
       return untilAborted(
@@ -77,10 +81,15 @@ export class RemoteShells {
     }
     const started = this.options.start(host);
     if (started === undefined) return Promise.resolve(undefined);
+    if (open !== undefined) {
+      this.retired.add(open);
+      open.closeWhenIdle();
+    }
     const { process, prompts } = started;
     const entry: Entry = { process, flow: currentSshPromptFlow() };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
+      if (entry.shell !== undefined) this.retired.delete(entry.shell);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
     entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
@@ -101,12 +110,16 @@ export class RemoteShells {
   }
 
   /**
-   * The login of the shell to `host` (`open`), for the SSH check (RemoteShellAccess.login): undefined when the host has
-   * no transport; a failure with the error output of `ssh`. Rejects only with an AbortError.
+   * The login of the shell to `host` (`open`, also with `fresh`), for the SSH check (RemoteShellAccess.login): undefined
+   * when the host has no transport; a failure with the error output of `ssh`. Rejects only with an AbortError.
    */
-  async login(host: string, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined> {
+  async login(
+    host: string,
+    signal?: AbortSignal,
+    options: { fresh?: boolean } = {},
+  ): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined> {
     try {
-      return (await this.open(host, signal)) === undefined ? undefined : { ok: true };
+      return (await this.open(host, signal, options)) === undefined ? undefined : { ok: true };
     } catch (error) {
       if (error instanceof RemoteShellError) return { ok: false, detail: error.detail, timedOut: error.timedOut };
       throw error;
@@ -165,6 +178,8 @@ export class RemoteShells {
   /** Stops every shell at once (the window closes), also a login in progress. */
   dispose(): void {
     this.disposed = true;
+    for (const shell of this.retired) shell.killNow();
+    this.retired.clear();
     for (const entry of this.entries.values()) {
       if (entry.shell) entry.shell.killNow();
       else if (entry.process.killNow) entry.process.killNow();
