@@ -76,6 +76,11 @@ const CONTEXT_NAME = /^[A-Za-z0-9][A-Za-z0-9_.+-]*$/;
 /** The part of BootstrapDocker that the resolver uses. */
 export interface ContextReader {
   isInstalled(): boolean;
+  /**
+   * Whether a Docker CLI runs the calls on a remote engine (BootstrapDocker.canRunRemote: the Docker CLI of Devspaces or
+   * of this computer). Without it, only the Docker CLI of this computer (isInstalled).
+   */
+  canRunRemote?(): boolean;
   run(args: readonly string[], options?: RunOptions): Promise<RunResult>;
   /**
    * Whether the docker command is Podman (BootstrapDocker.podmanCli: `docker --version`, kept until the file of the CLI
@@ -117,12 +122,12 @@ export class DockerTargets {
 
   /**
    * Reads the current target now: the host of the list of Devspaces that it uses, else its local Docker (readLocal).
-   * Without a Docker CLI, the local Docker (LOCAL_DOCKER_TARGET), so that the Docker setup shows: a remote host needs the
-   * CLI of this computer too. Never throws.
+   * Without a Docker CLI for a remote engine (the Docker CLI of Devspaces or of this computer, canRunRemote), the local
+   * Docker, so that the Docker setup shows. Never throws.
    */
   async resolve(): Promise<DockerTarget> {
     const read = ++this.readsStarted;
-    const host = this.docker.isInstalled() ? await this.chosenHost() : undefined;
+    const host = (this.docker.canRunRemote?.() ?? this.docker.isInstalled()) ? await this.chosenHost() : undefined;
     const target = host === undefined ? await outsideOperation(() => this.readLocal()) : remoteDockerTarget(host);
     // A read that started before a newer one finished (overlapping reads) does not overwrite what that one found.
     if (read < this.readApplied) return target;

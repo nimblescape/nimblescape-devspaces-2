@@ -2,9 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The download of the Docker CLI of Devspaces (core/docker/ownDockerCli.ts) in the window of a devspace on another
-// computer, when it is not installed yet: with a progress notification that can be cancelled, and a message when it
-// fails. The window then uses the Docker CLI of this computer, if it has one.
+// The download of the Docker CLI of Devspaces (core/docker/ownDockerCli.ts) when it is not installed yet: in the window
+// of a devspace on another computer, and for "Use a Remote Docker Host…" on a computer without a Docker CLI. With a
+// progress notification that can be cancelled, and a message when it fails. The window then uses the Docker CLI of
+// this computer, if it has one; the command sets no remote host.
 import { errorMessage } from '../core/errors';
 import { installOwnDockerCli, OWN_DOCKER_CLI_VERSION } from '../core/docker/ownDockerCli';
 import { isAbortError, type Logger } from '../core/ports';
@@ -19,6 +20,8 @@ export const OwnDockerCliTexts = {
   failedWithoutFallback: (reason: string) =>
     `The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be downloaded, and this computer has no Docker CLI, so this window cannot connect to its devspace. ${reason}`,
   cancelled: 'The download of the Docker CLI of Devspaces was cancelled.',
+  failedForRemoteHost: (reason: string) =>
+    `The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be downloaded, and this computer has no Docker CLI, so Devspaces cannot use a remote Docker host. ${reason}`,
 } as const;
 
 export interface OwnDockerCliWindowOptions {
@@ -29,6 +32,11 @@ export interface OwnDockerCliWindowOptions {
   logger: Logger;
   /** The Docker CLI of this computer, which the window uses when the download fails. */
   fallback: string | undefined;
+  /**
+   * The message of a failed download, in place of the one of the window (failedForRemoteHost, for "Use a Remote Docker
+   * Host…"); then a cancel shows no message.
+   */
+  failed?: (reason: string) => string;
 }
 
 /**
@@ -63,7 +71,9 @@ export async function installOwnDockerCliWithProgress(options: OwnDockerCliWindo
   } catch (error) {
     const reason = isAbortError(error) ? OwnDockerCliTexts.cancelled : errorMessage(error);
     logger.warn(`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be installed: ${reason}`);
-    if (options.fallback !== undefined) void showWarningMessage(OwnDockerCliTexts.failedWithFallback(reason));
+    if (options.failed !== undefined) {
+      if (!isAbortError(error)) void showErrorMessage(options.failed(reason));
+    } else if (options.fallback !== undefined) void showWarningMessage(OwnDockerCliTexts.failedWithFallback(reason));
     else void showErrorMessage(OwnDockerCliTexts.failedWithoutFallback(reason));
     return undefined;
   }

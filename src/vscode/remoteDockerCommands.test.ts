@@ -15,7 +15,7 @@ import { ENGINE_INFO_FORMAT } from '../core/docker/remoteDocker';
 import { Messages, dockerHostReason } from '../core/messages';
 import type { RunOptions, RunResult } from '../core/ports';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
-import { RemoteDockerCommands, RemoteDockerTexts, describeEntry } from './remoteDockerCommands';
+import { RemoteDockerCommands, RemoteDockerTexts, describeEntry, type RemoteDockerDeps } from './remoteDockerCommands';
 import { fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 import { MonitorIcons } from './treeModel';
 
@@ -36,6 +36,8 @@ class FakeCli {
   hosts = new Map<string, RunResult>();
 
   isInstalled = () => true;
+  /** BootstrapDocker.canRunRemote; without it, isInstalled counts. */
+  canRunRemote: (() => boolean) | undefined = undefined;
   processEnv = (): NodeJS.ProcessEnv => ({ PATH: '/usr/bin', SSH_AUTH_SOCK: '/tmp/agent' });
 
   run = async (args: readonly string[], options?: RunOptions): Promise<RunResult> => {
@@ -73,7 +75,7 @@ let commands: RemoteDockerCommands;
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() };
 const { window } = fakeVscode;
 
-function create(): RemoteDockerCommands {
+function create(extra: Partial<RemoteDockerDeps> = {}): RemoteDockerCommands {
   targets = new DockerTargets(cli, env, logger, 'linux', state);
   const created = new RemoteDockerCommands({
     docker: cli,
@@ -90,6 +92,7 @@ function create(): RemoteDockerCommands {
     env,
     devspaceCount,
     onDidSwitch,
+    ...extra,
   });
   // As extension.ts: each read of the Docker host may offer the SSH host of a Docker context of the user.
   targets.onDidResolve((target) => void created.offerDockerContextHost(target));
@@ -280,13 +283,85 @@ describe('Use a Remote Docker Host…', () => {
     expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.nowRemote('build-box', true));
   });
 
-  // Without a Docker CLI on this computer, the missing CLI is the reason, not the host.
-  it('names the missing Docker CLI of this computer before it asks for a host', async () => {
+  // Without a Docker CLI on this computer, and none of Devspaces for it, the missing CLI is the reason, not the host.
+  it('names the missing Docker CLI after the pick when Docker publishes none for this computer', async () => {
     cli.isInstalled = () => false;
+    pick('build-box');
     await commands.useRemoteHost();
-    expect(window.showQuickPick).not.toHaveBeenCalled();
     expect(window.showErrorMessage.mock.calls[0]?.[0]).toBe(RemoteDockerTexts.cliMissing);
     expect(cli.calls).toEqual([]);
+    expect(await state.dockerHost()).toBeUndefined();
+  });
+
+  // A computer without Docker: the Docker CLI of Devspaces is downloaded after the pick (not before: a cancelled pick
+  // downloads nothing), then the host is tested with it and used.
+  it('downloads the Docker CLI of Devspaces after the pick on a computer without a Docker CLI, then tests and uses the host', async () => {
+    let own: string | undefined;
+    cli.isInstalled = () => false;
+    cli.canRunRemote = () => own !== undefined;
+    const installOwnCli = vi.fn(async () => (own = '/storage/docker-cli/29.9.2/docker'));
+    commands = create({ installOwnCli });
+    await commands.useRemoteHost();
+    expect(installOwnCli).not.toHaveBeenCalled();
+    cli.hosts.set('build-box', engineInfo());
+    pick('build-box');
+    await commands.useRemoteHost();
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(cli.calls.map((call) => call.args.slice(0, 3))).toEqual([['-H', 'ssh://build-box', 'info']]);
+    expect(await state.dockerHost()).toBe('build-box');
+    expect(targets.last).toEqual(remoteDockerTarget('build-box'));
+    expect(onDidSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  // The download shows its own message when it fails; a cancel shows none.
+  it('sets no host and tests nothing when the download of the Docker CLI of Devspaces fails or is cancelled', async () => {
+    cli.isInstalled = () => false;
+    cli.canRunRemote = () => false;
+    const installOwnCli = vi.fn(async () => undefined);
+    commands = create({ installOwnCli });
+    pick('build-box');
+    await commands.useRemoteHost();
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(cli.calls).toEqual([]);
+    expect(window.showErrorMessage).not.toHaveBeenCalled();
+    expect(await state.dockerHost()).toBeUndefined();
+  });
+
+  // The host of the list that no Docker CLI reaches (its Docker CLI of Devspaces was removed): DockerTargets.resolve
+  // gave the local Docker, so the setup shows; the choice of that host downloads and tests as a new choice.
+  it('downloads the Docker CLI of Devspaces for the host that Devspaces uses already when no Docker CLI reaches it', async () => {
+    await listed(['build-box'], 'build-box');
+    let own: string | undefined;
+    cli.isInstalled = () => false;
+    cli.canRunRemote = () => own !== undefined;
+    const installOwnCli = vi.fn(async () => (own = '/storage/docker-cli/29.9.2/docker'));
+    commands = create({ installOwnCli });
+    cli.hosts.set('build-box', engineInfo());
+    pick('$(check) build-box');
+    await commands.useRemoteHost();
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(window.showInformationMessage).not.toHaveBeenCalledWith(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(cli.calls.map((call) => call.args.slice(0, 3))).toEqual([['-H', 'ssh://build-box', 'info']]);
+    expect(targets.last).toEqual(remoteDockerTarget('build-box'));
+    // Then it is the host that Devspaces uses: said so, nothing tested.
+    pick('$(check) build-box');
+    await commands.useRemoteHost();
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(cli.calls).toHaveLength(1);
+  });
+
+  // The Docker CLI of Devspaces that another window downloaded, or the Docker CLI of this computer: no download.
+  it('downloads nothing while a Docker CLI runs the calls on a remote engine', async () => {
+    cli.isInstalled = () => false;
+    cli.canRunRemote = () => true;
+    const installOwnCli = vi.fn(async () => '/storage/docker-cli/29.9.2/docker');
+    commands = create({ installOwnCli });
+    cli.hosts.set('build-box', engineInfo());
+    pick('build-box');
+    await commands.useRemoteHost();
+    expect(installOwnCli).not.toHaveBeenCalled();
+    expect(await state.dockerHost()).toBe('build-box');
   });
 });
 

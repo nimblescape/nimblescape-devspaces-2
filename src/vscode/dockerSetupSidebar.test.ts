@@ -612,6 +612,13 @@ describe('the Docker setup in the sidebar welcome view', () => {
     expect(links).toContain(`(command:${Commands.dockerSetupInstall})`);
     expect(links).toContain(`(command:${Commands.dockerSetupInstallWsl})`);
     expect(links).toContain(`(command:${Commands.signIn})`);
+    expect(links).toContain(`(command:${Commands.useRemoteDockerHost})`);
+  });
+
+  // A computer without Docker can use a remote host: the command downloads the Docker CLI of Devspaces.
+  it('offers a remote Docker host in the setup, on every platform', () => {
+    const remote = manifest().contributes.viewsWelcome.filter((view) => view.contents.includes(`(command:${Commands.useRemoteDockerHost})`));
+    expect(remote.map((view) => view.when)).toEqual([DockerContextKeys.setupRequired]);
   });
 
   it('names the license of Docker Desktop in the steps that install it', () => {

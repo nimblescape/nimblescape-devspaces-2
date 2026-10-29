@@ -90,6 +90,23 @@ describe('DockerTargets.resolve (the Docker host of Devspaces, else the current 
     await expect(targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: '' });
   });
 
+  // A computer without Docker that uses a remote host with the Docker CLI of Devspaces (BootstrapDocker.ownCli).
+  it('uses a host of its list on a computer without a Docker CLI while the Docker CLI of Devspaces is installed', async () => {
+    const cli = new FakeDockerCli();
+    const choice = new FakeChoice();
+    let own: string | undefined;
+    const docker = new BootstrapDocker(cli, undefined, { PATH: '/usr/bin' }, silentLogger, 'linux', { ownCli: () => own });
+    const targets = new DockerTargets(docker, { PATH: '/usr/bin' }, silentLogger, 'linux', choice);
+    choice.host = 'build-box';
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: '' });
+    own = '/storage/docker-cli/29.9.2/docker';
+    await expect(targets.resolve()).resolves.toEqual(remoteDockerTarget('build-box'));
+    // The local Docker still needs the Docker CLI of this computer.
+    choice.host = undefined;
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: '' });
+    expect(cli.calls).toEqual([]);
+  });
+
   // Devspaces reaches a remote host only through its own list.
   it('does not support a current context of the user that reaches a host over SSH, and names the host', async () => {
     const { targets, cli } = setup();

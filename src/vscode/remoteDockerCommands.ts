@@ -9,7 +9,8 @@
 // else is written: no Docker context, no setting, no DOCKER_HOST, no setting of the Dev Containers extension, so the
 // docker command in the terminals of the user keeps its target. One Docker host at a time, for every window of
 // Devspaces on this computer. A Docker context or DOCKER_HOST of the user that reaches a host over SSH is offered once
-// for the list (offerDockerContextHost).
+// for the list (offerDockerContextHost). A computer without a Docker CLI gets the Docker CLI of Devspaces for the remote
+// host first (ensureRemoteCli), so no Docker needs to be installed on it.
 import * as vscode from 'vscode';
 import {
   describeDockerHost,
@@ -86,8 +87,8 @@ export const RemoteDockerTexts = {
   /** One list of the hosts and the local Docker. */
   choosePlaceholder: 'Choose a host, enter an SSH address, or use the local Docker',
   current: 'current',
-  /** The Docker CLI of this computer talks to the remote host. */
-  cliMissing: 'A remote Docker host needs the Docker CLI on this computer. Install Docker first (Docker Desktop brings the CLI).',
+  /** Neither the Docker CLI of this computer nor one of Devspaces (Docker publishes none for this computer). */
+  cliMissing: 'Docker publishes no Docker CLI that Devspaces can download for this computer, so a remote Docker host needs the Docker CLI of Docker Desktop here. Install Docker first.',
   /** The entry of the choice that removes a host from the list, and its own choice. */
   removeHost: 'Remove a Host from the List…',
   removeTitle: 'Remove a Host from the List',
@@ -120,6 +121,12 @@ export interface RemoteDockerDeps {
   devspaceCount?: (host: string) => Promise<number>;
   /** After a change of the Docker host of Devspaces: the sidebar shows the devspaces of the new host. */
   onDidSwitch: () => Promise<void>;
+  /**
+   * Downloads the Docker CLI of Devspaces with a progress notification (installOwnDockerCliWithProgress) for a computer
+   * without a Docker CLI: its path, or undefined when the download failed (the message says so) or was cancelled.
+   * Undefined where Docker publishes no Docker CLI that runs on this computer.
+   */
+  installOwnCli?: () => Promise<string | undefined>;
 }
 
 interface HostItem extends vscode.QuickPickItem {
@@ -140,10 +147,12 @@ export class RemoteDockerCommands {
 
   constructor(private readonly deps: RemoteDockerDeps) {}
 
-  /** "Use a Remote Docker Host…": pick, test, use. Never throws. */
+  /**
+   * "Use a Remote Docker Host…": pick, test, use. On a computer without a Docker CLI, the Docker CLI of Devspaces is
+   * downloaded after the pick (ensureRemoteCli). Never throws.
+   */
   async useRemoteHost(): Promise<void> {
     try {
-      if (this.refuseMissingCli()) return;
       const current = await this.deps.state.dockerHost();
       const host = await this.pickHost({ currentHost: current });
       if (host === undefined || host === LOCAL_CHOICE) return;
@@ -151,10 +160,12 @@ export class RemoteDockerCommands {
         await this.removeHost();
         return;
       }
-      if (host === current) {
+      // The host of the list without a Docker CLI for it (DockerTargets.resolve gave the local Docker): as a new choice.
+      if (host === current && this.remoteCliReady()) {
         this.inform(RemoteDockerTexts.alreadyHost(host));
         return;
       }
+      if (!(await this.ensureRemoteCli())) return;
       await this.switchToRemote(host);
     } catch (error) {
       this.showFailure(error);
@@ -187,11 +198,11 @@ export class RemoteDockerCommands {
         await this.removeHost();
         return;
       }
-      if (picked === current) {
+      if (picked === current && this.remoteCliReady()) {
         this.inform(RemoteDockerTexts.alreadyHost(picked));
         return;
       }
-      if (this.refuseMissingCli()) return;
+      if (!(await this.ensureRemoteCli())) return;
       await this.switchToRemote(picked);
     } catch (error) {
       this.showFailure(error);
@@ -231,7 +242,7 @@ export class RemoteDockerCommands {
       this.deps.logger.info(`Docker on this computer is set to ${host} over SSH, which is not in the list of Devspaces; Devspaces offers it once.`);
       const use = RemoteDockerTexts.useHost(host);
       const choice = await showInformationMessage(RemoteDockerTexts.offer(host, target.context), use, RemoteDockerTexts.notNow);
-      if (choice !== use || this.refuseMissingCli()) return;
+      if (choice !== use || !(await this.ensureRemoteCli())) return;
       await this.switchToRemote(host);
     } catch (error) {
       this.showFailure(error);
@@ -350,12 +361,27 @@ export class RemoteDockerCommands {
     await this.afterSwitch();
   }
 
-  /** No Docker CLI on this computer: says so, true when refused. */
-  private refuseMissingCli(): boolean {
-    if (this.deps.docker.isInstalled()) return false;
-    this.deps.logger.warn('No Docker CLI on this computer; no remote Docker host is set.');
-    this.showError(RemoteDockerTexts.cliMissing);
-    return true;
+  /**
+   * A Docker CLI for the calls on a remote host: the Docker CLI of Devspaces or of this computer (canRunRemote). Without
+   * either, the Docker CLI of Devspaces is downloaded now (installOwnCli); where Docker publishes none for this
+   * computer, the message says to install Docker. True when there is one afterwards.
+   */
+  private async ensureRemoteCli(): Promise<boolean> {
+    const { installOwnCli, logger } = this.deps;
+    if (this.remoteCliReady()) return true;
+    if (installOwnCli === undefined) {
+      logger.warn('This computer has no Docker CLI, and Docker publishes none that Devspaces can download for it; no remote Docker host is set.');
+      this.showError(RemoteDockerTexts.cliMissing);
+      return false;
+    }
+    logger.info('This computer has no Docker CLI, so Devspaces downloads its own Docker CLI for the remote Docker host.');
+    return (await installOwnCli()) !== undefined && this.remoteCliReady();
+  }
+
+  /** Whether a Docker CLI runs the calls on a remote host: the one of Devspaces or of this computer (canRunRemote). */
+  private remoteCliReady(): boolean {
+    const { docker } = this.deps;
+    return docker.canRunRemote?.() ?? docker.isInstalled();
   }
 
   /**

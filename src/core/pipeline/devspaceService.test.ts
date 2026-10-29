@@ -4245,7 +4245,7 @@ describe('refreshStates', () => {
     h = recreate({ workerRefresh });
     await seedTwo(h);
     h.docker.running = false;
-    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map() });
+    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map(), dockerStopped: true });
     expect(workerRefresh).not.toHaveBeenCalled();
   });
 

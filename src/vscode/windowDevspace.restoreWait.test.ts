@@ -5,6 +5,7 @@
 // Mutation probes: findWindowDevspace waits WINDOW_RESTORE_TIMEOUT_MS, and reads the registry again only when the
 // worker restored entries.
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { LOCAL_DOCKER_TARGET } from '../core/docker/dockerHost';
 import { silentLogger } from '../core/ports';
 import type { Devspace } from '../core/types';
 import { WINDOW_RESTORE_TIMEOUT_MS, findWindowDevspace, restoreAfterPrebuild } from './windowDevspace';
@@ -15,7 +16,8 @@ function deps(found: Array<Devspace | undefined>, added: number) {
   return {
     registry: { findByContainerName: vi.fn(async () => found.shift()) },
     needsRestore: async () => true,
-    docker: { isInstalled: () => true },
+    docker: { canRunOn: () => true },
+    current: async () => LOCAL_DOCKER_TARGET,
     service: { reconcileInWorker: vi.fn(async (_options: { passive: boolean; signal?: AbortSignal }) => added) },
     logger: silentLogger,
   };

@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { GitHubApiError, GitHubRateLimitError } from '../core/discovery/githubApi';
-import { LOCAL_DOCKER_TARGET } from '../core/docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../core/docker/dockerHost';
 import { operationDockerTarget, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { Actions, Messages, StateTexts } from '../core/messages';
 import { StoragePaths } from '../core/storage/paths';
@@ -465,14 +465,28 @@ describe('Sidebar', () => {
     await h.registry.add(devspace(API, 'acme/api', { dockerHost: 'devspace' }));
     await signedIn();
     h.service.refreshStates.mockResolvedValue({ runtime: undefined, branches: new Map() });
-    h.docker.isRunning.mockResolvedValue(false);
+    // `docker info` asks the engine whose states were read (outside of an operation it would ask the local Docker).
+    h.dockerTargets.withOperation.mockImplementation(async <T,>(fn: () => Promise<T>) => runWithDockerTarget(remoteDockerTarget('devspace'), fn));
+    const asked: unknown[] = [];
+    h.docker.isRunning.mockImplementation(async () => {
+      asked.push(operationDockerTarget());
+      return false;
+    });
     await h.sidebar.refreshStates();
+    expect(asked).toEqual([remoteDockerTarget('devspace')]);
+    h.dockerTargets.withOperation.mockImplementation(async <T,>(fn: () => Promise<T>) => runWithDockerTarget(LOCAL_DOCKER_TARGET, fn));
     expect(rowOf('acme/api').stateUnknown).toBe(true);
     expect(rowOf('acme/api').description).toContain(`${StateTexts.unknown} (devspace cannot be reached)`);
     // The actions of the state that Docker that does not run gives (Start reconnects), as before.
     expect(rowOf('acme/api').state).toBe('stopped');
     expect(rowOf('acme/api').contextValue).toContain('canStart');
     expect(h.helperBuilds.status).not.toHaveBeenCalled();
+    // Docker did not answer in refreshStates already: it is not asked again (each ask waits for its time limit).
+    asked.length = 0;
+    h.service.refreshStates.mockResolvedValue({ runtime: undefined, branches: new Map(), dockerStopped: true });
+    await h.sidebar.refreshStates();
+    expect(asked).toEqual([]);
+    expect(rowOf('acme/api').description).toContain(`${StateTexts.unknown} (devspace cannot be reached)`);
     // The local Docker that does not run: nothing runs, so Stopped, never unknown.
     h.dockerHost.value = '';
     await h.registry.add(devspace(OLD, 'acme/web'));

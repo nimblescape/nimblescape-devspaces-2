@@ -11,7 +11,7 @@ import { Messages, dockerHostReason } from '../messages';
 import type { RunOptions, RunResult } from '../ports';
 import { RemoteDockerState } from '../storage/remoteDockerState';
 import { remoteDockerTarget } from './dockerHost';
-import { UNREADABLE_DOCKER_TARGET } from './dockerTargets';
+import { UNREADABLE_DOCKER_TARGET, operationDockerTarget } from './dockerTargets';
 import {
   CONTEXT_COMMAND_TIMEOUT_MS,
   ENGINE_INFO_FORMAT,
@@ -95,6 +95,18 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     expect(options?.env).not.toHaveProperty('DOCKER_HOST');
     // The SSH agent of the user stays as it is.
     expect(options?.env?.SSH_AUTH_SOCK).toBe('/tmp/agent.sock');
+  });
+
+  // As a call on that host, so that BootstrapDocker runs it with the Docker CLI of Devspaces when it is installed.
+  it('runs docker info as a call of an operation on the tested host', async () => {
+    const targets: unknown[] = [];
+    const docker = fakeDocker(() => {
+      targets.push(operationDockerTarget());
+      return info();
+    });
+    await testRemoteDockerHost(docker, 'me@box:2222', sshDeps());
+    expect(targets).toEqual([remoteDockerTarget('me@box:2222')]);
+    expect(operationDockerTarget()).toBeUndefined();
   });
 
   it.each([

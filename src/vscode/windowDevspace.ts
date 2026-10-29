@@ -83,7 +83,9 @@ export async function findWindowDevspace(
   deps: {
     registry: Pick<DevspaceRegistry, 'findByContainerName'>;
     needsRestore: () => Promise<boolean>;
-    docker: Pick<BootstrapDocker, 'isInstalled'>;
+    docker: Pick<BootstrapDocker, 'canRunOn'>;
+    /** The current Docker target, whose worker restores. */
+    current: () => Promise<DockerTarget>;
     service: Pick<DevspaceOperations, 'reconcileInWorker'>;
     logger: Logger;
     /** Whether a lost registry may be restored here, or the check of it; true when not given. */
@@ -96,8 +98,9 @@ export async function findWindowDevspace(
     if (devspace || deps.mayRestore === false || !(await needsRestore())) return devspace;
     if (typeof deps.mayRestore === 'function' && !(await deps.mayRestore())) return undefined;
     // reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH), then whether
-    // Docker runs; the worker of the Docker host restores, in the background (passive).
-    if (!docker.isInstalled()) return undefined;
+    // Docker runs; the worker of the Docker host restores, in the background (passive). On a computer without Docker, the
+    // Docker CLI of Devspaces runs the calls on a remote host (BootstrapDocker.canRunOn).
+    if (!docker.canRunOn(await deps.current())) return undefined;
     // The activation waits at most WINDOW_RESTORE_TIMEOUT_MS for it; the restore in the background of the activation,
     // and the one after the build of the helper image, adopt the window later (reconcileIfRegistryLost with `adopt`).
     try {
@@ -197,14 +200,14 @@ export async function containerDevspace(
  * lost its content and nothing was restored from the current engine, which has the removal mark (`mayRestore` of the
  * activation): the labels of the container give it (containerDevspace, on that engine, within
  * WINDOW_RESTORE_TIMEOUT_MS), so that the account rule holds for the window there too (Controller.workWithoutDevspaces,
- * Controller.leaveUnknownOwner). `none` without a Docker CLI, for a registry that did not lose its content, and on an
- * engine without the mark (the restore ran there). Never throws.
+ * Controller.leaveUnknownOwner). `none` without a Docker CLI for that engine, for a registry that did not lose its
+ * content, and on an engine without the mark (the restore ran there). Never throws.
  */
 export async function removedEngineWindowDevspace(
   containerName: string,
   deps: {
     needsRestore: () => Promise<boolean>;
-    docker: Pick<BootstrapDocker, 'isInstalled' | 'run'>;
+    docker: Pick<BootstrapDocker, 'canRunOn' | 'run'>;
     current: () => Promise<DockerTarget>;
     removed: (target: DockerTarget) => Promise<boolean>;
     now: () => string;
@@ -212,9 +215,9 @@ export async function removedEngineWindowDevspace(
   },
 ): Promise<ContainerDevspace> {
   try {
-    if (!deps.docker.isInstalled() || !(await deps.needsRestore())) return { kind: 'none' };
+    if (!(await deps.needsRestore())) return { kind: 'none' };
     const target = await deps.current();
-    if (!(await deps.removed(target))) return { kind: 'none' };
+    if (!deps.docker.canRunOn(target) || !(await deps.removed(target))) return { kind: 'none' };
     const found = await runWithDockerTarget(target, () =>
       containerDevspace(containerName, { docker: deps.docker, host: target.host, now: deps.now(), timeoutMs: WINDOW_RESTORE_TIMEOUT_MS }),
     );
