@@ -146,9 +146,14 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     expect(commands).toEqual([`'docker' 'info' '--format' '${ENGINE_INFO_FORMAT}'`]);
     expect(docker.calls).toEqual([]);
     expect(sshLogins.isFresh('me@box:2222')).toBe(true);
-    // A failed login names its reason; docker info does not run.
+    // A failed login names its reason, and the earlier success no longer counts; docker info does not run.
     shells.login.mockResolvedValueOnce({ ok: false, detail: 'Permission denied (publickey,password).', timedOut: false } as never);
-    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toEqual({ ok: false, problem: 'login', detail: 'Permission denied (publickey,password).' });
+    await expect(testRemoteDockerHost(docker, 'me@box:2222', { ...sshDeps(), shells, sshLogins })).resolves.toEqual({
+      ok: false,
+      problem: 'login',
+      detail: 'Permission denied (publickey,password).',
+    });
+    expect(sshLogins.isFresh('me@box:2222')).toBe(false);
     shells.login.mockResolvedValueOnce({ ok: false, detail: 'ssh did not answer within 30 seconds.', timedOut: true } as never);
     await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: false, problem: 'unreachable' });
     expect(commands).toHaveLength(1);

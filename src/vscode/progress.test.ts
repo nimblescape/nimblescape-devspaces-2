@@ -8,7 +8,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 import { Messages } from '../core/messages';
 import type { ProgressReporter } from '../core/ports';
-import { sshPromptsAllowed } from '../core/sshAskpass';
+import { sshPromptSignal, sshPromptsAllowed } from '../core/sshAskpass';
 import { currentOperation, onDidChangeBusy, progressMessage, runWithProgress, withNotificationProgress, type BusyChange } from './progress';
 import { EventEmitter, fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
@@ -60,11 +60,19 @@ describe('withNotificationProgress', () => {
     expect(runs[0].options.cancellable).toBe(false);
   });
 
-  // The test of a remote host is a flow of the user: its SSH login may ask for a password or a host key in VS Code.
-  it('runs the task as a flow of the user, whose SSH logins may ask', async () => {
-    scriptWithProgress();
-    expect(await withNotificationProgress({ title: 'Testing the connection to build-box…' }, async () => sshPromptsAllowed())).toBe(true);
+  // The test of a remote host is a flow of the user: its SSH login may ask for a password or a host key in VS Code,
+  // until the Cancel of the notification.
+  it('runs the task as a flow of the user, whose SSH logins may ask until its Cancel', async () => {
+    const runs = scriptWithProgress();
+    const result = await withNotificationProgress({ title: 'Testing the connection to build-box…', cancellable: true }, async () => {
+      const signal = sshPromptSignal();
+      const before = signal?.aborted;
+      runs[0].cancel();
+      return [sshPromptsAllowed(), before, signal?.aborted];
+    });
+    expect(result).toEqual([true, false, true]);
     expect(sshPromptsAllowed()).toBe(false);
+    expect(sshPromptSignal()).toBeUndefined();
   });
 });
 
@@ -108,10 +116,19 @@ describe('runWithProgress', () => {
     ]);
   });
 
-  // A Start, an Open or a Stop of the user: the SSH login of its engine may ask in VS Code.
-  it('runs the task as a flow of the user, whose SSH logins may ask', async () => {
-    scriptWithProgress();
-    expect(await runWithProgress({ title: 'Starting acme/api…', task: async () => sshPromptsAllowed() })).toBe(true);
+  // A Start, an Open or a Stop of the user: the SSH login of its engine may ask in VS Code, until the Cancel.
+  it('runs the task as a flow of the user, whose SSH logins may ask until its Cancel', async () => {
+    const runs = scriptWithProgress();
+    const result = await runWithProgress({
+      title: 'Starting acme/api…',
+      cancellable: true,
+      task: async (_progress, signal) => {
+        const prompts = sshPromptSignal();
+        runs[0].cancel();
+        return [sshPromptsAllowed(), prompts === signal, prompts?.aborted];
+      },
+    });
+    expect(result).toEqual([true, true, true]);
     expect(sshPromptsAllowed()).toBe(false);
   });
 

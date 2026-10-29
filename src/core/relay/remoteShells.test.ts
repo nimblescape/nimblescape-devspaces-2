@@ -9,6 +9,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { silentLogger, type Logger, type StartedByteProcess } from '../ports';
 import { NodeProcessRunner } from '../process';
+import { sshPromptsAllowed, withSshPrompts } from '../sshAskpass';
 import { RemoteShells } from './remoteShells';
 
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
@@ -76,6 +77,30 @@ describeUnix('RemoteShells', () => {
     await expect(registry.login('box')).resolves.toEqual({ ok: false, detail: 'ssh: connect to host box port 22: Connection refused', timedOut: false });
     await expect(registry.run('box', 'true')).resolves.toEqual({ exitCode: 255, stdout: '', stderr: 'ssh: connect to host box port 22: Connection refused', timedOut: false });
     expect(logins).toEqual(['box', 'box']);
+  });
+
+  // A login of the background runs with BatchMode and fails for a host that needs a password or an unknown host key.
+  it('logs in anew for a flow of the user after a login of the background in progress failed', async () => {
+    const logins: string[] = [];
+    const prompts = { onPrompt: () => () => undefined };
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 5_000,
+      start: () => {
+        const asks = sshPromptsAllowed();
+        logins.push(asks ? 'asks' : 'quiet');
+        const script = asks ? 'exec sh -s' : 'sleep 0.3; echo "me@box: Permission denied (password)." >&2; exit 255';
+        const process = runner.startBytes('sh', ['-c', script]);
+        return asks ? { process, prompts } : { process };
+      },
+    });
+    const background = registry.login('box');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const flow = withSshPrompts(() => registry.login('box'));
+    await expect(background).resolves.toMatchObject({ ok: false, detail: 'me@box: Permission denied (password).' });
+    await expect(flow).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['quiet', 'asks']);
+    registry.dispose();
   });
 
   it('gives the relay the login of the shell after the calls before it, and a new login to the calls after it', async () => {

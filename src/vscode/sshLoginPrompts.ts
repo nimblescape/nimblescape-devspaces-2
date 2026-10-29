@@ -3,12 +3,12 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The questions of SSH logins in VS Code (docs/architecture.md "Login without setup"; the helper and the protocol are in
-// src/core/sshAskpass.ts). SshAskpassServer writes the helper and its launcher to the storage of the extension, listens
-// on a pipe of this extension host that only this user can open (a Unix socket in a private folder, or a named pipe
-// with a random name), and gives each login that may ask its own token (`login`). A question with a token that it does
-// not know is not asked. The dialogs come one at a time: a password, a passphrase or a code in an input box that hides
-// what is typed, an unknown host key in a modal dialog with its fingerprint. After a cancel, the login asks nothing more.
-// No answer is logged or kept.
+// src/core/sshAskpass.ts). SshAskpassServer writes the helper (and on Linux and macOS its launcher) to the storage of
+// the extension, listens on a pipe of this extension host that only this user can open (a Unix socket in a private
+// folder, or a named pipe with a random name), and gives each login that may ask its own token (`login`). A question
+// with a token that it does not know is not asked. The dialogs come one at a time: a password, a passphrase or a code
+// in an input box that hides what is typed, an unknown host key in a modal dialog with its fingerprint. After a cancel
+// (also the Cancel of the flow), the login asks nothing more. No answer is logged or kept.
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -103,12 +103,16 @@ export interface SshAskpassServerOptions {
 interface LoginState {
   host: string;
   createdAt: number;
-  /** The questions of a password, a passphrase or a code so far: a second one follows an answer that was not accepted. */
-  secrets: number;
+  /** The text of the last question for a password, a passphrase or a code: the same text again follows a wrong answer. */
+  lastSecret?: string;
   passwordAsked: boolean;
   cancelled: boolean;
   open: number;
   listeners: Set<(open: boolean) => void>;
+  /** The questions of the login that are not answered yet: a cancel of the login closes them. */
+  asking: Set<Cancel>;
+  /** Cancels the login (the Cancel of its flow): it asks nothing more, and its open questions close. */
+  cancel(): void;
 }
 
 /** The text of `ssh` for a dialog: plain lines, without control characters, at most MAX_PROMPT_TEXT characters. */
@@ -143,9 +147,10 @@ export class SshAskpassServer implements vscode.Disposable {
 
   /**
    * A new login to `host` that may ask, or undefined while the pipe does not listen (prepare): the login then asks
-   * nothing, as the logins of the background.
+   * nothing, as the logins of the background. When `signal` aborts (the Cancel of the flow, sshPromptSignal), the login
+   * asks nothing more, and its open questions close.
    */
-  login(host: string): SshLogin | undefined {
+  login(host: string, signal?: AbortSignal): SshLogin | undefined {
     const files = this.files;
     if (files === undefined || this.disposed) {
       if (!this.notReadySaid && !this.disposed) {
@@ -157,8 +162,22 @@ export class SshAskpassServer implements vscode.Disposable {
     }
     this.forgetOldLogins();
     const token = randomBytes(32).toString('hex');
-    const state: LoginState = { host, createdAt: this.now(), secrets: 0, passwordAsked: false, cancelled: false, open: 0, listeners: new Set() };
+    const state: LoginState = {
+      host,
+      createdAt: this.now(),
+      passwordAsked: false,
+      cancelled: false,
+      open: 0,
+      listeners: new Set(),
+      asking: new Set(),
+      cancel: () => {
+        state.cancelled = true;
+        for (const question of [...state.asking]) question.cancel();
+      },
+    };
     this.logins.set(token, state);
+    if (signal?.aborted) state.cancel();
+    signal?.addEventListener('abort', state.cancel, { once: true });
     const { platform } = this.options;
     return {
       host,
@@ -173,6 +192,7 @@ export class SshAskpassServer implements vscode.Disposable {
       dispose: () => {
         this.logins.delete(token);
         state.listeners.clear();
+        signal?.removeEventListener('abort', state.cancel);
       },
     };
   }
@@ -203,11 +223,15 @@ export class SshAskpassServer implements vscode.Disposable {
   private async prepareNow(): Promise<void> {
     const { folder, platform, nodePath } = this.options;
     await fs.promises.mkdir(folder, { recursive: true, mode: 0o700 });
-    const launcher = askpassLauncher(platform);
     const helper = path.join(folder, 'askpass.js');
-    const launcherPath = path.join(folder, launcher.fileName);
     await writeIfChanged(helper, ASKPASS_HELPER_SOURCE, 0o600);
-    await writeIfChanged(launcherPath, launcher.text, 0o700);
+    // Windows runs the helper without a launcher (askpassProgram).
+    let launcherPath: string | undefined;
+    if (platform !== 'win32') {
+      const launcher = askpassLauncher();
+      launcherPath = path.join(folder, launcher.fileName);
+      await writeIfChanged(launcherPath, launcher.text, 0o700);
+    }
     const address = await this.listen();
     if (this.disposed) {
       this.dispose();
@@ -294,8 +318,10 @@ export class SshAskpassServer implements vscode.Disposable {
       dialogs.notice(host, text);
       return '';
     }
-    if (kind === 'secret') state.secrets++;
-    const again = kind === 'secret' && state.secrets > 1;
+    // `ssh` asks the same question again after a wrong answer; another text (a password after the passphrase of a key,
+    // a one-time code after the password) is a new question.
+    const again = kind === 'secret' && state.lastSecret === text;
+    if (kind === 'secret') state.lastSecret = text;
     if (kind === 'secret' && isPasswordPrompt(text)) state.passwordAsked = true;
     const what =
       kind === 'hostKey'
@@ -307,18 +333,24 @@ export class SshAskpassServer implements vscode.Disposable {
             : 'for a passphrase or a code';
     logger.info(`The SSH login to ${host} asks ${what} in VS Code.`);
     this.setOpen(state, true);
+    state.asking.add(cancel);
     try {
-      // One dialog at a time; a question whose helper ended meanwhile is not shown.
+      // One dialog at a time; a question whose helper ended or whose login was cancelled meanwhile is not shown.
       const run = this.dialogQueue.then(async (): Promise<string | undefined> => {
-        if (cancel.isCancellationRequested || !this.logins.has(request.token)) return undefined;
+        if (cancel.isCancellationRequested || state.cancelled || !this.logins.has(request.token)) return undefined;
+        let value: string | undefined;
         switch (kind) {
           case 'hostKey':
-            return (await dialogs.hostKey(host, text)) ? 'yes' : 'no';
+            value = (await dialogs.hostKey(host, text)) ? 'yes' : 'no';
+            break;
           case 'confirm':
-            return (await dialogs.confirm(host, text)) ? '' : undefined;
+            value = (await dialogs.confirm(host, text)) ? '' : undefined;
+            break;
           default:
-            return dialogs.secret(host, text, again, cancel);
+            value = await dialogs.secret(host, text, again, cancel);
         }
+        // A modal dialog cannot be closed: its answer after the end of the question is no answer.
+        return cancel.isCancellationRequested ? undefined : value;
       });
       this.dialogQueue = run.catch(() => undefined);
       const value = await run;
@@ -330,6 +362,7 @@ export class SshAskpassServer implements vscode.Disposable {
       }
       return value;
     } finally {
+      state.asking.delete(cancel);
       this.setOpen(state, false);
     }
   }

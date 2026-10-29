@@ -105,8 +105,9 @@ export function workerLocks(
           relay: (target) => {
             const transport = options.relay?.(target);
             if (transport === undefined) return undefined;
+            const start = () => ({ process: runner.startBytes(transport.file, transport.args, { env: transport.env }) });
             return relayAccess(relayConnections, target.host, (command, bundle) =>
-              openRelayConnection(runner, transport, testArgs(command), bundle, { logger: log, name: target.host }),
+              openRelayConnection(start, testArgs(command), bundle, { logger: log, name: target.host }),
             );
           },
           runDirect: (args, options) => docker.run(args, options),

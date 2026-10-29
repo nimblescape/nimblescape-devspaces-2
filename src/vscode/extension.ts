@@ -22,9 +22,9 @@ import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../cor
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { HostPipes } from '../core/relay/hostPipes';
-import { RemoteShells } from '../core/relay/remoteShells';
+import { RemoteShells, type RemoteShellStart } from '../core/relay/remoteShells';
 import { dockerPipeBase } from '../core/relay/pipeAddress';
-import { sshPromptsAllowed } from '../core/sshAskpass';
+import { sshPromptSignal, sshPromptsAllowed } from '../core/sshAskpass';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -302,26 +302,27 @@ async function activateExtension(
   });
   context.subscriptions.push(askpass);
   void askpass.prepare();
-  /** A login to `host` that may ask: only within a flow of the user (withSshPrompts). */
-  const promptingLogin = (host: string): SshLogin | undefined => (sshPromptsAllowed() ? askpass.login(host) : undefined);
+  /**
+   * A new login `ssh … sh -s` to `host` (sshHostTransport), for a shell before the relay or a connection of the relay.
+   * Within a flow of the user (withSshPrompts), it may ask in VS Code until the Cancel of the flow; its questions end
+   * with its process. Undefined without `ssh` and for a host that is no SSH alias or address.
+   */
+  const startLogin = (host: string): RemoteShellStart | undefined => {
+    const ssh = sshPath();
+    if (ssh === undefined) return undefined;
+    const login: SshLogin | undefined = sshPromptsAllowed() ? askpass.login(host, sshPromptSignal()) : undefined;
+    const transport = sshHostTransport(host, ssh, env, login);
+    if (transport === undefined) {
+      login?.dispose();
+      return undefined;
+    }
+    const process = runner.startBytes(transport.file, transport.args, { env: transport.env });
+    if (login !== undefined) void process.exited.then(() => login.dispose());
+    return { process, prompts: login };
+  };
   // The shells before the relay, one per SSH host: the checks before a connection of the relay run on one login, which
   // the connection then takes over (`ssh … sh -s`, as its transport).
-  remoteShells = new RemoteShells({
-    logger,
-    start: (host) => {
-      const ssh = sshPath();
-      if (ssh === undefined) return undefined;
-      const login = promptingLogin(host);
-      const transport = sshHostTransport(host, ssh, env, login);
-      if (transport === undefined) {
-        login?.dispose();
-        return undefined;
-      }
-      const process = runner.startBytes(transport.file, transport.args, { env: transport.env });
-      if (login !== undefined) void process.exited.then(() => login.dispose());
-      return { process, prompts: login };
-    },
-  });
+  remoteShells = new RemoteShells({ logger, start: startLogin });
   const shells = remoteShells;
   // The SSH check before the Docker calls to a remote host: the login of its shell before the relay. A success counts
   // for a minute per host, and the Docker pipe of the extension for the host makes it needless while the calls go
@@ -495,19 +496,14 @@ async function activateExtension(
             if (ssh === undefined || sshRelayTransport(target, ssh, env) === undefined) return undefined;
             // The login of the shell before the relay, when its checks left one open; else a new one, which may ask
             // within a flow of the user.
-            return relayAccess(relayConnections, target.host, (command, bundle) => {
-              const login = promptingLogin(target.host);
-              const transport = sshRelayTransport(target, ssh, env, login);
-              if (transport === undefined) throw new Error(`${target.host} is no SSH alias or address.`);
-              const starter = {
-                startBytes: (file: string, args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
-                  const started = runner.startBytes(file, args, options);
-                  if (login !== undefined) void started.exited.then(() => login.dispose());
-                  return started;
-                },
-              };
-              return openRelayConnection(starter, transport, command, bundle, { logger, name: target.host, takeOver: () => shells.takeOver(target.host) });
-            });
+            const start = () => {
+              const started = startLogin(target.host);
+              if (started === undefined) throw new Error(`${target.host} is no SSH alias or address.`);
+              return started;
+            };
+            return relayAccess(relayConnections, target.host, (command, bundle) =>
+              openRelayConnection(start, command, bundle, { logger, name: target.host, takeOver: () => shells.takeOver(target.host) }),
+            );
           },
           runDirect: (args, options, withoutPipe) => (withoutPipe === true ? docker.runWithoutPipe(args, options) : docker.run(args, options)),
           logger,

@@ -6,7 +6,7 @@
 // host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
 // it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
-import type { SshLoginPrompts } from '../sshAskpass';
+import { sshPromptsAllowed, type SshLoginPrompts } from '../sshAskpass';
 import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } from './remoteShell';
 
 /** A login that started: its process, and the questions it may ask in VS Code (a login of a flow of the user). */
@@ -27,6 +27,8 @@ export interface RemoteShellsOptions {
 /** A shell of `RemoteShells`: open, or still logging in on `process`. */
 interface Entry {
   process: StartedByteProcess;
+  /** True for a login that may ask in VS Code (a login of a flow of the user). */
+  asks: boolean;
   shell?: RemoteShell;
   opening?: Promise<RemoteShell>;
 }
@@ -52,17 +54,28 @@ export class RemoteShells {
   /**
    * The open shell to `host`, or a new one (one SSH login, RemoteShell.open), which callers at the same time share.
    * Undefined when the host has no transport, and after `dispose`. Rejects with RemoteShellError when the login failed,
-   * and with an AbortError when `signal` aborts (the login goes on for the others).
+   * and with an AbortError when `signal` aborts (the login goes on for the others). A flow of the user whose login may
+   * ask (sshPromptsAllowed) that finds a login of the background in progress waits for it, and logs in anew after its
+   * failure: a login without questions fails for a host that needs a password or an unknown host key.
    */
   open(host: string, signal?: AbortSignal): Promise<RemoteShell | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
     const current = this.entries.get(host);
     if (current?.shell?.isOpen) return Promise.resolve(current.shell);
-    if (current?.opening) return untilAborted(current.opening, signal);
+    if (current?.opening) {
+      if (current.asks || !sshPromptsAllowed()) return untilAborted(current.opening, signal);
+      return untilAborted(
+        current.opening.catch((error: unknown) => {
+          if (!(error instanceof RemoteShellError) || signal?.aborted) throw error;
+          return this.open(host, signal);
+        }),
+        signal,
+      );
+    }
     const started = this.options.start(host);
     if (started === undefined) return Promise.resolve(undefined);
     const { process, prompts } = started;
-    const entry: Entry = { process };
+    const entry: Entry = { process, asks: prompts !== undefined };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };

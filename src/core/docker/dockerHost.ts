@@ -298,10 +298,11 @@ export function sshEndpoint(host: string): string {
  * The arguments of `ssh` that run `remoteCommand` (one string that the remote shell runs) on `target` without any
  * question: BatchMode (no password or passphrase prompt, no host key question: an unknown key fails), a time limit for
  * the connection, no terminal. With `prompts`, without BatchMode: a login of a flow of the user, whose questions
- * SSH_ASKPASS asks in VS Code (sshAskpass.ts). The destination comes after `--`, so it can never be an option.
+ * SSH_ASKPASS asks in VS Code (sshAskpass.ts); `-x` forwards no X11 to the DISPLAY of its environment (ASKPASS_DISPLAY).
+ * The destination comes after `--`, so it can never be an option.
  */
 export function sshCommandArgs(target: SshAddress, remoteCommand: string, connectTimeoutSeconds = 15, options: { prompts?: boolean } = {}): string[] {
-  const args = [...(options.prompts === true ? [] : ['-o', 'BatchMode=yes']), '-o', `ConnectTimeout=${connectTimeoutSeconds}`, '-T'];
+  const args = [...(options.prompts === true ? ['-x'] : ['-o', 'BatchMode=yes']), '-o', `ConnectTimeout=${connectTimeoutSeconds}`, '-T'];
   if (target.port !== undefined) args.push('-p', String(target.port));
   if (target.user !== undefined) args.push('-l', target.user);
   args.push('--', target.host, remoteCommand);

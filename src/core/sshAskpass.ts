@@ -5,11 +5,11 @@
 // The questions of an SSH login in VS Code (docs/architecture.md "Login without setup"). The `ssh` of the system asks
 // for a password, the passphrase of a key, a one-time code, or whether to accept an unknown host key through the
 // program in SSH_ASKPASS (with SSH_ASKPASS_REQUIRE=force; older versions without it need DISPLAY and no terminal). That
-// program is a small launcher of Devspaces (askpassLauncher) that runs ASKPASS_HELPER_SOURCE with the Node.js of VS Code;
-// the helper sends the question over a local pipe of the extension host, with the token of its login, and prints the
-// answer. Only a login that a flow of the user starts may ask (withSshPrompts); every other login runs with
-// BatchMode=yes and asks nothing. Pure parts and the scope of the flows; the pipe and the dialogs are in
-// src/vscode/sshLoginPrompts.ts. No `vscode`.
+// program runs ASKPASS_HELPER_SOURCE with the Node.js of VS Code (askpassProgram): on Linux and macOS through a small
+// launcher of Devspaces (askpassLauncher), on Windows directly. The helper sends the question over a local pipe of the
+// extension host, with the token of its login, and prints the answer. Only a login that a flow of the user starts may
+// ask (withSshPrompts); every other login runs with BatchMode=yes and asks nothing. Pure parts and the scope of the
+// flows; the pipe and the dialogs are in src/vscode/sshLoginPrompts.ts. No `vscode`.
 import { AsyncLocalStorage } from 'async_hooks';
 
 /** The address of the pipe of the extension host that answers the helper. */
@@ -20,7 +20,10 @@ export const ASKPASS_TOKEN_ENV = 'DEVSPACES_ASKPASS_TOKEN';
 export const ASKPASS_NODE_ENV = 'DEVSPACES_ASKPASS_NODE';
 /** The file of the helper (ASKPASS_HELPER_SOURCE). */
 export const ASKPASS_HELPER_ENV = 'DEVSPACES_ASKPASS_HELPER';
-/** DISPLAY for an `ssh` older than OpenSSH 8.4, which uses SSH_ASKPASS only when DISPLAY is set; only when it is not set. */
+/**
+ * DISPLAY for an `ssh` older than OpenSSH 8.4 (also the 8.1 of Windows 10), which uses SSH_ASKPASS only when DISPLAY is
+ * set; only when it is not set. A login that may ask forwards no X11 (sshCommandArgs), so `ssh` never connects to it.
+ */
 export const ASKPASS_DISPLAY = 'devspaces:0';
 /** The longest line of a question or an answer on the pipe, in characters. */
 export const MAX_ASKPASS_LINE = 64 * 1024;
@@ -65,35 +68,40 @@ socket.on('end', fail);
 `;
 
 /**
- * The launcher of the helper, which SSH_ASKPASS names: a shell script, or on Windows a batch file. Both read the paths
- * from the environment, so their text is the same on every computer (no path of a user in it, also none with other
- * characters than ASCII), and they set ELECTRON_RUN_AS_NODE only for the helper.
+ * The launcher of the helper on Linux and macOS, which SSH_ASKPASS names: a shell script that reads the paths from the
+ * environment, so its text is the same on every computer (no path of a user in it), and that sets ELECTRON_RUN_AS_NODE
+ * only for the helper. Windows has none (askpassProgram).
  */
-export function askpassLauncher(platform: NodeJS.Platform): { fileName: string; text: string } {
-  if (platform === 'win32') {
-    return {
-      fileName: 'askpass.cmd',
-      text: ['@echo off', 'set ELECTRON_RUN_AS_NODE=1', `"%${ASKPASS_NODE_ENV}%" "%${ASKPASS_HELPER_ENV}%" %*`, ''].join('\r\n'),
-    };
-  }
+export function askpassLauncher(): { fileName: string; text: string } {
   return {
     fileName: 'askpass.sh',
     text: ['#!/bin/sh', `ELECTRON_RUN_AS_NODE=1 exec "$${ASKPASS_NODE_ENV}" "$${ASKPASS_HELPER_ENV}" "$@"`, ''].join('\n'),
   };
 }
 
-/** Where the files of one login point: the launcher, the helper, the program that runs it, and the pipe. */
+/** Where the files of one login point: the launcher (not on Windows), the helper, the program that runs it, and the pipe. */
 export interface AskpassFiles {
-  launcher: string;
+  launcher?: string;
   helper: string;
   node: string;
   address: string;
 }
 
 /**
- * The environment of an `ssh` that may ask (`base` with the variables of the helper): SSH_ASKPASS is the launcher,
- * SSH_ASKPASS_REQUIRE=force, DISPLAY when it is not set, and the token of the login. Each variable replaces one of
- * another case (Windows).
+ * The value of SSH_ASKPASS: the launcher, or on Windows (no launcher) the command `"<node>" "<helper>"`. Win32-OpenSSH
+ * starts it with CreateProcess as it is, with the question as the next argument in double quotes, so the question goes
+ * to the helper as one argument, also with its line breaks. A batch file is no launcher on Windows: cmd.exe would read
+ * the question as a command line, where a line break cuts it and a `"` with a `&` in the text of a host runs a command.
+ */
+export function askpassProgram(files: AskpassFiles): string {
+  return files.launcher ?? `"${files.node}" "${files.helper}"`;
+}
+
+/**
+ * The environment of an `ssh` that may ask (`base` with the variables of the helper): SSH_ASKPASS (askpassProgram),
+ * SSH_ASKPASS_REQUIRE=force, DISPLAY when it is not set, and the token of the login. On Windows also
+ * ELECTRON_RUN_AS_NODE, which the launcher sets on the other systems; the programs that `ssh` starts (a ProxyCommand)
+ * get it too, which only an Electron app reads. Each variable replaces one of another case (Windows).
  */
 export function askpassEnv(base: NodeJS.ProcessEnv, files: AskpassFiles, token: string, platform: NodeJS.Platform): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -101,8 +109,9 @@ export function askpassEnv(base: NodeJS.ProcessEnv, files: AskpassFiles, token: 
     if (platform === 'win32') for (const key of Object.keys(env)) if (key.toUpperCase() === name) delete env[key];
     env[name] = value;
   };
-  set('SSH_ASKPASS', files.launcher);
+  set('SSH_ASKPASS', askpassProgram(files));
   set('SSH_ASKPASS_REQUIRE', 'force');
+  if (platform === 'win32') set('ELECTRON_RUN_AS_NODE', '1');
   const hasDisplay = Object.keys(env).some((key) => (platform === 'win32' ? key.toUpperCase() : key) === 'DISPLAY' && !!env[key]);
   if (!hasDisplay) set('DISPLAY', ASKPASS_DISPLAY);
   set(ASKPASS_ADDRESS_ENV, files.address);
@@ -175,21 +184,23 @@ export interface SshLoginPrompts {
 }
 
 /**
- * The flow of the user that runs now: its logins may ask. Timers and listeners that a flow creates keep its store after
- * it ended; `active` is false then, so their logins ask nothing (as the scope of an operation in dockerTargets.ts).
+ * The flow of the user that runs now: its logins may ask, until `signal` aborts (the Cancel of its progress). Timers and
+ * listeners that a flow creates keep its store after it ended; `active` is false then, so their logins ask nothing (as
+ * the scope of an operation in dockerTargets.ts).
  */
 interface PromptScope {
   active: boolean;
+  signal?: AbortSignal;
 }
 
 const promptScopes = new AsyncLocalStorage<PromptScope>();
 
 /**
  * Runs `fn` as a flow of the user (a command with its progress notification, the test of a remote host): an SSH login
- * that it starts may ask in VS Code.
+ * that it starts may ask in VS Code. When `signal` aborts, the questions of those logins close (sshPromptSignal).
  */
-export async function withSshPrompts<T>(fn: () => Promise<T>): Promise<T> {
-  const scope: PromptScope = { active: true };
+export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const scope: PromptScope = { active: true, signal };
   try {
     return await promptScopes.run(scope, fn);
   } finally {
@@ -200,4 +211,10 @@ export async function withSshPrompts<T>(fn: () => Promise<T>): Promise<T> {
 /** True within withSshPrompts: an SSH login that starts now may ask. */
 export function sshPromptsAllowed(): boolean {
   return promptScopes.getStore()?.active === true;
+}
+
+/** The signal of the flow of the user that runs now (withSshPrompts): when it aborts, its logins ask nothing more. */
+export function sshPromptSignal(): AbortSignal | undefined {
+  const scope = promptScopes.getStore();
+  return scope?.active === true ? scope.signal : undefined;
 }

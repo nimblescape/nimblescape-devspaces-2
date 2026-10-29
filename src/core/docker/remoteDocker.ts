@@ -143,7 +143,10 @@ export async function testRemoteDockerHost(
   if (ssh.shells !== undefined && ssh.sshPath !== undefined && sshTargetOf(host) !== undefined) {
     const shell = await ssh.shells.login(host, options.signal);
     if (shell !== undefined) {
-      if (!shell.ok) return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
+      if (!shell.ok) {
+        ssh.sshLogins?.forget(host);
+        return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
+      }
       ssh.sshLogins?.remember(host);
       const result = await ssh.shells.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal: options.signal });
       if (result !== undefined) return engineCheckOf(result, timeoutMs);

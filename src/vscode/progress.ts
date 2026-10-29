@@ -102,18 +102,22 @@ export function withNotificationProgress<R>(
       // A report with only an increment keeps the newest message.
       let message: string | undefined;
       progress.report({ message: progressMessage(options.title, undefined, undefined) });
-      // A flow of the user: its SSH logins may ask in VS Code (withSshPrompts).
-      return withSshPrompts(async () =>
-        task(
-          {
-            report: (value) => {
-              if (value.message !== undefined) message = value.message;
-              progress.report({ ...value, message: progressMessage(options.title, undefined, message) });
+      // A flow of the user: its SSH logins may ask in VS Code (withSshPrompts), until its Cancel.
+      const cancel = new AbortController();
+      const cancellation = token.onCancellationRequested(() => cancel.abort());
+      return withSshPrompts(
+        async () =>
+          task(
+            {
+              report: (value) => {
+                if (value.message !== undefined) message = value.message;
+                progress.report({ ...value, message: progressMessage(options.title, undefined, message) });
+              },
             },
-          },
-          token,
-        ),
-      );
+            token,
+          ),
+        cancel.signal,
+      ).finally(() => cancellation.dispose());
     },
   );
 }
@@ -160,8 +164,8 @@ export function runWithProgress<T>(run: ProgressRun<T>): Promise<T> {
           try {
             // Also a task that throws before it returns its promise (the rejection is passed on). The notification
             // stays until the task settles; then the `finally` stops the reports to the closed notification.
-            // A flow of the user: its SSH logins may ask in VS Code (withSshPrompts).
-            const task = withSshPrompts(() => Promise.resolve().then(() => run.task(reporter, controller.signal)));
+            // A flow of the user: its SSH logins may ask in VS Code (withSshPrompts), until its Cancel.
+            const task = withSshPrompts(() => Promise.resolve().then(() => run.task(reporter, controller.signal)), controller.signal);
             task.then(resolve, reject);
             await task.then(() => undefined, () => undefined);
           } finally {

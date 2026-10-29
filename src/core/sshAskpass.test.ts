@@ -16,10 +16,12 @@ import {
   askpassAnswerLine,
   askpassEnv,
   askpassLauncher,
+  askpassProgram,
   hostKeyFingerprint,
   isPasswordPrompt,
   parseAskpassRequest,
   sshPromptKind,
+  sshPromptSignal,
   sshPromptsAllowed,
   withSshPrompts,
   type AskpassRequest,
@@ -38,12 +40,27 @@ const HOST_KEY_PROMPT = [
 
 describe('the launcher and the environment of ssh', () => {
   it('names the helper and its program by variables, so its text holds no path', () => {
-    const unix = askpassLauncher('linux');
+    const unix = askpassLauncher();
     expect(unix.fileName).toBe('askpass.sh');
     expect(unix.text).toBe('#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$DEVSPACES_ASKPASS_NODE" "$DEVSPACES_ASKPASS_HELPER" "$@"\n');
-    const windows = askpassLauncher('win32');
-    expect(windows.fileName).toBe('askpass.cmd');
-    expect(windows.text).toBe('@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"%DEVSPACES_ASKPASS_NODE%" "%DEVSPACES_ASKPASS_HELPER%" %*\r\n');
+  });
+
+  // No batch file on Windows: cmd.exe would read the question of the host as a command line.
+  it('runs the helper on Windows without a launcher, as one command that Win32-OpenSSH starts as it is', () => {
+    expect(askpassProgram(FILES)).toBe(FILES.launcher);
+    const windows = { helper: 'C:\\Users\\Jo Doe\\storage\\askpass.js', node: 'C:\\Program Files\\Microsoft VS Code\\Code.exe', address: '\\\\.\\pipe\\devspaces-askpass-0123' };
+    expect(askpassProgram(windows)).toBe('"C:\\Program Files\\Microsoft VS Code\\Code.exe" "C:\\Users\\Jo Doe\\storage\\askpass.js"');
+    expect(askpassEnv({ Path: 'C:\\Windows' }, windows, 't', 'win32')).toEqual({
+      Path: 'C:\\Windows',
+      SSH_ASKPASS: '"C:\\Program Files\\Microsoft VS Code\\Code.exe" "C:\\Users\\Jo Doe\\storage\\askpass.js"',
+      SSH_ASKPASS_REQUIRE: 'force',
+      ELECTRON_RUN_AS_NODE: '1',
+      DISPLAY: ASKPASS_DISPLAY,
+      DEVSPACES_ASKPASS_ADDRESS: windows.address,
+      DEVSPACES_ASKPASS_TOKEN: 't',
+      DEVSPACES_ASKPASS_NODE: windows.node,
+      DEVSPACES_ASKPASS_HELPER: windows.helper,
+    });
   });
 
   it('sets SSH_ASKPASS with force, the pipe and the token, and DISPLAY only when it is not set', () => {
@@ -64,8 +81,8 @@ describe('the launcher and the environment of ssh', () => {
   });
 
   it('replaces the variables of another case on Windows, and keeps a DISPLAY of any case', () => {
-    const env = askpassEnv({ Path: 'C:\\Windows', Ssh_Askpass_Require: 'never', display: 'x:0' }, { ...FILES, launcher: 'C:\\askpass.cmd' }, 't', 'win32');
-    expect(env).toMatchObject({ Path: 'C:\\Windows', SSH_ASKPASS: 'C:\\askpass.cmd', SSH_ASKPASS_REQUIRE: 'force', display: 'x:0' });
+    const env = askpassEnv({ Path: 'C:\\Windows', Ssh_Askpass_Require: 'never', display: 'x:0' }, { helper: 'C:\\askpass.js', node: 'C:\\Code.exe', address: 'p' }, 't', 'win32');
+    expect(env).toMatchObject({ Path: 'C:\\Windows', SSH_ASKPASS: '"C:\\Code.exe" "C:\\askpass.js"', SSH_ASKPASS_REQUIRE: 'force', display: 'x:0' });
     expect(env.Ssh_Askpass_Require).toBeUndefined();
     expect(env.DISPLAY).toBeUndefined();
   });
@@ -102,6 +119,7 @@ describe('the protocol of the helper', () => {
 describe('the flows of the user', () => {
   it('lets the logins of a flow ask, and no login outside of it or after it', async () => {
     expect(sshPromptsAllowed()).toBe(false);
+    expect(sshPromptSignal()).toBeUndefined();
     let later: Promise<boolean> | undefined;
     const inside = await withSshPrompts(async () => {
       await Promise.resolve();
@@ -112,6 +130,18 @@ describe('the flows of the user', () => {
     expect(inside).toBe(true);
     expect(await later).toBe(false);
     expect(sshPromptsAllowed()).toBe(false);
+  });
+
+  it('gives the logins of a flow its signal while it runs', async () => {
+    const cancel = new AbortController();
+    let later: Promise<AbortSignal | undefined> | undefined;
+    const inside = await withSshPrompts(async () => {
+      later = new Promise((resolve) => setTimeout(() => resolve(sshPromptSignal()), 20));
+      return sshPromptSignal();
+    }, cancel.signal);
+    expect(inside).toBe(cancel.signal);
+    expect(await later).toBeUndefined();
+    expect(await withSshPrompts(async () => sshPromptSignal())).toBeUndefined();
   });
 });
 

@@ -110,6 +110,56 @@ describeUnix('SshAskpassServer', () => {
     expect(lines).toEqual(['The SSH login to build-box asks for a password in VS Code.', 'The SSH login to build-box asks for a password in VS Code.']);
   });
 
+  // A wrong answer brings the same question again; another question (the password after the passphrase of a key) is new.
+  it('says that an answer was not accepted only when the same question comes again', async () => {
+    const { fake, asked } = dialogs({ secrets: ['phrase', 'wrong', 'right'] });
+    const askpass = await prepared(fake);
+    const env = askpass.login('build-box')!.env({ PATH: process.env.PATH });
+    expect(await runAskpass(env, "Enter passphrase for key '/home/me/.ssh/id_ed25519': ")).toMatchObject({ code: 0 });
+    expect(await runAskpass(env, "me@build-box's password: ")).toMatchObject({ code: 0 });
+    expect(await runAskpass(env, "me@build-box's password: ")).toMatchObject({ code: 0 });
+    expect(asked).toEqual([
+      "secret build-box Enter passphrase for key '/home/me/.ssh/id_ed25519':",
+      "secret build-box me@build-box's password:",
+      "secret build-box again me@build-box's password:",
+    ]);
+  });
+
+  // The Cancel of the progress notification of the flow (sshPromptSignal).
+  it('closes the open question when the flow is cancelled, and then asks nothing more', async () => {
+    const asked: string[] = [];
+    let closed = false;
+    const fake: SshLoginDialogs = {
+      ...dialogs().fake,
+      secret: (_host, prompt, _again, cancel) =>
+        new Promise((resolve) => {
+          asked.push(prompt);
+          cancel.onCancellationRequested(() => {
+            closed = true;
+            resolve(undefined);
+          });
+        }),
+    };
+    const askpass = await prepared(fake);
+    const flow = new AbortController();
+    const login = askpass.login('build-box', flow.signal)!;
+    const open: boolean[] = [];
+    login.onPrompt((value) => open.push(value));
+    const env = login.env({ PATH: process.env.PATH });
+    const first = runAskpass(env, "me@build-box's password: ");
+    while (asked.length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    flow.abort();
+    expect(await first).toMatchObject({ code: 1 });
+    expect(closed).toBe(true);
+    expect(open).toEqual([true, false]);
+    expect(await runAskpass(env, "me@build-box's password: ")).toMatchObject({ code: 1 });
+    expect(asked).toHaveLength(1);
+    // A login of a flow that was cancelled before asks nothing.
+    const late = askpass.login('build-box', flow.signal)!.env({ PATH: process.env.PATH });
+    expect(await runAskpass(late, "me@build-box's password: ")).toMatchObject({ code: 1 });
+    expect(asked).toHaveLength(1);
+  });
+
   it('asks for an unknown host key with its fingerprint: yes accepts it, and a refusal asks nothing more', async () => {
     const { fake, asked } = dialogs({ hostKey: [true, false], secrets: ['pw'] });
     const askpass = await prepared(fake);
