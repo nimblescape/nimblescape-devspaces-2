@@ -4,18 +4,19 @@
 
 // The Docker calls of an operation on an SSH host go through the Docker pipe of the extension for the host while a
 // connection of the relay to it is open (BootstrapDockerOptions.dockerPipe): DOCKER_HOST is the pipe, without
-// DOCKER_CONTEXT and the TLS variables. Without the pipe, outside of an operation, for the local Docker, for the checks
-// of a new connection (runWithContext), and for the start of the worker, the calls go as before.
+// DOCKER_CONTEXT and the TLS variables. Without the pipe, for the checks of a new connection (runWithoutPipe), and for
+// the start of the worker, DOCKER_HOST is `ssh://<host>`, and each such call logs in itself. Outside of an operation and
+// for the local Docker, the calls go as before.
 import { describe, expect, it, vi } from 'vitest';
 import { silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { BootstrapDocker, isShellCall } from './bootstrapDocker';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames, type DockerTarget } from './dockerHost';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget, type DockerTarget } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 
 const OK: RunResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false };
 const PIPE = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
-const CONTEXT = remoteContextNames('build-box')[0];
-const REMOTE = dockerTargetOf('ssh://build-box', CONTEXT);
+const SSH = 'ssh://build-box';
+const REMOTE = remoteDockerTarget('build-box');
 
 function recorder(): { runner: ProcessRunner; envs: NodeJS.ProcessEnv[]; starts: NodeJS.ProcessEnv[] } {
   const envs: NodeJS.ProcessEnv[] = [];
@@ -47,13 +48,13 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     expect(envs[0].DOCKER_CONFIG).toBe('/home/me/.docker');
   });
 
-  it('keeps the Docker context of the operation without the pipe, and asks for none outside of an operation or for the local Docker', async () => {
+  it('gives the calls of an operation on an SSH host ssh://<host> without the pipe, and asks for no pipe outside of an operation or for the local Docker', async () => {
     const { runner, envs } = recorder();
     const dockerPipe = vi.fn((): string | undefined => undefined);
     const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'linux', { dockerPipe });
     await runWithDockerTarget(REMOTE, () => docker.run(['container', 'inspect', 'x']));
-    expect(envs[0].DOCKER_CONTEXT).toBe(CONTEXT);
-    expect(envs[0].DOCKER_HOST).toBeUndefined();
+    expect(envs[0].DOCKER_HOST).toBe(SSH);
+    expect(envs[0].DOCKER_CONTEXT).toBeUndefined();
     expect(dockerPipe).toHaveBeenCalledTimes(1);
     dockerPipe.mockReturnValue(PIPE);
     await docker.run(['container', 'inspect', 'x']);
@@ -63,45 +64,37 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     expect(dockerPipe).toHaveBeenCalledTimes(1);
   });
 
-  it('runs the checks of a new connection of the relay with the Docker context also while the host has the pipe', async () => {
+  it('runs the checks of a new connection of the relay with ssh://<host> also while the host has the pipe', async () => {
     const { runner, envs } = recorder();
     const dockerPipe = vi.fn(() => PIPE);
     const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'linux', { dockerPipe });
-    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info', '--format', '{{json .ID}}']));
-    expect(envs[0].DOCKER_CONTEXT).toBe(CONTEXT);
-    expect(envs[0].DOCKER_HOST).toBeUndefined();
+    await runWithDockerTarget(REMOTE, () => docker.runWithoutPipe(['info', '--format', '{{json .ID}}']));
+    expect(envs[0].DOCKER_HOST).toBe(SSH);
+    expect(envs[0].DOCKER_CONTEXT).toBeUndefined();
     expect(dockerPipe).not.toHaveBeenCalled();
     // `run` takes the pipe.
     await runWithDockerTarget(REMOTE, () => docker.run(['info', '--format', '{{json .ID}}']));
     expect(envs[1].DOCKER_HOST).toBe(PIPE);
   });
 
-  it('logs each call of an operation on an SSH host that logs in with the Docker context, never a call through the pipe', async () => {
+  it('logs each call of an operation on an SSH host that logs in over SSH, never a call through the pipe', async () => {
     const { runner } = recorder();
     const lines: string[] = [];
     const logger: Logger = { ...silentLogger, info: (message) => lines.push(message) };
     let pipe: string | undefined;
-    let last: DockerTarget | undefined;
-    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', { dockerPipe: () => pipe, lastTarget: () => last });
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', { dockerPipe: () => pipe });
     await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
     pipe = PIPE;
     await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
-    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info', '--format', '{{json .ID}}']));
+    await runWithDockerTarget(REMOTE, () => docker.runWithoutPipe(['info', '--format', '{{json .ID}}']));
     await runWithDockerTarget(LOCAL_DOCKER_TARGET, () => docker.run(['image', 'inspect', 'x']));
-    await docker.run(['image', 'inspect', 'x']);
-    last = LOCAL_DOCKER_TARGET;
-    await docker.run(['image', 'inspect', 'x']);
-    // Outside an operation, the Docker CLI uses the current Docker context, the one of the last read.
-    last = REMOTE;
+    // Outside an operation, the Docker CLI uses the local Docker.
     await docker.run(['info']);
     // The commands of the Docker contexts and the version of the CLI log in nowhere.
-    await docker.run(['context', 'inspect', '--format', '{{json .}}']);
-    await docker.run(['--version']);
-    expect(lines).toEqual([
-      'docker image inspect x logs in to build-box with the Docker context.',
-      'docker info --format {{json .ID}} logs in to build-box with the Docker context.',
-      'docker info logs in to build-box with the Docker context (outside an operation).',
-    ]);
+    pipe = undefined;
+    await runWithDockerTarget(REMOTE, () => docker.run(['context', 'inspect', '--format', '{{json .}}']));
+    await runWithDockerTarget(REMOTE, () => docker.run(['--version']));
+    expect(lines).toEqual(['docker image inspect x logs in to build-box over SSH.', 'docker info --format {{json .ID}} logs in to build-box over SSH.']);
   });
 
   it('starts the worker (standard input open) never through the pipe', async () => {
@@ -109,12 +102,12 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     const dockerPipe = vi.fn(() => PIPE);
     const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'linux', { dockerPipe });
     await runWithDockerTarget(REMOTE, async () => docker.start(['run', '-i', 'img']));
-    expect(starts[0].DOCKER_CONTEXT).toBe(CONTEXT);
-    expect(starts[0].DOCKER_HOST).toBeUndefined();
+    expect(starts[0].DOCKER_HOST).toBe(SSH);
+    expect(starts[0].DOCKER_CONTEXT).toBeUndefined();
     expect(dockerPipe).not.toHaveBeenCalled();
   });
 
-  it('logs in with the Docker context when the lookup of the pipe fails', async () => {
+  it('logs in over SSH when the lookup of the pipe fails', async () => {
     const { runner, envs } = recorder();
     const warnings: string[] = [];
     const logger: Logger = { ...silentLogger, warn: (message) => warnings.push(message) };
@@ -124,8 +117,8 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
       },
     });
     await runWithDockerTarget(REMOTE, () => docker.run(['container', 'inspect', 'x']));
-    expect(envs[0].DOCKER_CONTEXT).toBe(CONTEXT);
-    expect(envs[0].DOCKER_HOST).toBeUndefined();
+    expect(envs[0].DOCKER_HOST).toBe(SSH);
+    expect(envs[0].DOCKER_CONTEXT).toBeUndefined();
     expect(warnings).toEqual(['The Docker pipe of build-box could not be looked up, so the call logs in itself: broken']);
   });
 });
@@ -140,22 +133,22 @@ describe('BootstrapDocker: the shell before the relay', () => {
     const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'linux', { dockerPipe: () => pipe, remoteShell });
     const signal = new AbortController().signal;
     await expect(runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', '--format', '{{json .Id}}', 'x'], { timeoutMs: 5_000, signal }))).resolves.toEqual(SHELL);
-    // runWithContext too: the checks of a new connection of the relay.
-    await expect(runWithDockerTarget(REMOTE, () => docker.runWithContext(['info', '--format', '{{json .ID}}']))).resolves.toEqual(SHELL);
+    // runWithoutPipe too: the checks of a new connection of the relay.
+    await expect(runWithDockerTarget(REMOTE, () => docker.runWithoutPipe(['info', '--format', '{{json .ID}}']))).resolves.toEqual(SHELL);
     expect(remoteShell.mock.calls).toEqual([
       [REMOTE, ['image', 'inspect', '--format', '{{json .Id}}', 'x'], { timeoutMs: 5_000, signal }],
       [REMOTE, ['info', '--format', '{{json .ID}}'], { timeoutMs: undefined, signal: undefined }],
     ]);
     expect(envs).toEqual([]);
-    // With the pipe, the call goes through it, and runWithContext still on the shell.
+    // With the pipe, the call goes through it, and runWithoutPipe still on the shell.
     pipe = PIPE;
     await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
-    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info']));
+    await runWithDockerTarget(REMOTE, () => docker.runWithoutPipe(['info']));
     expect(envs.map((env) => env.DOCKER_HOST)).toEqual([PIPE]);
     expect(remoteShell).toHaveBeenCalledTimes(3);
   });
 
-  it('logs in with the Docker context for the calls that the shell does not take, and when the host has no shell', async () => {
+  it('logs in over SSH for the calls that the shell does not take, and when the host has no shell', async () => {
     const { runner, envs } = recorder();
     const lines: string[] = [];
     const logger: Logger = { ...silentLogger, info: (message) => lines.push(message) };
@@ -179,18 +172,18 @@ describe('BootstrapDocker: the shell before the relay', () => {
     await docker.run(['image', 'inspect', 'x']);
     expect(remoteShell.mock.calls.map(([, args]) => args)).toEqual([['ps']]);
     expect(envs).toHaveLength(11);
-    expect(lines.filter((line) => line.endsWith('logs in to build-box with the Docker context.'))).toEqual([
-      'docker volume create x logs in to build-box with the Docker context.',
-      'docker --config /home/me/.docker info logs in to build-box with the Docker context.',
-      'docker version --format {{json .Server}} logs in to build-box with the Docker context.',
-      'docker image inspect x logs in to build-box with the Docker context.',
-      'docker image inspect x logs in to build-box with the Docker context.',
-      'docker image inspect x logs in to build-box with the Docker context.',
-      'docker ps logs in to build-box with the Docker context.',
+    expect(lines.filter((line) => line.endsWith('logs in to build-box over SSH.'))).toEqual([
+      'docker volume create x logs in to build-box over SSH.',
+      'docker --config /home/me/.docker info logs in to build-box over SSH.',
+      'docker version --format {{json .Server}} logs in to build-box over SSH.',
+      'docker image inspect x logs in to build-box over SSH.',
+      'docker image inspect x logs in to build-box over SSH.',
+      'docker image inspect x logs in to build-box over SSH.',
+      'docker ps logs in to build-box over SSH.',
     ]);
   });
 
-  it('logs a failure of the shell and logs in with the Docker context; an abort is no failure', async () => {
+  it('logs a failure of the shell and logs in over SSH; an abort is no failure', async () => {
     const { runner, envs } = recorder();
     const lines: string[] = [];
     const logger: Logger = { ...silentLogger, warn: (message) => lines.push(message) };
@@ -199,7 +192,7 @@ describe('BootstrapDocker: the shell before the relay', () => {
     });
     const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', { remoteShell });
     await expect(runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']))).resolves.toEqual(OK);
-    expect(lines).toEqual(['docker image inspect could not run on the shell before the relay on build-box, so it logs in with the Docker context: broken']);
+    expect(lines).toEqual(['docker image inspect could not run on the shell before the relay on build-box, so it logs in over SSH itself: broken']);
     expect(envs).toHaveLength(1);
     remoteShell.mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }));
     await expect(runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']))).rejects.toMatchObject({ name: 'AbortError' });

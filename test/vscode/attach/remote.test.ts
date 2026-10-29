@@ -4,14 +4,14 @@
 
 /// <reference types="mocha" />
 // Attach tests in the window of a devspace on the Docker engine of another computer (.vscode-test.mjs, label attach,
-// DEVSPACE_TEST_ATTACH=remote): Docker uses that engine over SSH (its Docker context is the current context, as after
-// "Use a Remote Docker Host…"), and VS Code starts in the window of the devspace there, whose folder URI names the
-// Docker pipe of the window (`settings.host`, src/core/relay/windowPipe.ts). prepare.ts made the devspace without
+// DEVSPACE_TEST_ATTACH=remote): Devspaces uses that engine over SSH (the host is the Docker host of Devspaces in its
+// list, as after "Use a Remote Docker Host…", and the current Docker context stays `default`), and VS Code starts in the
+// window of the devspace there, whose folder URI names the Docker pipe of the window (`settings.host`,
+// src/core/relay/windowPipe.ts). prepare.ts made the devspace without
 // container, so the extension restores it from its volume labels on that engine and runs the open pipeline there
 // before the window connects; the Dev Containers extension attaches through the Docker pipe, which the extension serves
 // through the connection of the relay of its worker. The engine of the runner has a container with the name of the
-// devspace container, which the window must not use. The window of another Docker host than the current one closes
-// before it attaches (controller.ts, onWindowHost).
+// devspace container, which the window must not use.
 // The first test counts the SSH logins of the open on the other computer, writes them to the log of the test and to the
 // summary of the CI job, and allows one: the checks before the relay run on the shell whose login the relay takes over.
 // The window attaches with the Docker CLI of Devspaces (src/core/docker/ownDockerCli.ts), which it downloads at its start,
@@ -92,7 +92,9 @@ function lineTime(line: string, near: number): number | undefined {
 }
 
 describe('the window of a devspace on a Docker engine over SSH', () => {
-  const { containerName, dockerContext = '', remoteHost = '', dockerHost = '', remoteHostContainer = '', preparedAt = '' } = seed();
+  const { containerName, remoteHost = '', dockerHost = '', remoteHostContainer = '', preparedAt = '' } = seed();
+  /** `docker` with the Docker of the other computer (`-H ssh://<host>`, as Devspaces reaches a host of its list). */
+  const remoteDocker = (args: string[]): string => docker(['-H', `ssh://${remoteHost}`, ...args]);
   let failed = false;
 
   afterEach(function () {
@@ -178,7 +180,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
   });
 
   it('connects after the extension restored the devspace on that engine and ran its open pipeline there', async () => {
-    assert.ok(dockerContext && remoteHost && dockerHost, 'The seed names no Docker context, host, or Docker pipe (prepare.ts, DEVSPACE_TEST_ATTACH_PREPARE=remote)');
+    assert.ok(remoteHost && dockerHost, 'The seed names no host or Docker pipe (prepare.ts, DEVSPACE_TEST_ATTACH_PREPARE=remote)');
     const folder = await connectedFolder();
     assert.deepStrictEqual(decodeAuthorityParts(folder.authority), { containerName, dockerHost });
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
@@ -195,7 +197,9 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
     // Each line of a worker names its engine: the operations ran on the other computer, none on the local Docker.
     assert.ok(log.includes(`[${remoteHost}] open#`), `No operation open on ${remoteHost} in the log`);
     assert.doesNotMatch(log, /\[the local Docker\]/);
-    assert.strictEqual(docker(['--context', dockerContext, 'inspect', '-f', '{{.State.Status}}', containerName]).trim(), 'running');
+    assert.strictEqual(remoteDocker(['inspect', '-f', '{{.State.Status}}', containerName]).trim(), 'running');
+    // Devspaces changed no Docker context: the docker command of the runner still uses its local engine.
+    assert.strictEqual(docker(['context', 'show']).trim(), DEFAULT_CONTEXT_NAME);
     const entries = (await vscode.workspace.fs.readDirectory(folder)).map(([name]) => name);
     assert.ok(entries.includes('.devcontainer'), entries.join(', '));
   });
@@ -226,7 +230,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
     const folder = await connectedFolder();
     const text = crypto.randomUUID();
     await vscode.workspace.fs.writeFile(folder.with({ path: WINDOW_MARK }), Buffer.from(text, 'utf8'));
-    assert.strictEqual(docker(['--context', dockerContext, 'exec', containerName, 'cat', WINDOW_MARK]), text);
+    assert.strictEqual(remoteDocker(['exec', containerName, 'cat', WINDOW_MARK]), text);
     // The container of the local Docker still runs, and the window left nothing there: no file and no VS Code server.
     assert.strictEqual(docker(['--context', DEFAULT_CONTEXT_NAME, 'inspect', '-f', '{{.State.Status}}', containerName]).trim(), 'running');
     const found = docker(['--context', DEFAULT_CONTEXT_NAME, 'exec', containerName, 'sh', '-c', 'for f in "$@"; do if [ -e "$f" ]; then echo "$f"; fi; done', 'sh', WINDOW_MARK, `/root/${serverDataFolder()}`]);
@@ -234,7 +238,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
   });
 
   it('runs the Monitor on that engine and creates nothing on the local Docker', () => {
-    assert.notStrictEqual(docker(['--context', dockerContext, 'ps', '-q', '--filter', `label=${LABEL_MONITOR}`, '--filter', 'status=running']).trim(), '', `No Monitor runs on ${remoteHost}`);
+    assert.notStrictEqual(remoteDocker(['ps', '-q', '--filter', `label=${LABEL_MONITOR}`, '--filter', 'status=running']).trim(), '', `No Monitor runs on ${remoteHost}`);
     // Workers and the Monitor are containers of the helper image, which carries LABEL_HELPER.
     const local = (args: string[]): string => docker(['--context', DEFAULT_CONTEXT_NAME, ...args]).trim();
     assert.strictEqual(local(['images', '-q', '--filter', `label=${LABEL_HELPER}`]), '', 'A helper image on the local Docker');

@@ -2,8 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Docker on another computer through SSH: the test of a host before the switch, the Docker context commands,
-// the reachability check that replaces the Docker Desktop start for a remote host, and the rootless socket.
+// Docker on another computer through SSH: the test of a host before it becomes the Docker host of Devspaces, the
+// list of the Docker contexts (to offer their SSH hosts), the reachability check that replaces the Docker Desktop start
+// for a remote host, and the rootless socket. Devspaces creates and changes no Docker context: the Docker calls of an
+// operation on a host of its list get DOCKER_HOST=ssh://<host> (BootstrapDocker), or go through its Docker pipe.
 //
 // No questions, ever: the Docker CLI starts `ssh` for an `ssh://` endpoint in a new session without a terminal
 // (docker/cli connhelper/commandconn, session_unix.go: Setsid), so ssh cannot ask for a password, a passphrase, or a host
@@ -24,26 +26,20 @@
 // the checks and the connection share one login; the test of a host before a switch (useCache false) keeps `true`.
 // While the Docker calls of the extension to the host go through its Docker pipe (HostPipes, BootstrapDocker), the
 // check is skipped: the Docker CLI starts no ssh for them, and the connection of the relay behind the pipe logged in
-// with the options of this check. The few calls of such an operation that still log in with the Docker context come
-// right after such a login to the same host: a build of the helper image, the calls that change something, and the
-// calls after the connection ended.
+// with the options of this check. The few calls of such an operation that still log in with `ssh://<host>` come right
+// after such a login to the same host: a build of the helper image, the calls that change something, and the calls
+// after the connection ended.
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import type { RemoteDockerState } from '../storage/remoteDockerState';
-import { envValue } from './dockerCli';
 import {
-  DEFAULT_CONTEXT_NAME,
   RUNTIME_DIR_COMMAND,
-  classifyDockerEndpoint,
   dockerHostProblem,
-  isOwnContextDescription,
-  ownContextDescription,
+  isDockerContextHostTarget,
   isRootlessEngine,
   isPodmanDockerTarget,
   isUnreadableDockerTarget,
-  parseContextInspect,
-  remoteContextNames,
   rootlessSocketPath,
   sshCommandArgs,
   sshEndpoint,
@@ -57,7 +53,7 @@ import {
 export const REMOTE_INFO_TIMEOUT_MS = 45_000;
 /** Time limit of our own `ssh` call. */
 export const SSH_TIMEOUT_MS = 30_000;
-/** Time limit of `docker context create|update|use`, which only write files of the Docker CLI. */
+/** Time limit of `docker context ls`, which only reads files of the Docker CLI. */
 export const CONTEXT_COMMAND_TIMEOUT_MS = 15_000;
 /** `docker info` in one line of JSON: the server version and the security options (`name=rootless`). */
 export const ENGINE_INFO_FORMAT = '{"version":{{json .ServerVersion}},"securityOptions":{{json .SecurityOptions}}}';
@@ -123,8 +119,9 @@ async function runEngineInfo(
 }
 
 /**
- * The test before the switch: the SSH check (checkSshLogin), then `docker -H ssh://<host> info`, without questions (see
- * the module comment). The current context is not used and not changed.
+ * The test before a host becomes the Docker host of Devspaces: the SSH check (checkSshLogin), then
+ * `docker -H ssh://<host> info`, without questions (see the module comment). The current context is not used and not
+ * changed.
  */
 export async function testRemoteDockerHost(
   docker: RemoteDockerCli,
@@ -142,7 +139,7 @@ export async function testRemoteDockerHost(
   return runEngineInfo(docker, ['-H', sshEndpoint(host), 'info', '--format', ENGINE_INFO_FORMAT], { env, signal: options.signal }, timeoutMs);
 }
 
-/** `docker info` of the current context (of the operation). */
+/** `docker info` of the Docker host of the operation. */
 export async function checkCurrentEngine(
   docker: Pick<RemoteDockerCli, 'run'>,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
@@ -319,19 +316,21 @@ export function dockerHostUnreachable(host: string, problem: DockerHostProblem, 
 }
 
 /**
- * The message of a target that is not supported: an endpoint that is neither local nor SSH, a current Docker context
- * that could not be read (isUnreadableDockerTarget), or a docker command that is Podman (isPodmanDockerTarget).
+ * The message of a target that is not supported: an endpoint that is neither local nor SSH, a context or DOCKER_HOST of
+ * the user that reaches a host over SSH (isDockerContextHostTarget), a current Docker context that could not be read
+ * (isUnreadableDockerTarget), or a docker command that is Podman (isPodmanDockerTarget).
  */
-export function unsupportedTargetMessage(target: Pick<DockerTarget, 'kind' | 'endpoint' | 'podman'>): string {
+export function unsupportedTargetMessage(target: Pick<DockerTarget, 'kind' | 'endpoint' | 'podman' | 'sshHost' | 'context'>): string {
   if (isPodmanDockerTarget(target)) return Messages.podmanNotSupported;
+  if (isDockerContextHostTarget(target)) return Messages.dockerContextHost(target.sshHost, target.context);
   return isUnreadableDockerTarget(target) ? Messages.dockerContextUnreadable : Messages.dockerEndpointUnsupported(target.endpoint);
 }
 
 /** UserFacingError('dockerEndpointUnsupported') for a target that is not supported (unsupportedTargetMessage). */
-export function dockerEndpointUnsupported(target: Pick<DockerTarget, 'kind' | 'endpoint' | 'podman'>): UserFacingError {
+export function dockerEndpointUnsupported(target: Pick<DockerTarget, 'kind' | 'endpoint' | 'podman' | 'sshHost' | 'context'>): UserFacingError {
   const detail = isPodmanDockerTarget(target)
     ? target.podman
-    : isUnreadableDockerTarget(target)
+    : isUnreadableDockerTarget(target) || isDockerContextHostTarget(target)
       ? unsupportedTargetReason(target)
       : `Docker endpoint: ${target.endpoint}`;
   return new UserFacingError('dockerEndpointUnsupported', unsupportedTargetMessage(target), detail);
@@ -354,8 +353,8 @@ export interface RemoteReachabilityDeps {
 }
 
 /**
- * The step "Docker start" for a remote host: the SSH check (checkSshLogin), then one `docker info` through the current context (no Docker Desktop start, no
- * setup, no "Starting Docker" step). Throws UserFacingError('dockerHostUnreachable') with the plain reason. A rootless
+ * The step "Docker start" for a remote host: the SSH check (checkSshLogin), then one `docker info` of the host (no Docker
+ * Desktop start, no setup, no "Starting Docker" step). Throws UserFacingError('dockerHostUnreachable') with the plain reason. A rootless
  * engine gets its socket recorded (read once with ssh), a rootful one has it forgotten, so the helper mounts the right
  * socket of that computer.
  */
@@ -400,29 +399,11 @@ export async function recordRootlessSocket(
   await deps.state.setRootlessSocket(host, read.socket);
 }
 
-/**
- * The environment of a Docker context command: without DOCKER_CONTEXT (the command names its context itself). The
- * caller refuses a switch while DOCKER_HOST or DOCKER_CONTEXT is set for VS Code (dockerVariableOverride).
- */
+/** The environment of `docker context ls`: without DOCKER_CONTEXT and DOCKER_HOST, which do not change the list. */
 function contextCommandEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
-  for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT') delete env[key];
+  for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT' || key.toUpperCase() === 'DOCKER_HOST') delete env[key];
   return env;
-}
-
-/** DOCKER_HOST or DOCKER_CONTEXT set for VS Code: a context switch would have no effect on it. */
-export function dockerVariableOverride(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): 'DOCKER_HOST' | 'DOCKER_CONTEXT' | undefined {
-  if ((envValue(env, 'DOCKER_HOST', platform) ?? '').trim() !== '') return 'DOCKER_HOST';
-  if ((envValue(env, 'DOCKER_CONTEXT', platform) ?? '').trim() !== '') return 'DOCKER_CONTEXT';
-  return undefined;
-}
-
-async function contextCommand(docker: RemoteDockerCli, args: readonly string[]): Promise<RunResult> {
-  return docker.run(['context', ...args], { env: contextCommandEnv(docker.processEnv()), timeoutMs: CONTEXT_COMMAND_TIMEOUT_MS });
-}
-
-function contextCommandError(args: readonly string[], result: RunResult): Error {
-  return new Error(`docker context ${args.join(' ')} failed: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
 }
 
 /** A Docker context as `docker context ls` lists it. */
@@ -435,9 +416,11 @@ export interface ContextInfo {
 
 /** The contexts of the Docker CLI (`docker context ls --format '{{json .}}'`, one object per line). */
 export async function listContextInfos(docker: RemoteDockerCli): Promise<ContextInfo[]> {
-  const args = ['ls', '--format', '{{json .}}'];
-  const result = await contextCommand(docker, args);
-  if (result.exitCode !== 0) throw contextCommandError(args, result);
+  const args = ['context', 'ls', '--format', '{{json .}}'];
+  const result = await docker.run(args, { env: contextCommandEnv(docker.processEnv()), timeoutMs: CONTEXT_COMMAND_TIMEOUT_MS });
+  if (result.exitCode !== 0) {
+    throw new Error(`docker ${args.join(' ')} failed: ${(result.stderr || result.stdout).trim() || `exit code ${result.exitCode}`}`);
+  }
   const contexts: ContextInfo[] = [];
   for (const line of result.stdout.split(/\r?\n/)) {
     if (line.trim() === '') continue;
@@ -445,7 +428,7 @@ export async function listContextInfos(docker: RemoteDockerCli): Promise<Context
     try {
       value = JSON.parse(line);
     } catch {
-      throw new Error(`docker context ${args.join(' ')} printed a line that is not JSON: ${line.trim().slice(0, 200)}`);
+      throw new Error(`docker ${args.join(' ')} printed a line that is not JSON: ${line.trim().slice(0, 200)}`);
     }
     if (typeof value !== 'object' || value === null) continue;
     const record = value as Record<string, unknown>;
@@ -457,106 +440,6 @@ export async function listContextInfos(docker: RemoteDockerCli): Promise<Context
     });
   }
   return contexts;
-}
-
-/**
- * The endpoint of the context `name` (`docker context inspect <name> --format '{{json .}}'`); undefined when it cannot
- * be read.
- */
-export async function contextEndpoint(docker: RemoteDockerCli, name: string): Promise<string | undefined> {
-  const args = ['inspect', name, '--format', '{{json .}}'];
-  const result = await contextCommand(docker, args);
-  if (result.exitCode !== 0) return undefined;
-  return parseContextInspect(result.stdout)?.endpoint;
-}
-
-/**
- * The context of `host` among `contexts`, by remoteContextNames: the first name whose context points to `ssh://<host>`
- * (one that the user made with that name and endpoint is taken as it is). `free`: the first name that no context has,
- * when no name points to the host. Neither: every name is taken by a context that points elsewhere.
- */
-export function remoteContextChoice(host: string, contexts: readonly ContextInfo[]): { existing?: string; free?: string } {
-  const endpoint = sshEndpoint(host);
-  let free: string | undefined;
-  for (const name of remoteContextNames(host)) {
-    const context = contexts.find((candidate) => candidate.name === name);
-    if (context === undefined) {
-      free ??= name;
-      continue;
-    }
-    if (context.endpoint === endpoint) return { existing: name };
-  }
-  return free === undefined ? {} : { free };
-}
-
-/** The name of the existing context of `host` (remoteContextChoice), undefined when there is none. */
-export async function findRemoteContext(docker: RemoteDockerCli, host: string): Promise<string | undefined> {
-  return remoteContextChoice(host, await listContextInfos(docker)).existing;
-}
-
-/**
- * The context of `host` (remoteContextChoice: named after the alias of the SSH config or the host name, with the pair
- * of the host only on a clash): the existing one, else a new one with `ssh://<host>` and the description of Devspaces
- * (`docker context create`). An existing context is never changed: an operation of another window that runs on it keeps
- * its host. Throws when every name is taken by a context that points elsewhere. Returns the name of the context.
- */
-export async function ensureRemoteContext(docker: RemoteDockerCli, host: string): Promise<string> {
-  const choice = remoteContextChoice(host, await listContextInfos(docker));
-  if (choice.existing !== undefined) return choice.existing;
-  if (choice.free === undefined) {
-    const names = remoteContextNames(host);
-    throw new Error(`The Docker contexts ${names.join(' and ')} exist and point elsewhere than ${sshEndpoint(host)}. Remove or rename one of them (docker context rm <name>) and try again.`);
-  }
-  const args = ['create', choice.free, '--description', ownContextDescription(host), '--docker', `host=${sshEndpoint(host)}`];
-  const written = await contextCommand(docker, args);
-  if (written.exitCode === 0) return choice.free;
-  // Another window may have created it a moment ago; its context is taken as it is.
-  const again = remoteContextChoice(host, await listContextInfos(docker).catch(() => []));
-  if (again.existing !== undefined) return again.existing;
-  throw contextCommandError(args, written);
-}
-
-/** Makes the context of `host` (ensureRemoteContext) the current context (`docker context use`). Returns its name. */
-export async function useRemoteContext(docker: RemoteDockerCli, host: string): Promise<string> {
-  const name = await ensureRemoteContext(docker, host);
-  await useContext(docker, name);
-  return name;
-}
-
-/** Whether the context `name` is one that Devspaces created (its description, isOwnContextDescription). */
-export async function isOwnContext(docker: RemoteDockerCli, name: string): Promise<boolean> {
-  return isOwnContextDescription((await listContextInfos(docker)).find((context) => context.name === name)?.description);
-}
-
-/** `docker context use <name>`. */
-export async function useContext(docker: RemoteDockerCli, name: string): Promise<void> {
-  const args = ['use', name];
-  const result = await contextCommand(docker, args);
-  if (result.exitCode !== 0) throw contextCommandError(args, result);
-}
-
-/**
- * The context for "Use the Local Docker" by name: the remembered one (for example Docker Desktop's `desktop-linux`) when
- * it still exists and is not ours, else `default`. chooseLocalContext also checks where it points.
- */
-export function localContextChoice(remembered: string | undefined, existing: readonly ContextInfo[]): string {
-  const context = existing.find((candidate) => candidate.name === remembered);
-  if (context !== undefined && !isOwnContextDescription(context.description)) return context.name;
-  return DEFAULT_CONTEXT_NAME;
-}
-
-/**
- * The context for "Use the Local Docker": localContextChoice, and the remembered context only when its endpoint is the
- * local Docker (classifyDockerEndpoint); one that points to another computer (for example a context `mybox` with
- * `ssh://…` of the user) gives `default`.
- */
-export async function chooseLocalContext(docker: RemoteDockerCli, remembered: string | undefined, logger?: Logger): Promise<string> {
-  const name = localContextChoice(remembered, await listContextInfos(docker));
-  if (name === DEFAULT_CONTEXT_NAME) return name;
-  const endpoint = await contextEndpoint(docker, name);
-  if (endpoint !== undefined && classifyDockerEndpoint(endpoint).kind === 'local') return name;
-  logger?.info(`The remembered Docker context ${name} does not point to the local Docker (${endpoint ?? 'not readable'}); the context ${DEFAULT_CONTEXT_NAME} is used.`);
-  return DEFAULT_CONTEXT_NAME;
 }
 
 /**

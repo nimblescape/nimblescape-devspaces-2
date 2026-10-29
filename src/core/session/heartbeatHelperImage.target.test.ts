@@ -14,7 +14,7 @@ import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
 import { heartbeatHelperImage } from './heartbeatHelperImage';
 import { HeartbeatPreparation } from './heartbeatPreparation';
 
-const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'devspaces-remote-11111111' };
+const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' };
 const IMAGE: HelperImageUse = { tag: 'devspaces-worker:0123456789ab', id: 'sha256:1111' };
 
 describe('the preparation of the worker for an open runs on its target', () => {

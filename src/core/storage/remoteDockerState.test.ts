@@ -20,27 +20,67 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-// "Don't Ask Again" for every Docker host question.
-describe('RemoteDockerState: questions not to ask again', () => {
-  it('remembers each question once, keeps the other fields, and forgets all of them on clear', async () => {
-    await state.setPreviousContext('desktop-linux');
-    expect(await state.dontAsk('switchToRemote')).toBe(false);
-    await state.setDontAsk('switchToRemote');
-    await state.setDontAsk('switchToRemote');
-    await state.setDontAsk('switchBack');
-    expect((await state.read()).dontAsk).toEqual(['switchToRemote', 'switchBack']);
-    expect(await state.dontAsk('switchToLocal')).toBe(false);
-    expect(await state.previousContext()).toBe('desktop-linux');
-    await expect(state.clearDontAsk()).resolves.toBe(true);
-    await expect(state.clearDontAsk()).resolves.toBe(false);
-    expect(await state.dontAsk('switchToRemote')).toBe(false);
-    expect(await state.previousContext()).toBe('desktop-linux');
+describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces', () => {
+  it('starts with the local Docker and an empty list', async () => {
+    expect(await state.dockerHost()).toBeUndefined();
+    expect(await state.remoteHosts()).toEqual([]);
+    expect(fs.existsSync(state.file)).toBe(false);
   });
 
-  it('ignores unknown or malformed entries of the file', async () => {
-    fs.writeFileSync(state.file, JSON.stringify({ dontAsk: ['switchBack', 'deleteEverything', 3] }));
-    expect((await state.read()).dontAsk).toEqual(['switchBack']);
-    fs.writeFileSync(state.file, JSON.stringify({ dontAsk: 'switchBack' }));
-    expect(await state.dontAsk('switchBack')).toBe(false);
+  it('adds a host to the end of the list when it becomes the Docker host, once', async () => {
+    await state.setDockerHost('build-box');
+    await state.setDockerHost('me@192.0.2.10:2222');
+    await state.setDockerHost('build-box');
+    expect(await state.dockerHost()).toBe('build-box');
+    expect(await state.remoteHosts()).toEqual(['build-box', 'me@192.0.2.10:2222']);
+    await state.setDockerHost(undefined);
+    expect(await state.dockerHost()).toBeUndefined();
+    expect(await state.remoteHosts()).toEqual(['build-box', 'me@192.0.2.10:2222']);
+  });
+
+  it('removes a host from the list, and the local Docker takes the place of the Docker host', async () => {
+    await state.setDockerHost('a');
+    await state.setDockerHost('b');
+    await state.setRootlessSocket('b', '/run/user/1000/docker.sock');
+    await expect(state.removeHost('a')).resolves.toBe(true);
+    expect(await state.dockerHost()).toBe('b');
+    await expect(state.removeHost('b')).resolves.toBe(true);
+    expect(await state.dockerHost()).toBeUndefined();
+    expect(await state.remoteHosts()).toEqual([]);
+    expect((await state.read()).remoteHosts).toBeUndefined();
+    // The rootless socket of the host stays for its devspaces.
+    expect(await state.rootlessSocket('b')).toBe('/run/user/1000/docker.sock');
+    await expect(state.removeHost('b')).resolves.toBe(false);
+  });
+
+  it('remembers each offered host once', async () => {
+    expect(await state.wasOffered('build-box')).toBe(false);
+    await state.setOffered('build-box');
+    await state.setOffered('build-box');
+    expect(await state.wasOffered('build-box')).toBe(true);
+    expect((await state.read()).offered).toEqual(['build-box']);
+  });
+
+  it('drops the fields of the versions that switched the Docker context, and puts a Docker host that is not listed into the list', async () => {
+    fs.writeFileSync(
+      state.file,
+      JSON.stringify({ previousContext: 'desktop-linux', dontAsk: ['switchBack'], dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: 'x' }),
+    );
+    expect(await state.read()).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'] });
+    await state.setOffered('x');
+    expect(JSON.parse(fs.readFileSync(state.file, 'utf8'))).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'], offered: ['x'] });
+  });
+});
+
+describe('RemoteDockerState: rootless sockets', () => {
+  it('records, changes and forgets the socket of a host', async () => {
+    await state.setRootlessSocket('build-box', '/run/user/1000/docker.sock');
+    expect(await state.rootlessSocket('build-box')).toBe('/run/user/1000/docker.sock');
+    await state.setRootlessSocket('build-box', '/run/user/1001/docker.sock');
+    expect(await state.rootlessSocket('build-box')).toBe('/run/user/1001/docker.sock');
+    await state.setRootlessSocket('build-box', undefined);
+    expect(await state.rootlessSocket('build-box')).toBeUndefined();
+    // A rootless socket is no host of the list.
+    expect(await state.remoteHosts()).toEqual([]);
   });
 });

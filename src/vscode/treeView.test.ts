@@ -205,6 +205,18 @@ describe('RepositoriesTreeProvider', () => {
     expect(podmanItem.label).toBe(Messages.podmanNotSupportedLabel);
     expect(podmanItem.tooltip).toBe(Messages.podmanNotSupportedTooltip);
     expect((podmanItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-warning');
+    // A Docker context of the user on an SSH host, which is not in the list of Devspaces.
+    provider.setDockerHost({ kind: 'sshContext', host: 'me@box', context: 'mine' });
+    const contextItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
+    expect(contextItem.label).toBe('Docker is set to me@box over SSH');
+    expect(contextItem.tooltip).toBe(
+      'The Docker context mine of this computer reaches me@box over SSH. Devspaces uses a remote host only from its own list, so it does nothing with Docker now. Click to choose the Docker host.',
+    );
+    expect((contextItem.iconPath as ThemeIcon).id).toBe('devspaces-monitor-warning');
+    expect(contextItem.command).toMatchObject({ command: 'devspaces.chooseDockerHost' });
+    provider.setDockerHost({ kind: 'sshContext', host: 'me@box' });
+    const variableItem = provider.getTreeItem(provider.getChildren()[0]) as unknown as TreeItem;
+    expect(variableItem.tooltip).toContain('DOCKER_HOST of this computer reaches me@box over SSH.');
     provider.dispose();
   });
 

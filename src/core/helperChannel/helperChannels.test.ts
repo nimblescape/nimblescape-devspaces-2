@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { dockerTargetOf, remoteContextNames, LOCAL_DOCKER_TARGET, type DockerTarget } from '../docker/dockerHost';
+import { dockerTargetOf, LOCAL_DOCKER_TARGET, remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import { operationDockerTarget } from '../docker/dockerTargets';
 import { abortError, silentLogger, type Logger, type StartedProcess } from '../ports';
 import { UserFacingError } from '../errors';
@@ -30,8 +30,7 @@ import {
 } from './protocol';
 import { EXPECTED_STATES, REFRESH_DEVSPACES } from '../pipeline/refreshStates.testkit';
 
-// The Docker context of a host is named after it (remoteContextNames).
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('build-box');
 /** The engine identity (ENGINE_IDENTITY_ARGS) of the engine of the tests. */
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
 /**
@@ -130,8 +129,7 @@ describe('HelperChannels', () => {
     expect(b).toBe(channel);
     expect(await channels.get(REMOTE)).toBe(channel);
     expect(open).toHaveBeenCalledTimes(1);
-    // The context named after the host (remoteContextNames).
-    const other = dockerTargetOf('ssh://other-box', remoteContextNames('other-box')[0]);
+    const other = remoteDockerTarget('other-box');
     await channels.get(other);
     expect(open).toHaveBeenCalledTimes(2);
     channels.dispose();
@@ -145,8 +143,8 @@ describe('HelperChannels', () => {
     const open = vi.fn().mockResolvedValueOnce(remote).mockResolvedValueOnce(local).mockResolvedValueOnce(desktop);
     const channels = new HelperChannels({ open, logger: silentLogger });
     expect(await channels.get(REMOTE)).toBe(remote);
-    expect(await channels.get(dockerTargetOf('ssh://build-box', 'my-build-box'))).toBe(remote);
-    expect(await channels.get(dockerTargetOf('ssh://build-box', undefined))).toBe(remote);
+    expect(await channels.get(remoteDockerTarget('build-box'))).toBe(remote);
+    expect(await channels.get(remoteDockerTarget('build-box'))).toBe(remote);
     expect(await channels.get(LOCAL_DOCKER_TARGET)).toBe(local);
     expect(await channels.get(dockerTargetOf('unix:///Users/me/.docker/run/docker.sock', 'desktop-linux'))).toBe(desktop);
     expect(open).toHaveBeenCalledTimes(3);
@@ -179,8 +177,8 @@ describe('HelperChannels', () => {
     const second = fakeChannel();
     const open = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second);
     const channels = new HelperChannels({ open, logger: silentLogger });
-    const before = dockerTargetOf('ssh://host-a', 'prod');
-    const after = dockerTargetOf('ssh://host-b', 'prod');
+    const before = remoteDockerTarget('host-a');
+    const after = remoteDockerTarget('host-b');
     expect(await channels.get(before)).toBe(first);
     expect(await channels.get(after)).toBe(second);
     expect(open).toHaveBeenLastCalledWith(after);
@@ -217,13 +215,13 @@ describe('HelperChannels', () => {
     // Closed while it is being opened: the channel of that open is closed, and is not used.
     channels.close(REMOTE);
     expect(second.closed).toBe(1);
-    const pending = channels.get(dockerTargetOf('ssh://other-box', remoteContextNames('other-box')[0]));
-    channels.close(dockerTargetOf('ssh://other-box', remoteContextNames('other-box')[0]));
+    const pending = channels.get(remoteDockerTarget('other-box'));
+    channels.close(remoteDockerTarget('other-box'));
     finishOpen(opening as unknown as HelperChannel);
     expect(await pending).toBeUndefined();
     expect(opening.closed).toBe(1);
     // An engine without a channel: nothing to close.
-    channels.close(dockerTargetOf('ssh://third-box', remoteContextNames('third-box')[0]));
+    channels.close(remoteDockerTarget('third-box'));
     channels.dispose();
   });
 
@@ -403,8 +401,7 @@ describe('HelperChannels', () => {
       .mockImplementationOnce(() => new Promise((resolve) => (finishOpen = resolve)));
     const channels = new HelperChannels({ open, logger: silentLogger });
     await channels.get(REMOTE);
-    // The context named after the host (remoteContextNames).
-    const pending = channels.get(dockerTargetOf('ssh://other-box', remoteContextNames('other-box')[0]));
+    const pending = channels.get(remoteDockerTarget('other-box'));
     channels.dispose();
     expect(open1.closed).toBe(1);
     finishOpen(open2 as unknown as HelperChannel);

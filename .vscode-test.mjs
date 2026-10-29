@@ -114,7 +114,7 @@ function configuration(label, index, options, { keepUserDataDir = false } = {}) 
 
 /**
  * The configuration `attach`: the window of the container DEVSPACE_TEST_ATTACH of out/test/vscode/attach/seed.json, on
- * the Docker engine of this computer (`remote`: of the other computer that the current Docker context names). The fake
+ * the Docker engine of this computer (`remote`: of the other computer, the Docker host of Devspaces). The fake
  * sign-in provider `github` (test/vscode/github) replaces the built-in one.
  * `reattach`, `account` and `longopen` start VS Code again in the window of the devspace with the user data folder of
  * the run `devspace`, as a restart of VS Code; `account` with another signed-in account than the owner of the devspace.
@@ -143,11 +143,14 @@ function attachConfiguration(kind, index) {
     const pending = path.join(base.env.DEVSPACE_TEST_USER_DATA_DIR, 'User', 'globalStorage', `${manifest.publisher}.${manifest.name}`, 'pending');
     for (const name of fs.existsSync(pending) ? fs.readdirSync(pending) : []) fs.rmSync(path.join(pending, name), { force: true });
   }
-  // `remote` starts with the ID of the computer for which prepare.ts made the Docker pipe in the folder URI.
+  // `remote` starts with the ID of the computer for which prepare.ts made the Docker pipe in the folder URI, and with the
+  // other computer as the Docker host of Devspaces in its list (src/core/storage/remoteDockerState.ts), as after "Use a
+  // Remote Docker Host…".
   if (kind === 'remote' && !listsOnly) {
     const storage = path.join(base.env.DEVSPACE_TEST_USER_DATA_DIR, 'User', 'globalStorage', `${manifest.publisher}.${manifest.name}`);
     fs.mkdirSync(storage, { recursive: true });
     fs.writeFileSync(path.join(storage, 'computer.id'), seed.computerId);
+    writeJson(path.join(storage, 'remote-docker.json'), { dockerHost: seed.remoteHost, remoteHosts: [seed.remoteHost] });
   }
   // `plain` starts as after the first use of Devspaces (the empty marker `used`, src/core/storage/firstUse.ts), so that
   // the window of a container that is no devspace restores the devspaces from the volumes while it activates, as the

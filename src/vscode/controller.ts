@@ -9,15 +9,15 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark, isFreshPending, statusNamesDevspace, type WindowMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, type DockerTarget } from '../core/docker/dockerHost';
-import { dockerEndpointUnsupported, ensureRemoteContext } from '../core/docker/remoteDocker';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
+import { dockerEndpointUnsupported } from '../core/docker/remoteDocker';
 import { engineInventory, inventoryIsEmpty, removalEndedNote, removeEngineInfrastructure, type EngineInventory, type RemovalResult } from '../core/docker/engineRemoval';
-import { operationDockerTarget, outsideOperation, type DockerTargets } from '../core/docker/dockerTargets';
+import { operationDockerTarget, outsideOperation, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
 import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
 import { UserFacingError, errorMessage } from '../core/errors';
-import { Actions, Messages, formatChanges, listSome } from '../core/messages';
+import { Actions, Messages, dockerHostReason, formatChanges, listSome } from '../core/messages';
 import type { WindowStateValue } from '../core/helperChannel/protocol';
 import { HOST_ACCESS_CHECKS_OFF_SETTING, hostAccessChecks, withHostAccessChecks, type HostAccessChecks } from '../core/policy/hostAccessChecks';
 import { VSCODE_STORE_VOLUME, repositoryFolder, splitRepository } from '../core/names';
@@ -158,19 +158,19 @@ export interface ControllerDeps {
    */
   revealRow?: (rowId: string) => Promise<void>;
   /**
-   * The current Docker host, read at the start of each operation (the current Docker context). Default: the local
-   * Docker.
+   * The current Docker host, read at the start of each operation (the Docker host of Devspaces), and the target of the
+   * Docker host of a devspace (`ofHost`). Default: the local Docker.
    */
-  dockerTargets?: Pick<DockerTargets, 'resolve' | 'current' | 'withOperation'>;
+  dockerTargets?: Pick<DockerTargets, 'resolve' | 'current' | 'withOperation' | 'ofHost'>;
   /**
    * The address of the Docker pipe of the window of `devspace` with its container `containerName` (docs/architecture.md
    * "The Docker pipe"), which the authority of its window names (`settings.host`): for a devspace on an SSH host that
-   * the connection of the relay reaches; undefined for every other devspace, whose window names its Docker context.
-   * Default: none.
+   * the connection of the relay reaches; undefined for every other devspace (a local one has no Docker settings in its
+   * authority). Default: none.
    */
   windowDockerHost?: (devspace: Devspace, containerName: string) => string | undefined;
-  /** "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
-  remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'askAgain' | 'offerSwitchBack'>;
+  /** "Use a Remote Docker Host…", "Use the Local Docker", and the choice of the first row of the view. */
+  remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost'>;
   /**
    * One heartbeat with the current keep-running flag of a devspace to the Monitor container of its engine
    * (Close and Keep Running, Keep Running When Closed, Stop When Closed), on every engine, through this window's worker
@@ -516,7 +516,6 @@ export class Controller implements vscode.Disposable {
       useRemoteDockerHost: async () => this.deps.remoteDocker?.useRemoteHost(),
       useLocalDocker: async () => this.deps.remoteDocker?.useLocalDocker(),
       chooseDockerHost: async () => this.deps.remoteDocker?.chooseDockerHost(),
-      askAgainDockerHost: async () => this.deps.remoteDocker?.askAgain(),
       rowActivated: (argument) => this.rowActivated(argument),
       rowEnter: () => this.rowEnter(),
     };
@@ -524,7 +523,7 @@ export class Controller implements vscode.Disposable {
     // host read it themselves. A click or Enter on a row is no operation: only the Start of a double-click or of Enter
     // is one. Show Log reads no Docker host, so the log opens at once also while the Docker CLI does not answer (the
     // link Show details of a running operation).
-    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'chooseDockerHost', 'askAgainDockerHost', 'rowActivated', 'rowEnter', 'showLog']);
+    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'chooseDockerHost', 'rowActivated', 'rowEnter', 'showLog']);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       // Enter on a row whose command is another command of Devspaces (the Sign in row, the Docker host row) ends with
       // that command: a click on a repository row right after it only selects that row (rowActivation.ts).
@@ -622,10 +621,9 @@ export class Controller implements vscode.Disposable {
     // The devspace of another account runs no pipeline and starts no container; the window closes.
     const devspace = await this.ownWindowDevspace(attached, containerName);
     if (!devspace) return;
-    // A devspace of another Docker host (for example a window of Open Recent after a switch, or Docker Desktop
-    // reset the context) is used only after the user switched back; otherwise the window closes its connection.
-    if (!(await this.onWindowHost(devspace))) return;
-    await this.withDockerTarget(() => this.openAttachedDevspace(devspace, containerName, pending));
+    // The window knows its Docker host from its devspace: the pipeline runs there, whatever host Devspaces uses now (for
+    // example a window of Open Recent after the user chose another host).
+    await this.withHostOf(devspace, () => this.openAttachedDevspace(devspace, containerName, pending));
   }
 
   /**
@@ -1376,7 +1374,7 @@ export class Controller implements vscode.Disposable {
 
   /**
    * "Remove Devspaces from This Docker Engine…" (the Command Palette and the "…" menu of the view), on the engine of the
-   * current Docker context: after a confirmation, the Monitor, the helper containers and images, and the shared volumes
+   * Docker host of Devspaces: after a confirmation, the Monitor, the helper containers and images, and the shared volumes
    * of Devspaces (engineRemoval.ts, with the Docker CLI of the extension once the worker of this window ended); and,
    * after a second confirmation, first the devspaces of the signed-in account there (each as Delete does, in the
    * worker, with all its volumes). Devspaces of other accounts and of other computers stay. Refused while a window of
@@ -1553,9 +1551,9 @@ export class Controller implements vscode.Disposable {
     let failedDevspaces = 0;
     // Cancel while the devspaces are deleted: nothing else was removed yet, so the log names the commands that remove
     // the rest (removalEndedNote, as for a removal that ended later), as the message says (removalEnded).
-    const context = target.kind === 'remote' ? target.context : undefined;
+    const remoteHost = target.kind === 'remote' ? target.host : undefined;
     const cancelled = (): { result: RemovalResult; failedDevspaces: number } => {
-      this.logger.warn(removalEndedNote('cancelled', context));
+      this.logger.warn(removalEndedNote('cancelled', remoteHost));
       return { result: { items: [], ended: 'cancelled' }, failedDevspaces };
     };
     for (const devspace of devspaces) {
@@ -1600,7 +1598,7 @@ export class Controller implements vscode.Disposable {
     const result = await removeEngineInfrastructure(removal.docker, {
       answers: (answerSignal) => removal.engineAnswers(target, answerSignal ?? signal),
       logger: this.logger,
-      ...(context !== undefined ? { context } : {}),
+      ...(remoteHost !== undefined ? { remoteHost } : {}),
       onItem: (item) => progress.detail(ControllerTexts.removingItem(item)),
       signal,
     });
@@ -2572,10 +2570,10 @@ export class Controller implements vscode.Disposable {
     }
     await this.deps.coordinator.writePending(result.devspace.id);
     if (request.newWindow) {
-      await this.deps.connection.openInNewWindow(...(await this.windowArgs(result.devspace, result.containerName, result.remoteWorkspaceFolder)));
+      await this.deps.connection.openInNewWindow(...this.windowArgs(result.devspace, result.containerName, result.remoteWorkspaceFolder));
       return;
     }
-    await this.deps.connection.open(...(await this.windowArgs(result.devspace, result.containerName, result.remoteWorkspaceFolder)));
+    await this.deps.connection.open(...this.windowArgs(result.devspace, result.containerName, result.remoteWorkspaceFolder));
   }
 
   /**
@@ -3198,7 +3196,7 @@ export class Controller implements vscode.Disposable {
     if (!devspace || ownerAmong(devspace, accounts) === undefined) return false;
     this.left = undefined;
     this.logger.info(`The GitHub account of ${left.repository} is signed in again. The window reloads to open it.`);
-    await this.deps.connection.open(...(await this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository))));
+    await this.deps.connection.open(...this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository)));
     return true;
   }
 
@@ -3894,6 +3892,18 @@ export class Controller implements vscode.Disposable {
     return this.deps.dockerTargets ? this.deps.dockerTargets.withOperation(fn) : fn();
   }
 
+  /**
+   * Runs `fn` as one operation on the Docker host of `devspace` (DockerTargets.ofHost), whatever host Devspaces uses now;
+   * an operation that runs already keeps its own.
+   */
+  private async withHostOf<T>(devspace: Devspace, fn: () => Promise<T>): Promise<T> {
+    const targets = this.deps.dockerTargets;
+    if (targets === undefined || operationDockerTarget() !== undefined) return fn();
+    const target = await outsideOperation(() => targets.ofHost(dockerHostOf(devspace)));
+    if (!isOnDockerHost(devspace, target.host)) this.logger.info(`This window's devspace is on ${describeDockerHost(dockerHostOf(devspace))}, and ${target.kind === 'unsupported' ? unsupportedTargetReason(target) : `Docker is set to ${describeDockerHost(target.host)}.`}`);
+    return runWithDockerTarget(target, fn);
+  }
+
   /** The Docker target of the operation (outside of one, the current one); the local Docker without dockerTargets. */
   private async operationTarget(): Promise<DockerTarget> {
     return this.deps.dockerTargets ? this.deps.dockerTargets.current() : LOCAL_DOCKER_TARGET;
@@ -3950,33 +3960,6 @@ export class Controller implements vscode.Disposable {
     return this.deps.dockerTargets ? (await this.deps.dockerTargets.current()).host : '';
   }
 
-  /**
-   * A restored window whose devspace is on another Docker host than the current Docker context asks "Use <host>
-   * again?" (RemoteDockerCommands.offerSwitchBack: the same test and modal as the commands). True when Docker uses the
-   * devspace's host (then the open continues); otherwise the window closes its remote connection with the message,
-   * and nothing runs on the other host. The pipeline of this extension runs on the current context; the Dev Containers
-   * extension attaches through the context in the window's authority. Assumption: VS Code waits for activate() before
-   * it resolves the authority.
-   */
-  private async onWindowHost(devspace: Devspace): Promise<boolean> {
-    if (!this.deps.dockerTargets) return true;
-    const current = await this.deps.dockerTargets.resolve();
-    if (isOnDockerHost(devspace, current.host)) return true;
-    const devspaceHost = dockerHostOf(devspace);
-    this.logger.info(
-      `This window's devspace is on ${describeDockerHost(devspaceHost)}, and Docker is set to ${describeDockerHost(current.host)}.`,
-    );
-    const switched = (await this.deps.remoteDocker?.offerSwitchBack(devspaceHost, current)) ?? false;
-    if (switched) {
-      const now = await this.deps.dockerTargets.resolve();
-      if (isOnDockerHost(devspace, now.host)) return true;
-    }
-    const repository = this.displayName({ repository: devspace.repository });
-    this.logger.info('The window closes its remote connection: its devspace is on another Docker host.');
-    await this.leaveDevspace(Messages.otherDockerHost(repository, devspaceHost, current.host));
-    return false;
-  }
-
   private showError(error: unknown, retry?: () => Promise<void>): void {
     presentError(error, { logger: this.logger, showLog: () => this.logger.show(), retry });
   }
@@ -4023,52 +4006,17 @@ export class Controller implements vscode.Disposable {
   }
 
   /**
-   * The arguments of ConnectionAdapter.open and openInNewWindow for `devspace`: the container, the folder, and for
-   * a devspace on another Docker host how the Dev Containers extension reaches its engine (without it in the authority,
-   * it asks the local Docker first and reports the container as one that "no longer exists"). The Docker pipe of the
-   * window when the devspace has one (windowDockerHost), else its Docker context, in this order:
-   * - the one of the running operation, when that is on the devspace's host (a context that the user made; none when
-   *   DOCKER_HOST decides);
-   * - outside an operation, the one in the authority of this window when it shows the same container;
-   * - the current context, when that is on the devspace's host (read outside any operation);
-   * - else the one that "Use a Remote Docker Host…" creates for the host (ensureRemoteContext: created when missing).
-   * Also for a window with the Docker pipe, the context is created when missing, as far as it can be: the heartbeats of
-   * the devspace and the worker that opens the connection of the relay find the engine of the host through it.
+   * The arguments of ConnectionAdapter.open and openInNewWindow for `devspace`: the container, the folder, and for a
+   * devspace on an SSH host the Docker pipe of its window (windowDockerHost), through which the Dev Containers extension
+   * reaches its engine (without it in the authority, it asks the local Docker first and reports the container as one that
+   * "no longer exists"). Throws when such a devspace has no Docker pipe (no `ssh` on this computer).
    */
-  private async windowArgs(
-    devspace: Devspace,
-    containerName: string,
-    folder: string,
-  ): Promise<[containerName: string, folder: string, docker?: WindowDocker]> {
+  private windowArgs(devspace: Devspace, containerName: string, folder: string): [containerName: string, folder: string, docker?: WindowDocker] {
     const host = dockerHostOf(devspace);
     if (host === '') return [containerName, folder];
     const pipe = this.deps.windowDockerHost?.(devspace, containerName);
-    if (pipe === undefined) {
-      const context = await this.windowContext(devspace, containerName, host);
-      return context === undefined ? [containerName, folder] : [containerName, folder, { context }];
-    }
-    try {
-      await this.windowContext(devspace, containerName, host);
-    } catch (error) {
-      this.logger.warn(`The Docker context of ${host} could not be made (${errorMessage(error)}). The window connects through its Docker pipe.`);
-    }
+    if (pipe === undefined) throw new UserFacingError('dockerHostUnreachable', Messages.dockerHostUnreachable(host, dockerHostReason('sshMissing', host)), 'The window has no Docker pipe.');
     return [containerName, folder, { host: pipe }];
-  }
-
-  /** The Docker context of the window of `devspace` on `host` (see windowArgs); undefined when DOCKER_HOST decides. */
-  private async windowContext(devspace: Devspace, containerName: string, host: string): Promise<string | undefined> {
-    const target = operationDockerTarget();
-    if (target && isOnDockerHost(devspace, target.host)) return target.context;
-    if (this.deps.connection.currentContainerName() === containerName) {
-      const own = this.deps.connection.currentDockerContext();
-      if (own !== undefined) return own;
-    }
-    const targets = this.deps.dockerTargets;
-    if (targets) {
-      const current = await outsideOperation(() => targets.resolve());
-      if (isOnDockerHost(devspace, current.host)) return current.context;
-    }
-    return ensureRemoteContext(this.deps.docker, host);
   }
 
   /**
@@ -4109,25 +4057,22 @@ export class Controller implements vscode.Disposable {
 
   /**
    * The window connects only to a container that the Docker of the window finds running. The Dev Containers extension
-   * of the window attaches through the Docker context in the window's authority (or, without one, the local Docker),
-   * and reports a container that it does not find as one that "no longer exists". So right before the window connects:
-   * the current Docker context is still on the host of the devspace (another window or Docker Desktop may have
-   * changed it while the pipeline ran), and the container answers as running (a few checks, 1 s apart, for an engine
-   * that answers late). Returns the error of the refusal, or undefined when the window may connect. Stops early when
-   * `signal` aborts (the caller then reports the cancel).
+   * of the window attaches through the Docker pipe in the window's authority (a devspace on an SSH host), or else
+   * through the current Docker context of this computer, and reports a container that it does not find as one that "no
+   * longer exists". So right before the window connects: for a local devspace, the current Docker context is still the
+   * local Docker (the user or Docker Desktop may have changed it while the pipeline ran), and the container answers as
+   * running (a few checks, 1 s apart, for an engine that answers late). Returns the error of the refusal, or undefined
+   * when the window may connect. Stops early when `signal` aborts (the caller then reports the cancel).
    */
   private async readyForWindow(devspace: Devspace, containerName: string, signal: AbortSignal): Promise<UserFacingError | undefined> {
     const repository = this.displayName({ repository: devspace.repository });
     const targets = this.deps.dockerTargets;
-    if (targets) {
+    if (targets && dockerHostOf(devspace) === '') {
       // The current context itself, not the one this operation is pinned to (DOCKER_CONTEXT).
-      const current = await outsideOperation(() => targets.resolve());
-      if (!isOnDockerHost(devspace, current.host)) {
-        const devspaceHost = dockerHostOf(devspace);
-        this.logger.warn(
-          `${repository} is not connected: Docker is set to ${describeDockerHost(current.host)} now, the container runs on ${describeDockerHost(devspaceHost)}.`,
-        );
-        return new UserFacingError('otherDockerHost', Messages.otherDockerHostAfterStart(repository, devspaceHost, current.host));
+      const current = await outsideOperation(() => targets.ofHost(''));
+      if (current.kind !== 'local') {
+        this.logger.warn(`${repository} is not connected: the container runs on the local Docker, and ${unsupportedTargetReason(current)}`);
+        return new UserFacingError('otherDockerHost', Messages.otherDockerHostAfterStart(repository, current.host));
       }
     }
     // The last state that Docker reported goes into the log (Show details).

@@ -10,32 +10,22 @@ import { UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import type { RunOptions, RunResult } from '../ports';
 import { RemoteDockerState } from '../storage/remoteDockerState';
-import { namePair } from '../namePairs';
-import { ownContextDescription, remoteContextNames } from './dockerHost';
+import { remoteDockerTarget } from './dockerHost';
 import { UNREADABLE_DOCKER_TARGET } from './dockerTargets';
 import {
+  CONTEXT_COMMAND_TIMEOUT_MS,
   ENGINE_INFO_FORMAT,
   SSH_CHECK_CACHE_MS,
   SshLoginCache,
   checkCurrentEngine,
   checkSshLogin,
-  chooseLocalContext,
-  dockerVariableOverride,
   ensureDockerHostReachable,
-  ensureRemoteContext,
-  findRemoteContext,
-  isOwnContext,
   listContextInfos,
-  localContextChoice,
-  remoteContextChoice,
   noPromptEnv,
   parseEngineInfo,
   readRootlessSocket,
   startDockerFor,
   testRemoteDockerHost,
-  useContext,
-  useRemoteContext,
-  type ContextInfo,
   type RemoteDockerCli,
 } from './remoteDocker';
 
@@ -238,7 +228,7 @@ describe('the ssh check before the Docker calls', () => {
   });
 
   it('runs before docker info of each operation (a success of the last minute counts), and stops at its failure', async () => {
-    const target = { kind: 'remote' as const, host: 'me@box:2222', endpoint: 'ssh://me@box:2222', context: remoteContextNames('me@box:2222')[0] };
+    const target = remoteDockerTarget('me@box:2222');
     const docker = fakeDocker(() => info());
     const runner = sshRunner();
     const sshLogins = new SshLoginCache();
@@ -291,10 +281,9 @@ describe('readRootlessSocket', () => {
 });
 
 describe('ensureDockerHostReachable (the Docker start of a remote host)', () => {
-  // The context is named after the SSH host.
-  const target = { kind: 'remote' as const, host: 'box', endpoint: 'ssh://box', context: 'box' };
+  const target = remoteDockerTarget('box');
 
-  it('asks docker info through the current context; a rootful engine has no recorded socket', async () => {
+  it('asks docker info of the host; a rootful engine has no recorded socket', async () => {
     await state.setRootlessSocket('box', '/run/user/1000/docker.sock');
     const docker = fakeDocker(() => info(false));
     const runner = sshRunner();
@@ -403,28 +392,17 @@ describe('startDockerFor (remote mode skips the Docker Desktop start)', () => {
   });
 });
 
-/** The output of `docker context ls --format '{{json .}}'` for `contexts`. */
-function contextLs(contexts: readonly ContextInfo[]): RunResult {
-  return ok(
-    contexts
-      .map((context) => `${JSON.stringify({ Name: context.name, Description: context.description, DockerEndpoint: context.endpoint, Current: false })}\n`)
-      .join(''),
-  );
-}
 const LS_ARGS = ['context', 'ls', '--format', '{{json .}}'];
-const local = (name: string, endpoint = 'unix:///var/run/docker.sock'): ContextInfo => ({ name, description: '', endpoint });
-const own = (name: string, host: string): ContextInfo => ({ name, description: ownContextDescription(host), endpoint: `ssh://${host}` });
 
-// The context of a host is named after its SSH alias or host name (remoteContextNames), with the pair of the host only
-// on a clash; ours are recognised by their description.
-describe('the Docker context commands', () => {
-  it('lists the name, the description and the endpoint of every context', async () => {
+// The contexts of the user: Devspaces only reads them, for the SSH hosts that "Use a Remote Docker Host…" offers.
+describe('listContextInfos', () => {
+  it('lists the name, the description and the endpoint of every context, without DOCKER_CONTEXT and DOCKER_HOST in its environment', async () => {
     const docker = fakeDocker(() =>
       ok(
         [
           JSON.stringify({ Name: 'default', Description: 'Current DOCKER_HOST based configuration', DockerEndpoint: 'unix:///var/run/docker.sock', Current: true }),
           '',
-          JSON.stringify({ Name: 'htldvm', Description: ownContextDescription('htldvm'), DockerEndpoint: 'ssh://htldvm' }),
+          JSON.stringify({ Name: 'htldvm', Description: 'my box', DockerEndpoint: 'ssh://htldvm' }),
           JSON.stringify({ Name: 'bare' }),
           JSON.stringify({ Name: '' }),
           'null',
@@ -433,199 +411,35 @@ describe('the Docker context commands', () => {
     );
     await expect(listContextInfos(docker)).resolves.toEqual([
       { name: 'default', description: 'Current DOCKER_HOST based configuration', endpoint: 'unix:///var/run/docker.sock' },
-      { name: 'htldvm', description: ownContextDescription('htldvm'), endpoint: 'ssh://htldvm' },
+      { name: 'htldvm', description: 'my box', endpoint: 'ssh://htldvm' },
       { name: 'bare', description: '', endpoint: '' },
     ]);
     expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS]);
+    expect(docker.calls[0].options?.env).not.toHaveProperty('DOCKER_CONTEXT');
+    expect(docker.calls[0].options?.env).not.toHaveProperty('DOCKER_HOST');
+    expect(docker.calls[0].options?.timeoutMs).toBe(CONTEXT_COMMAND_TIMEOUT_MS);
   });
 
-  it('refuses a line of `docker context ls` that is not JSON', async () => {
-    const docker = fakeDocker(() => ok('default\n'));
-    await expect(listContextInfos(docker)).rejects.toThrow('printed a line that is not JSON: default');
-  });
-
-  it('creates the context of the host, named after the host, and uses it, without DOCKER_CONTEXT in their environment', async () => {
-    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default'), local('desktop-linux')]) : ok('')));
-    await expect(useRemoteContext(docker, 'me@box')).resolves.toBe('box');
-    // A context per host.
-    expect(docker.calls.map((call) => call.args)).toEqual([
-      LS_ARGS,
-      ['context', 'create', 'box', '--description', 'Devspaces: remote Docker host me@box', '--docker', 'host=ssh://me@box'],
-      ['context', 'use', 'box'],
-    ]);
-    for (const call of docker.calls) expect(call.options?.env).not.toHaveProperty('DOCKER_CONTEXT');
-  });
-
-  it('takes the alias as the name as it is', async () => {
-    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default')]) : ok('')));
-    await expect(ensureRemoteContext(docker, 'htldvm')).resolves.toBe('htldvm');
-    expect(docker.calls[1].args).toEqual(['context', 'create', 'htldvm', '--description', ownContextDescription('htldvm'), '--docker', 'host=ssh://htldvm']);
-  });
-
-  it('takes the name with the pair of the host when a context with the name points elsewhere', async () => {
-    const docker = fakeDocker((args) =>
-      args[1] === 'ls' ? contextLs([local('default'), { name: 'box', description: 'mine', endpoint: 'ssh://me@box' }]) : ok(''),
-    );
-    const pair = `box-${namePair('other@box:2222')}`;
-    await expect(ensureRemoteContext(docker, 'other@box:2222')).resolves.toBe(pair);
-    expect(docker.calls.map((call) => call.args)).toEqual([
-      LS_ARGS,
-      ['context', 'create', pair, '--description', ownContextDescription('other@box:2222'), '--docker', 'host=ssh://other@box:2222'],
-    ]);
-  });
-
-  it("never changes a context that points to the host, ours or the user's; it only uses it", async () => {
-    // No `docker context update`: an operation of another window that runs on the context keeps its host.
-    for (const existing of [own('other', 'other'), { name: 'other', description: 'my own', endpoint: 'ssh://other' }]) {
-      const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default'), existing]) : ok('')));
-      await expect(useRemoteContext(docker, 'other')).resolves.toBe('other');
-      expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS, ['context', 'use', 'other']]);
-    }
-  });
-
-  it('reuses the context with the pair when the name points elsewhere and the pair points to the host', async () => {
-    const [name, pair] = remoteContextNames('me@box');
-    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([{ name, description: '', endpoint: 'ssh://box' }, own(pair, 'me@box')]) : ok('')));
-    await expect(ensureRemoteContext(docker, 'me@box')).resolves.toBe(pair);
-    await expect(findRemoteContext(docker, 'me@box')).resolves.toBe(pair);
-    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'ls']);
-  });
-
-  it('refuses when both names point elsewhere, and changes nothing', async () => {
-    const [name, pair] = remoteContextNames('other');
-    const docker = fakeDocker((args) =>
-      args[1] === 'ls' ? contextLs([{ name, description: '', endpoint: 'ssh://elsewhere' }, own(pair, 'elsewhere')]) : ok(''),
-    );
-    await expect(ensureRemoteContext(docker, 'other')).rejects.toThrow(`The Docker contexts ${name} and ${pair} exist and point elsewhere than ssh://other`);
-    await expect(useRemoteContext(docker, 'other')).rejects.toThrow('docker context rm <name>');
-    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'ls']);
-  });
-
-  it('throws when creating the context fails', async () => {
-    const docker = fakeDocker((args) => (args[1] === 'ls' ? contextLs([]) : fail('permission denied')));
-    await expect(ensureRemoteContext(docker, 'box')).rejects.toThrow('docker context create box');
-  });
-
-  it('takes the context that another window created meanwhile when its own create fails', async () => {
-    let lists = 0;
-    const docker = fakeDocker((args) => {
-      if (args[1] === 'ls') return contextLs(lists++ === 0 ? [] : [own('box', 'box')]);
-      return fail('context "box" already exists');
-    });
-    await expect(ensureRemoteContext(docker, 'box')).resolves.toBe('box');
-    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
-  });
-
-  // When the list after the failed create fails too, the error of the create is thrown (it says why), not the one of
-  // the list.
-  it('throws the error of the create when the list after it fails too', async () => {
-    let lists = 0;
-    const docker = fakeDocker((args) => {
-      if (args[1] === 'ls') return lists++ === 0 ? contextLs([]) : fail('Cannot connect to the Docker daemon');
-      return fail('permission denied');
-    });
-    const thrown = await ensureRemoteContext(docker, 'box').catch((error: unknown) => error);
-    expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as Error).message).toContain('docker context create box');
-    expect((thrown as Error).message).toContain('permission denied');
-    expect((thrown as Error).message).not.toContain('Cannot connect to the Docker daemon');
-    expect(docker.calls.map((call) => call.args[1])).toEqual(['ls', 'create', 'ls']);
-  });
-
-  it('chooses among the contexts by remoteContextChoice', () => {
-    const [name, pair] = remoteContextNames('me@box');
-    expect(remoteContextChoice('me@box', [])).toEqual({ free: name });
-    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://me@box' }])).toEqual({ existing: name });
-    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://box' }])).toEqual({ free: pair });
-    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://box' }, own(pair, 'me@box')])).toEqual({ existing: pair });
-    expect(remoteContextChoice('me@box', [{ name, description: '', endpoint: 'ssh://box' }, own(pair, 'x')])).toEqual({});
-    // An existing context of the host wins over a free name before it.
-    expect(remoteContextChoice('me@box', [own(pair, 'me@box')])).toEqual({ existing: pair });
-  });
-
-  it('finds no context of a host that has none', async () => {
-    const docker = fakeDocker(() => contextLs([local('default'), { name: 'box', description: '', endpoint: 'ssh://elsewhere' }]));
-    await expect(findRemoteContext(docker, 'box')).resolves.toBeUndefined();
-    expect(docker.calls.map((call) => call.args)).toEqual([LS_ARGS]);
-  });
-
-  it('knows its own contexts by their description, whatever their name', async () => {
-    const docker = fakeDocker(() =>
-      contextLs([local('default'), own('htldvm', 'htldvm'), { name: 'mybox', description: 'mine', endpoint: 'ssh://mybox' }]),
-    );
-    await expect(isOwnContext(docker, 'htldvm')).resolves.toBe(true);
-    await expect(isOwnContext(docker, 'mybox')).resolves.toBe(false);
-    await expect(isOwnContext(docker, 'default')).resolves.toBe(false);
-    await expect(isOwnContext(docker, 'gone')).resolves.toBe(false);
-  });
-
-  it('throws when a command fails', async () => {
-    const docker = fakeDocker(() => fail('context "x" does not exist'));
-    await expect(useContext(docker, 'x')).rejects.toThrow('docker context use x failed: context "x" does not exist');
-    await expect(listContextInfos(docker)).rejects.toThrow('docker context ls');
-  });
-
-  it('goes back to the remembered context, else default; never to one of ours', () => {
-    expect(localContextChoice('desktop-linux', [local('default'), local('desktop-linux'), own('box', 'box')])).toBe('desktop-linux');
-    expect(localContextChoice('gone', [local('default')])).toBe('default');
-    expect(localContextChoice(undefined, [local('default'), local('desktop-linux')])).toBe('default');
-    // A context named `devspaces-remote` without the description of Devspaces is not one of ours; like any context of
-    // the user it is remembered.
-    expect(localContextChoice('devspaces-remote', [local('default'), local('devspaces-remote')])).toBe('devspaces-remote');
-    // Never a context of ours: ours by the description, whatever the name.
-    expect(localContextChoice('box', [local('default'), own('box', 'box')])).toBe('default');
-    expect(localContextChoice('anything', [local('default'), own('anything', 'me@box')])).toBe('default');
-    expect(localContextChoice('box', [local('default'), { name: 'box', description: 'mine', endpoint: 'ssh://box' }])).toBe('box');
-  });
-
-  it('goes back to a remembered context only when it points to the local Docker', async () => {
-    const endpoints: Record<string, string> = {
-      default: 'unix:///var/run/docker.sock',
-      'desktop-linux': 'unix:///home/me/.docker/desktop/docker.sock',
-      mybox: 'ssh://me@mybox',
-      tcpbox: 'tcp://10.0.0.5:2375',
-      loop: 'tcp://127.0.0.1:2375',
-    };
-    const docker = fakeDocker((args) => {
-      if (args[1] === 'ls') return contextLs(Object.entries(endpoints).map(([name, endpoint]) => local(name, endpoint)));
-      if (args[1] === 'inspect') return ok(JSON.stringify({ Name: args[2], Endpoints: { docker: { Host: endpoints[args[2]] } } }));
-      return fail('unexpected');
-    });
-    await expect(chooseLocalContext(docker, 'desktop-linux')).resolves.toBe('desktop-linux');
-    await expect(chooseLocalContext(docker, 'loop')).resolves.toBe('loop');
-    await expect(chooseLocalContext(docker, 'mybox')).resolves.toBe('default');
-    await expect(chooseLocalContext(docker, 'tcpbox')).resolves.toBe('default');
-    await expect(chooseLocalContext(docker, undefined)).resolves.toBe('default');
-    const unreadable = fakeDocker((args) => (args[1] === 'ls' ? contextLs([local('default'), local('x')]) : fail('no')));
-    await expect(chooseLocalContext(unreadable, 'x')).resolves.toBe('default');
-  });
-
-  it('names DOCKER_HOST or DOCKER_CONTEXT set for VS Code', () => {
-    expect(dockerVariableOverride({}, 'linux')).toBeUndefined();
-    expect(dockerVariableOverride({ DOCKER_HOST: 'unix:///x' }, 'linux')).toBe('DOCKER_HOST');
-    expect(dockerVariableOverride({ DOCKER_CONTEXT: 'x' }, 'linux')).toBe('DOCKER_CONTEXT');
-    expect(dockerVariableOverride({ docker_host: 'x' }, 'win32')).toBe('DOCKER_HOST');
-    expect(dockerVariableOverride({ DOCKER_HOST: ' ' }, 'linux')).toBeUndefined();
+  it('refuses a line of `docker context ls` that is not JSON, and throws when the command fails', async () => {
+    await expect(listContextInfos(fakeDocker(() => ok('default\n')))).rejects.toThrow('printed a line that is not JSON: default');
+    await expect(listContextInfos(fakeDocker(() => fail('broken')))).rejects.toThrow('docker context ls --format {{json .}} failed: broken');
   });
 });
 
 describe('RemoteDockerState', () => {
-  it('remembers the previous context and the rootless sockets per host', async () => {
+  it('remembers the rootless sockets per host', async () => {
     expect(await state.read()).toEqual({});
-    await state.setPreviousContext('desktop-linux');
     await state.setRootlessSocket('box', '/run/user/1000/docker.sock');
     await state.setRootlessSocket('__proto__', '/run/user/1/docker.sock');
-    expect(await state.previousContext()).toBe('desktop-linux');
     expect(await state.rootlessSocket('box')).toBe('/run/user/1000/docker.sock');
     expect(await state.rootlessSocket('__proto__')).toBe('/run/user/1/docker.sock');
     expect(await state.rootlessSocket('other')).toBeUndefined();
     await state.setRootlessSocket('box', undefined);
-    await state.setPreviousContext(undefined);
     expect(await state.read()).toEqual({ hosts: [{ host: '__proto__', rootlessSocket: '/run/user/1/docker.sock' }] });
   });
 
   it('ignores invalid content', async () => {
-    fs.writeFileSync(state.file, JSON.stringify({ previousContext: 3, hosts: [{ host: 'a', rootlessSocket: 'relative' }, 'x', { host: '' }] }));
+    fs.writeFileSync(state.file, JSON.stringify({ previousContext: 3, dockerHost: 7, hosts: [{ host: 'a', rootlessSocket: 'relative' }, 'x', { host: '' }] }));
     expect(await state.read()).toEqual({ hosts: [{ host: 'a' }] });
   });
 });

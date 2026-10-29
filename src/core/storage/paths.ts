@@ -59,7 +59,7 @@ export class StoragePaths {
   readonly reopen: string;
   /** State of the workspace helper images: base image digests, last check, last use, last cleanup. */
   readonly helperState: string;
-  /** Remote Docker hosts: the context before the switch, and the rootless sockets (RemoteDockerState). */
+  /** Remote Docker hosts: the list of SSH hosts, the Docker host of Devspaces, and the rootless sockets (RemoteDockerState). */
   readonly remoteDocker: string;
   /**
    * The Docker engines (DockerEngineRecords): the answer to the question about the Monitor of each, the removal mark of

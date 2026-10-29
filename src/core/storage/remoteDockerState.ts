@@ -2,9 +2,11 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// What Devspace remembers about remote Docker hosts, in `remote-docker.json` of the global storage folder: the Docker
-// context that was current before "Use a Remote Docker Host…" (for "Use the Local Docker"), and per host the socket of
-// a rootless engine there (the source of the helper's socket mount on that computer).
+// What Devspaces remembers about remote Docker hosts, in `remote-docker.json` of the global storage folder: its own list
+// of SSH hosts, the Docker host of Devspaces (one host of the list, or none for the local Docker), the hosts of Docker
+// contexts that it offered once, and per host the socket of a rootless engine there (the source of the helper's socket
+// mount on that computer). Devspaces creates and changes no Docker context (docs/architecture.md "Remote Docker
+// hosts").
 import { readJson, writeJsonAtomic } from './atomicJson';
 
 export interface RemoteDockerHostRecord {
@@ -13,20 +15,14 @@ export interface RemoteDockerHostRecord {
   rootlessSocket?: string;
 }
 
-/**
- * The questions that the user answered with "Don't Ask Again". `switchToRemote`: "All Docker tools on this computer
- * will use <host>…"; `switchToLocal`: "… will use the local Docker again."; `switchBack`: "This devspace is on
- * <host> … Use <host> again?".
- */
-export type DockerHostQuestion = 'switchToRemote' | 'switchToLocal' | 'switchBack';
-const DOCKER_HOST_QUESTIONS: readonly DockerHostQuestion[] = ['switchToRemote', 'switchToLocal', 'switchBack'];
-
 export interface RemoteDockerStateFile {
-  /** The context that was current before the switch to a remote host. */
-  previousContext?: string;
+  /** The Docker host of Devspaces: a host of `remoteHosts`. Absent: the local Docker. */
+  dockerHost?: string;
+  /** The list of SSH hosts of Devspaces (an alias of the SSH config, or `user@host[:port]`), in the order they were added. */
+  remoteHosts?: string[];
+  /** The hosts of a Docker context or of DOCKER_HOST that Devspaces offered once for the list (offerDockerContextHost). */
+  offered?: string[];
   hosts?: RemoteDockerHostRecord[];
-  /** The questions not to ask again (DockerHostQuestion). */
-  dontAsk?: DockerHostQuestion[];
 }
 
 export class RemoteDockerState {
@@ -36,37 +32,58 @@ export class RemoteDockerState {
     return normalize(await readJson<unknown>(this.file));
   }
 
-  async previousContext(): Promise<string | undefined> {
-    return (await this.read()).previousContext;
+  /** The Docker host of Devspaces: a host of the list, or undefined for the local Docker. */
+  async dockerHost(): Promise<string | undefined> {
+    return (await this.read()).dockerHost;
   }
 
-  async setPreviousContext(context: string | undefined): Promise<void> {
+  /** The SSH hosts of the list, in the order they were added. */
+  async remoteHosts(): Promise<string[]> {
+    return (await this.read()).remoteHosts ?? [];
+  }
+
+  /**
+   * Makes `host` the Docker host of Devspaces (added to the end of the list when it is not in it), or with `undefined`
+   * the local Docker. Writes only when something changes.
+   */
+  async setDockerHost(host: string | undefined): Promise<void> {
     const state = await this.read();
-    if (context === undefined) delete state.previousContext;
-    else state.previousContext = context;
+    const hosts = state.remoteHosts ?? [];
+    const listed = host === undefined || hosts.includes(host);
+    if (state.dockerHost === host && listed) return;
+    if (host === undefined) delete state.dockerHost;
+    else state.dockerHost = host;
+    if (!listed) state.remoteHosts = [...hosts, host];
     await writeJsonAtomic(this.file, state);
   }
 
-  /** True when the user answered `question` with "Don't Ask Again". */
-  async dontAsk(question: DockerHostQuestion): Promise<boolean> {
-    return (await this.read()).dontAsk?.includes(question) ?? false;
-  }
-
-  /** Remembers "Don't Ask Again" for `question`. */
-  async setDontAsk(question: DockerHostQuestion): Promise<void> {
+  /**
+   * Removes `host` from the list; when it is the Docker host of Devspaces, the local Docker takes its place. Its rootless
+   * socket and the devspaces on it stay. True when it was in the list.
+   */
+  async removeHost(host: string): Promise<boolean> {
     const state = await this.read();
-    if (state.dontAsk?.includes(question)) return;
-    state.dontAsk = [...(state.dontAsk ?? []), question];
-    await writeJsonAtomic(this.file, state);
-  }
-
-  /** Asks every question again. True when there was something to forget. */
-  async clearDontAsk(): Promise<boolean> {
-    const state = await this.read();
-    if (!state.dontAsk?.length) return false;
-    delete state.dontAsk;
+    const hosts = state.remoteHosts ?? [];
+    if (!hosts.includes(host) && state.dockerHost !== host) return false;
+    const rest = hosts.filter((entry) => entry !== host);
+    if (rest.length > 0) state.remoteHosts = rest;
+    else delete state.remoteHosts;
+    if (state.dockerHost === host) delete state.dockerHost;
     await writeJsonAtomic(this.file, state);
     return true;
+  }
+
+  /** True when Devspaces offered `host` of a Docker context or of DOCKER_HOST once already. */
+  async wasOffered(host: string): Promise<boolean> {
+    return (await this.read()).offered?.includes(host) ?? false;
+  }
+
+  /** Remembers that `host` was offered (wasOffered). */
+  async setOffered(host: string): Promise<void> {
+    const state = await this.read();
+    if (state.offered?.includes(host)) return;
+    state.offered = [...(state.offered ?? []), host];
+    await writeJsonAtomic(this.file, state);
   }
 
   /** The socket of the rootless engine on `host`, or undefined for a rootful engine (the default socket). */
@@ -92,11 +109,30 @@ export class RemoteDockerState {
   }
 }
 
+/** A list of host names without repeats or empty entries; undefined when none is left. */
+function hostNames(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const names = [...new Set(value.filter((entry): entry is string => typeof entry === 'string' && entry !== ''))];
+  return names.length > 0 ? names : undefined;
+}
+
+/**
+ * The fields of the file that Devspaces knows; others (for example `previousContext` and `dontAsk` of the versions that
+ * switched the Docker context) are dropped at the next write. A Docker host that is not in the list is added to it.
+ */
 function normalize(value: unknown): RemoteDockerStateFile {
   const result: RemoteDockerStateFile = {};
   if (typeof value !== 'object' || value === null) return result;
   const record = value as Record<string, unknown>;
-  if (typeof record.previousContext === 'string' && record.previousContext !== '') result.previousContext = record.previousContext;
+  const remoteHosts = hostNames(record.remoteHosts);
+  if (typeof record.dockerHost === 'string' && record.dockerHost !== '') {
+    result.dockerHost = record.dockerHost;
+    result.remoteHosts = remoteHosts?.includes(record.dockerHost) ? remoteHosts : [...(remoteHosts ?? []), record.dockerHost];
+  } else if (remoteHosts !== undefined) {
+    result.remoteHosts = remoteHosts;
+  }
+  const offered = hostNames(record.offered);
+  if (offered !== undefined) result.offered = offered;
   if (Array.isArray(record.hosts)) {
     result.hosts = record.hosts.flatMap((entry): RemoteDockerHostRecord[] => {
       if (typeof entry !== 'object' || entry === null) return [];
@@ -104,10 +140,6 @@ function normalize(value: unknown): RemoteDockerStateFile {
       if (typeof host !== 'string' || host === '') return [];
       return [typeof rootlessSocket === 'string' && rootlessSocket.startsWith('/') ? { host, rootlessSocket } : { host }];
     });
-  }
-  if (Array.isArray(record.dontAsk)) {
-    const questions = DOCKER_HOST_QUESTIONS.filter((question) => (record.dontAsk as unknown[]).includes(question));
-    if (questions.length > 0) result.dontAsk = questions;
   }
   return result;
 }

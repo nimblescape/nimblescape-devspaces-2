@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it, vi } from 'vitest';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf } from '../docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../docker/dockerHost';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
 import { RelayConnectionError } from './connection';
@@ -13,12 +13,12 @@ describe('sshRelayTransport', () => {
   const env = { PATH: '/usr/bin', ssh_askpass_require: 'force' };
 
   it('logs in once without questions and runs sh -s, for an alias and for an address', () => {
-    expect(sshRelayTransport(dockerTargetOf('ssh://build-box', 'build-box'), '/usr/bin/ssh', env)).toEqual({
+    expect(sshRelayTransport(remoteDockerTarget('build-box'), '/usr/bin/ssh', env)).toEqual({
       file: '/usr/bin/ssh',
       args: ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '--', 'build-box', RELAY_SHELL_COMMAND],
       env: { PATH: '/usr/bin', SSH_ASKPASS_REQUIRE: 'never' },
     });
-    expect(sshRelayTransport(dockerTargetOf('ssh://me@[::1]:2222', undefined), '/usr/bin/ssh', env)?.args).toEqual([
+    expect(sshRelayTransport(remoteDockerTarget('me@[::1]:2222'), '/usr/bin/ssh', env)?.args).toEqual([
       '-o',
       'BatchMode=yes',
       '-o',

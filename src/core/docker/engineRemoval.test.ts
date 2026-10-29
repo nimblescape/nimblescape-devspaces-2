@@ -257,7 +257,7 @@ describe('removeEngineInfrastructure', () => {
     const runner = new FakeEngine(engine);
     const logger = recordingLogger();
     const answers = { count: 0 };
-    const result = await removeEngineInfrastructure(dockerOf(runner), options(logger, { answers: async () => (answers.count++, true), context: 'devspaces-build-box' }));
+    const result = await removeEngineInfrastructure(dockerOf(runner), options(logger, { answers: async () => (answers.count++, true), remoteHost: 'build-box' }));
     expect(result.ended).toBeUndefined();
     const outcome = (name: string) => result.items.find((item) => item.name === name)?.outcome;
     expect(outcome('devspaces-worker-cache')).toBe('missing');
@@ -268,7 +268,7 @@ describe('removeEngineInfrastructure', () => {
     expect(answers.count).toBe(0);
     expect(logger.lines).toContain('info The volume devspaces-worker-cache was not there anymore.');
     expect(logger.lines).toContain(
-      'warn The volume devspaces-vscode is in use and was not removed (Error response from daemon: remove devspaces-vscode: volume is in use - [d1]). Remove it later with: docker --context devspaces-build-box volume rm devspaces-vscode',
+      'warn The volume devspaces-vscode is in use and was not removed (Error response from daemon: remove devspaces-vscode: volume is in use - [d1]). Remove it later with: docker -H ssh://build-box volume rm devspaces-vscode',
     );
   });
 
@@ -332,17 +332,17 @@ describe('removeEngineInfrastructure', () => {
 });
 
 describe('the commands in the log', () => {
-  it('names each item, with --context for a remote engine', () => {
+  it('names each item, with -H ssh://<host> for a remote engine', () => {
     expect(manualCommand({ kind: 'container', name: 'devspaces-monitor' })).toBe('docker rm -f devspaces-monitor');
-    expect(manualCommand({ kind: 'image', name: 'devspaces-worker:0123456789ab' }, 'devspaces-build-box')).toBe('docker --context devspaces-build-box image rm devspaces-worker:0123456789ab');
+    expect(manualCommand({ kind: 'image', name: 'devspaces-worker:0123456789ab' }, 'me@build-box:2222')).toBe('docker -H ssh://me@build-box:2222 image rm devspaces-worker:0123456789ab');
     expect(manualCommand({ kind: 'volume', name: 'devspaces-vscode' })).toBe('docker volume rm devspaces-vscode');
     expect(manualCommand({ kind: 'image', name: 'label=nimblescape.devspaces.worker=true' })).toBe('docker image prune -a -f --filter label=nimblescape.devspaces.worker=true');
     expect(itemText({ kind: 'container', name: 'label=nimblescape.devspaces.monitor' })).toBe('the containers with the label nimblescape.devspaces.monitor');
-    expect(uninstallCommands('ctx')).toEqual([
-      'docker --context ctx rm -f $(docker --context ctx ps -aq --filter label=nimblescape.devspaces.monitor)',
-      'docker --context ctx rm -f $(docker --context ctx ps -aq --filter label=nimblescape.devspaces.worker-run)',
-      'docker --context ctx image prune -a -f --filter label=nimblescape.devspaces.worker',
-      'docker --context ctx volume rm devspaces-monitor devspaces-worker-cache devspaces-vscode',
+    expect(uninstallCommands('box')).toEqual([
+      'docker -H ssh://box rm -f $(docker -H ssh://box ps -aq --filter label=nimblescape.devspaces.monitor)',
+      'docker -H ssh://box rm -f $(docker -H ssh://box ps -aq --filter label=nimblescape.devspaces.worker-run)',
+      'docker -H ssh://box image prune -a -f --filter label=nimblescape.devspaces.worker',
+      'docker -H ssh://box volume rm devspaces-monitor devspaces-worker-cache devspaces-vscode',
     ]);
   });
 });

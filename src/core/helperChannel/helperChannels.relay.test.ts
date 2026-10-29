@@ -7,7 +7,7 @@
 // refusals of `docker run` in the failure of the connection; the open connection of the engine is used again; a new
 // connection ends when the open fails.
 import { describe, expect, it, vi } from 'vitest';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
 import { silentLogger, type RunOptions, type StartedProcess } from '../ports';
 import { RelayConnectionError, type RelayConnection } from '../relay/connection';
@@ -16,7 +16,7 @@ import { HelperChannelError, type HelperChannel } from './helperChannel';
 import { openHelperChannel, type ChannelOpenDeps } from './helperChannels';
 import { CHANNEL_PROTOCOL_VERSION, ENGINE_IDENTITY_ARGS, encodeMessage, parseClientMessage } from './protocol';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('build-box');
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
 const ENGINE_IDENTITY = { id: '7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11', rootDir: '/var/lib/docker' };
 

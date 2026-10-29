@@ -110,7 +110,7 @@ A course link needs the GitHub sign-in, because only the sign-in tells Devspaces
 
 ## The sidebar
 
-The first row names the Docker engine that the view shows: **Local Docker**, or **Remote Docker host: `<host>`**. Select it to choose another engine. Below it, the repositories are grouped by owner.
+The first row names the Docker engine that the view shows: **Local Docker**, or **Remote Docker host: `<host>`**. When the current Docker context of your computer reaches a host over SSH that is not in the list of Devspaces, it shows **Docker is set to `<host>` over SSH** (see [Remote Docker host](#remote-docker-host)). Select it to choose another engine. Below it, the repositories are grouped by owner.
 
 The title bar has **Select Organizations…** (limits the list and the scan to the organizations and accounts that you select; with several GitHub accounts, each organization names the accounts that are members), **Show Only Devspaces** (lists only the repositories that have a devspace, in any state; **Show All Repositories** lists all again), **Search**, **Refresh**, **Expand All** (opens every owner, group and repository with several sources), and VS Code's **Collapse All**. Its **…** menu has **Add GitHub Account…**, **Edit Repository Groups…**, **Update All Images Now**, and **Remove Devspaces from This Docker Engine…**.
 
@@ -203,8 +203,7 @@ All commands are in the category **Devspaces** of the Command Palette. A command
 | Add GitHub Account… | Adds another GitHub account of VS Code to Devspaces, or signs in with a new one (see [Several GitHub accounts](#several-github-accounts)). |
 | Start with Account… | In the context menu of a repository that two or more of your accounts can access: starts it with the account that you select. |
 | Show Log | Opens the log of Devspaces. |
-| Use a Remote Docker Host…, Use the Local Docker | Choose the Docker engine (see [Remote Docker host](#remote-docker-host)). |
-| Ask Again Before Changing the Docker Host | Brings back the questions that you answered with "Don't Ask Again". |
+| Use a Remote Docker Host…, Use the Local Docker | Choose the Docker engine of Devspaces (see [Remote Docker host](#remote-docker-host)). |
 | Update All Images Now | Runs the background work of the Monitor on the current Docker engine at once (see [Updates](#updates)). |
 | Remove Devspaces from This Docker Engine… | Removes the Monitor, the helper containers and images, and the shared volumes of Devspaces from the current Docker engine, and, if you agree, the devspaces of your accounts there (see [Uninstall](#uninstall)). |
 
@@ -303,27 +302,26 @@ Work that runs in a container after its window closed, for example a long build 
 
 ## Remote Docker host
 
-Your devspaces can run on Docker on another computer, for example a build server or a stronger machine, reached over SSH. VS Code, Devspaces, and your GitHub sign-in stay on your computer; the containers, volumes, and images are on the other computer. The remote engine is the current [Docker context](https://docs.docker.com/engine/manage-resources/contexts/), so Docker, Docker Compose, and Devspaces follow it. The window of a devspace on the other computer reaches its engine through a Docker pipe of Devspaces on your computer, which the folder URI of the window names: the Dev Containers extension uses it for that window, and Devspaces carries its Docker connections over its own SSH connection. Devspaces sets no `DOCKER_HOST` of your environment and writes no setting of the Dev Containers extension. That window runs the Dev Containers extension with the Docker CLI of Devspaces (see [What to know](#what-to-know)).
+Your devspaces can run on Docker on another computer, for example a build server or a stronger machine, reached over SSH. VS Code, Devspaces, and your GitHub sign-in stay on your computer; the containers, volumes, and images are on the other computer. Devspaces keeps its own list of such hosts, and uses one of them, or the local Docker, in all its windows on this computer. It does not create or change a [Docker context](https://docs.docker.com/engine/manage-resources/contexts/) or any setting of Docker, so the `docker` command in your terminals keeps its target. The window of a devspace on the other computer reaches its engine through a Docker pipe of Devspaces on your computer, which the folder URI of the window names: the Dev Containers extension uses it for that window, and Devspaces carries its Docker connections over its own SSH connection. Devspaces sets no `DOCKER_HOST` of your environment and writes no setting of the Dev Containers extension. That window runs the Dev Containers extension with the Docker CLI of Devspaces (see [What to know](#what-to-know)).
 
 ### Set up
 
 1. On the other computer, install Docker Engine and let your SSH user use it: add the user to the group `docker`, or use rootless Docker. On your computer, the Docker CLI is needed (Docker Desktop brings it).
 2. Make sure that SSH to the host works in a terminal **without any question**: your key is loaded in the SSH agent (`ssh-add`) or named with `IdentityFile`, and you have accepted the host key once (`ssh <alias>`, or `ssh -p <port> <user>@<host>`). Devspaces never asks for a password and never accepts a host key for you.
-3. Run **Devspaces: Use a Remote Docker Host…**, or select the first row of the view. The list shows the hosts of your SSH config (`~/.ssh/config`, on Windows `%USERPROFILE%\.ssh\config`, with its `Include` files). **Enter an SSH address…** takes `user@host` or `user@host:port` (an IPv6 address in brackets).
-4. Devspaces tests the connection and then asks: "All Docker tools on this computer will use `<host>` until you switch back." After your confirmation, it makes the Docker context of that host current, named after the host as in your SSH config. It creates the context the first time and never changes it afterwards.
-5. **Devspaces: Use the Local Docker** switches back to the context that was current before, if that points to the local Docker, or else to `default`.
-
-Each question before a change of the Docker host has a second button "…, Don't Ask Again". **Devspaces: Ask Again Before Changing the Docker Host** brings the questions back.
+3. Run **Devspaces: Use a Remote Docker Host…**, or select the first row of the view. The list shows the hosts that Devspaces used before (**Hosts of Devspaces**), the other hosts of your SSH config (`~/.ssh/config`, on Windows `%USERPROFILE%\.ssh\config`, with its `Include` files), and the SSH hosts of your Docker contexts. **Enter an SSH address…** takes `user@host` or `user@host:port` (an IPv6 address in brackets).
+4. Devspaces tests the connection without a question, adds the host to its list, and uses it: "Devspaces now uses Docker on `<host>`."
+5. **Devspaces: Use the Local Docker** goes back to the Docker of your computer. The host stays in the list.
+6. **Remove a Host from the List…** at the end of the list of step 3 removes a host from the list. Its devspaces stay on that computer: add the host again to use them. When Devspaces uses that host, it uses the local Docker afterwards.
 
 ### What to know
 
-- The view, the switcher, the status bar, and every command show and act only on the devspaces of the current Docker engine. Each devspace belongs to the engine where it was created, and a repository gets its own devspace on each engine. Two names of the same computer (an SSH alias and `user@address`) count as two hosts. When the current engine is not the engine of the devspace of a window, **Stop** and **Rebuild** in that window change nothing and say so; switch back to its engine first.
-- The context changes for every Docker tool of your user on this computer, also in terminals. If `DOCKER_HOST` or `DOCKER_CONTEXT` is set for VS Code, the context has no effect, and the commands say so.
-- Docker Desktop may make its own context current again when it starts or updates. When a window of a devspace on another host opens again, for example from **Open Recent**, Devspaces asks "Use `<host>` again?" and switches back after the same test.
+- The view, the switcher, the status bar, and every command show and act only on the devspaces of the current Docker engine. Each devspace belongs to the engine where it was created, and a repository gets its own devspace on each engine. Two names of the same computer (an SSH alias and `user@address`) count as two hosts. When the current engine is not the engine of the devspace of a window, **Stop** and **Rebuild** in that window change nothing and say so; switch back to its engine first. A window of a devspace that opens again, for example from **Open Recent**, always runs on the engine of its devspace, without a question.
+- Devspaces does not follow your Docker context. When the current Docker context, or `DOCKER_HOST`, reaches a computer over SSH while Devspaces uses the local Docker, Devspaces does nothing with Docker, and the first row of the view shows **Docker is set to `<host>` over SSH**. Devspaces offers once to use that host: **Use `<host>`** adds it to the list and uses it, as **Devspaces: Use a Remote Docker Host…** does. Else set Docker on your computer to its local engine, for example with `docker context use default`.
 - A Docker context that points to another computer without SSH (for example `tcp://10.0.0.5:2375`) is not supported: no operation runs there, and the view says so.
-- When Devspaces cannot read the current Docker context (the command `docker context inspect` fails) and `DOCKER_HOST` is not set, it does nothing with Docker, because it does not know which computer the Docker commands would reach. The view shows "Docker context cannot be read". Run `docker context inspect` in a terminal to see the problem, or choose **Devspaces: Use the Local Docker** or **Devspaces: Use a Remote Docker Host…**.
+- When Devspaces cannot read the current Docker context (the command `docker context inspect` fails) and `DOCKER_HOST` is not set, it does nothing with Docker, because it does not know which computer the Docker commands would reach. The view shows "Docker context cannot be read". Run `docker context inspect` in a terminal to see the problem, or choose **Devspaces: Use a Remote Docker Host…**.
 - When the host cannot be reached, the message names the reason: the computer does not answer, the login failed, the host key is unknown, or Docker does not run there. Devspaces never starts or installs Docker on a remote host.
-- To stop using a host, run **Devspaces: Remove Devspaces from This Docker Engine…** while it is the current engine, then **Devspaces: Use the Local Docker**. The Docker context of the host stays; [Uninstall](#uninstall) says how to remove it.
+- To stop using a host, run **Devspaces: Remove Devspaces from This Docker Engine…** while it is the current engine, then **Remove a Host from the List…**.
+- Versions before 0.3.0 created a Docker context for each host and made it current for every Docker tool of your user. Devspaces keeps those contexts and does not use them: when one of them is still current, Devspaces offers its host once, as above. [Docker contexts and your computer](#docker-contexts-and-your-computer) says how to remove them.
 - Published ports are bound to `127.0.0.1` of the other computer. Reach them through the port forwarding of VS Code (the Ports view, `forwardPorts`). `host.docker.internal` exists only with Docker Desktop.
 - Rootless Docker on the other computer works. Its limits: no published ports below 1024, Docker-in-Docker needs set-up there, and resource limits need cgroup v2.
 - The window of a devspace on another computer connects only while Devspaces runs in that VS Code: its folder URI names the Docker pipe of Devspaces on your computer. Such a URI does not work on another computer, or after you copied it; open the devspace there from the Devspaces view. When the window cannot serve its pipe, it closes its connection and says so.
@@ -393,7 +391,7 @@ The checks are a guard rail against mistakes and copied templates, not a sandbox
 ## Troubleshooting
 
 - **The log.** **Devspaces: Show Log** opens the complete log of Devspaces, including the output of the clone, the build, and the lifecycle commands. Every progress notification of Devspaces has **Show details** for the same log. **Show details** also hides the notification: the operation goes on, the status bar shows its progress, and the notification stays in the notification center (the bell in the status bar) with its **Cancel** button.
-- **The Monitor.** Its log shows each stop, each background run, and each prepare: `docker logs devspaces-monitor` on the engine, or from your computer `docker --context <context> logs devspaces-monitor`. Docker keeps at most 2 × 1 MB of it.
+- **The Monitor.** Its log shows each stop, each background run, and each prepare: `docker logs devspaces-monitor` on the engine, or from your computer `docker -H ssh://<host> logs devspaces-monitor`. Docker keeps at most 2 × 1 MB of it.
 - **A devspace stops too early or keeps running.** Check its row for `· kept`, and the settings `stopOnClose`, `stopAfterMinutes`, and `respectShutdownActionNone`. If the window warns that its heartbeats failed, the Monitor may stop the devspace after `stopAfterMinutes`.
 - **GitHub limits the requests.** When GitHub refuses the requests of your account for a while (its rate limit), the view keeps the repositories that it shows, and a message says at what time Devspaces loads the list again. It tries once at that time; after that, use **Refresh**.
 - **`State unknown`.** Devspaces could not read the engine. On a remote host, check that `ssh <host>` works without a question and that Docker runs there. After the images of an engine were removed, Devspaces prepares the engine again in the background; the status bar shows "Devspaces: preparing `<host>`…".
@@ -425,7 +423,7 @@ What to know:
 
 ### Remove by hand
 
-These Docker commands remove the same without the extension, in a shell such as bash, zsh or PowerShell. For a remote engine, run `docker context use <name>` first, or write `docker --context <name>` for each `docker`. A command with an empty list stops with "requires at least 1 argument": there is nothing of that kind. A volume that does not exist gives an error for that volume only.
+These Docker commands remove the same without the extension, in a shell such as bash, zsh or PowerShell. For a remote engine, write `docker -H ssh://<host>` for each `docker`, or set `DOCKER_HOST=ssh://<host>` in the shell first (in PowerShell `$env:DOCKER_HOST = 'ssh://<host>'`). A command with an empty list stops with "requires at least 1 argument": there is nothing of that kind. A volume that does not exist gives an error for that volume only.
 
 1. First the Monitor and the helper containers, so that nothing of Devspaces works on the engine while you remove the rest, and no helper container uses a volume of a devspace:
 
@@ -456,8 +454,8 @@ The objects of version 0.4.0 and older have other names: see [Update from versio
 
 ### Docker contexts and your computer
 
-- **Docker contexts.** For each remote host, Devspaces created a Docker context, named after the host as in your SSH config. `docker context ls` lists them with the description "Devspaces: remote Docker host `<host>`". To remove one, run `docker context use default` if it is the current context, then `docker context rm <name>`.
-- **Files.** Devspaces keeps its records in a folder of VS Code: `~/.config/Code/User/globalStorage/nimblescape.nimblescape-devspaces-2` on Linux, `~/Library/Application Support/Code/User/globalStorage/nimblescape.nimblescape-devspaces-2` on macOS, and `%APPDATA%\Code\User\globalStorage\nimblescape.nimblescape-devspaces-2` on Windows. For VS Code Insiders, the folder `Code - Insiders` takes the place of `Code`. You can delete this folder after the uninstall.
+- **Docker contexts.** Devspaces creates no Docker context. Versions before 0.3.0 created one for each remote host, named after the host as in your SSH config. `docker context ls` lists them with the description "Devspaces: remote Docker host `<host>`". To remove one, run `docker context use default` if it is the current context, then `docker context rm <name>`.
+- **Files.** Devspaces keeps its records, also the list of remote hosts (`remote-docker.json`), in a folder of VS Code: `~/.config/Code/User/globalStorage/nimblescape.nimblescape-devspaces-2` on Linux, `~/Library/Application Support/Code/User/globalStorage/nimblescape.nimblescape-devspaces-2` on macOS, and `%APPDATA%\Code\User\globalStorage\nimblescape.nimblescape-devspaces-2` on Windows. For VS Code Insiders, the folder `Code - Insiders` takes the place of `Code`. You can delete this folder after the uninstall.
 - **Settings.** The settings `devspaces.…` stay in your `settings.json` until you remove them.
 
 ## Build from source

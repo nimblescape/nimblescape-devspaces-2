@@ -2,16 +2,20 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The Docker host of an operation. The current Docker context is read at the start of each operation (`docker context
-// inspect`), never cached beyond it: a context switch while VS Code runs takes effect for the next operation. An
-// operation keeps the host it started with: its Docker calls get DOCKER_CONTEXT with the name of the context that it
-// read (BootstrapDocker.run), so a switch in the middle does not move half of it to another engine.
+// The Docker host of an operation: the Docker host of Devspaces (RemoteDockerState), read at the start of each operation
+// and never cached beyond it, so that a choice in another window takes effect for the next operation. A host of the
+// list of Devspaces is reached over SSH (remoteDockerTarget). The local Docker is the current Docker context
+// (`docker context inspect`), or DOCKER_HOST; a context or DOCKER_HOST of the user that reaches a host over SSH is not
+// supported there (isDockerContextHostTarget), because Devspaces reaches remote hosts only through its own list. An
+// operation keeps the host it started with: its Docker calls get DOCKER_CONTEXT with the name of the local context that
+// it read, or DOCKER_HOST of its remote host (BootstrapDocker.run), so a change in the middle does not move half of it to
+// another engine.
 import { AsyncLocalStorage } from 'async_hooks';
 import { errorMessage } from '../errors';
 import { Messages } from '../messages';
 import type { Logger, RunOptions, RunResult } from '../ports';
 import { envValue } from './dockerCli';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf, parseContextInspect, type DockerTarget } from './dockerHost';
+import { LOCAL_DOCKER_TARGET, dockerTargetOf, parseContextInspect, remoteDockerTarget, type DockerTarget } from './dockerHost';
 
 /**
  * The target when the current Docker context cannot be read and DOCKER_HOST is not set (isUnreadableDockerTarget).
@@ -81,6 +85,11 @@ export interface ContextReader {
   podmanCli?(): Promise<string | undefined>;
 }
 
+/** The Docker host of Devspaces (RemoteDockerState.dockerHost): a host of its list, or undefined for the local Docker. */
+export interface DockerHostChoice {
+  dockerHost(): Promise<string | undefined>;
+}
+
 /** Reads the current Docker target, and runs operations with it. */
 export class DockerTargets {
   private lastTarget: DockerTarget | undefined;
@@ -97,6 +106,8 @@ export class DockerTargets {
     private readonly env: NodeJS.ProcessEnv,
     private readonly logger: Logger,
     private readonly platform: NodeJS.Platform = process.platform,
+    /** Without it, Devspaces uses the local Docker. */
+    private readonly choice?: DockerHostChoice,
   ) {}
 
   /** The target of the last read, for synchronous callers (the Docker setup). Undefined before the first read. */
@@ -105,14 +116,13 @@ export class DockerTargets {
   }
 
   /**
-   * Reads the current target now: DOCKER_HOST of VS Code's environment if set, else the current Docker context (which
-   * DOCKER_CONTEXT may name). Without a Docker CLI, the local Docker. When the context cannot be read: DOCKER_HOST when
-   * it is set, else podmanDockerTarget for a docker command that is Podman, else UNREADABLE_DOCKER_TARGET (logged).
+   * Reads the current target now: the host of the list of Devspaces that it uses, else its local Docker (readLocal).
    * Never throws.
    */
   async resolve(): Promise<DockerTarget> {
     const read = ++this.readsStarted;
-    const target = await this.read();
+    const host = await this.chosenHost();
+    const target = host === undefined ? await this.readLocal() : remoteDockerTarget(host);
     // A read that started before a newer one finished (overlapping reads) does not overwrite what that one found.
     if (read < this.readApplied) return target;
     this.readApplied = read;
@@ -156,9 +166,17 @@ export class DockerTargets {
     return runWithDockerTarget(target, fn);
   }
 
-  /**The target of the Docker context `name` (for example the one in a window's authority, or `default`), whatever
-   *context is current. With DOCKER_HOST set in VS Code's environment, DOCKER_HOST decides, as for `resolve`. Undefined
-   *without a Docker CLI, for a name that is not a context name, or when the
+  /**
+   * The target of the Docker host `host`, whatever host Devspaces uses now: for a host of the list its Docker over SSH,
+   * for '' the local Docker (readLocal). Does not change `last` and tells no listener. Never throws.
+   */
+  async ofHost(host: string): Promise<DockerTarget> {
+    return host === '' ? this.readLocal() : remoteDockerTarget(host);
+  }
+
+  /**The target of the Docker context `name` (for example `default`), whatever context is current. With DOCKER_HOST set
+   *in VS Code's environment, DOCKER_HOST decides, as for the local Docker. Undefined without a Docker CLI, for a name that
+   *is not a context name, or when the
    * context cannot be read (logged). Does not change `last` and tells no listener. Never throws.
    */
   async ofContext(name: string): Promise<DockerTarget | undefined> {
@@ -177,7 +195,23 @@ export class DockerTargets {
     return undefined;
   }
 
-  private async read(): Promise<DockerTarget> {
+  /** The host of the list that Devspaces uses, or undefined for the local Docker (also when it cannot be read, logged). */
+  private async chosenHost(): Promise<string | undefined> {
+    try {
+      return await this.choice?.dockerHost();
+    } catch (error) {
+      this.logger.warn(`The Docker host of Devspaces could not be read, so it uses the local Docker: ${errorMessage(error)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * The local Docker of Devspaces: DOCKER_HOST of VS Code's environment if set, else the current Docker context (which
+   * DOCKER_CONTEXT may name); one that reaches a host over SSH is not supported (isDockerContextHostTarget). Without a
+   * Docker CLI, the local Docker. When the context cannot be read: DOCKER_HOST when it is set, else podmanDockerTarget
+   * for a docker command that is Podman, else UNREADABLE_DOCKER_TARGET (logged). Never throws.
+   */
+  private async readLocal(): Promise<DockerTarget> {
     if (!this.docker.isInstalled()) return LOCAL_DOCKER_TARGET;
     const dockerHost = envValue(this.env, 'DOCKER_HOST', this.platform)?.trim();
     let detail: string;

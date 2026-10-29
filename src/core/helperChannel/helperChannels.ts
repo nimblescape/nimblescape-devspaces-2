@@ -139,10 +139,10 @@ export interface ChannelOpenDeps {
   relay?(target: DockerTarget): RelayAccess | undefined;
   /**
    * BootstrapDocker.run: `docker <args>` without the worker, with the environment of the operation (the engine identity
-   * of the open). `withContext` (BootstrapDocker.runWithContext): with the Docker context of the operation also while
-   * the host has the Docker pipe of the extension.
+   * of the open). `withoutPipe` (BootstrapDocker.runWithoutPipe): with `ssh://<host>` of the operation also while the
+   * host has the Docker pipe of the extension.
    */
-  runDirect(args: readonly string[], options?: RunOptions, withContext?: boolean): Promise<RunResult>;
+  runDirect(args: readonly string[], options?: RunOptions, withoutPipe?: boolean): Promise<RunResult>;
   logger: Logger;
   /** The content of dist/helperChannel.js. */
   script(): Promise<string>;
@@ -255,7 +255,7 @@ async function openBehindRelay(
  * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). For a worker on the open connection
  * of the engine, that call goes through that connection (the Docker pipe of the extension, BootstrapDocker), whose
  * engine passed this check at its own open (a worker starts there only within RELAY_WORKER_MAX_AGE_MS of it); for a new
- * connection, it logs in with the Docker context (withContext): the open connection may be the one that the worker
+ * connection, it logs in over SSH itself (withoutPipe): the open connection may be the one that the worker
  * could not use. The worker reads its identity over
  * the Engine API (`GET /info`), so both are compared as their values (sameEngine; the Docker CLI prints them as JSON in
  * Go's form, which escapes `<`, `>` and `&`), and the value of the worker is checked (parseProbeValue) as everything
@@ -282,7 +282,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   // The new connection of the relay that this open made: the current one of the engine only after the checks, so that
   // no Docker stream of the window goes to a new connection whose engine the checks refuse.
   let opened: RelayConnection | undefined;
-  // Its calls without the worker use the Docker context (withContext), not the open connection of the engine.
+  // Its calls without the worker log in over SSH themselves (withoutPipe), not through the open connection of the engine.
   const ownDeps: ChannelOpenDeps = { ...deps, runDirect: (args, options) => deps.runDirect(args, options, true) };
   // The engine identity without the worker, read before the start: on an SSH host, on the shell before the relay, whose
   // login the new connection then takes over (no login after it).

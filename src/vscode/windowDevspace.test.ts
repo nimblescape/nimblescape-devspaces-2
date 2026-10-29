@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { silentLogger } from '../core/ports';
 import type { Devspace } from '../core/types';
 import { resourceName } from '../core/names';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf } from '../core/docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../core/docker/dockerHost';
 import { operationDockerTarget } from '../core/docker/dockerTargets';
 import type { RunResult } from '../core/ports';
 import {
@@ -119,7 +119,7 @@ describe('the devspace of the window at its activation', () => {
 
   // "Remove Devspaces from This Docker Engine…": until a flow of the user there, nothing runs there by itself.
   it('does the Docker work at the start on the current engine, unless Devspaces was removed from it', async () => {
-    const remote = dockerTargetOf('ssh://build-box', 'devspaces-build-box');
+    const remote = remoteDockerTarget('build-box');
     const lines: string[] = [];
     const logger = { ...silentLogger, info: (line: string) => void lines.push(line) };
     const removed = vi.fn(async (target: { host: string }) => target.host === 'build-box');
@@ -283,7 +283,7 @@ describe('the devspace of the window by the labels of its container', () => {
   // Mutation: the activation without this read leaves the window of another account on an engine with the mark
   // connected (role C).
   it('the activation reads them only for a lost registry on an engine with the mark, on that engine, within the time limit of the activation', async () => {
-    const remote = dockerTargetOf('ssh://build-box', 'devspaces-build-box');
+    const remote = remoteDockerTarget('build-box');
     const lines: string[] = [];
     const engines: unknown[] = [];
     const run = vi.fn(async () => {
