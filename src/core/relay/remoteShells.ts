@@ -61,7 +61,8 @@ export class RemoteShells {
    * logs in anew when it failed: a login without questions fails for a host that needs a password or an unknown host
    * key, and the Cancel of the other flow ends the questions of its login. After the time limit of that login it does
    * not: a login without questions fails at once instead of waiting, so the host did not answer in time. `fresh`: a new
-   * login also when a shell is open (the test of a host); the open shell ends after its commands (closeWhenIdle).
+   * login also when a shell is open (the test of a host; a login in progress counts as new). Once the new login
+   * succeeded, the open shell ends after its commands (closeWhenIdle); when it fails, the open shell stays.
    */
   open(host: string, signal?: AbortSignal, options: { fresh?: boolean } = {}): Promise<RemoteShell | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
@@ -81,10 +82,8 @@ export class RemoteShells {
     }
     const started = this.options.start(host);
     if (started === undefined) return Promise.resolve(undefined);
-    if (open !== undefined) {
-      this.retired.add(open);
-      open.closeWhenIdle();
-    }
+    // The open shell that a fresh login replaces: the window stops it at its end until it ended.
+    if (open !== undefined) this.retired.add(open);
     const { process, prompts } = started;
     const entry: Entry = { process, flow: currentSshPromptFlow() };
     const forget = () => {
@@ -98,10 +97,16 @@ export class RemoteShells {
         entry.opening = undefined;
         if (this.disposed) shell.killNow();
         else logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        open?.closeWhenIdle();
         return shell;
       },
       (error: unknown) => {
         forget();
+        // A fresh login that failed leaves the open shell to the calls after it.
+        if (open !== undefined && current !== undefined) {
+          this.retired.delete(open);
+          if (open.isOpen && !this.disposed && !this.entries.has(host)) this.entries.set(host, current);
+        }
         throw error;
       },
     );

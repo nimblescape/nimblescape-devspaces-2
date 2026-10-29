@@ -122,6 +122,25 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
+  it('keeps the open shell when a fresh login fails', async () => {
+    const logins: string[] = [];
+    let script = 'exec sh -s';
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 5_000,
+      start: () => {
+        logins.push('login');
+        return { process: runner.startBytes('sh', ['-c', script]) };
+      },
+    });
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    script = 'echo "me@box: Permission denied (password)." >&2; exit 255';
+    await expect(registry.login('box', undefined, { fresh: true })).resolves.toMatchObject({ ok: false });
+    await expect(registry.run('box', 'printf two')).resolves.toMatchObject({ stdout: 'two' });
+    expect(logins).toEqual(['login', 'login']);
+    registry.dispose();
+  });
+
   it('stops a shell that a fresh login replaced at the end of the window', async () => {
     const { registry, processes } = shells();
     await registry.login('box');

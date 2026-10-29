@@ -151,6 +151,28 @@ describeUnix('RemoteShell', () => {
     expect(listeners.size).toBe(0);
   });
 
+  // A shell that a new login replaced (RemoteShells with `fresh`): what waits for it runs first.
+  it('ends after the command and the takeover that wait for it, and takes no command after it', async () => {
+    let ended = 0;
+    const shell = await RemoteShell.open(login(), { logger: silentLogger, name: 'box', onEnd: () => ended++ });
+    const running = shell.run('sleep 0.2; printf first');
+    const taking = shell.takeOver();
+    shell.closeWhenIdle();
+    await expect(running).resolves.toMatchObject({ stdout: 'first' });
+    const taken = await taking;
+    expect(taken).toBeDefined();
+    expect(ended).toBe(1);
+    taken!.killNow?.();
+    // Without a takeover, the shell ends after its command.
+    const other = await RemoteShell.open(login(), { logger: silentLogger, name: 'box' });
+    const last = other.run('sleep 0.2; printf last');
+    other.closeWhenIdle();
+    const after = other.run('true');
+    await expect(last).resolves.toMatchObject({ stdout: 'last' });
+    await expect(after).rejects.toBeInstanceOf(ShellGoneError);
+    expect(other.isOpen).toBe(false);
+  });
+
   it('closes a shell that no command used for a while', async () => {
     const { logger, lines } = logged();
     let ended = 0;

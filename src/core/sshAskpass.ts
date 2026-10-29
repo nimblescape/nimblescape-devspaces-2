@@ -204,22 +204,6 @@ function activeScope(): PromptScope | undefined {
   return scope?.active === true ? scope : undefined;
 }
 
-/** A signal that aborts when `signal` or `outer` aborts (undefined for none), and the end of its listener on `outer`. */
-function eitherSignal(signal: AbortSignal | undefined, outer: AbortSignal | undefined): { signal?: AbortSignal; dispose(): void } {
-  if (signal === undefined || outer === undefined) return { signal: signal ?? outer, dispose: () => undefined };
-  const controller = new AbortController();
-  const abort = (): void => controller.abort();
-  if (signal.aborted || outer.aborted) abort();
-  signal.addEventListener('abort', abort, { once: true });
-  outer.addEventListener('abort', abort, { once: true });
-  return {
-    signal: controller.signal,
-    dispose: () => {
-      signal.removeEventListener('abort', abort);
-      outer.removeEventListener('abort', abort);
-    },
-  };
-}
 
 /**
  * Runs `fn` as a flow of the user (a command with its progress notification, the test of a remote host): an SSH login
@@ -227,13 +211,13 @@ function eitherSignal(signal: AbortSignal | undefined, outer: AbortSignal | unde
  * of those logins close (sshPromptSignal).
  */
 export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const either = eitherSignal(signal, activeScope()?.signal);
-  const scope: PromptScope = { active: true, signal: either.signal };
+  const outer = activeScope()?.signal;
+  const either = signal !== undefined && outer !== undefined ? AbortSignal.any([signal, outer]) : (signal ?? outer);
+  const scope: PromptScope = { active: true, signal: either };
   try {
     return await promptScopes.run(scope, fn);
   } finally {
     scope.active = false;
-    either.dispose();
   }
 }
 

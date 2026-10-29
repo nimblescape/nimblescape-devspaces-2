@@ -262,14 +262,16 @@ export class SshAskpassServer implements vscode.Disposable {
           resolve();
         });
       });
+      if (this.options.platform !== 'win32') await fs.promises.chmod(address, 0o600);
     } catch (error) {
-      // The next prepare makes a new folder.
-      if (this.socketFolder !== undefined) await fs.promises.rm(this.socketFolder, { recursive: true, force: true });
+      // The next prepare listens on a new pipe in a new folder.
+      server.close();
+      const folder = this.socketFolder;
       this.socketFolder = undefined;
+      if (folder !== undefined) await fs.promises.rm(folder, { recursive: true, force: true }).catch(() => undefined);
       throw error;
     }
     server.on('error', (error: Error) => this.options.logger.warn(`The pipe of the questions of SSH logins failed: ${error.message}`));
-    if (this.options.platform !== 'win32') await fs.promises.chmod(address, 0o600);
     this.server = server;
     return address;
   }
