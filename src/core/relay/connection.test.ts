@@ -222,8 +222,9 @@ describe('RelayConnection.open', () => {
     const after = new FakeTransport();
     const afterOpening = open(after);
     after.print(`${after.marker()}\n`);
+    after.printError('docker: Error response from daemon: Conflict. The container name "/w-worker1" is already in use by container "abc".\n');
     after.endOutput();
-    await expect(afterOpening).rejects.toThrow('could not be opened: the connection ended before the hello of the relay');
+    await expect(afterOpening).rejects.toThrow('could not be opened: its output ended (docker: Error response from daemon: Conflict. The container name "/w-worker1" is already in use by container "abc".)');
   });
 
   it('rejects with the refusal of `docker run` after the marker, and with the exit code without error output', async () => {

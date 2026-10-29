@@ -149,9 +149,9 @@ export class RelayConnection {
 
   /** Ends the connection and stops the transport at once (the end of the extension host). */
   killNow(): void {
-    this.shutdown('stopped by the extension');
     if (this.process.killNow) this.process.killNow();
     else this.process.kill();
+    this.shutdown('stopped by the extension');
   }
 
   /** The readable end of the error output of the transport (readableStderr), or empty. */
@@ -226,15 +226,16 @@ export class RelayConnection {
           if (rest.length > 0) this.mux.input(rest);
         },
         // The end of the transport says why (its error output): the open fails, or the connection ends, with it when
-        // the transport ends within EXIT_REASON_WAIT_MS. A transport that keeps running after the end of its output (for
-        // example `ssh` that waits for a program of the session) ends the open or the connection then, without it.
+        // the transport ends within EXIT_REASON_WAIT_MS (the handler of `exited` below). A transport that keeps running
+        // after the end of its output (for example `ssh` that waits for a program of the session) fails the open then,
+        // also with its error output, or ends the open connection.
         () => {
-          let wait: ReturnType<typeof setTimeout> | undefined;
-          void Promise.race([process.exited, new Promise((resolve) => (wait = setTimeout(resolve, EXIT_REASON_WAIT_MS)))]).then(() => {
-            clearTimeout(wait);
-            if (this.mux) this.mux.inputEnded();
-            else fail(`its output ended (${this.stderrReason() || 'no error output'})`);
-          });
+          const wait = setTimeout(() => {
+            if (!settled) fail(`its output ended (${this.stderrReason() || 'no error output'})`);
+            else this.mux?.inputEnded();
+          }, EXIT_REASON_WAIT_MS);
+          wait.unref?.();
+          void process.exited.then(() => clearTimeout(wait));
         },
       );
       void process.exited.then(({ exitCode, error }) => {
