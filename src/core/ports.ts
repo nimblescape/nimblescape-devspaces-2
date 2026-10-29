@@ -200,6 +200,25 @@ export function heldOutput<T>(): { deliver(value: T): void; listen(listener: (va
   };
 }
 
+/**
+ * Text output of a started program from its bytes (heldOutput): decoded as UTF-8 as it comes, so a character split
+ * between two chunks stays whole; `end` delivers the rest of an incomplete character. Empty text is not delivered.
+ * TextDecoder, not Node's string_decoder module: that fails in the extension host of VS Code 1.139 (Electron 43) with
+ * "StringDecoder is not a constructor".
+ */
+export function decodedOutput(): { push(chunk: Uint8Array): void; end(): void; listen(listener: (text: string) => void): void } {
+  const decoder = new TextDecoder('utf-8');
+  const output = heldOutput<string>();
+  const deliver = (text: string) => {
+    if (text !== '') output.deliver(text);
+  };
+  return {
+    push: (chunk) => deliver(decoder.decode(chunk, { stream: true })),
+    end: () => deliver(decoder.decode()),
+    listen: output.listen,
+  };
+}
+
 export interface Credentials {
   username: string;
   password: string;

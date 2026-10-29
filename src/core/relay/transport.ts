@@ -8,7 +8,7 @@
 // No `vscode`.
 import { sshCommandArgs, sshTargetOf, type DockerTarget } from '../docker/dockerHost';
 import { noPromptEnv } from '../docker/remoteDocker';
-import { MAX_BUNDLE_LINE_LENGTH, encodeBundle } from '../loader/pipeLoader';
+import { bundleLine } from '../loader/pipeLoader';
 import type { Logger, ProcessRunner } from '../ports';
 import { RelayConnection, RelayConnectionError } from './connection';
 import { relayStartScript, startMarker } from './startScript';
@@ -49,8 +49,8 @@ export async function openRelayConnection(
   options: { logger: Logger; name: string },
 ): Promise<RelayConnection> {
   // The loader limits the escaped line (the memory guard of the pipe loader), so the same is checked here.
-  const length = encodeBundle(bundle).length - 1;
-  if (length > MAX_BUNDLE_LINE_LENGTH) throw new RelayConnectionError(`The connection to ${options.name} could not be opened: the bundle is too long (${length} characters as JSON).`);
+  const { length, tooLong } = bundleLine(bundle);
+  if (tooLong) throw new RelayConnectionError(`The connection to ${options.name} could not be opened: the bundle is too long (${length} characters as JSON).`);
   const marker = startMarker();
   const startScript = relayStartScript(marker, command);
   const process = runner.startBytes(transport.file, transport.args, { env: transport.env });

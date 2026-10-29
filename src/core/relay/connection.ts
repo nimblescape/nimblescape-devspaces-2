@@ -3,13 +3,14 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The connection of the relay on the side of the extension (docs/architecture.md "The connection of the relay"). A
-// transport program (`ssh … sh -s`) gets the start script first (startScript.ts). Its output up to the marker of the
-// script is what the login printed (its size goes to the log, never its text); then the extension writes the bundle
-// line for the pipe loader, and from then on both directions carry the frames of the streams (mux.ts). The connection
-// is open once the HELLO of the relay came. A stream to the target `worker` is the program of a helper channel
-// (openWorker). No `vscode`.
+// transport program (`ssh … sh -s`) gets the start script first (startScript.ts). Its standard output up to the marker
+// of the script is what the login printed (its size goes to the log, never its text); then the extension writes the
+// bundle line for the pipe loader, and from then on both directions carry the frames of the streams (mux.ts). The
+// connection is open once the HELLO of the relay came. The error output of the transport (the messages of `ssh`, the
+// relay, and the worker) is kept as the reason of a failure, as the error output of the Docker CLI before. A stream to
+// the target `worker` is the program of a helper channel (openWorker). No `vscode`.
 import { encodeBundle, readableStderr } from '../loader/pipeLoader';
-import { heldOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
+import { decodedOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
 import { Mux } from './mux';
 
 /** The longest time from the start of the transport to the HELLO of the relay: the login, the start, the bundle. */
@@ -97,23 +98,19 @@ export class RelayConnection {
   openWorker(): StartedProcess {
     if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
     const stream = this.mux.open('worker');
-    const decoder = new TextDecoder('utf-8');
-    const stdout = heldOutput<string>();
-    const deliver = (text: string) => {
-      if (text !== '') stdout.deliver(text);
-    };
+    const stdout = decodedOutput();
     let settle: (result: { exitCode: number | null; error?: Error }) => void = () => {};
     const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => {
       let settled = false;
       settle = (result) => {
         if (settled) return;
         settled = true;
-        deliver(decoder.decode());
+        stdout.end();
         resolve(result);
       };
     });
     stream.onData((chunk) => {
-      deliver(decoder.decode(chunk, { stream: true }));
+      stdout.push(chunk);
       stream.consumed(chunk.length);
     });
     stream.onExit((exit) => settle({ exitCode: exit.code }));

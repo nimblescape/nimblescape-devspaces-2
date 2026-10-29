@@ -12,6 +12,7 @@ import {
   MAX_READABLE_STDERR_LINE,
   PIPE_LOADER,
   bundleHash,
+  bundleLine,
   encodeBundle,
   loaderCommand,
   readableStderr,
@@ -52,6 +53,14 @@ describe('the pipe loader', () => {
     const line = encodeBundle('x\n'.repeat(1000));
     expect(line.indexOf('\n')).toBe(line.length - 1);
     expect(JSON.parse(line)).toBe('x\n'.repeat(1000));
+  });
+
+  it('bundleLine: the line of encodeBundle, too long only above MAX_BUNDLE_LINE_LENGTH without its line feed', () => {
+    // Two quotes: a bundle of MAX_BUNDLE_LINE_LENGTH - 2 characters is a line of exactly the limit.
+    const fits = bundleLine('x'.repeat(MAX_BUNDLE_LINE_LENGTH - 2));
+    expect(fits).toEqual({ line: encodeBundle('x'.repeat(MAX_BUNDLE_LINE_LENGTH - 2)), length: MAX_BUNDLE_LINE_LENGTH, tooLong: false });
+    // An escaped line feed counts as two characters.
+    expect(bundleLine(`${'x'.repeat(MAX_BUNDLE_LINE_LENGTH - 3)}\n`)).toMatchObject({ length: MAX_BUNDLE_LINE_LENGTH + 1, tooLong: true });
   });
 
   it('bundleHash: sha256 hex over UTF-8', () => {
