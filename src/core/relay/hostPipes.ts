@@ -25,7 +25,7 @@ export interface HostPipesDeps {
   base(): string;
   /** The open connection of the relay to `host` for a Docker stream (RelayConnections.get), or undefined. */
   relayConnection(host: string): RelayConnection | undefined;
-  /** `ssh … docker system dial-stdio` on `host`; undefined without `ssh` or for a host it cannot reach. */
+  /** `ssh … docker system dial-stdio` on `host`; undefined without `ssh` or for a host that is no SSH alias or address. */
   dialStdio(host: string): StartedByteProcess | undefined;
   /** Only for the tests: the id of the next pipe (16 hexadecimal digits). */
   randomId?: () => string;
@@ -68,7 +68,8 @@ export class HostPipes {
     const direct = processDockerDial(
       () => {
         const process = this.deps.dialStdio(host);
-        if (process === undefined) throw new Error(`ssh was not found, or ${host} is no SSH host`);
+        // Only an SSH host gets a pipe (see serve).
+        if (process === undefined) throw new Error('ssh was not found');
         return process;
       },
       logger,

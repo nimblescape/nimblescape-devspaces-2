@@ -188,16 +188,16 @@ describe('the ssh check before the Docker calls', () => {
     expect(runner.run).toHaveBeenCalledTimes(5);
   });
 
-  it('skips the check while a connection of the relay to the host is open, except for the test before a switch', async () => {
+  it('skips the check while the Docker calls to the host go through the Docker pipe of the extension, except for the test before a switch', async () => {
     const runner = sshRunner();
-    const relayOpen = vi.fn((host: string) => host === 'box');
-    const deps = { runner, sshPath: '/usr/bin/ssh', env: {}, relayOpen };
-    await expect(checkSshLogin('box', deps)).resolves.toEqual({ ok: true, skipped: 'relayOpen' });
+    const viaDockerPipe = vi.fn((host: string) => host === 'box');
+    const deps = { runner, sshPath: '/usr/bin/ssh', env: {}, viaDockerPipe };
+    await expect(checkSshLogin('box', deps)).resolves.toEqual({ ok: true, skipped: 'dockerPipe' });
     expect(runner.run).not.toHaveBeenCalled();
     await expect(checkSshLogin('other', deps)).resolves.toEqual({ ok: true });
     await expect(checkSshLogin('box', deps, { useCache: false })).resolves.toEqual({ ok: true });
     expect(runner.run).toHaveBeenCalledTimes(2);
-    expect(relayOpen.mock.calls.map(([host]) => host)).toEqual(['box', 'other']);
+    expect(viaDockerPipe.mock.calls.map(([host]) => host)).toEqual(['box', 'other']);
   });
 
   it('runs before docker -H ssh://… info of the test, always connects, and stops at its failure', async () => {
@@ -271,10 +271,10 @@ describe('ensureDockerHostReachable (the Docker start of a remote host)', () => 
     expect(await state.rootlessSocket('box')).toBeUndefined();
   });
 
-  it('asks only docker info while a connection of the relay to the host is open', async () => {
+  it('asks only docker info while the Docker calls to the host go through the Docker pipe of the extension', async () => {
     const docker = fakeDocker(() => info(false));
     const runner = sshRunner();
-    await ensureDockerHostReachable(target, { docker, runner, state, logger, sshPath: '/usr/bin/ssh', env: {}, relayOpen: (host) => host === 'box' });
+    await ensureDockerHostReachable(target, { docker, runner, state, logger, sshPath: '/usr/bin/ssh', env: {}, viaDockerPipe: (host) => host === 'box' });
     expect(docker.calls.map((call) => call.args)).toEqual([['info', '--format', ENGINE_INFO_FORMAT]]);
     expect(runner.run).not.toHaveBeenCalled();
   });

@@ -296,6 +296,14 @@ export class BootstrapDocker {
     }
   }
 
+  /**
+   * run, with the Docker context of the operation also while its host has the Docker pipe of the extension (dockerPipe):
+   * for the checks of a new connection of the relay, which must not depend on another connection to the host.
+   */
+  runWithContext(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    return this.run(args, { ...options, env: options.env ?? this.operationEnv(false) });
+  }
+
   /** runOnce, repeated once after an SSH drop of a call that only reads (sshDroppedReadCall). */
   private async runRepeated(args: readonly string[], options: RunOptions): Promise<RunResult> {
     const result = await this.runOnce(args, options);

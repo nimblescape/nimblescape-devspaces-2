@@ -4,8 +4,8 @@
 
 // The Docker calls of an operation on an SSH host go through the Docker pipe of the extension for the host while a
 // connection of the relay to it is open (BootstrapDockerOptions.dockerPipe): DOCKER_HOST is the pipe, without
-// DOCKER_CONTEXT and the TLS variables. Without the pipe, outside of an operation, for the local Docker, and for the
-// start of the worker, the calls go as before.
+// DOCKER_CONTEXT and the TLS variables. Without the pipe, outside of an operation, for the local Docker, for the checks
+// of a new connection (runWithContext), and for the start of the worker, the calls go as before.
 import { describe, expect, it, vi } from 'vitest';
 import { silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { BootstrapDocker } from './bootstrapDocker';
@@ -61,6 +61,19 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     expect(envs[1].DOCKER_HOST).toBeUndefined();
     expect(envs[2].DOCKER_HOST).toBeUndefined();
     expect(dockerPipe).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the checks of a new connection of the relay with the Docker context also while the host has the pipe', async () => {
+    const { runner, envs } = recorder();
+    const dockerPipe = vi.fn(() => PIPE);
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'linux', { dockerPipe });
+    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info', '--format', '{{json .ID}}']));
+    expect(envs[0].DOCKER_CONTEXT).toBe(CONTEXT);
+    expect(envs[0].DOCKER_HOST).toBeUndefined();
+    expect(dockerPipe).not.toHaveBeenCalled();
+    // `run` takes the pipe.
+    await runWithDockerTarget(REMOTE, () => docker.run(['info', '--format', '{{json .ID}}']));
+    expect(envs[1].DOCKER_HOST).toBe(PIPE);
   });
 
   it('starts the worker (standard input open) never through the pipe', async () => {

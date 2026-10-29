@@ -161,7 +161,7 @@ describe('HostPipes', () => {
     dialStdio.mockReturnValue(undefined);
     connection = undefined;
     await expect(roundTrip(address.path, 'y')).resolves.toBe('');
-    expect(log.lines.at(-1)).toBe('warn The Docker pipe of the extension on build-box could not reach the Docker engine: ssh was not found, or build-box is no SSH host');
+    expect(log.lines.at(-1)).toBe('warn The Docker pipe of the extension on build-box could not reach the Docker engine: ssh was not found');
   });
 
   it('logs a pipe that cannot listen, and tries again at the next serve', async () => {

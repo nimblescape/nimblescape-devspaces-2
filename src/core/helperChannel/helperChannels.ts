@@ -139,9 +139,10 @@ export interface ChannelOpenDeps {
   relay?(target: DockerTarget): RelayAccess | undefined;
   /**
    * BootstrapDocker.run: `docker <args>` without the worker, with the environment of the operation (the engine identity
-   * of the open).
+   * of the open). `withContext` (BootstrapDocker.runWithContext): with the Docker context of the operation also while
+   * the host has the Docker pipe of the extension.
    */
-  runDirect(args: readonly string[], options?: RunOptions): Promise<RunResult>;
+  runDirect(args: readonly string[], options?: RunOptions, withContext?: boolean): Promise<RunResult>;
   logger: Logger;
   /** The content of dist/helperChannel.js. */
   script(): Promise<string>;
@@ -251,9 +252,10 @@ async function openBehindRelay(
  * after the checks), then checks with
  * the operation `probe` that the worker reaches its engine, and that it is the engine of `target`: the engine identity
  * of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a socket mount of another engine,
- * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). While the host has an open
- * connection of the relay, that call goes through it (the Docker pipe of the extension, BootstrapDocker), whose engine
- * passed this check at its own open; else it logs in with the Docker context. The worker reads its identity over
+ * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). For a worker on the open connection
+ * of the engine, that call goes through that connection (the Docker pipe of the extension, BootstrapDocker), whose
+ * engine passed this check at its own open; for a new connection, it logs in with the Docker context (withContext):
+ * the open connection may be the one that the worker could not use. The worker reads its identity over
  * the Engine API (`GET /info`), so both are compared as their values (sameEngine; the Docker CLI prints them as JSON in
  * Go's form, which escapes `<`, `>` and `&`), and the value of the worker is checked (parseProbeValue) as everything
  * that it answers. Throws HelperChannelError('open').
@@ -267,7 +269,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   if (relay !== undefined && shared !== undefined) {
     try {
       const channel = await openWorkerOn(shared, deps.logger, name, WORKER_HELLO_BEHIND_RELAY_MS);
-      await checkChannelEngine(deps, target, name, channel);
+      await checkChannelEngine(deps, target, name, channel, false);
       return channel;
     } catch (error) {
       // The open connection keeps its streams and stays the one of the Docker pipe (its engine passed the checks when
@@ -281,7 +283,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   let opened: RelayConnection | undefined;
   try {
     const channel = await startChannel(deps, target, name, relay, (connection) => (opened = connection));
-    await checkChannelEngine(deps, target, name, channel);
+    await checkChannelEngine(deps, target, name, channel, true);
     if (opened !== undefined) relay?.use(opened);
     return channel;
   } catch (error) {
@@ -320,14 +322,14 @@ async function startChannel(
     return HelperChannel.open(process, script, { logger: deps.logger, name });
   };
   const nameStart = workerNameStart(deps.windowName?.() ?? '', devspace);
-  // The names of the containers of the engine that contain nameStart, with one call without the worker (`,` separates
-  // the names of one container); undefined when the list fails (the last list stays, and the next number is tried
-  // then).
+  // The names of the containers of the engine that contain nameStart, with one call without the worker and with the
+  // Docker context (`,` separates the names of one container); undefined when the list fails (the last list stays, and
+  // the next number is tried then).
   const workerNames = async (): Promise<string[] | undefined> => {
     let detail: string;
     try {
       const result = await runWithDockerTarget(target, () =>
-        deps.runDirect(['ps', '--all', '--filter', `name=${nameStart}`, '--format', '{{.Names}}'], { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }),
+        deps.runDirect(['ps', '--all', '--filter', `name=${nameStart}`, '--format', '{{.Names}}'], { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }, true),
       );
       if (result.exitCode === 0) return result.stdout.split(/[\n,]/).map((line) => line.trim());
       detail = result.timedOut ? 'no answer in time' : result.stderr.trim().slice(-500) || `exit code ${result.exitCode}`;
@@ -376,10 +378,11 @@ async function startChannel(
 }
 
 /**
- * The checks of openHelperChannel after the start: the probe, the engine identity, and the removal of the stopped helper
- * containers in the background. Closes the channel when a check fails.
+ * The checks of openHelperChannel after the start: the probe, the engine identity (`withContext`: read with the Docker
+ * context, ChannelOpenDeps.runDirect), and the removal of the stopped helper containers in the background. Closes the
+ * channel when a check fails.
  */
-async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, name: string, channel: HelperChannel): Promise<void> {
+async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, name: string, channel: HelperChannel, withContext: boolean): Promise<void> {
   let engine: EngineIdentity | undefined;
   try {
     // The parameters of the schema of both sides (none).
@@ -394,7 +397,7 @@ async function checkChannelEngine(deps: ChannelOpenDeps, target: DockerTarget, n
   let direct: EngineIdentity | undefined;
   let directDetail = '';
   try {
-    const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }));
+    const result = await runWithDockerTarget(target, () => deps.runDirect(ENGINE_IDENTITY_ARGS, { timeoutMs: CHANNEL_PROBE_TIMEOUT_MS }, withContext));
     direct = result.exitCode === 0 ? engineIdentity(result.stdout) : undefined;
     directDetail = result.stderr.trim().slice(-500);
   } catch (error) {

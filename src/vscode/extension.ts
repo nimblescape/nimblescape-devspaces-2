@@ -255,8 +255,8 @@ async function activateExtension(
     relayConnection: (host) => relayConnections.get(host),
     dialStdio,
   });
-  // The SSH check before the Docker calls to a remote host; a success counts for a minute per host, and an open
-  // connection of the relay to the host makes it needless.
+  // The SSH check before the Docker calls to a remote host; a success counts for a minute per host, and the Docker pipe
+  // of the extension for the host makes it needless while the calls go through it (they start no `ssh`).
   const sshLogins = new SshLoginCache();
   const remoteDeps = (): RemoteReachabilityDeps => ({
     docker,
@@ -266,7 +266,7 @@ async function activateExtension(
     sshPath: sshPath(),
     env,
     sshLogins,
-    relayOpen: (host) => relayConnections.get(host) !== undefined,
+    viaDockerPipe: (host) => hostPipes?.dockerHost(host) !== undefined,
   });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
@@ -428,7 +428,7 @@ async function activateExtension(
             if (transport === undefined) return undefined;
             return relayAccess(relayConnections, target.host, (command, bundle) => openRelayConnection(runner, transport, command, bundle, { logger, name: target.host }));
           },
-          runDirect: (args, options) => docker.run(args, options),
+          runDirect: (args, options, withContext) => (withContext === true ? docker.runWithContext(args, options) : docker.run(args, options)),
           logger,
           script: workerScript,
           helperTag: async () => helperImageTag(await fs.promises.readFile(helperDockerfile, 'utf8')),
@@ -821,7 +821,9 @@ async function activateExtension(
           dockerEngineAnswers(target, { daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs), ssh: remoteDeps(), logger }, signal),
         ),
       docker,
-      // The connection of the relay too: the removal removes the container of its worker next.
+      // The connection of the relay too: the removal removes the container of its worker next. Its calls after this log
+      // in with the Docker context without a new SSH check: the connection was such a login without questions, and it
+      // carried the calls of the inventory a moment before.
       closeWorker: (target) => {
         channels.close(target);
         if (target.kind === 'remote') relayConnections.close(target.host, 'Devspaces is removed from the engine');

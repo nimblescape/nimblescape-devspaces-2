@@ -224,18 +224,22 @@ export interface SshCheckDeps {
   env: NodeJS.ProcessEnv;
   /** Keeps successes for a while; without it, every check opens a connection. */
   sshLogins?: SshLoginCache;
-  /** True while a connection of the relay to `host` is open (RelayConnections.get); the check is skipped then. */
-  relayOpen?(host: string): boolean;
+  /**
+   * True while the Docker calls of the extension to `host` go through its Docker pipe (HostPipes.dockerHost): the
+   * Docker CLI starts no `ssh` then, so the check is skipped.
+   */
+  viaDockerPipe?(host: string): boolean;
 }
 
 export type SshLoginCheck =
-  | { ok: true; skipped?: 'cached' | 'relayOpen' | 'notAnSshTarget' }
+  | { ok: true; skipped?: 'cached' | 'dockerPipe' | 'notAnSshTarget' }
   | { ok: false; problem: DockerHostProblem; detail: string };
 
 /**
  * The SSH check before a Docker call to `host` (see the module comment): `ssh -o BatchMode=yes -o ConnectTimeout=15 -T
  * [-p port] [-l user] -- <host> true`, without questions. `useCache`: a success of the last SSH_CHECK_CACHE_MS counts,
- * and an open connection of the relay to the host (the test before a switch always connects). A host that is no usable
+ * and so do Docker calls that go through the Docker pipe of the extension (the test before a switch always connects). A
+ * host that is no usable
  * alias or address (for example of a context of the user with a path) is left to the Docker CLI.
  */
 export async function checkSshLogin(
@@ -244,7 +248,7 @@ export async function checkSshLogin(
   options: { signal?: AbortSignal; useCache?: boolean } = {},
 ): Promise<SshLoginCheck> {
   if (options.useCache !== false && deps.sshLogins?.isFresh(host)) return { ok: true, skipped: 'cached' };
-  if (options.useCache !== false && deps.relayOpen?.(host) === true) return { ok: true, skipped: 'relayOpen' };
+  if (options.useCache !== false && deps.viaDockerPipe?.(host) === true) return { ok: true, skipped: 'dockerPipe' };
   const target = sshTargetOf(host);
   if (!target) return { ok: true, skipped: 'notAnSshTarget' };
   if (deps.sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
@@ -304,8 +308,8 @@ export interface RemoteReachabilityDeps {
   env: NodeJS.ProcessEnv;
   /** The successes of the SSH check, per host (one cache for the extension). */
   sshLogins?: SshLoginCache;
-  /** True while a connection of the relay to `host` is open (SshCheckDeps.relayOpen). */
-  relayOpen?(host: string): boolean;
+  /** True while the Docker calls of the extension to `host` go through its Docker pipe (SshCheckDeps.viaDockerPipe). */
+  viaDockerPipe?(host: string): boolean;
 }
 
 /**
