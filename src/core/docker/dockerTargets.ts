@@ -117,11 +117,12 @@ export class DockerTargets {
 
   /**
    * Reads the current target now: the host of the list of Devspaces that it uses, else its local Docker (readLocal).
-   * Never throws.
+   * Without a Docker CLI, the local Docker (LOCAL_DOCKER_TARGET), so that the Docker setup shows: a remote host needs the
+   * CLI of this computer too. Never throws.
    */
   async resolve(): Promise<DockerTarget> {
     const read = ++this.readsStarted;
-    const host = await this.chosenHost();
+    const host = this.docker.isInstalled() ? await this.chosenHost() : undefined;
     const target = host === undefined ? await outsideOperation(() => this.readLocal()) : remoteDockerTarget(host);
     // A read that started before a newer one finished (overlapping reads) does not overwrite what that one found.
     if (read < this.readApplied) return target;

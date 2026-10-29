@@ -534,7 +534,7 @@ async function activateExtension(
   let windowCoordinator: SessionCoordinator | undefined;
   // The engine of a devspace for its heartbeats and for the Docker pipe of its window (resolveHeartbeatEngine, hostEngine).
   const engineSources = {
-    ofHost: (host: string) => outsideOperation(() => targets.ofHost(host)),
+    ofHost: (host: string) => targets.ofHost(host),
     ofContext: (name: string) => outsideOperation(() => targets.ofContext(name)),
   };
   const windowHeartbeats = new WindowHeartbeats({

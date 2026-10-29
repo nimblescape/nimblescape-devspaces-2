@@ -75,22 +75,23 @@ export class RemoteDockerState {
 
   /**
    * Removes `host` from the list; when it is the Docker host of Devspaces, the local Docker takes its place. Its rootless
-   * socket and the devspaces on it stay. True when it was in the list.
+   * socket and the devspaces on it stay. `removed`: it was in the list; `wasDockerHost`: it was the Docker host of
+   * Devspaces (both as found under the lock).
    */
-  async removeHost(host: string): Promise<boolean> {
-    let removed = false;
+  async removeHost(host: string): Promise<{ removed: boolean; wasDockerHost: boolean }> {
+    let result = { removed: false, wasDockerHost: false };
     await this.change((state) => {
-      // Set on each run: after a lost lock, the second run counts (change).
+      // Set on each run: the last run counts (change).
       const hosts = state.remoteHosts ?? [];
-      removed = hosts.includes(host) || state.dockerHost === host;
-      if (!removed) return false;
+      result = { removed: hosts.includes(host) || state.dockerHost === host, wasDockerHost: state.dockerHost === host };
+      if (!result.removed) return false;
       const rest = hosts.filter((entry) => entry !== host);
       if (rest.length > 0) state.remoteHosts = rest;
       else delete state.remoteHosts;
       if (state.dockerHost === host) delete state.dockerHost;
       return true;
     });
-    return removed;
+    return result;
   }
 
   /**
@@ -133,13 +134,15 @@ export class RemoteDockerState {
   }
 
   /**
-   * Changes the file: `update` changes the state that was read and returns whether to write it. The read and the write
-   * run under the lock folder `lockDir`. If another process took over the lock meanwhile (this process stalled longer
-   * than the stale time, see withLockFolder), nothing is written and the whole change runs once more on the current
-   * file, as for registry.json: `update` can run twice, and its last run counts. Throws, and writes nothing, when the
-   * lock is not free within the wait.
+   * Changes the file: `update` changes the state that was read and returns whether to write it. A first run on the file
+   * without the lock decides whether there is anything to write (most calls change nothing, for example the rootful
+   * engine at each Docker start); only then the read and the write run under the lock folder `lockDir`. If another
+   * process took over the lock meanwhile (this process stalled longer than the stale time, see withLockFolder), nothing
+   * is written and the whole change runs once more on the current file, as for registry.json. So `update` runs up to
+   * three times, and its last run counts. Throws, and writes nothing, when the lock is not free within the wait.
    */
   private async change(update: (state: RemoteDockerStateFile) => boolean): Promise<void> {
+    if (!update(await this.read())) return;
     const run = () =>
       withLockFolder(
         this.lockDir,

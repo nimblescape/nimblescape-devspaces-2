@@ -81,6 +81,8 @@ export const RemoteDockerTexts = {
   switchFailed: 'The Docker host of Devspaces could not be changed.',
   /** The title of the choice of the Docker host (the first row of the view). */
   chooseTitle: (host: string) => `Docker host: ${host}`,
+  /** The local Docker in that title while Devspaces cannot use it (the current Docker context is not supported). */
+  localNotSupported: 'Local Docker (not supported now)',
   /** One list of the hosts and the local Docker. */
   choosePlaceholder: 'Choose a host, enter an SSH address, or use the local Docker',
   current: 'current',
@@ -92,7 +94,7 @@ export const RemoteDockerTexts = {
   removePlaceholder: 'Choose the host that Devspaces forgets',
   removed: (host: string, devspaces: number, wasCurrent: boolean) =>
     `${host} is no longer in the list of Devspaces.${
-      devspaces > 0 ? ` ${devspaces === 1 ? 'Its devspace stays' : `Its ${devspaces} devspaces stay`} on that computer: add ${host} again to use ${devspaces === 1 ? 'it' : 'them'}.` : ''
+      devspaces > 0 ? ` ${devspaces === 1 ? 'Its devspace stays' : `Its ${devspaces} devspaces stay`} on that computer: add ${host} again to show ${devspaces === 1 ? 'it' : 'them'} in the sidebar.` : ''
     }${wasCurrent ? ' Devspaces now uses the local Docker.' : ''}`,
   /** The offer of a host of a Docker context or of DOCKER_HOST of the user (offerDockerContextHost). */
   offer: (host: string, context: string | undefined) =>
@@ -103,7 +105,7 @@ export const RemoteDockerTexts = {
 export interface RemoteDockerDeps {
   docker: RemoteDockerCli;
   runner: ProcessRunner;
-  targets: Pick<DockerTargets, 'resolve'>;
+  targets: Pick<DockerTargets, 'resolve' | 'last'>;
   state: RemoteDockerState;
   logger: Logger;
   showLog: () => void;
@@ -166,12 +168,15 @@ export class RemoteDockerCommands {
   async chooseDockerHost(): Promise<void> {
     try {
       const current = await this.deps.state.dockerHost();
+      // The local Docker as the first row shows it (the last read): one that Devspaces cannot use is not marked current.
+      const localSupported = current !== undefined || this.deps.targets.last?.kind !== 'unsupported';
       // One choice: the hosts, the current one marked, and the local Docker last.
       const picked = await this.pickHost({
-        title: RemoteDockerTexts.chooseTitle(describeDockerHost(current ?? '')),
+        title: RemoteDockerTexts.chooseTitle(localSupported ? describeDockerHost(current ?? '') : RemoteDockerTexts.localNotSupported),
         placeHolder: RemoteDockerTexts.choosePlaceholder,
         currentHost: current,
         offerLocal: true,
+        localSupported,
       });
       if (picked === undefined) return;
       if (picked === LOCAL_CHOICE) {
@@ -328,14 +333,19 @@ export class RemoteDockerCommands {
       { title: RemoteDockerTexts.removeTitle, placeHolder: RemoteDockerTexts.removePlaceholder },
     );
     if (picked === undefined) return;
-    await this.deps.state.removeHost(picked.host);
+    // What the file holds now counts, not what was read before the choice (another window may have changed it).
+    const { removed, wasDockerHost } = await this.deps.state.removeHost(picked.host);
+    if (!removed) {
+      this.deps.logger.info(`${picked.host} is not in the list of Devspaces anymore.`);
+      return;
+    }
     const count = await (this.deps.devspaceCount?.(picked.host) ?? Promise.resolve(0)).catch((error: unknown) => {
       this.deps.logger.warn(`The devspaces on ${picked.host} could not be counted: ${errorMessage(error)}`);
       return 0;
     });
     this.deps.logger.info(`${picked.host} was removed from the list of Devspaces (${count} devspaces on it).`);
-    this.inform(RemoteDockerTexts.removed(picked.host, count, picked.host === current));
-    if (picked.host !== current) return;
+    this.inform(RemoteDockerTexts.removed(picked.host, count, wasDockerHost));
+    if (!wasDockerHost) return;
     await this.deps.targets.resolve();
     await this.afterSwitch();
   }
@@ -352,10 +362,10 @@ export class RemoteDockerCommands {
    * A host or a typed SSH address: the hosts of the list of Devspaces, then the other hosts of the SSH config, then the
    * SSH hosts of the Docker contexts of the user (each host once); `currentHost` is marked. "Remove a Host from the
    * List…" when the list has a host. With `offerLocal` (the choice of the first row of the sidebar), the local Docker is
-   * the last entry (LOCAL_CHOICE), marked when no host is current.
+   * the last entry (LOCAL_CHOICE), marked when no host is current and `localSupported` is not false.
    */
   private async pickHost(
-    options: { title?: string; placeHolder?: string; currentHost?: string; offerLocal?: boolean },
+    options: { title?: string; placeHolder?: string; currentHost?: string; offerLocal?: boolean; localSupported?: boolean },
   ): Promise<string | typeof LOCAL_CHOICE | typeof REMOVE_CHOICE | undefined> {
     let entries: SshHostEntry[] = [];
     try {
@@ -392,9 +402,9 @@ export class RemoteDockerCommands {
     if (listed.length > 0) items.push({ label: RemoteDockerTexts.removeHost, remove: true });
     if (options.offerLocal) {
       items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
-      // The local Docker is marked when it is current.
+      // The local Docker is marked when it is current and Devspaces can use it.
       items.push(
-        options.currentHost === undefined
+        options.currentHost === undefined && options.localSupported !== false
           ? { label: `$(check) ${RemoteDockerTexts.useLocal}`, description: RemoteDockerTexts.current, local: true }
           : { label: `$(${MonitorIcons.off}) ${RemoteDockerTexts.useLocal}`, local: true },
       );

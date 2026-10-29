@@ -311,7 +311,7 @@ Your devspaces can run on Docker on another computer, for example a build server
 3. Run **Devspaces: Use a Remote Docker Host…**, or select the first row of the view. The list shows the hosts that Devspaces used before (**Hosts of Devspaces**), the other hosts of your SSH config (`~/.ssh/config`, on Windows `%USERPROFILE%\.ssh\config`, with its `Include` files), and the SSH hosts of your Docker contexts. **Enter an SSH address…** takes `user@host` or `user@host:port` (an IPv6 address in brackets).
 4. Devspaces tests the connection without a question, adds the host to its list, and uses it: "Devspaces now uses Docker on `<host>`."
 5. **Devspaces: Use the Local Docker** goes back to the Docker of your computer. The host stays in the list.
-6. **Remove a Host from the List…** at the end of the list of step 3 removes a host from the list. Its devspaces stay on that computer: add the host again to use them. When Devspaces uses that host, it uses the local Docker afterwards.
+6. **Remove a Host from the List…** at the end of the list of step 3 removes a host from the list. Its devspaces stay on that computer: add the host again to show them in the sidebar. An open window of such a devspace keeps working. When Devspaces uses that host, it uses the local Docker afterwards.
 
 ### What to know
 

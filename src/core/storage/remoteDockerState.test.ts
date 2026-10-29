@@ -42,15 +42,15 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
     await state.setDockerHost('a');
     await state.setDockerHost('b');
     await state.setRootlessSocket('b', '/run/user/1000/docker.sock');
-    await expect(state.removeHost('a')).resolves.toBe(true);
+    await expect(state.removeHost('a')).resolves.toEqual({ removed: true, wasDockerHost: false });
     expect(await state.dockerHost()).toBe('b');
-    await expect(state.removeHost('b')).resolves.toBe(true);
+    await expect(state.removeHost('b')).resolves.toEqual({ removed: true, wasDockerHost: true });
     expect(await state.dockerHost()).toBeUndefined();
     expect(await state.remoteHosts()).toEqual([]);
     expect((await state.read()).remoteHosts).toBeUndefined();
     // The rootless socket of the host stays for its devspaces.
     expect(await state.rootlessSocket('b')).toBe('/run/user/1000/docker.sock');
-    await expect(state.removeHost('b')).resolves.toBe(false);
+    await expect(state.removeHost('b')).resolves.toEqual({ removed: false, wasDockerHost: false });
   });
 
   it('claims the offer of a host once, and never for a host of the list', async () => {
@@ -69,6 +69,17 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
     expect(claims.slice(0, 5).filter((claimed) => claimed === true)).toHaveLength(1);
     expect(await state.read()).toEqual({ dockerHost: 'a', remoteHosts: ['a'], offered: ['me@box'], hosts: [{ host: 'a', rootlessSocket: '/run/user/1000/docker.sock' }] });
     expect(fs.existsSync(state.lockDir)).toBe(false);
+  });
+
+  // Most calls change nothing (the rootful engine at each Docker start, a host that was offered): they take no lock.
+  it('takes the lock only for a change', async () => {
+    await state.setDockerHost('a');
+    fs.mkdirSync(state.lockDir);
+    await state.setDockerHost('a');
+    await state.setRootlessSocket('a', undefined);
+    await expect(state.claimOffer('a')).resolves.toBe(false);
+    await expect(state.removeHost('b')).resolves.toEqual({ removed: false, wasDockerHost: false });
+    fs.rmdirSync(state.lockDir);
   });
 
   it('drops the fields that it does not know, and puts a Docker host that is not listed into the list', async () => {

@@ -83,6 +83,13 @@ describe('DockerTargets.resolve (the Docker host of Devspaces, else the current 
     expect(targets.last).toEqual(remoteDockerTarget('me@box:2222'));
   });
 
+  // A remote host needs the Docker CLI of this computer too: without one, the Docker setup shows (the local Docker).
+  it('reads the local Docker without a Docker CLI, also with a host of its list', async () => {
+    const { targets, choice } = setup({ PATH: '/usr/bin' }, false);
+    choice.host = 'build-box';
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: '' });
+  });
+
   // Devspaces reaches a remote host only through its own list.
   it('does not support a current context of the user that reaches a host over SSH, and names the host', async () => {
     const { targets, cli } = setup();

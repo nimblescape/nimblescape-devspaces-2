@@ -12,7 +12,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, sshTargetOf, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
 import { dockerEndpointUnsupported } from '../core/docker/remoteDocker';
 import { engineInventory, inventoryIsEmpty, removalEndedNote, removeEngineInfrastructure, type EngineInventory, type RemovalResult } from '../core/docker/engineRemoval';
-import { operationDockerTarget, outsideOperation, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
+import { operationDockerTarget, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
 import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
@@ -3206,9 +3206,16 @@ export class Controller implements vscode.Disposable {
     const devspace = await this.deps.registry.get(left.devspaceId).catch(() => undefined);
     if (this.left !== left || this.current || this.disposed) return false;
     if (!devspace || ownerAmong(devspace, accounts) === undefined) return false;
+    let args: ReturnType<Controller['windowArgs']>;
+    try {
+      args = this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository));
+    } catch (error) {
+      this.logger.warn(`The GitHub account of ${left.repository} is signed in again, but the window cannot open it: ${errorMessage(error)}`);
+      return false;
+    }
     this.left = undefined;
     this.logger.info(`The GitHub account of ${left.repository} is signed in again. The window reloads to open it.`);
-    await this.deps.connection.open(...this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository)));
+    await this.deps.connection.open(...args);
     return true;
   }
 
@@ -3919,8 +3926,7 @@ export class Controller implements vscode.Disposable {
 
   /** The target of the Docker host of `devspace` (DockerTargets.ofHost); undefined without Docker targets. */
   private async hostTargetOf(devspace: Devspace): Promise<DockerTarget | undefined> {
-    const targets = this.deps.dockerTargets;
-    return targets === undefined ? undefined : outsideOperation(() => targets.ofHost(dockerHostOf(devspace)));
+    return this.deps.dockerTargets?.ofHost(dockerHostOf(devspace));
   }
 
   /**
@@ -4103,8 +4109,8 @@ export class Controller implements vscode.Disposable {
     }
     const targets = this.deps.dockerTargets;
     if (targets && dockerHostOf(devspace) === '') {
-      // The current context itself, not the one this operation is pinned to (DOCKER_CONTEXT).
-      const current = await outsideOperation(() => targets.ofHost(''));
+      // The current context itself, not the one this operation is pinned to (DOCKER_CONTEXT; ofHost reads it outside).
+      const current = await targets.ofHost('');
       if (current.kind !== 'local') {
         this.logger.warn(`${repository} is not connected: the container runs on the local Docker, and ${unsupportedTargetReason(current)}`);
         return new UserFacingError('otherDockerHost', Messages.otherDockerHostAfterStart(repository, current.host));

@@ -318,6 +318,17 @@ describe('Choose the Docker Host… (the choice of the first row)', () => {
     expect((window.showQuickPick.mock.calls[0][1] as { title: string }).title).toBe('Docker host: the local Docker');
   });
 
+  // As the first row: the local Docker that Devspaces cannot use now (here a Docker context of the user on an SSH host).
+  it('does not mark the local Docker as current while Devspaces cannot use it', async () => {
+    cli.contexts.set('mine', 'ssh://me@mybox');
+    cli.current = 'mine';
+    await state.claimOffer('me@mybox');
+    await targets.resolve();
+    await commands.chooseDockerHost();
+    expect(shown().at(-1)).toEqual([`$(${MonitorIcons.off}) ${RemoteDockerTexts.useLocal}`, undefined]);
+    expect((window.showQuickPick.mock.calls[0][1] as { title: string }).title).toBe('Docker host: Local Docker (not supported now)');
+  });
+
   it('switches to the picked host, says so for the current one, and goes local on "Use the Local Docker"', async () => {
     cli.hosts.set('gpu', engineInfo());
     pick('gpu');
@@ -428,9 +439,9 @@ describe('Remove a Host from the List…', () => {
 
   it('says how many devspaces stay, and that Devspaces uses the local Docker', () => {
     expect(RemoteDockerTexts.removed('box', 0, false)).toBe('box is no longer in the list of Devspaces.');
-    expect(RemoteDockerTexts.removed('box', 1, false)).toBe('box is no longer in the list of Devspaces. Its devspace stays on that computer: add box again to use it.');
+    expect(RemoteDockerTexts.removed('box', 1, false)).toBe('box is no longer in the list of Devspaces. Its devspace stays on that computer: add box again to show it in the sidebar.');
     expect(RemoteDockerTexts.removed('box', 3, true)).toBe(
-      'box is no longer in the list of Devspaces. Its 3 devspaces stay on that computer: add box again to use them. Devspaces now uses the local Docker.',
+      'box is no longer in the list of Devspaces. Its 3 devspaces stay on that computer: add box again to show them in the sidebar. Devspaces now uses the local Docker.',
     );
   });
 });
