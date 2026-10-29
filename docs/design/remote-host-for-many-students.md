@@ -246,3 +246,48 @@ Level 1 on every host. When the students must be strictly separated, for example
 - **Level 3** keeps the images on the disk of each VM, and each VM runs every Linux program. But each VM has an own kernel and an own page cache.
 
 The test with three students on the host decides between them: it runs the classroom image in both levels and measures the RAM, the disk and the time of `npm install`.
+
+## Automatic setup of the host
+
+Hannes runs the host on af.stack of Artfiles, an OpenStack cloud with a REST API, a command-line client and Ansible modules ([af.stack](https://www.artfiles.de/en/cloud/af-stack)). The setup of level 1 is automated in three layers, so that a second host or a rebuilt host is the same as the first.
+
+### Layer 1: the server
+
+OpenTofu with the OpenStack provider, or a Heat template, creates:
+
+- the VM, with a flavor that has enough RAM for the planned number of students;
+- a volume for `/home`, which holds the data of all rootless engines;
+- a swap volume for zswap;
+- a security group that lets in only SSH.
+
+The server gets a short cloud-init file: it adds the key of the admin, installs Ansible and starts layer 2. Whether the images of af.stack run cloud-init needs a check; the standard cloud images of Debian and Ubuntu do.
+
+### Layer 2: the configuration of the host
+
+One Ansible playbook in a Git repository describes the whole host. Each run makes the host match it, so a second run changes nothing. The playbook:
+
+- installs Docker Engine with `docker-ce-rootless-extras`, `uidmap`, `dbus-user-session`, nftables and the quota tools, and gives no student access to the rootful engine (no member in the group `docker`);
+- writes the global user unit `/etc/systemd/user/docker.service` and runs `systemctl --global enable docker`;
+- writes `/etc/systemd/system/user-.slice.d/resources.conf` with `MemoryHigh=`, `MemoryMax=`, `CPUQuota=` and `TasksMax=`;
+- writes the sshd drop-in of [sshd takes the keys from the host service](#sshd-takes-the-keys-from-the-host-service), and `/etc/security/namespace.conf` with pam\_namespace in the PAM files;
+- writes the nftables rules of level 1 for the UID range of the students, for example 20000 to 29999; the host service creates students only in that range;
+- sets the sysctls of level 1, mounts `/proc` with `hidepid=invisible`, and turns on zswap and the quotas of `/home`;
+- creates the folder of the shared VS Code store and its service user;
+- turns on unattended upgrades, with a fixed time outside the lessons for the reboot after a kernel update;
+- installs the host service.
+
+The playbook runs with `ansible-pull` on a systemd timer: the host fetches its configuration from Git itself, in the same way as the host service connects out to the page. No machine outside needs SSH access as root.
+
+### Layer 3: the students
+
+The host service, not Ansible, creates, locks and removes the Linux users and writes their keys, because these follow the management page (see [The life of a student's Linux user](#the-life-of-a-students-linux-user)).
+
+### Tests of the setup
+
+A test host on af.stack, created by layer 1 from the same files, gets each change of the playbook first. A short test then checks the walls of level 1: student A cannot reach a published port of student B, `ps` shows no process of another student, `/tmp` is private, and `docker info` of a student shows a rootless engine. Only then does the course host get the change.
+
+### Open choices of the setup
+
+- Where the playbook lives: a folder `host/` in the Devspaces 2 repository (recommended for now), or a repository of its own, for example `nimblescape/devspaces-host`, once the host service is its own program or the configuration must be private.
+- OpenTofu or Heat for layer 1.
+- The Linux distribution of the host: Debian 13 or Ubuntu 24.04.
