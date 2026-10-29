@@ -2791,6 +2791,31 @@ describe('the question about the Monitor of the engine', () => {
     expect(asked()).toEqual(['build-box', '']);
   });
 
+  // Mutation: a Try again that runs in the ended scope of the failed Start takes the host that Devspaces uses (build-box).
+  it('Try again of a failed Start runs on the Docker host of its devspace', async () => {
+    const target = remoteDockerTarget('build-box');
+    recreateHarness({
+      dockerTargets: {
+        resolve: async () => target,
+        current: async () => operationDockerTarget() ?? target,
+        withOperation: <T,>(fn: () => Promise<T>) => (operationDockerTarget() ? fn() : runWithDockerTarget(target, fn)),
+        ofHost: async (host: string) => (host === '' ? dockerTargetOf('unix:///var/run/docker.sock', 'default') : remoteDockerTarget(host)),
+      } as unknown as ControllerDeps['dockerTargets'],
+    });
+    const local = devspace();
+    await h.registry.add(local);
+    const hosts: Array<string | undefined> = [];
+    h.service.openDevspaceInWorker.mockImplementation(async () => {
+      hosts.push(operationDockerTarget()?.host);
+      if (hosts.length === 1) throw new UserFacingError('buildFailed', Messages.buildFailed, 'log');
+      return openResult(local);
+    });
+    fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
+    await run('start', row('acme/api', local));
+    await settle(() => hosts.length === 2, 'Try again');
+    expect(hosts).toEqual(['', '']);
+  });
+
   // The newest request wins (connect): a Start of the user takes its connect request before its question, so the
   // automatic reopen, whose pipeline ends while the question is open, does not take the window. Mutation: a Start that
   // takes its request only after the question fails it.

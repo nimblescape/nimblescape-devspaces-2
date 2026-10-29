@@ -11,9 +11,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { silentLogger, type Logger } from '../ports';
-import { readJson, writeJsonAtomic } from './atomicJson';
+import { writeJsonAtomic } from './atomicJson';
 import { DEFAULT_LOCK_STALE_MS, DEFAULT_LOCK_TIMEOUT_MS, LockLostError, withLockFolder, type LockTimings } from './lockFolder';
-import { parseJson, readTextFile, retryTransient } from './paths';
+import { parseJson, readJsonTolerant, readTextFile, retryTransient } from './paths';
 
 export interface RemoteDockerHostRecord {
   host: string;
@@ -43,9 +43,13 @@ export class RemoteDockerState {
     this.lockDir = path.join(path.dirname(file), `${path.basename(file, '.json')}.lock`);
   }
 
-  /** The file as it is now; a missing file or one that is not valid knows nothing. A read needs no lock (atomic writes). */
+  /**
+   * The file as it is now; a missing file, one that cannot be read or one that is not valid knows nothing. It parses the
+   * file as the read of a change does (parseJson: a byte order mark is ignored, a transient error is tried again). A read
+   * needs no lock (atomic writes).
+   */
   async read(): Promise<RemoteDockerStateFile> {
-    return normalize(await readJson<unknown>(this.file));
+    return normalize(await readJsonTolerant(this.file));
   }
 
   /** The Docker host of Devspaces: a host of the list, or undefined for the local Docker. */
@@ -171,14 +175,14 @@ export class RemoteDockerState {
 
   /**
    * The file for a change: a transient error of Windows is tried again, and any other error of the read is thrown
-   * (readTextFile), so that a change never writes over a list that it could not read. A file that is not valid JSON
-   * knows nothing (`invalid`: a copy is kept before the write).
+   * (readTextFile), so that a change never writes over a list that it could not read. A file that is not valid (isStateFile)
+   * knows nothing, or only its valid fields (`invalid`: a copy is kept before the write).
    */
   private async readForChange(): Promise<{ state: RemoteDockerStateFile; invalid: boolean }> {
     const text = await readTextFile(this.file);
     if (text === undefined) return { state: {}, invalid: false };
     const value = parseJson(text);
-    return { state: normalize(value), invalid: value === undefined };
+    return { state: normalize(value), invalid: !isStateFile(value) };
   }
 
   /** Keeps a copy of a file that is not valid before a change writes over it: `<file>.backup-<time>`. */
@@ -187,6 +191,16 @@ export class RemoteDockerState {
     await retryTransient(() => fs.promises.copyFile(this.file, copy));
     this.logger.warn(`The list of the remote Docker hosts was not valid, so it counts as empty. A copy was saved as ${copy}.`);
   }
+}
+
+/**
+ * True for the content of a valid file: a JSON object whose Docker host is a string and whose list is a list. Entries of
+ * the list that are not host names, and the other fields, are only dropped (normalize).
+ */
+function isStateFile(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const { dockerHost, remoteHosts } = value as Record<string, unknown>;
+  return (dockerHost === undefined || typeof dockerHost === 'string') && (remoteHosts === undefined || Array.isArray(remoteHosts));
 }
 
 /** A list of host names without repeats or empty entries; undefined when none is left. */

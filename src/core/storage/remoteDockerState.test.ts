@@ -96,6 +96,22 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
     expect(fs.readFileSync(path.join(dir, copies[0]), 'utf8')).toBe('{"remoteHosts": ["a"');
   });
 
+  it('keeps a copy of a file whose list is not a list', async () => {
+    fs.writeFileSync(state.file, '{"remoteHosts": "a"}');
+    await state.setDockerHost('b');
+    expect(await state.read()).toEqual({ dockerHost: 'b', remoteHosts: ['b'] });
+    expect(fs.readdirSync(dir).filter((name) => name.startsWith('remote-docker.json.backup-'))).toHaveLength(1);
+  });
+
+  // An editor of Windows may save the file with a byte order mark: the read and the read of a change agree on it.
+  it('reads a file with a byte order mark', async () => {
+    fs.writeFileSync(state.file, `\uFEFF${JSON.stringify({ dockerHost: 'a', remoteHosts: ['a', 'b'] })}`);
+    expect(await state.read()).toEqual({ dockerHost: 'a', remoteHosts: ['a', 'b'] });
+    await expect(state.removeHost('a')).resolves.toEqual({ removed: true, wasDockerHost: true });
+    expect(await state.read()).toEqual({ remoteHosts: ['b'] });
+    expect(fs.readdirSync(dir).filter((name) => name.startsWith('remote-docker.json.backup-'))).toHaveLength(0);
+  });
+
   it('drops the fields that it does not know, and puts a Docker host that is not listed into the list', async () => {
     fs.writeFileSync(state.file, JSON.stringify({ other: 'x', dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: 'x' }));
     expect(await state.read()).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'] });

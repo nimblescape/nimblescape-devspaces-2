@@ -806,8 +806,6 @@ export class Controller implements vscode.Disposable {
     }
     const accounts = await this.readAccounts();
     const dockerHost = await this.currentDockerHost();
-    // The target of each Docker host, read once for all its operations.
-    const engines = new Map<string, Promise<DockerTarget | undefined>>();
     for (const operation of runnable) {
       if (this.disposed) return;
       // An operation of a devspace of an account that Devspaces does not use is not run by this window; it expires.
@@ -820,8 +818,8 @@ export class Controller implements vscode.Disposable {
       }
       // It runs on the Docker host of its devspace, whatever host Devspaces uses now; not when that host is not supported
       // now (the local Docker set to an endpoint that Devspaces does not use), and it expires.
-      if (target && !engines.has(dockerHostOf(target))) engines.set(dockerHostOf(target), this.hostTargetOf(target));
-      const engine = target ? await engines.get(dockerHostOf(target)) : undefined;
+      // The target is read for each operation: an operation before it may run for minutes, and the local Docker may change.
+      const engine = target ? await this.hostTargetOf(target) : undefined;
       if (target && engine && !isOnDockerHost(target, engine.host)) {
         this.logger.info(`The pending ${operation.operation} of ${operation.devspaceId} is for ${describeDockerHost(dockerHostOf(target))}, which is not supported now. It is not run.`);
         continue;
@@ -2399,15 +2397,19 @@ export class Controller implements vscode.Disposable {
               ),
           }),
         // Try again is a Start: a repository takes the account of a session with a working token, as at the first try;
-        // it opens in the same kind of window as the first try.
+        // it opens in the same kind of window as the first try. A devspace starts on its own Docker host (retryOn), a new
+        // one on the host that Devspaces uses then.
         {
           retry:
             retry ??
-            (async () => {
-              // Nothing when the user cancels a question of the account (repositoryTargetFor).
-              const fresh = await this.refreshedTarget(target, 'start');
-              if (fresh) await this.startTarget(fresh, { window: options.window, source: options.source });
-            }),
+            (() =>
+              outsideOperation(async () => {
+                // Nothing when the user cancels a question of the account (repositoryTargetFor).
+                const fresh = await this.refreshedTarget(target, 'start');
+                if (!fresh) return;
+                const again = () => this.startTarget(fresh, { window: options.window, source: options.source });
+                await (fresh.devspace ? this.withHostOf(fresh.devspace, again) : again());
+              })),
           refused: () => (refused = true),
         },
       );
