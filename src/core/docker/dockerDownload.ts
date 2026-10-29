@@ -10,7 +10,7 @@ import * as https from 'https';
 import { pipeline } from 'stream/promises';
 import { userAgent } from '../http';
 import { abortError } from '../ports';
-import { DOCKER_DOWNLOAD_HOST } from './dockerSetup';
+import { DOCKER_DOWNLOAD_HOST, isHttpsUrlOf } from './dockerSetup';
 
 const MAX_REDIRECTS = 5;
 
@@ -43,6 +43,8 @@ export interface DownloadOptions {
   host?: string;
   /** The SHA-256 (hex) and the size in bytes that the file must have; it is not kept otherwise. */
   expected?: { sha256: string; size: number };
+  /** The redirects that are followed, each within `host`. Default: 5. With 0, a redirect fails the download. */
+  maxRedirects?: number;
   /** The file to write. A partial download is written next to it (`.download`) and removed on failure. */
   target: string;
   signal?: AbortSignal;
@@ -50,16 +52,6 @@ export interface DownloadOptions {
   onProgress?: (received: number, total: number | undefined) => void;
   /** For tests. Default: `nodeHttpsGet`. */
   get?: HttpGet;
-}
-
-/** True for an HTTPS URL of `host` (also the target of a redirect is checked with it). */
-export function isHttpsUrlOf(url: string, host: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'https:' && parsed.hostname === host && parsed.port === '';
-  } catch {
-    return false;
-  }
 }
 
 function header(headers: DownloadResponse['headers'], name: string): string | undefined {
@@ -83,6 +75,7 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
   const signal = options.signal ?? new AbortController().signal;
   const host = options.host ?? DOCKER_DOWNLOAD_HOST;
   const { expected } = options;
+  const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
   if (!isHttpsUrlOf(options.url, host)) throw new Error(`Downloads come only from https://${host}: ${options.url}`);
   // The partial file is always a new file ('wx' below), never one that exists or a link that another program put there.
   // Removed before the request: the body must not start to flow before the pipeline reads it.
@@ -95,8 +88,9 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
     const location = header(response.headers, 'location');
     if (response.statusCode < 300 || response.statusCode >= 400 || !location) break;
     discard(response);
-    if (redirects >= MAX_REDIRECTS) throw new Error(`Too many redirects for ${options.url}.`);
     const next = new URL(location, url).href;
+    if (maxRedirects === 0) throw new Error(`The download of ${options.url} was redirected to ${next}; it takes no redirect.`);
+    if (redirects >= maxRedirects) throw new Error(`Too many redirects for ${options.url}.`);
     // Docker's link of the latest version points to a versioned file of the same host: a redirect never leaves it.
     if (!isHttpsUrlOf(next, host)) {
       throw new Error(`The download of ${options.url} was redirected to ${next}, which is not HTTPS on ${host}.`);

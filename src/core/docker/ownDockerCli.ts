@@ -8,7 +8,7 @@
 // platform are pinned in dockerCliPin.json (written by scripts/docker-cli-pin.mjs: Docker publishes no checksums for
 // these files). The download is checked against the pin before anything is taken out of it, and only the `docker`
 // program is kept: `<global storage>/docker-cli/<version>/docker[.exe]`. A new version comes only with a new version of
-// Devspaces; the folders of other versions are removed. Windows on Arm runs the x86_64 build (Docker publishes no other).
+// Devspaces; the folders of older versions are removed. Windows on Arm runs the x86_64 build (Docker publishes no other).
 // No `vscode`.
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -153,6 +153,8 @@ async function installNow(options: InstallOwnDockerCliOptions, current: DockerCl
         target: archive,
         host: DOCKER_CLI_DOWNLOAD_HOST,
         expected: { size: download.size, sha256: download.sha256 },
+        // The pinned URL is the file itself.
+        maxRedirects: 0,
         signal: options.signal === undefined ? stall.signal : AbortSignal.any([options.signal, stall.signal]),
         onProgress: (received, total) => {
           watch();
@@ -193,7 +195,18 @@ async function isFile(file: string): Promise<boolean> {
   }
 }
 
-/** Removes the folders of the other versions (a link is removed, never what it points to). */
+/** The order of two versions x.y.z: negative when `a` is older. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i];
+  return 0;
+}
+
+/**
+ * Removes the folders of older versions (a link is removed, never what it points to). A newer version stays: an older
+ * version of Devspaces in a window that was not reloaded after an update must not remove the program of the newer one.
+ */
 async function removeOtherVersions(folder: string, version: string, logger: Logger): Promise<void> {
   let names: string[];
   try {
@@ -202,7 +215,7 @@ async function removeOtherVersions(folder: string, version: string, logger: Logg
     return;
   }
   for (const name of names) {
-    if (name === version) continue;
+    if (!/^\d+\.\d+\.\d+$/.test(name) || compareVersions(name, version) >= 0) continue;
     try {
       await fs.promises.rm(path.join(folder, name), { recursive: true, force: true });
       logger.info(`The Docker CLI ${name} of Devspaces was removed.`);

@@ -169,7 +169,10 @@ export interface ControllerDeps {
    * Default: none.
    */
   windowDockerHost?: (devspace: Devspace, containerName: string) => string | undefined;
-  /** Before a window with a Docker pipe (windowDockerHost) opens: installs the Docker CLI of Devspaces. Never rejects. */
+  /**
+   * Before a window with a Docker pipe (windowDockerHost) opens, and before the pending connection file of its open:
+   * installs the Docker CLI of Devspaces. Never rejects.
+   */
   prepareDockerPipeWindow?: () => Promise<void>;
   /** "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
   remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'askAgain' | 'offerSwitchBack'>;
@@ -2572,6 +2575,8 @@ export class Controller implements vscode.Disposable {
         .catch((error: unknown) => this.logger.warn(`The pending connection file could not be removed: ${errorMessage(error)}`));
       throw notReady;
     }
+    // A download of the Docker CLI of the window comes first: the pending connection file is fresh for 2 minutes.
+    await this.prepareWindow(result.devspace, result.containerName);
     await this.deps.coordinator.writePending(result.devspace.id);
     if (request.newWindow) {
       await this.deps.connection.openInNewWindow(...(await this.windowArgs(result.devspace, result.containerName, result.remoteWorkspaceFolder)));
@@ -3200,6 +3205,7 @@ export class Controller implements vscode.Disposable {
     if (!devspace || ownerAmong(devspace, accounts) === undefined) return false;
     this.left = undefined;
     this.logger.info(`The GitHub account of ${left.repository} is signed in again. The window reloads to open it.`);
+    await this.prepareWindow(devspace, left.containerName);
     await this.deps.connection.open(...(await this.windowArgs(devspace, left.containerName, devspace.remoteWorkspaceFolder ?? repositoryFolder(devspace.repository))));
     return true;
   }
@@ -4054,8 +4060,13 @@ export class Controller implements vscode.Disposable {
     } catch (error) {
       this.logger.warn(`The Docker context of ${host} could not be made (${errorMessage(error)}). The window connects through its Docker pipe.`);
     }
-    await this.deps.prepareDockerPipeWindow?.();
     return [containerName, folder, { host: pipe }];
+  }
+
+  /** Before the window of `devspace` opens: the Docker CLI of Devspaces when the window has a Docker pipe. */
+  private async prepareWindow(devspace: Devspace, containerName: string): Promise<void> {
+    if (dockerHostOf(devspace) === '' || this.deps.windowDockerHost?.(devspace, containerName) === undefined) return;
+    await this.deps.prepareDockerPipeWindow?.();
   }
 
   /** The Docker context of the window of `devspace` on `host` (see windowArgs); undefined when DOCKER_HOST decides. */

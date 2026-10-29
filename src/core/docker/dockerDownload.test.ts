@@ -176,4 +176,13 @@ describe('downloadFile with another host and a pinned file', () => {
     await expect(downloadFile({ url: URL_CLI, target, get, host: 'download.docker.com' })).rejects.toThrow('which is not HTTPS on download.docker.com');
     await expect(downloadFile({ url: 'https://download.docker.com:8443/x.tgz', target, host: 'download.docker.com', get: fakeGet({}).get })).rejects.toThrow('Downloads come only');
   });
+
+  it('refuses every redirect with maxRedirects 0, also one on the same host', async () => {
+    const { get, urls } = fakeGet({ [URL_CLI]: () => respond(302, '', { location: '/mac/static/stable/aarch64/docker-9.9.9.tgz' }) });
+    await expect(downloadFile({ url: URL_CLI, target, get, host: 'download.docker.com', maxRedirects: 0 })).rejects.toThrow(
+      `The download of ${URL_CLI} was redirected to https://download.docker.com/mac/static/stable/aarch64/docker-9.9.9.tgz; it takes no redirect.`,
+    );
+    expect(urls).toEqual([URL_CLI]);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
 });

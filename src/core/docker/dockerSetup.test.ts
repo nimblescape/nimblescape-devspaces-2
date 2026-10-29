@@ -7,6 +7,7 @@ import {
   BREW_INSTALL_COMMAND,
   DOCKER_DESKTOP_DOCS_URL,
   DOCKER_DESKTOP_DOWNLOADS,
+  DOCKER_DOWNLOAD_HOST,
   DOCKER_ENGINE_INSTALL_URL,
   DockerContextKeys,
   DockerSetupTexts,
@@ -21,7 +22,7 @@ import {
   hardwareArch,
   installConfirmation,
   installPlan,
-  isOfficialDownloadUrl,
+  isHttpsUrlOf,
   keepWatchingInstall,
   needsMissingCliCheck,
   nextDockerSetupState,
@@ -459,13 +460,14 @@ describe('download links', () => {
     ['https://desktop.docker.com.evil.example/Docker.dmg', false],
     ['https://evil.example/desktop.docker.com/Docker.dmg', false],
     ['https://user@desktop.docker.com/Docker.dmg', true],
+    ['https://desktop.docker.com:8443/Docker.dmg', false],
     ['not a url', false],
   ])('%s is an official download URL: %s', (url, expected) => {
-    expect(isOfficialDownloadUrl(url)).toBe(expected);
+    expect(isHttpsUrlOf(url, DOCKER_DOWNLOAD_HOST)).toBe(expected);
   });
 
   it('lists only official links', () => {
-    for (const url of Object.values(DOCKER_DESKTOP_DOWNLOADS)) expect(isOfficialDownloadUrl(url)).toBe(true);
+    for (const url of Object.values(DOCKER_DESKTOP_DOWNLOADS)) expect(isHttpsUrlOf(url, DOCKER_DOWNLOAD_HOST)).toBe(true);
   });
 });
 

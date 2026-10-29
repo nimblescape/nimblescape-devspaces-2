@@ -141,9 +141,11 @@ describe('installOwnDockerCli', () => {
   const current = pinOf('1.2.3', 'linux-x86_64', archive, 'tgz');
   const url = current.files['linux-x86_64'].url;
 
-  it('downloads the pinned file once for the calls at the same time, keeps only the program, and removes other versions', async () => {
+  it('downloads the pinned file once for the calls at the same time, keeps only the program, and removes older versions', async () => {
     fs.mkdirSync(path.join(folder, '1.0.0'));
     fs.writeFileSync(path.join(folder, '1.0.0', 'docker'), 'old');
+    // A newer version (of a newer Devspaces in another window) and what is no version stay.
+    for (const name of ['1.10.0', 'notes']) fs.mkdirSync(path.join(folder, name));
     const { get, urls } = serving({ [url]: archive });
     const { logger, lines } = logged();
     const options = { folder, platform: 'linux' as const, arch: 'x64', logger, pin: current, get };
@@ -153,7 +155,7 @@ describe('installOwnDockerCli', () => {
     expect(urls).toEqual([url]);
     expect(fs.readFileSync(target)).toEqual(PROGRAM);
     if (process.platform !== 'win32') expect(fs.statSync(target).mode & 0o777).toBe(0o755);
-    expect(fs.readdirSync(folder)).toEqual(['1.2.3']);
+    expect(fs.readdirSync(folder).sort()).toEqual(['1.10.0', '1.2.3', 'notes']);
     expect(fs.readdirSync(path.join(folder, '1.2.3'))).toEqual(['docker']);
     expect(lines).toEqual([
       'The Docker CLI 1.0.0 of Devspaces was removed.',

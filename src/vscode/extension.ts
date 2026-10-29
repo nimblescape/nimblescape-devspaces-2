@@ -12,7 +12,7 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
-import { installOwnDockerCli, ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
+import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
 import { classifyDockerEndpoint, describeDockerHost, dockerHostOf, isOnDockerHost, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
@@ -814,11 +814,8 @@ async function activateExtension(
     // the new window finds it installed. A failure is logged; that window tries again.
     prepareDockerPipeWindow: async () => {
       if (ownDockerCliDownload(platform, process.arch) === undefined) return;
-      try {
-        await installOwnDockerCli({ folder: paths.dockerCliDir, platform, arch: process.arch, logger });
-      } catch (error) {
-        logger.warn(`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be installed before the window opens: ${errorMessage(error)}`);
-      }
+      if (presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) !== undefined) return;
+      await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli, showFailure: false });
     },
     // The Docker pipe of the window of a devspace on an SSH host (docs/architecture.md "The Docker pipe").
     windowDockerHost: (devspace, shownContainer) =>

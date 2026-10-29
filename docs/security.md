@@ -248,7 +248,7 @@ The socket that answers credential requests stays open, and a program in the con
 ## Stored data
 
 - The repository lists (one per GitHub account) and the registry of devspaces in the global storage of the extension hold metadata only: repository names, URLs, dates, volume and image names, image digests, branch names, numbers of changes, and the user ID and login of the account of each devspace.
-- The Docker CLI of Devspaces in `docker-cli/<version>/` of the global storage of the extension, only the program `docker` (`docker.exe` on Windows); Devspaces removes the folders of other versions when it downloads a new one.
+- The Docker CLI of Devspaces in `docker-cli/<version>/` of the global storage of the extension, only the program `docker` (`docker.exe` on Windows); Devspaces removes the folders of older versions when it downloads a new one.
 - The IDs of the GitHub accounts that Devspaces offered once with its notification (see [Accounts](#accounts)), in the state that VS Code keeps for the extension on this computer.
 - `computer.id` in the global storage of the extension: a random ID of this installation, not tied to you or to your GitHub account. The heartbeat records and the lists of images in use in the volume of the Monitor, and the label of a Monitor that keeps running, contain it, so that the Monitor can distinguish the computers that share an engine.
 - The volume of the Monitor on each engine holds heartbeat records, locks, the image references in use, registry answers, and the extension lists of recent opens. It holds no secret, and no dev container mounts it.

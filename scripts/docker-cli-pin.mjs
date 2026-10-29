@@ -59,8 +59,8 @@ async function fileOf(platform, version) {
     hash.update(chunk);
     size += chunk.length;
   }
-  const length = Number(response.headers.get('content-length'));
-  if (Number.isFinite(length) && length !== size) throw new Error(`GET ${url}: ${size} of ${length} bytes`);
+  const length = response.headers.get('content-length');
+  if (length !== null && Number(length) !== size) throw new Error(`GET ${url}: ${size} of ${length} bytes`);
   return { url, size, sha256: hash.digest('hex') };
 }
 
@@ -75,8 +75,9 @@ async function main() {
     }
     return;
   }
-  const given = args.includes('--version') ? args[args.indexOf('--version') + 1] : undefined;
-  if (given !== undefined && !/^\d+\.\d+\.\d+$/.test(given)) throw new Error(`--version needs x.y.z: ${given}`);
+  const at = args.indexOf('--version');
+  const given = at < 0 ? undefined : (args[at + 1] ?? '');
+  if (given !== undefined && !/^\d+\.\d+\.\d+$/.test(given)) throw new Error(`--version needs x.y.z: "${given}"`);
   let version = given;
   if (version === undefined) {
     const lists = await Promise.all(Object.keys(PLATFORMS).map(versionsOf));

@@ -34,6 +34,14 @@ class ChunkReader {
   /** The next `count` bytes, or undefined when the stream ends before. */
   async read(count: number): Promise<Buffer | undefined> {
     if (!(await this.fill(count))) return undefined;
+    const head = this.chunks[0];
+    if (head.length >= count) {
+      // Without a copy of the buffered chunks.
+      if (head.length === count) this.chunks.shift();
+      else this.chunks[0] = head.subarray(count);
+      this.buffered -= count;
+      return head.subarray(0, count);
+    }
     const all = Buffer.concat(this.chunks);
     this.chunks = all.length > count ? [all.subarray(count)] : [];
     this.buffered -= count;
@@ -103,7 +111,11 @@ const MAX_HEADER_RECORD = 64 * 1024;
  * `maxSize`; `target` may then hold a part of it (the caller removes it).
  */
 export async function extractTarGzEntry(archive: string, entry: string, target: string, maxSize: number): Promise<void> {
-  const stream = fs.createReadStream(archive).pipe(zlib.createGunzip());
+  const source = fs.createReadStream(archive);
+  const stream = zlib.createGunzip();
+  // A read error of the archive ends the reader too; both streams close at the end, also when the entry came early.
+  source.on('error', (error) => stream.destroy(error));
+  source.pipe(stream);
   const reader = new ChunkReader(stream[Symbol.asyncIterator]());
   try {
     let longName: string | undefined;
@@ -141,6 +153,7 @@ export async function extractTarGzEntry(archive: string, entry: string, target: 
       if (!(await reader.pass(padded))) throw new Error(`${entry} is not in the archive ${archive}.`);
     }
   } finally {
+    source.destroy();
     stream.destroy();
   }
 }

@@ -6725,8 +6725,9 @@ describe('the Docker host of the current Docker context', () => {
     await run('start', row('acme/api', remoteDevspace()));
     expect(h.connection.open.mock.calls[0]).toEqual(['devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: pipe }]);
     expect(windowDockerHost).toHaveBeenCalledWith(expect.objectContaining({ id: REMOTE_ENV_ID }), 'devspaces-acme-api-a1b2c3d4');
-    // The Docker CLI of Devspaces is installed before the window opens.
+    // The Docker CLI of Devspaces is installed before the pending connection file and before the window opens.
     expect(prepareDockerPipeWindow).toHaveBeenCalledTimes(1);
+    expect(prepareDockerPipeWindow.mock.invocationCallOrder[0]).toBeLessThan(h.coordinator.writePending.mock.invocationCallOrder[0]);
     expect(prepareDockerPipeWindow.mock.invocationCallOrder[0]).toBeLessThan(h.connection.open.mock.invocationCallOrder[0]);
     // The window of a local devspace never asks for one.
     windowDockerHost.mockClear();

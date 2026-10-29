@@ -183,6 +183,8 @@ describe('extractTarGzEntry', () => {
     fs.writeFileSync(target, 'kept');
     await expect(extractTarGzEntry(write('f.tgz', tarGz([{ name: 'docker/docker', data: CLI }])), 'docker/docker', target, CLI.length)).rejects.toThrow();
     expect(fs.readFileSync(target, 'utf8')).toBe('kept');
+    // An archive that cannot be read (here a folder) fails the reader, instead of an error that nobody hears.
+    await expect(extractTarGzEntry(dir, 'docker/docker', path.join(dir, 'other'), CLI.length)).rejects.toMatchObject({ code: 'EISDIR' });
   });
 });
 
