@@ -175,6 +175,11 @@ export interface BootstrapDockerOptions {
    * the Docker context of the operation. Not for the start of the worker (`start`), whose standard input stays open.
    */
   dockerPipe?: (target: DockerTarget) => string | undefined;
+  /**
+   * The target of the current Docker context as it was read last (DockerTargets.last), only for the log line of a call
+   * outside an operation that logs in to an SSH host.
+   */
+  lastTarget?: () => DockerTarget | undefined;
   /** Only for tests. Default: SSH_DROP_RETRY_DELAY_MS. */
   sshDropRetryDelayMs?: number;
   /** Only for tests. Default: cliFileIdentity. */
@@ -223,6 +228,7 @@ export class BootstrapDocker {
   private readonly onCliLost: BootstrapDockerOptions['onCliLost'];
   private readonly onCliFound: BootstrapDockerOptions['onCliFound'];
   private readonly dockerPipe: BootstrapDockerOptions['dockerPipe'];
+  private readonly lastTarget: BootstrapDockerOptions['lastTarget'];
   private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
   private readonly fileIdentity: (path: string) => Promise<string | undefined>;
@@ -256,6 +262,7 @@ export class BootstrapDocker {
     this.onCliLost = options.onCliLost;
     this.onCliFound = options.onCliFound;
     this.dockerPipe = options.dockerPipe;
+    this.lastTarget = options.lastTarget;
     this.sshDropRetryDelayMs = options.sshDropRetryDelayMs ?? SSH_DROP_RETRY_DELAY_MS;
     this.fileIdentity = options.fileIdentity ?? cliFileIdentity;
     // The caller has just looked the CLI up.
@@ -329,7 +336,7 @@ export class BootstrapDocker {
       // The environment after the lookup: a CLI that was found again has its own (dockerProcessEnv).
       const call = options.env === undefined ? this.callEnv(viaPipe) : { env: options.env };
       // Each such call is one SSH login of the Docker CLI (`ssh … docker system dial-stdio`), which SSH servers limit.
-      if (call.login !== undefined) this.logger.info(`docker ${dockerCommandWords(args).join(' ')} logs in to ${call.login} with the Docker context.`);
+      if (call.login !== undefined) this.logger.info(`${commandText(args)} logs in to ${call.login} with the Docker context${call.outside ? ' (outside an operation)' : ''}.`);
       return await this.runner.run(dockerPath, args, { ...options, env: call.env });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
@@ -370,10 +377,17 @@ export class BootstrapDocker {
     return this.callEnv(viaPipe).env;
   }
 
-  /** operationEnv, and the SSH host that a call with it logs in to with the Docker context (a remote target without the pipe). */
-  private callEnv(viaPipe: boolean): { env: NodeJS.ProcessEnv; login?: string } {
+  /**
+   * operationEnv, and the SSH host that a call with it logs in to with the Docker context: the remote target of the
+   * operation without the pipe, or outside an operation (`outside`) the remote target of the current Docker context as
+   * it was read last (lastTarget).
+   */
+  private callEnv(viaPipe: boolean): { env: NodeJS.ProcessEnv; login?: string; outside?: true } {
     const target = operationDockerTarget();
-    if (target === undefined) return { env: this.env };
+    if (target === undefined) {
+      const last = this.lastTarget?.();
+      return last?.kind === 'remote' ? { env: this.env, login: last.host, outside: true } : { env: this.env };
+    }
     const pipe = viaPipe && target.kind === 'remote' ? this.pipeOf(target) : undefined;
     if (pipe !== undefined) {
       const env: NodeJS.ProcessEnv = { ...this.env };

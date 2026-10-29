@@ -209,6 +209,8 @@ async function activateExtension(
   const docker = new BootstrapDocker(runner, dockerPath, env, logger, platform, {
     ...adapterOptions,
     dockerPipe: (target) => hostPipes?.dockerHost(target.host),
+    // Only for the log line of a call outside an operation that logs in to an SSH host (targets is set right below).
+    lastTarget: () => targets.last,
     onCliFound: shareDockerFolder,
     onDaemonStatus: (running) => {
       if (running && !daemonRunning) helperChannels?.clearFailures();

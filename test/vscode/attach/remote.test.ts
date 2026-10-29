@@ -38,9 +38,9 @@ const LOGINS_WAIT_MS = 90_000;
 const SESSION_TEXT_LENGTH = 200;
 /**
  * The lines of the Devspaces log that the timeline shows next to the logins: the Docker calls that log in with the
- * Docker context, and the connections of the relay and the Docker pipes.
+ * Docker context, the connections of the relay, and the Docker pipes (also the requests that they log).
  */
-const LOGIN_LOG_LINE = /logs? in|SSH login|without the connection of the relay|The connection to \S+ (is open|could not be opened)|Docker pipe of .* listens/;
+const LOGIN_LOG_LINE = /logs? in|SSH login|without the connection of the relay|The connection to \S+ (is open|could not be opened)|Docker pipe of /;
 /** The most lines of the Devspaces log in the timeline. */
 const LOGIN_LOG_LINES = 60;
 

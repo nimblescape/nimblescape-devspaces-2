@@ -9,7 +9,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { BootstrapDocker } from './bootstrapDocker';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames } from './dockerHost';
+import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames, type DockerTarget } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 
 const OK: RunResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false };
@@ -81,14 +81,24 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     const lines: string[] = [];
     const logger: Logger = { ...silentLogger, info: (message) => lines.push(message) };
     let pipe: string | undefined;
-    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', { dockerPipe: () => pipe });
+    let last: DockerTarget | undefined;
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', { dockerPipe: () => pipe, lastTarget: () => last });
     await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
     pipe = PIPE;
     await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
-    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info']));
+    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info', '--format', '{{json .ID}}']));
     await runWithDockerTarget(LOCAL_DOCKER_TARGET, () => docker.run(['image', 'inspect', 'x']));
     await docker.run(['image', 'inspect', 'x']);
-    expect(lines).toEqual(['docker image inspect logs in to build-box with the Docker context.', 'docker info logs in to build-box with the Docker context.']);
+    last = LOCAL_DOCKER_TARGET;
+    await docker.run(['image', 'inspect', 'x']);
+    // Outside an operation, the Docker CLI uses the current Docker context, the one of the last read.
+    last = REMOTE;
+    await docker.run(['info']);
+    expect(lines).toEqual([
+      'docker image inspect x logs in to build-box with the Docker context.',
+      'docker info --format {{json .ID}} logs in to build-box with the Docker context.',
+      'docker info logs in to build-box with the Docker context (outside an operation).',
+    ]);
   });
 
   it('starts the worker (standard input open) never through the pipe', async () => {
