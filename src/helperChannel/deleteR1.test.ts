@@ -86,7 +86,7 @@ function run(setup: Setup = {}, params: Record<string, unknown> = {}) {
   const engine: DockerEngine = {
     ...unusedEngine(),
     version: async () => ({ apiVersion: '1.48', version: '29.0.0' }),
-    containers: async (label) => (engineCalls.push(`containers ${label}`), containers.filter((c) => label === LABEL_DEVSPACE_ID || label === `${LABEL_DEVSPACE_ID}=${ID}`)),
+    containers: async (label) => (engineCalls.push(`containers ${label}`), containers.filter(() => label === LABEL_DEVSPACE_ID || label === `${LABEL_DEVSPACE_ID}=${ID}`)),
     container: async (reference) => containers.find((c) => c.name === reference || c.id === reference),
     containerIds: async () => [],
     stop: async (container) => void engineCalls.push(`stop ${container}`),

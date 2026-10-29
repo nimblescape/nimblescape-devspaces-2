@@ -69,7 +69,7 @@ export function engineMonitor(engine: DockerEngine): MonitorEngine {
         return monitorInspected(await limited(REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal, (limit) => engine.inspect('container', name, limit)));
       } catch (error) {
         if (isAbortError(error) && signal?.aborted) throw error;
-        throw new Error(`docker container inspect failed: ${errorMessage(error)}`);
+        throw new Error(`docker container inspect failed: ${errorMessage(error)}`, { cause: error });
       }
     },
 
@@ -92,7 +92,7 @@ export function engineMonitor(engine: DockerEngine): MonitorEngine {
         if (isAbortError(error) && signal?.aborted) throw error;
         // Another window removes it right now.
         if (error instanceof EngineError && REMOVAL_IN_PROGRESS.test(error.message)) return;
-        throw new Error(`docker rm failed: ${errorMessage(error)}`);
+        throw new Error(`docker rm failed: ${errorMessage(error)}`, { cause: error });
       }
     },
 
@@ -101,7 +101,7 @@ export function engineMonitor(engine: DockerEngine): MonitorEngine {
         await limited(REMOTE_MONITOR_DOCKER_TIMEOUT_MS, signal, (limit) => engine.start(id, limit));
       } catch (error) {
         if (isAbortError(error) && signal?.aborted) throw error;
-        throw new Error(`docker start failed: ${errorMessage(error)}`);
+        throw new Error(`docker start failed: ${errorMessage(error)}`, { cause: error });
       }
     },
 

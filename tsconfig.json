@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT
+// © 2026 Hannes Stauss (scalarion@nimblescape.com)
+// Licensed under the MIT License. See LICENSE in the repository root for details.
+
+// The type check (npm run typecheck) with TypeScript 6.0, the same in every nimblescape extension: strict, and no
+// output, because esbuild builds the bundles. ESLint (npm run lint) reads the types of the same files.
 {
   "compilerOptions": {
     "target": "ES2022",
@@ -7,14 +13,12 @@
     "types": ["node"],
     "strict": true,
     "noEmit": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
     "noImplicitOverride": true,
     "noUnusedLocals": true,
-    "noFallthroughCasesInSwitch": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true
+    "noFallthroughCasesInSwitch": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

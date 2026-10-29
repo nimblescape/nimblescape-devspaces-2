@@ -451,7 +451,7 @@ export class HelperChannel {
    */
   private write(line: string): boolean {
     if (this.state === 'closed') return false;
-    let written = false;
+    let written: boolean;
     try {
       written = this.process.write(line);
     } catch {

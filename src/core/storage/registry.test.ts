@@ -164,7 +164,7 @@ describe('DevspaceRegistry reading', () => {
   });
 
   it('ignores a byte order mark', async () => {
-    writeRaw(`﻿${JSON.stringify({ version: 1, devspaces: [devspace(ID_A, 'o/r')] })}`);
+    writeRaw(`\uFEFF${JSON.stringify({ version: 1, devspaces: [devspace(ID_A, 'o/r')] })}`);
     await expect(new DevspaceRegistry(paths).list()).resolves.toHaveLength(1);
   });
 

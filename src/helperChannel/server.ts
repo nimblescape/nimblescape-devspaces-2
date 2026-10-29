@@ -212,7 +212,7 @@ export class ChannelServer {
       });
     }
     if (line.length - 1 > MAX_SERVER_LINE) return;
-    let written = false;
+    let written: boolean;
     try {
       written = this.deps.write(line);
     } catch {

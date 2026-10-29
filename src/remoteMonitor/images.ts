@@ -536,7 +536,7 @@ export class ImageMaintenance {
     try {
       listed = await this.deps.engine.images({}, AbortSignal.timeout(IMAGE_LIST_TIMEOUT_MS));
     } catch (error) {
-      throw new Error(`the list of the images failed: ${engineFailure(error, IMAGE_LIST_TIMEOUT_MS)}`);
+      throw new Error(`the list of the images failed: ${engineFailure(error, IMAGE_LIST_TIMEOUT_MS)}`, { cause: error });
     }
     const byRepository = new Map<string, LocalImage[]>();
     for (const image of localImagesOf(listed)) {

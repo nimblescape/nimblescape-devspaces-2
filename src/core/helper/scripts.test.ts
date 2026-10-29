@@ -479,7 +479,7 @@ describe('COMPOSE_MODEL_SCRIPT with a fake docker', () => {
       '  *"-p devspaces-probe"*) cat > /dev/null; printf \'%s\\n\' "$FAKE_PROBE"; exit 0 ;;',
       'esac',
       `printf '%s\\n' "$PWD" "$COMPOSE_PROJECT_NAME" "$@" > '${argsFile}'`,
-      'if [ -n "\${FAKE_ERROR:-}" ]; then printf \'%s\\n\' "$FAKE_ERROR" >&2; exit 15; fi',
+      'if [ -n "${FAKE_ERROR:-}" ]; then printf \'%s\\n\' "$FAKE_ERROR" >&2; exit 15; fi',
       'printf \'%s\\n\' "$FAKE_MODEL"',
     ].join('\n');
     write(path.join(dir, 'bin', 'docker'), `${fake}\n`);

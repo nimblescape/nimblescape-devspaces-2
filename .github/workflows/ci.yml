@@ -2,35 +2,34 @@
 # © 2026 Hannes Stauss (scalarion@nimblescape.com)
 # Licensed under the MIT License. See LICENSE in the repository root for details.
 
-# Test the extension and build its package for every push to main and every
-# pull request, on the pinned Node.js 24 release (.node-version); VS Code 1.125
+# Test the extension and build its package for every push to main and every pull
+# request, on the pinned Node.js 24 release (.node-version); VS Code 1.125
 # (engines.vscode) and later run extensions on Node.js 24 too. The job "test"
-# installs the locked development tools, checks the types, runs the unit tests,
-# and packages the VSIX with vsce. The helper container runs its scripts as root
-# on the files of other users, and the tests of that behavior need root (chown
-# to other users, mknod, mount --bind), so the job "test as root" runs the unit
-# tests again as root; the job "test" runs them as a user without root, as some
-# tests need. The job "every test ran" fails when a test is skipped in both
-# runs, so no test stops running unseen. The job "docker" runs the integration
-# tests against the Docker Engine of the runner, in three groups of test files
-# side by side, each on a runner of its own. The job "vscode" runs the
-# tests in a real VS Code (stable) with the Dev Containers extension on Linux,
-# Windows and macOS, against the packaged VSIX and on Linux also against the
-# development build. The job "vscode attach" starts VS Code in the windows of
-# containers on the Docker Engine of the runner, through the real Dev
-# Containers extension, the job "vscode attach remote" in the window of a
+# installs the locked development tools, checks the types and the code (ESLint),
+# runs the unit tests, and packages the VSIX with vsce. The helper container
+# runs its scripts as root on the files of other users, and the tests of that
+# behavior need root (chown to other users, mknod, mount --bind), so the job
+# "test as root" runs the unit tests again as root; the job "test" runs them as
+# a user without root, as some tests need. The job "every test ran" fails when a
+# test is skipped in both runs, so no test stops running unseen. The job
+# "docker" runs the integration tests against the Docker Engine of the runner,
+# in three groups of test files side by side, each on a runner of its own. The
+# job "vscode" runs the tests in a real VS Code (stable) with the Dev Containers
+# extension on Linux, Windows and macOS, against the packaged VSIX and on Linux
+# also against the development build. The job "vscode attach" starts VS Code in
+# the windows of containers on the Docker Engine of the runner, through the real
+# Dev Containers extension, the job "vscode attach remote" in the window of a
 # devspace on a Docker Engine over SSH, and the job "vscode update" in the
 # window of a devspace before and after the update from the last released
-# version. The VSIX of the job "test" stays a
-# workflow artifact for inspection. This workflow publishes nothing: the
-# release workflow calls it for the commit of a version and publishes the VSIX
-# of that call. A push or a pull request that changes only documentation,
-# Markdown files and the files of docs/, starts no run; the release calls this
-# workflow for each version, where these path filters do not apply. A change
-# of this file changes the release process: its pull request needs a dry run
-# (rule 4). The workflow "VS Code versions" calls it
-# once per week with another VS Code version for the VS Code jobs; such a call
-# runs only the job "test", for the VSIX, and the VS Code jobs.
+# version. The VSIX of the job "test" stays a workflow artifact for inspection.
+# This workflow publishes nothing: the release workflow calls it for the commit
+# of a version and publishes the VSIX of that call. A push or a pull request
+# that changes only documentation, Markdown files and the files of docs/, starts
+# no run; the release calls this workflow for each version, where these path
+# filters do not apply. A change of this file changes the release process: its
+# pull request needs a dry run (rule 4). The workflow "VS Code versions" calls
+# it once per week with another VS Code version for the VS Code jobs; such a
+# call runs only the job "test", for the VSIX, and the VS Code jobs.
 
 name: CI
 
@@ -87,6 +86,9 @@ jobs:
 
       - name: Check the types
         run: npm run typecheck
+
+      - name: Check the code with ESLint
+        run: npm run lint
 
       # The reporters default and github-actions are those of vitest on GitHub; json keeps the results for the job
       # "every test ran".

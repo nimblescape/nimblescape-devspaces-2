@@ -849,7 +849,7 @@ const main = () => {
   const result = { configText };
   let config;
   try {
-    config = JSON.parse(stripJsonc(configText.replace(/^﻿/, '')));
+    config = JSON.parse(stripJsonc(configText.replace(/^\uFEFF/, '')));
   } catch {
     return result;
   }

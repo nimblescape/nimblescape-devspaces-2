@@ -508,7 +508,7 @@ export class RemoteMonitorLoop {
     try {
       listed = await this.deps.engine.containerSummaries(`${LABEL_DEVSPACE_ID}=${devspaceId}`, AbortSignal.timeout(LIST_TIMEOUT_MS));
     } catch (error) {
-      throw new Error(`its containers could not be listed again. ${engineFailure(error, LIST_TIMEOUT_MS)}`);
+      throw new Error(`its containers could not be listed again. ${engineFailure(error, LIST_TIMEOUT_MS)}`, { cause: error });
     }
     const records = (await readRecords(this.deps.dir)).filter((record) => record.devspaceId === devspaceId);
     const now = this.deps.now();
@@ -841,13 +841,13 @@ export class UnusedEnd {
     try {
       ids = await engine.containerIds({ label: [`${LABEL_MONITOR_CREATE}=${createId}`] }, AbortSignal.timeout(UNUSED_END_TIMEOUT_MS));
     } catch (error) {
-      throw new Error(`its container could not be listed: ${engineFailure(error, UNUSED_END_TIMEOUT_MS)}`);
+      throw new Error(`its container could not be listed: ${engineFailure(error, UNUSED_END_TIMEOUT_MS)}`, { cause: error });
     }
     if (ids.length !== 1) throw new Error(`${ids.length} containers have the nonce of its create`);
     try {
       await engine.updateRestartPolicy(ids[0], policy, AbortSignal.timeout(UNUSED_END_TIMEOUT_MS));
     } catch (error) {
-      throw new Error(`its restart policy could not be changed: ${engineFailure(error, UNUSED_END_TIMEOUT_MS)}`);
+      throw new Error(`its restart policy could not be changed: ${engineFailure(error, UNUSED_END_TIMEOUT_MS)}`, { cause: error });
     }
   }
 }

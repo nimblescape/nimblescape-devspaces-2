@@ -488,7 +488,7 @@ async function activateExtension(
     { scope: () => getSettings().owners },
   );
   const ui = new VsCodePipelineUi(auth, logger, () => logger.show(), systemClock, () => getSettings().updateContainer ?? 'notify');
-  const sessionCoordinator = new SessionCoordinator({
+  const sessionCoordinator: SessionCoordinator = new SessionCoordinator({
     paths,
     sessionFiles,
     logger,
