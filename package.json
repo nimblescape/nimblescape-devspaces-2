@@ -379,11 +379,6 @@
         "category": "Devspaces"
       },
       {
-        "command": "devspaces.askAgainDockerHost",
-        "title": "Ask Again Before Changing the Docker Host",
-        "category": "Devspaces"
-      },
-      {
         "command": "devspaces.rowActivated",
         "title": "Start on Double-Click",
         "category": "Devspaces"

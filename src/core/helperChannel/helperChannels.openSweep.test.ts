@@ -6,13 +6,13 @@
 // worker. They check the time limit of what the open sends, and what an open that fails sends; each probe names its
 // mutant.
 import { describe, expect, it, vi } from 'vitest';
-import { dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import { silentLogger, type StartedProcess } from '../ports';
 import { HelperChannelError } from './helperChannel';
 import { CHANNEL_PROBE_TIMEOUT_MS, openHelperChannel } from './helperChannels';
 import { CHANNEL_PROTOCOL_VERSION, encodeMessage, parseClientMessage } from './protocol';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('build-box');
 /** The engine identity as the extension's Docker CLI prints it (ENGINE_IDENTITY_ARGS), and as the worker answers it. */
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
 const ENGINE_IDENTITY = { id: '7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11', rootDir: '/var/lib/docker' };

@@ -27,7 +27,7 @@ const HEADING = 'What Devspaces does on your computer';
 const SECURITY_LINK = 'https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/security.md#what-devspaces-does-on-your-computer';
 const read = (file: string) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 // What a start of VS Code does before the first devspace, and that a registry is asked without a login first.
-const FIRST_USE_AND_LOGINS = ['Before your first devspace, Devspaces only reads the current Docker context when VS Code starts.', 'first without a login'];
+const FIRST_USE_AND_LOGINS = ['Before your first devspace, Devspaces only reads its Docker host and, for the local Docker, the current Docker context when VS Code starts.', 'first without a login'];
 // The background container: the question before it keeps running, its end after 30 days, and the command that removes
 // it (the title in package.json).
 const REMOVE_COMMAND = 'Remove Devspaces from This Docker Engine…';
@@ -143,7 +143,7 @@ describe('the behaviors of Devspaces at the top of the Marketplace page', () => 
     expect(text).toContain('(https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#uninstall)');
   });
 
-  it('has the section Uninstall in the user guide, with the commands that the log names and the Docker contexts', () => {
+  it('has the section Uninstall in the user guide, with the commands that the log names and the files of Devspaces', () => {
     const { contributes } = JSON.parse(read('package.json')) as { contributes: { commands: Array<{ command: string; title: string }> } };
     expect(contributes.commands.find((command) => command.command === 'devspaces.removeFromDockerEngine')?.title).toBe(REMOVE_COMMAND);
     const guide = read('docs/guide.md');
@@ -152,7 +152,7 @@ describe('the behaviors of Devspaces at the top of the Marketplace page', () => 
     expect(text).toContain(`**Devspaces: ${REMOVE_COMMAND}**`);
     for (const volume of SHARED_VOLUMES) expect(text).toContain(`\`${volume}\``);
     for (const command of uninstallCommands()) expect(text).toContain(command);
-    for (const words of ['docker context rm', 'Devspaces: remote Docker host', 'globalStorage/nimblescape.nimblescape-devspaces-2']) expect(text).toContain(words);
+    for (const words of ['Devspaces creates no Docker context', 'globalStorage/nimblescape.nimblescape-devspaces-2']) expect(text).toContain(words);
   });
 
   it('names the scopes, Docker, the Dev Containers CLI and the background container in the description', () => {

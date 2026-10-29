@@ -24,8 +24,7 @@
 // of another nor piles up calls; each attempt (send, repair, send) is bounded by HEARTBEAT_ATTEMPT_DEADLINE_MS (an
 // AbortSignal for `send` and `repair`, and a race): an attempt past it counts as a failure towards that warning, and
 // while it still hangs, each due heartbeat of that engine counts as one more failure without a new call. The engine of
-// the connected devspace is the one of this window's own Docker context (`engineFor` with `connected`); when it
-// cannot be found, each tick counts as a failed heartbeat and the warning fires as for any other failure. After a
+// the connected devspace is the one of its Docker host (`engineFor` with `connected`); when it cannot be found, each tick counts as a failed heartbeat and the warning fires as for any other failure. After a
 // failed repair, further repairs of that engine wait REPAIR_BACKOFF_MS (1, 2, then 5 minutes) while the plain heartbeat
 // is still sent; a success resets it.
 //
@@ -59,7 +58,7 @@
 // monitor does not write over the newer record (SEQ_ORDER_WINDOW_MS). No `vscode`; never throws (except from a `deps`
 // call that throws, which a tick logs).
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
-import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, sameDockerHost, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
+import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, sameDockerHost, type DockerTarget } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { Messages } from '../messages';
 import { systemClock, type Clock, type Logger } from '../ports';
@@ -110,10 +109,9 @@ export interface WindowHeartbeatsDeps {
   /** The id of this computer (`computer.id`), the source of the heartbeats. */
   sourceId: () => string;
   /**
-   * The Docker engine of a devspace as this window uses it; undefined when it cannot be found from here. For the
-   * devspace this window is connected to (`use.connected`), the engine of this window's own Docker context, never
-   * the global current one; for one it is busy with, the engine of the operation. Asked once per devspace and role;
-   * the answer is kept while the window uses it.
+   * The Docker engine of a devspace as this window uses it; undefined when it cannot be found from here: the engine of
+   * its Docker host, whatever host Devspaces uses now (resolveHeartbeatEngine). Asked once per devspace and role
+   * (`use.connected`: the devspace this window is connected to); the answer is kept while the window uses it.
    */
   engineFor: (devspace: Devspace, use: { connected: boolean }) => Promise<DockerTarget | undefined>;
   /**
@@ -221,32 +219,20 @@ export function repairBackoffMs(failures: number): number {
 
 /** What resolveHeartbeatEngine reads. */
 export interface HeartbeatEngineSources {
-  /** The Docker context of this window (its authority, as in its status file), when this window shows `devspace`. */
-  windowContext: (devspace: Devspace) => string | undefined;
-  /** The current Docker target (the global current context, or DOCKER_HOST). */
-  current: () => Promise<DockerTarget>;
+  /** The target of a Docker host ('' = the local Docker), whatever host Devspaces uses now (DockerTargets.ofHost). */
+  ofHost: (host: string) => Promise<DockerTarget>;
   /** The target of a named Docker context (DockerTargets.ofContext); undefined when it cannot be read. */
   ofContext: (name: string) => Promise<DockerTarget | undefined>;
-  /** The existing Docker context of an SSH host (findRemoteContext); undefined when there is none or it fails. */
-  remoteContext: (host: string) => Promise<string | undefined>;
 }
 
 /**
- * The engine of `devspace` for its heartbeats (WindowHeartbeatsDeps.engineFor). For the connected devspace, the
- * engine of this window's own Docker context, also for a local devspace, never the global current context when the
- * window has its own (another window may have switched that to another host); undefined when that context is not on the
- * host of the devspace. A window without its own context takes the current target when it is on the host of the
- * devspace, else for an SSH host the context of "Use a Remote Docker Host…" (undefined when it cannot be had) and
- * for the local Docker the context `default`. A devspace this window is only busy with (an operation runs on it)
- * takes the current target when it is on its host, else for an SSH host that context; else undefined.
+ * The engine of `devspace` for its heartbeats (WindowHeartbeatsDeps.engineFor): the engine of its Docker host, whatever
+ * host Devspaces uses now (hostEngine). For the local Docker, when the current Docker context is not local anymore, the
+ * connected devspace takes the context `default` when that is local (the window still runs on the local engine); a
+ * devspace this window is only busy with (an operation runs on it) takes nothing then.
  */
 export async function resolveHeartbeatEngine(devspace: Devspace, use: { connected: boolean }, sources: HeartbeatEngineSources): Promise<DockerTarget | undefined> {
   const host = dockerHostOf(devspace);
-  const own = use.connected ? sources.windowContext(devspace) : undefined;
-  if (own !== undefined) {
-    const target = await sources.ofContext(own);
-    return target !== undefined && target.kind !== 'unsupported' && isOnDockerHost(devspace, target.host) ? target : undefined;
-  }
   const target = await hostEngine(host, sources);
   if (target !== undefined || host !== '' || !use.connected) return target;
   const local = await sources.ofContext(DEFAULT_CONTEXT_NAME);
@@ -254,15 +240,12 @@ export async function resolveHeartbeatEngine(devspace: Devspace, use: { connecte
 }
 
 /**
- * The engine on the Docker host `host` ('' = the local Docker) without the context of a window: the current target when
- * it is on the host, else for an SSH host its existing context; else undefined.
+ * The engine on the Docker host `host` ('' = the local Docker): a host of the list over SSH, or the local Docker when the
+ * current Docker context is local; else undefined.
  */
-export async function hostEngine(host: string, sources: Pick<HeartbeatEngineSources, 'current' | 'remoteContext'>): Promise<DockerTarget | undefined> {
-  const current = await sources.current();
-  if (current.kind !== 'unsupported' && sameDockerHost(host, current.host)) return current;
-  if (host === '') return undefined;
-  const context = await sources.remoteContext(host);
-  return context === undefined ? undefined : { kind: 'remote', host, endpoint: sshEndpoint(host), context };
+export async function hostEngine(host: string, sources: Pick<HeartbeatEngineSources, 'ofHost'>): Promise<DockerTarget | undefined> {
+  const target = await sources.ofHost(host);
+  return target.kind !== 'unsupported' && sameDockerHost(host, target.host) ? target : undefined;
 }
 
 export class WindowHeartbeats {
@@ -366,7 +349,7 @@ export class WindowHeartbeats {
   /**
    * The short release of `devspaceId`, which this window leaves (it closes, or switches to another devspace): one
    * heartbeat with `limitSeconds` and the keep-running flag of its entry, to the engine this window used it on as its
-   * connected devspace (its own Docker context), with the repair of `send`. Ends when `signal` aborts (then a
+   * connected devspace, with the repair of `send`. Ends when `signal` aborts (then a
    * failure; the long limit of the last heartbeat stays). A later tick that still uses the devspace sends the long
    * limit again at once. Never throws.
    */
@@ -602,7 +585,7 @@ export class WindowHeartbeats {
   }
 
   /**
-   * The engine of the connected devspace cannot be found from this window's Docker context; this counts as a failed
+   * The engine of the connected devspace cannot be found from this window; this counts as a failed
    * heartbeat, and the warning fires as for any other failure (time left from its last successful heartbeat).
    */
   private countUnresolved(devspace: Devspace, now: number, limitSeconds: number, reason?: string): void {

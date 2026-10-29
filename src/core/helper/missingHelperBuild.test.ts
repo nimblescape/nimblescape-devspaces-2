@@ -7,7 +7,7 @@
 // and the refresh after a build. With the real HelperChannels: the refresh that finds no helper image asks for it, and
 // the refresh after the build reads the states.
 import { describe, expect, it, vi } from 'vitest';
-import { LOCAL_DOCKER_TARGET, dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { dockerTargetOf, LOCAL_DOCKER_TARGET, remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import type { HelperChannel } from '../helperChannel/helperChannel';
 import { HelperChannels } from '../helperChannel/helperChannels';
 import { refreshValue } from '../helperChannel/protocol';
@@ -15,8 +15,8 @@ import { EXPECTED_STATES, REFRESH_DEVSPACES } from '../pipeline/refreshStates.te
 import { silentLogger } from '../ports';
 import { MISSING_HELPER_RETRY_MS, MissingHelperBuild, type MissingHelperBuildDeps } from './missingHelperBuild';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://devspace', remoteContextNames('devspace')[0]);
-const OTHER: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('devspace');
+const OTHER: DockerTarget = remoteDockerTarget('build-box');
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => {};

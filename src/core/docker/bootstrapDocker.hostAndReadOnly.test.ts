@@ -9,13 +9,13 @@ import { describe, expect, it } from 'vitest';
 import { silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import { BootstrapDocker } from './bootstrapDocker';
 import { isReadOnlyDockerCall } from './dockerCli';
-import { dockerTargetOf, remoteContextNames } from './dockerHost';
+import { dockerTargetOf, remoteDockerTarget } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 
 const OK: RunResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false };
 
 describe('BootstrapDocker: the Docker host, a lost CLI', () => {
-  it('gives an operation exactly one DOCKER_CONTEXT, also when the environment spells it otherwise (Windows)', async () => {
+  it('gives an operation exactly one DOCKER_CONTEXT or DOCKER_HOST, also when the environment spells it otherwise (Windows)', async () => {
     const envs: NodeJS.ProcessEnv[] = [];
     const runner: ProcessRunner = {
       async run(_file: string, _args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
@@ -23,12 +23,16 @@ describe('BootstrapDocker: the Docker host, a lost CLI', () => {
         return OK;
       },
     };
-    const docker = new BootstrapDocker(runner, 'C:\\Docker\\docker.exe', { Path: 'C:\\Windows', Docker_Context: 'desktop-linux' }, silentLogger, 'win32');
-    const context = remoteContextNames('build-box')[0];
-    await runWithDockerTarget(dockerTargetOf('ssh://build-box', context), () => docker.run(['container', 'inspect', 'x']));
+    const docker = new BootstrapDocker(runner, 'C:\\Docker\\docker.exe', { Path: 'C:\\Windows', Docker_Context: 'desktop-linux', Docker_Host: 'tcp://other:2375' }, silentLogger, 'win32');
+    await runWithDockerTarget(dockerTargetOf('npipe:////./pipe/docker_engine', 'default'), () => docker.run(['container', 'inspect', 'x']));
     const keys = Object.keys(envs[0]).filter((key) => key.toUpperCase() === 'DOCKER_CONTEXT');
     expect(keys).toEqual(['DOCKER_CONTEXT']);
-    expect(envs[0].DOCKER_CONTEXT).toBe(context);
+    expect(envs[0].DOCKER_CONTEXT).toBe('default');
+    // An operation on an SSH host gets exactly one DOCKER_HOST and no DOCKER_CONTEXT.
+    await runWithDockerTarget(remoteDockerTarget('build-box'), () => docker.run(['container', 'inspect', 'x']));
+    expect(Object.keys(envs[1]).filter((key) => key.toUpperCase() === 'DOCKER_CONTEXT')).toEqual([]);
+    expect(Object.keys(envs[1]).filter((key) => key.toUpperCase() === 'DOCKER_HOST')).toEqual(['DOCKER_HOST']);
+    expect(envs[1].DOCKER_HOST).toBe('ssh://build-box');
   });
 
   it('keeps a CLI found again meanwhile when an older call fails with ENOENT', async () => {

@@ -13,11 +13,11 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
-import { classifyDockerEndpoint, describeDockerHost, dockerHostOf, isOnDockerHost, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
+import { describeDockerHost, devspacesOfHost, dockerHostOf, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
-import { SshLoginCache, findRemoteContext, listContextInfos, noPromptEnv, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
@@ -65,7 +65,7 @@ import { defaultExtensionEntries, windowVscodeServer } from './vscodeServer';
 import { HELPER_DOCKER_SOCKET, VSCODE_STORE_VOLUME } from '../core/names';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { SessionFiles } from '../core/storage/sessionFiles';
-import type { Devspace, ExtensionSettings } from '../core/types';
+import type { ExtensionSettings } from '../core/types';
 import { AccountOffers } from './accountOffers';
 import { VsCodeGitHubAuth, watchGitHubEnterpriseSettings } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
@@ -235,8 +235,6 @@ async function activateExtension(
     dockerPipe: (target) => hostPipes?.dockerHost(target.host),
     // A call of an operation that only reads, while the host has no pipe: on the shell before the relay of the host.
     remoteShell: (target, args, options) => remoteShells?.docker(target.host, args, options) ?? Promise.resolve(undefined),
-    // Only for the log line of a call outside an operation that logs in to an SSH host (targets is set right below).
-    lastTarget: () => targets.last,
     onCliFound: shareDockerFolder,
     onDaemonStatus: (running) => {
       if (running && !daemonRunning) helperChannels?.clearFailures();
@@ -244,9 +242,10 @@ async function activateExtension(
       adapterOptions.onDaemonStatus?.(running);
     },
   });
-  // The Docker host is the current Docker context, read at the start of each operation.
-  const targets = new DockerTargets(docker, env, logger, platform);
-  const remoteState = new RemoteDockerState(paths.remoteDocker);
+  // The Docker host of Devspaces (a host of its own list, or the local Docker, which the current Docker context names),
+  // read at the start of each operation.
+  const remoteState = new RemoteDockerState(paths.remoteDocker, logger);
+  const targets = new DockerTargets(docker, env, logger, platform, remoteState);
   // What this computer remembers about each Docker engine (docker-engines.json): the answer to the question about its
   // Monitor (MonitorQuestion), and the removal mark of "Remove Devspaces from This Docker Engine…".
   const engineRecords = new DockerEngineRecords(paths.dockerEngines, { logger });
@@ -470,7 +469,7 @@ async function activateExtension(
               openRelayConnection(runner, transport, command, bundle, { logger, name: target.host, takeOver: () => shells.takeOver(target.host) }),
             );
           },
-          runDirect: (args, options, withContext) => (withContext === true ? docker.runWithContext(args, options) : docker.run(args, options)),
+          runDirect: (args, options, withoutPipe) => (withoutPipe === true ? docker.runWithoutPipe(args, options) : docker.run(args, options)),
           logger,
           script: workerScript,
           helperTag: async () => helperImageTag(await fs.promises.readFile(helperDockerfile, 'utf8')),
@@ -535,16 +534,8 @@ async function activateExtension(
   let windowCoordinator: SessionCoordinator | undefined;
   // The engine of a devspace for its heartbeats and for the Docker pipe of its window (resolveHeartbeatEngine, hostEngine).
   const engineSources = {
-    windowContext: (shown: Devspace) => (connection.currentContainerName() === shown.containerName ? connection.currentDockerContext() : undefined),
-    current: () => outsideOperation(() => targets.resolve()),
+    ofHost: (host: string) => targets.ofHost(host),
     ofContext: (name: string) => outsideOperation(() => targets.ofContext(name)),
-    // Only an existing context; a heartbeat never creates one (a context that the user removed is not made again by a
-    // tick).
-    remoteContext: (host: string) =>
-      outsideOperation(() => findRemoteContext(docker, host)).catch((error: unknown) => {
-        logger.warn(`The Docker context of ${host} could not be had: ${errorMessage(error)}`);
-        return undefined;
-      }),
   };
   const windowHeartbeats = new WindowHeartbeats({
     owner: () => ({ windowId: windowCoordinator?.windowId ?? '', pid: process.pid }),
@@ -552,9 +543,7 @@ async function activateExtension(
     registry,
     settings: getSettings,
     sourceId: computerId,
-    // The engine of the connected devspace is the one of this window's own Docker context (its authority, which its
-    // status file records as dockerContext), also for a local devspace; never the global current context when the
-    // window has its own (resolveHeartbeatEngine).
+    // The engine of the Docker host of the devspace, whatever host Devspaces uses now (resolveHeartbeatEngine).
     engineFor: (devspace, use) => resolveHeartbeatEngine(devspace, use, engineSources),
     // In the scope of a heartbeat, the worker's preparation runs with the long signal (heartbeatPreparation). The
     // operation `heartbeat` of the worker of that engine.
@@ -788,6 +777,32 @@ async function activateExtension(
     previewRunner: new PreviewWorkerRunner(groupsWorkerScript),
   });
   context.subscriptions.push(repositoryGroupsEditor);
+  // "Use a Remote Docker Host…", "Use the Local Docker", the choice of the first row of the view, and the offer of the
+  // SSH host of a Docker context of the user.
+  const remoteDocker = new RemoteDockerCommands({
+    docker,
+    runner,
+    targets,
+    state: remoteState,
+    logger,
+    showLog: () => logger.show(),
+    sshHosts: () => parseSshConfig(nodeSshConfigFiles, { home: os.homedir() }),
+    sshPath,
+    env,
+    sshLogins,
+    devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
+    onDidSwitch: async () => {
+      await sidebar.render();
+      if (view.visible) await sidebar.refreshStates();
+    },
+  });
+  // A Docker context or DOCKER_HOST of the user that reaches a host over SSH while Devspaces uses the local Docker: its
+  // host is offered once for the list (in the background; the read that found it goes on).
+  context.subscriptions.push({
+    dispose: targets.onDidResolve((target) => {
+      remoteDocker.offerDockerContextHost(target).catch((error: unknown) => logger.error('Could not offer the host of the Docker context.', error));
+    }),
+  });
   const controller = new Controller({
     logger,
     registry,
@@ -822,23 +837,7 @@ async function activateExtension(
         sshFound: () => sshPath() !== undefined,
         current: connection.currentDockerHost(),
       }),
-    remoteDocker: new RemoteDockerCommands({
-      docker,
-      runner,
-      targets,
-      state: remoteState,
-      logger,
-      showLog: () => logger.show(),
-      sshHosts: () => parseSshConfig(nodeSshConfigFiles, { home: os.homedir() }),
-      sshPath,
-      env,
-      platform,
-      sshLogins,
-      onDidSwitch: async () => {
-        await sidebar.render();
-        if (view.visible) await sidebar.refreshStates();
-      },
-    }),
+    remoteDocker,
     // Close and Keep Running tells the Monitor at once, on every engine, and Keep Running When Closed and Stop
     // When Closed too, through this window's worker of the engine.
     sessionMonitor: {
@@ -952,19 +951,17 @@ async function activateExtension(
       logger,
       platform,
       computerId,
-      // The SSH hosts of the Docker contexts, and of the current Docker (DOCKER_HOST=ssh://… names no context).
+      // The hosts of the list of Devspaces, and the SSH hosts of the Docker contexts of the user.
       knownHosts: async () => {
-        const [contexts, current] = await Promise.all([listContextInfos(docker), engineSources.current()]);
-        const endpoints = [...contexts.map((info) => classifyDockerEndpoint(info.endpoint)), current];
-        return endpoints.filter((endpoint) => endpoint.kind === 'remote').map((endpoint) => endpoint.host);
+        const [listed, contexts] = await Promise.all([remoteState.remoteHosts(), sshHostsOfContexts(docker).catch(() => [])]);
+        return [...new Set([...listed, ...contexts.map((entry) => entry.host)])];
       },
       engineRemoved: (host) => engineRemoved({ host }),
       openRelayConnection: (host) => relayConnections.get(host),
       relayConnection: async (host) => {
-        // The worker of the engine opens the connection; the engine as for the heartbeats of a devspace that this
-        // window does not show: the current one when it is on the host, else the context of the host.
+        // The worker of the engine opens the connection, whatever host Devspaces uses now.
         const target = await hostEngine(host, engineSources);
-        if (target === undefined) throw new Error(`Docker is set to another host, and no Docker context of ${host} was found`);
+        if (target === undefined) throw new Error(`${host} is no remote Docker host`);
         await channels.ensure(target);
         const opened = relayConnections.get(host);
         if (opened === undefined) throw new Error(`the worker on ${host} runs without the connection of the relay`);
@@ -1099,17 +1096,12 @@ async function activateExtension(
   if (currentDevspace && containerName && docker.isInstalled() && !onRemovedEngine && connection.currentDockerHost() === undefined) {
     // Which Docker the Dev Containers extension asks when it resolves this window. Only for a devspace of this
     // extension, and not for a window whose authority names a Docker host: its Docker pipe logs the Docker calls that
-    // come through it, and serveWindowPipe logged any other address. Its
-    // context: the one in the authority of this window, through which the Dev Containers extension attaches; for a
-    // window without one, the current context when that is on the host of the devspace, else none for the local
-    // Docker.
-    const devspace = currentDevspace;
+    // come through it, and serveWindowPipe logged any other address. Its context: the one in the authority of this
+    // window (a window of a remote devspace of the versions that made a Docker context for each host), through which
+    // the Dev Containers extension attaches; else the current context, which a window of a local devspace uses.
+    const own = connection.currentDockerContext();
     const logDocker = async (): Promise<void> => {
-      const host = dockerHostOf(devspace);
-      const own = connection.currentDockerContext();
-      const current = own === undefined ? await targets.resolve() : undefined;
-      const context = own ?? (current && isOnDockerHost(devspace, current.host) ? current.context : host === '' ? undefined : await findRemoteContext(docker, host));
-      const lines = await attachDiagnostics(docker, docker.processEnv(), containerName, context);
+      const lines = await attachDiagnostics(docker, docker.processEnv(), containerName, own);
       for (const line of lines) logger.info(`While this window connects: ${line}`);
     };
     background(logDocker(), 'log the Docker of this window');

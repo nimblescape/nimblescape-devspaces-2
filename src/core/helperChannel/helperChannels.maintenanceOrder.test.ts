@@ -11,14 +11,14 @@
 // - withChannel prepares the new worker of its retry after a closed channel without the maintenance: the worker that is
 //   set up for the open on that retry is prepared with the maintenance too.
 import { describe, expect, it, vi } from 'vitest';
-import { dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import { UserFacingError } from '../errors';
 import type { HelperMaintenance } from '../helper/helperImages';
 import { abortError, silentLogger } from '../ports';
 import { HelperChannelError, type HelperChannel } from './helperChannel';
 import { HelperChannels } from './helperChannels';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('build-box');
 const MAINTENANCE: HelperMaintenance = { checkBaseImage: true, onBuild: () => {}, onBuildEnd: () => {} };
 
 /** A channel stand-in whose close tells its listeners (HelperChannels then forgets it), with flows that answer at once. */

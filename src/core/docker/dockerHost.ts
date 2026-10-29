@@ -2,55 +2,25 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Docker on another computer: the remote Docker host is the current Docker context. Docker, Docker Compose, the Dev
-// Container CLI, the Dev Containers extension, and this extension all follow it by themselves. This module holds the
-// pure rules: which endpoint counts as local, remote (ssh://), or not supported; the Docker host of a devspace; the
-// check of an SSH address; the plain reasons of a failed connection. No `vscode`.
-import { namePair } from '../namePairs';
+// Docker on another computer: Devspaces keeps its own list of SSH hosts (RemoteDockerState) and reaches each with its
+// own `ssh`; it creates and changes no Docker context. Its local Docker is the current Docker context of the Docker CLI
+// (or DOCKER_HOST), as for Docker, Docker Compose, and the Dev Containers extension. This module holds the pure rules:
+// which endpoint counts as local, remote (ssh://), or not supported; the Docker host of a devspace; the check of an SSH
+// address; the plain reasons of a failed connection. No `vscode`.
 import type { Devspace } from '../types';
 import { isRecord } from '../valueChecks';
 
-/**
- * The description of the Docker contexts that "Use a Remote Docker Host…" creates (`docker context create --description`):
- * it marks a context as one of Devspace (isOwnContextDescription), whatever its name.
- */
-export const OWN_CONTEXT_DESCRIPTION_PREFIX = 'Devspaces: remote Docker host ';
-
-/** The description of the context of `host` (OWN_CONTEXT_DESCRIPTION_PREFIX). */
-export function ownContextDescription(host: string): string {
-  return `${OWN_CONTEXT_DESCRIPTION_PREFIX}${host}`;
-}
-
-/** True for the description of a context that Devspaces created (ownContextDescription). */
-export function isOwnContextDescription(description: string | undefined): boolean {
-  return description !== undefined && description.startsWith(OWN_CONTEXT_DESCRIPTION_PREFIX);
-}
-
-/**
- * The names that the Docker context of the remote host `host` (an alias or an address, as recorded) may get, in this
- * order: the alias of the SSH config, or the host name of an address (without the user and the port), for example
- * `htldvm`; on a clash with a context of that name that points elsewhere, the name with the pair of the host
- * (namePair), for example `htldvm-brave-noether`. Docker allows only `[a-zA-Z0-9_.+-]`, starting with a letter or
- * digit, and at least 2 characters, in the name of a context: every run of other characters becomes `-`, and a name of
- * one character gets the prefix `remote-`.
- */
-export function remoteContextNames(host: string): [string, string] {
-  const target = sshTargetOf(host)?.host ?? host;
-  const base = target.replace(/[^a-zA-Z0-9_.+-]+/g, '-').replace(/^[^a-zA-Z0-9]+/, '').replace(/-+$/, '');
-  // Docker needs at least 2 characters (`^[a-zA-Z0-9][a-zA-Z0-9_.+-]+$`).
-  const name = base === '' || base === DEFAULT_CONTEXT_NAME ? 'remote' : base.length < 2 ? `remote-${base}` : base;
-  return [name, `${name}-${namePair(host)}`];
-}
 /** The context of the Docker CLI that stands for DOCKER_HOST or the default endpoint. */
 export const DEFAULT_CONTEXT_NAME = 'default';
 
 /**
- * Where Docker runs, as the current Docker context (or DOCKER_HOST) says:
- * - `local`: the Docker of this computer (Docker Desktop, the default Unix socket, a named pipe, a rootless socket of
- *   this user, or TCP to this computer's loopback).
- * - `remote`: `ssh://…`, the Docker of another computer, reached through SSH.
- * - `unsupported`: any other endpoint (TCP to another computer, an unknown scheme), a current context that could not be
- *   read (isUnreadableDockerTarget), or a docker command that is Podman (isPodmanDockerTarget): refused with a message.
+ * Where Docker runs:
+ * - `local`: the Docker of this computer, as the current Docker context (or DOCKER_HOST) says (Docker Desktop, the
+ *   default Unix socket, a named pipe, a rootless socket of this user, or TCP to this computer's loopback).
+ * - `remote`: a host of the list of Devspaces (remoteDockerTarget), the Docker of another computer, reached through SSH.
+ * - `unsupported`: any other endpoint of the current context (TCP to another computer, an unknown scheme, or an SSH
+ *   host, isDockerContextHostTarget), a current context that could not be read (isUnreadableDockerTarget), or a docker
+ *   command that is Podman (isPodmanDockerTarget): refused with a message.
  */
 export type DockerTargetKind = 'local' | 'remote' | 'unsupported';
 
@@ -77,6 +47,11 @@ export interface DockerTarget {
    * "docker --version: podman version 5.2.2".
    */
   podman?: string;
+  /**
+   * Only for a current Docker context, or DOCKER_HOST, of the user that reaches a host over SSH while Devspaces uses the
+   * local Docker (isDockerContextHostTarget): that host, which Devspaces offers once for its list.
+   */
+  sshHost?: string;
 }
 
 /** The Docker of this computer, when nothing else is known (for example without a Docker CLI). */
@@ -145,16 +120,39 @@ export function isPodmanDockerTarget(target: Pick<DockerTarget, 'kind' | 'podman
   return target.kind === 'unsupported' && target.podman !== undefined;
 }
 
+/**
+ * True for the target of a current Docker context, or of DOCKER_HOST, that reaches a host over SSH while Devspaces uses
+ * the local Docker (DockerTargets): Devspaces reaches a remote host only through its own list, and such a context is not
+ * the Docker of this computer. It is refused like an endpoint that is not supported, and its host is offered once for
+ * the list.
+ */
+export function isDockerContextHostTarget(target: Pick<DockerTarget, 'kind' | 'sshHost'>): target is DockerTarget & { sshHost: string } {
+  return target.kind === 'unsupported' && target.sshHost !== undefined;
+}
+
 /** Why a target that is not supported is refused, for the log (one sentence). */
-export function unsupportedTargetReason(target: Pick<DockerTarget, 'kind' | 'endpoint' | 'podman'>): string {
+export function unsupportedTargetReason(target: Pick<DockerTarget, 'kind' | 'endpoint' | 'podman' | 'sshHost' | 'context'>): string {
   if (isPodmanDockerTarget(target)) return 'The docker command uses Podman, which Devspaces does not support.';
+  if (isDockerContextHostTarget(target)) {
+    return `${target.context === undefined ? 'DOCKER_HOST' : `The current Docker context ${target.context}`} reaches ${target.sshHost} over SSH, which is not a host of the list of Devspaces.`;
+  }
   return isUnreadableDockerTarget(target) ? 'The current Docker context could not be read.' : `The Docker endpoint ${target.endpoint} is neither local nor SSH.`;
 }
 
-/** The target of an endpoint read from the context `context` (undefined: DOCKER_HOST decides). */
+/**
+ * The target of an endpoint read from the context `context` (undefined: DOCKER_HOST decides), as the local Docker of
+ * Devspaces: an SSH endpoint is not supported (isDockerContextHostTarget).
+ */
 export function dockerTargetOf(endpoint: string, context: string | undefined): DockerTarget {
   const { kind, host } = classifyDockerEndpoint(endpoint);
-  return context === undefined ? { kind, host, endpoint } : { kind, host, endpoint, context };
+  const named = context === undefined ? {} : { context };
+  if (kind === 'remote') return { kind: 'unsupported', host: endpoint, endpoint, ...named, sshHost: host };
+  return { kind, host, endpoint, ...named };
+}
+
+/** The target of the host `host` of the list of Devspaces: its Docker over SSH, `ssh://<host>`. */
+export function remoteDockerTarget(host: string): DockerTarget {
+  return { kind: 'remote', host, endpoint: sshEndpoint(host) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

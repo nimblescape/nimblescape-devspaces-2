@@ -5,7 +5,7 @@
 // The heartbeats of a window to the Monitor container of the engine of each devspace that it uses, on every
 // engine.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { describeDockerHost, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { describeDockerHost, type DockerTarget } from '../docker/dockerHost';
 import { HELPER_PREBUILD_TIMEOUT_MS } from '../helper/helperPrebuild';
 import { abortError, isAbortError } from '../ports';
 import { Messages } from '../messages';
@@ -21,6 +21,7 @@ import {
   WINDOW_HEARTBEAT_INTERVAL_MS,
   WindowHeartbeats,
   engineKey,
+  hostEngine,
   repairBackoffMs,
   resolveHeartbeatEngine,
   type HeartbeatEngineSources,
@@ -40,7 +41,7 @@ const WINDOW = 'window-1';
 const PID = 4242;
 
 const LOCAL: DockerTarget = { kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock', context: 'default' };
-const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'devspaces-remote-11111111' };
+const REMOTE: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box' };
 
 function devspace(id: string, repository: string, extra: Partial<Devspace> = {}): Devspace {
   return {
@@ -552,99 +553,64 @@ describe('WindowHeartbeats', () => {
     });
   });
 
-  // The engine of the connected devspace is the one of this window's own context.
-  describe("the engine of the window's own context", () => {
+  // The engine of a devspace is the one of its Docker host, whatever host Devspaces uses now.
+  describe('the engine of the Docker host of a devspace', () => {
     const DESKTOP: DockerTarget = { kind: 'local', host: '', endpoint: 'unix:///home/me/.docker/desktop/docker.sock', context: 'desktop-linux' };
-    // The context of a host comes from ensureRemoteContext (remoteContext); `remote` answers per host, by default the
-    // first name of remoteContextNames.
-    function sources(options: { own?: string; current: DockerTarget; contexts: Record<string, DockerTarget | undefined>; remote?: Record<string, string | undefined> }) {
-      const asked: string[] = [];
-      const remoteAsked: string[] = [];
+    const SSH_CONTEXT: DockerTarget = { kind: 'unsupported', host: 'ssh://me@box', endpoint: 'ssh://me@box', context: 'box', sshHost: 'me@box' };
+    function sources(options: { hosts: Record<string, DockerTarget>; contexts?: Record<string, DockerTarget | undefined> }) {
+      const askedHosts: string[] = [];
+      const askedContexts: string[] = [];
       const value: HeartbeatEngineSources = {
-        windowContext: () => options.own,
-        current: async () => options.current,
-        ofContext: async (name) => {
-          asked.push(name);
-          return options.contexts[name];
+        ofHost: async (host) => {
+          askedHosts.push(host);
+          return options.hosts[host];
         },
-        remoteContext: async (host) => {
-          remoteAsked.push(host);
-          return options.remote === undefined ? remoteContextNames(host)[0] : options.remote[host];
+        ofContext: async (name) => {
+          askedContexts.push(name);
+          return options.contexts?.[name];
         },
       };
-      return { value, asked, remoteAsked };
+      return { value, askedHosts, askedContexts };
     }
 
-    it("uses the window's own context for a connected local devspace, even when the global context is remote", async () => {
-      const s = sources({ own: 'desktop-linux', current: REMOTE, contexts: { 'desktop-linux': DESKTOP } });
+    it('a local devspace: the local Docker of this computer, also while Devspaces uses an SSH host', async () => {
+      const s = sources({ hosts: { '': DESKTOP, 'build-box': REMOTE } });
       expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, s.value)).toEqual(DESKTOP);
-      expect(s.asked).toEqual(['desktop-linux']);
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: false }, s.value)).toEqual(DESKTOP);
+      expect(s.askedHosts).toEqual(['', '']);
+      expect(s.askedContexts).toEqual([]);
     });
 
-    it("uses the window's own context also when the global context is another local one", async () => {
-      const s = sources({ own: 'desktop-linux', current: LOCAL, contexts: { 'desktop-linux': DESKTOP } });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, s.value)).toEqual(DESKTOP);
+    it('a remote devspace: its host over SSH, never a Docker context', async () => {
+      const s = sources({ hosts: { '': LOCAL, 'build-box': REMOTE } });
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: true }, s.value)).toEqual(REMOTE);
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: false }, s.value)).toEqual(REMOTE);
+      expect(s.askedHosts).toEqual(['build-box', 'build-box']);
+      expect(s.askedContexts).toEqual([]);
     });
 
-    it("finds no engine when the window's context is not on the host of the devspace, or cannot be read", async () => {
-      const s = sources({ own: 'desktop-linux', current: LOCAL, contexts: { 'desktop-linux': REMOTE } });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, s.value)).toBeUndefined();
-      const t = sources({ own: 'gone', current: LOCAL, contexts: {} });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, t.value)).toBeUndefined();
-    });
-
-    it('without a context of its own: the current target on the host, else the context `default` for the local Docker', async () => {
-      const s = sources({ current: REMOTE, contexts: { default: LOCAL } });
+    it('the connected local devspace takes the context `default` when the Docker of this computer is not local now', async () => {
+      const s = sources({ hosts: { '': SSH_CONTEXT }, contexts: { default: LOCAL } });
       expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, s.value)).toEqual(LOCAL);
-      expect(s.asked).toEqual(['default']);
-      const t = sources({ current: DESKTOP, contexts: {} });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, t.value)).toEqual(DESKTOP);
+      expect(s.askedContexts).toEqual(['default']);
+      // Not when `default` is not local, or cannot be read.
+      const t = sources({ hosts: { '': SSH_CONTEXT }, contexts: { default: SSH_CONTEXT } });
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, t.value)).toBeUndefined();
+      const u = sources({ hosts: { '': SSH_CONTEXT }, contexts: {} });
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, u.value)).toBeUndefined();
     });
 
-    it('a remote devspace: its own context, else the context of its host', async () => {
-      const own: DockerTarget = { kind: 'remote', host: 'build-box', endpoint: 'ssh://build-box', context: 'my-box' };
-      const s = sources({ own: 'my-box', current: LOCAL, contexts: { 'my-box': own } });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: true }, s.value)).toEqual(own);
-      const t = sources({ current: LOCAL, contexts: {} });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: true }, t.value)).toEqual({
-        kind: 'remote',
-        host: 'build-box',
-        endpoint: 'ssh://build-box',
-        // The context named after the host (remoteContextNames).
-        context: remoteContextNames('build-box')[0],
-      });
-      expect(s.remoteAsked).toEqual([]);
-      expect(t.remoteAsked).toEqual(['build-box']);
+    it('a devspace this window is only busy with takes nothing when the Docker of this computer is not local now', async () => {
+      const s = sources({ hosts: { '': SSH_CONTEXT }, contexts: { default: LOCAL } });
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: false }, s.value)).toBeUndefined();
+      expect(s.askedContexts).toEqual([]);
     });
 
-    // The context of the host as ensureRemoteContext gives it (for example the name with the pair of the host on a
-    // clash); no engine when it cannot be had.
-    it('a remote devspace without its own context: the context that remoteContext gives, none when it gives none', async () => {
-      const remote = devspace(ID_A, 'acme/api', { dockerHost: 'me@build-box:2222' });
-      const pair = remoteContextNames('me@build-box:2222')[1];
-      const s = sources({ current: LOCAL, contexts: {}, remote: { 'me@build-box:2222': pair } });
-      expect(await resolveHeartbeatEngine(remote, { connected: true }, s.value)).toEqual({
-        kind: 'remote',
-        host: 'me@build-box:2222',
-        endpoint: 'ssh://me@build-box:2222',
-        context: pair,
-      });
-      const t = sources({ current: LOCAL, contexts: {}, remote: {} });
-      expect(await resolveHeartbeatEngine(remote, { connected: true }, t.value)).toBeUndefined();
-      expect(await resolveHeartbeatEngine(remote, { connected: false }, t.value)).toBeUndefined();
-      expect(t.remoteAsked).toEqual(['me@build-box:2222', 'me@build-box:2222']);
-      // A local devspace never asks for the context of a host.
-      const u = sources({ current: REMOTE, contexts: { default: LOCAL }, remote: {} });
-      expect(await resolveHeartbeatEngine(devspace(ID_B, 'acme/web'), { connected: true }, u.value)).toEqual(LOCAL);
-      expect(u.remoteAsked).toEqual([]);
-    });
-
-    it('a devspace this window is only busy with: the target of the operation on its host, not the context of the window', async () => {
-      const s = sources({ own: 'desktop-linux', current: LOCAL, contexts: { 'desktop-linux': DESKTOP } });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: false }, s.value)).toEqual(LOCAL);
-      expect(s.asked).toEqual([]);
-      const t = sources({ current: REMOTE, contexts: { default: LOCAL } });
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: false }, t.value)).toBeUndefined();
+    it('takes no engine of another host', async () => {
+      const s = sources({ hosts: { 'build-box': { ...REMOTE, host: 'other-box' } } });
+      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: true }, s.value)).toBeUndefined();
+      expect(await hostEngine('build-box', s.value)).toBeUndefined();
+      expect(await hostEngine('build-box', sources({ hosts: { 'build-box': REMOTE } }).value)).toEqual(REMOTE);
     });
 
     it('asks engineFor with the role of each devspace', async () => {
@@ -1204,35 +1170,6 @@ describe('WindowHeartbeats rules found by mutation: deadlines, engines and the p
       // The monitor holds the limit of 10 minutes from T0: 9 minutes 30 seconds are left (not 29 minutes).
       expect(h.warnings).toEqual([Messages.heartbeatsFailing('acme/api', 'the local Docker', 9)]);
     });
-
-    it('resolveHeartbeatEngine: a remote devspace this window is busy with, the current target local: the context of its host', async () => {
-      // The context of the host from ensureRemoteContext (remoteContext).
-      const value: HeartbeatEngineSources = {
-        windowContext: () => undefined,
-        current: async () => LOCAL,
-        ofContext: async () => undefined,
-        remoteContext: async (host) => remoteContextNames(host)[0],
-      };
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }), { connected: false }, value)).toEqual({
-        kind: 'remote',
-        host: 'build-box',
-        endpoint: 'ssh://build-box',
-        // The context named after the host (remoteContextNames).
-        context: remoteContextNames('build-box')[0],
-      });
-    });
-
-    it('resolveHeartbeatEngine: the context `default` on a remote engine is no engine for a local devspace', async () => {
-      const value: HeartbeatEngineSources = {
-        windowContext: () => undefined,
-        current: async () => REMOTE,
-        ofContext: async () => REMOTE,
-        remoteContext: async () => {
-          throw new Error('a local devspace asks for no context of a host');
-        },
-      };
-      expect(await resolveHeartbeatEngine(devspace(ID_A, 'acme/api'), { connected: true }, value)).toBeUndefined();
-    });
   });
 
   // The lookup of an engine is bounded and never stops the other heartbeats.
@@ -1417,8 +1354,7 @@ describe('WindowHeartbeats rules found by mutation: deadlines, engines and the p
 
   describe('engines, entries and seq', () => {
     it('two remote engines: one series each, each heartbeat with only its own devspace', async () => {
-      // The context named after the host (remoteContextNames).
-      const OTHER_BOX: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box', context: remoteContextNames('other-box')[0] };
+      const OTHER_BOX: DockerTarget = { kind: 'remote', host: 'other-box', endpoint: 'ssh://other-box' };
       const h = harness({ engines: { [ID_B]: OTHER_BOX } });
       h.devspaces.push(devspace(ID_A, 'acme/api', { dockerHost: 'build-box' }));
       h.devspaces.push(devspace(ID_B, 'acme/web', { dockerHost: 'other-box', ...busyMark() }));

@@ -6,13 +6,13 @@
 // worker that is not open yet (HelperChannelsOptions.prepare), never to the worker itself; a worker that is open is
 // used as it is.
 import { describe, expect, it, vi } from 'vitest';
-import { dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import type { HelperMaintenance } from '../helper/helperImages';
 import { silentLogger } from '../ports';
 import type { HelperChannel } from './helperChannel';
 import { HelperChannels } from './helperChannels';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('build-box');
 const MAINTENANCE: HelperMaintenance = { checkBaseImage: true, onBuild: () => {}, onBuildEnd: () => {} };
 
 /** An open channel whose flows answer at once. */

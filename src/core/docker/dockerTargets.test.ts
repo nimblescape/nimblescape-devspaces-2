@@ -7,7 +7,7 @@ import { Messages } from '../messages';
 import { silentLogger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 // The Docker CLI of the extension (BootstrapDocker).
 import { BootstrapDocker } from './bootstrapDocker';
-import { dockerTargetOf, isOnDockerHost, isPodmanDockerTarget, isUnreadableDockerTarget } from './dockerHost';
+import { dockerTargetOf, isDockerContextHostTarget, isOnDockerHost, isPodmanDockerTarget, isUnreadableDockerTarget, remoteDockerTarget } from './dockerHost';
 import { ensureDockerRunning } from './dockerStart';
 import {
   CONTEXT_INSPECT_TIMEOUT_MS,
@@ -29,7 +29,7 @@ interface Call {
 /** A Docker CLI whose current context the test changes (`context`), like `docker context use` in another terminal. */
 class FakeDockerCli implements ProcessRunner {
   readonly calls: Call[] = [];
-  contexts: Record<string, string> = { default: 'unix:///var/run/docker.sock', 'desktop-linux': 'unix:///home/me/.docker/desktop/docker.sock', 'devspaces-remote-26f8567f': 'ssh://box' };
+  contexts: Record<string, string> = { default: 'unix:///var/run/docker.sock', 'desktop-linux': 'unix:///home/me/.docker/desktop/docker.sock', box: 'ssh://box' };
   context = 'default';
   inspectFails = false;
 
@@ -49,15 +49,24 @@ class FakeDockerCli implements ProcessRunner {
   }
 }
 
+/** The Docker host of Devspaces that the test changes (`host`), like "Use a Remote Docker Host…" in another window. */
+class FakeChoice {
+  host: string | undefined;
+  async dockerHost(): Promise<string | undefined> {
+    return this.host;
+  }
+}
+
 function setup(env: NodeJS.ProcessEnv = { PATH: '/usr/bin' }, cliFound = true) {
   const dockerPath = cliFound ? DOCKER : undefined;
   const cli = new FakeDockerCli();
+  const choice = new FakeChoice();
   const docker = new BootstrapDocker(cli, dockerPath, env, silentLogger, 'linux');
-  const targets = new DockerTargets(docker, env, silentLogger, 'linux');
-  return { cli, docker, targets };
+  const targets = new DockerTargets(docker, env, silentLogger, 'linux', choice);
+  return { cli, docker, targets, choice };
 }
 
-describe('DockerTargets.resolve (remote mode detection from the current context)', () => {
+describe('DockerTargets.resolve (the Docker host of Devspaces, else the current context)', () => {
   it('reads the local Docker of the current context', async () => {
     const { targets, cli } = setup();
     await expect(targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: 'unix:///var/run/docker.sock', context: 'default' });
@@ -65,16 +74,54 @@ describe('DockerTargets.resolve (remote mode detection from the current context)
     expect(targets.last?.kind).toBe('local');
   });
 
-  it('reads an ssh:// context as the remote host after ssh://', async () => {
-    const { targets, cli } = setup();
-    cli.context = 'devspaces-remote-26f8567f';
-    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: 'box', endpoint: 'ssh://box', context: 'devspaces-remote-26f8567f' });
-    await expect(targets.host()).resolves.toBe('box');
+  it('uses a host of its list over SSH, and reads no Docker context for it', async () => {
+    const { targets, cli, choice } = setup();
+    choice.host = 'me@box:2222';
+    await expect(targets.resolve()).resolves.toEqual(remoteDockerTarget('me@box:2222'));
+    await expect(targets.host()).resolves.toBe('me@box:2222');
+    expect(cli.calls).toEqual([]);
+    expect(targets.last).toEqual(remoteDockerTarget('me@box:2222'));
   });
 
-  it('follows DOCKER_HOST of VS Code, without a context name', async () => {
-    const { targets } = setup({ PATH: '/usr/bin', DOCKER_HOST: 'ssh://me@other' });
-    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: 'me@other', endpoint: 'ssh://me@other' });
+  // A remote host needs the Docker CLI of this computer too: without one, the Docker setup shows (the local Docker).
+  it('reads the local Docker without a Docker CLI, also with a host of its list', async () => {
+    const { targets, choice } = setup({ PATH: '/usr/bin' }, false);
+    choice.host = 'build-box';
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: '' });
+  });
+
+  // Devspaces reaches a remote host only through its own list.
+  it('does not support a current context of the user that reaches a host over SSH, and names the host', async () => {
+    const { targets, cli } = setup();
+    cli.context = 'box';
+    const target = await targets.resolve();
+    expect(target).toEqual({ kind: 'unsupported', host: 'ssh://box', endpoint: 'ssh://box', context: 'box', sshHost: 'box' });
+    expect(isDockerContextHostTarget(target)).toBe(true);
+    // Its host is that of no devspace, also not of one on `box`.
+    expect(isOnDockerHost({ dockerHost: 'box' }, target.host)).toBe(false);
+  });
+
+  it('follows DOCKER_HOST of VS Code, without a context name; one that reaches a host over SSH is not supported', async () => {
+    const local = setup({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///run/user/1000/docker.sock' });
+    await expect(local.targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: 'unix:///run/user/1000/docker.sock' });
+    const ssh = setup({ PATH: '/usr/bin', DOCKER_HOST: 'ssh://me@other' });
+    await expect(ssh.targets.resolve()).resolves.toEqual({ kind: 'unsupported', host: 'ssh://me@other', endpoint: 'ssh://me@other', sshHost: 'me@other' });
+    // A host of the list wins over DOCKER_HOST.
+    ssh.choice.host = 'box';
+    await expect(ssh.targets.resolve()).resolves.toEqual(remoteDockerTarget('box'));
+  });
+
+  it('uses the local Docker when the Docker host of Devspaces cannot be read (logged), and without a choice', async () => {
+    const warnings: string[] = [];
+    const logger = { ...silentLogger, warn: (message: string) => warnings.push(message) };
+    const cli = new FakeDockerCli();
+    const docker = new BootstrapDocker(cli, DOCKER, { PATH: '/usr/bin' }, silentLogger, 'linux');
+    const broken = new DockerTargets(docker, { PATH: '/usr/bin' }, logger, 'linux', {
+      dockerHost: () => Promise.reject(new Error('EACCES: permission denied')),
+    });
+    await expect(broken.resolve()).resolves.toMatchObject({ kind: 'local', context: 'default' });
+    expect(warnings).toEqual(['The Docker host of Devspaces could not be read, so it uses the local Docker: EACCES: permission denied']);
+    await expect(new DockerTargets(docker, { PATH: '/usr/bin' }, silentLogger, 'linux').resolve()).resolves.toMatchObject({ kind: 'local' });
   });
 
   it('refuses tcp to another computer', async () => {
@@ -109,9 +156,9 @@ describe('DockerTargets.resolve (remote mode detection from the current context)
     };
     await expect(thrown.targets.resolve()).resolves.toEqual(UNREADABLE_DOCKER_TARGET);
     // With DOCKER_HOST set for VS Code, DOCKER_HOST decides the endpoint.
-    const withHost = setup({ PATH: '/usr/bin', DOCKER_HOST: 'ssh://me@other' });
+    const withHost = setup({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///run/user/1000/docker.sock' });
     withHost.cli.inspectFails = true;
-    await expect(withHost.targets.resolve()).resolves.toEqual({ kind: 'remote', host: 'me@other', endpoint: 'ssh://me@other' });
+    await expect(withHost.targets.resolve()).resolves.toEqual({ kind: 'local', host: '', endpoint: 'unix:///run/user/1000/docker.sock' });
   });
 
   // podman-docker on Fedora with the Podman socket not enabled: `docker` runs podman, which has no Docker contexts.
@@ -218,20 +265,23 @@ describe('DockerTargets.resolve (remote mode detection from the current context)
     });
   });
 
-  it('reads the context again for each operation, not once for ever', async () => {
-    const { targets, cli } = setup();
+  it('reads the Docker host of Devspaces and the context again for each operation, not once for ever', async () => {
+    const { targets, cli, choice } = setup();
     await expect(targets.host()).resolves.toBe('');
-    cli.context = 'devspaces-remote-26f8567f';
+    choice.host = 'box';
     await expect(targets.host()).resolves.toBe('box');
+    choice.host = undefined;
+    cli.context = 'desktop-linux';
+    await expect(targets.current()).resolves.toMatchObject({ kind: 'local', context: 'desktop-linux' });
   });
 });
 
 describe('DockerTargets.withOperation (an operation keeps the host it started with)', () => {
   // Background work of an operation (the image list of the remote monitor) that it pins with runWithDockerTarget keeps
-  // the target after the operation ended, also when the context was switched meanwhile.
+  // the target after the operation ended, also when the Docker host was switched meanwhile.
   it('background work pinned to the target of an operation keeps it after the operation ended', async () => {
-    const { targets, cli } = setup();
-    cli.context = 'devspaces-remote-26f8567f';
+    const { targets, choice } = setup();
+    choice.host = 'box';
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     let later: Promise<string | undefined> | undefined;
@@ -247,19 +297,19 @@ describe('DockerTargets.withOperation (an operation keeps the host it started wi
         return operationDockerTarget()?.host;
       })();
     });
-    cli.context = 'default';
+    choice.host = undefined;
     release();
     expect(await later).toBe('box');
     expect(await unpinned).toBeUndefined();
   });
 
   it('reads the target once; a switch in the middle does not move the operation', async () => {
-    const { targets, cli, docker } = setup();
-    cli.context = 'devspaces-remote-26f8567f';
+    const { targets, cli, docker, choice } = setup();
+    choice.host = 'box';
     await targets.withOperation(async () => {
       expect(operationDockerTarget()?.host).toBe('box');
-      // The user runs `docker context use default` meanwhile.
-      cli.context = 'default';
+      // The user chooses the local Docker in another window meanwhile.
+      choice.host = undefined;
       await expect(targets.host()).resolves.toBe('box');
       await docker.run(['ps']);
       // A nested operation keeps it too.
@@ -267,16 +317,23 @@ describe('DockerTargets.withOperation (an operation keeps the host it started wi
         await expect(targets.host()).resolves.toBe('box');
       });
     });
-    const inspects = cli.calls.filter((call) => call.args[1] === 'inspect');
-    expect(inspects).toHaveLength(1);
-    // Every Docker call of the operation names the context it started with.
+    expect(cli.calls.filter((call) => call.args[1] === 'inspect')).toHaveLength(0);
+    // Every Docker call of the operation goes to the host it started with.
     const ps = cli.calls.find((call) => call.args[0] === 'ps');
-    expect(ps?.options.env?.DOCKER_CONTEXT).toBe('devspaces-remote-26f8567f');
-    expect(ps?.options.env).not.toHaveProperty('DOCKER_HOST');
-    // The next operation reads the new context.
+    expect(ps?.options.env?.DOCKER_HOST).toBe('ssh://box');
+    expect(ps?.options.env).not.toHaveProperty('DOCKER_CONTEXT');
+    // The next operation reads the new host: the local Docker of the current context.
+    cli.calls.length = 0;
+    cli.context = 'desktop-linux';
     await targets.withOperation(async () => {
       await expect(targets.host()).resolves.toBe('');
+      // The user runs `docker context use default` meanwhile.
+      cli.context = 'default';
+      await docker.run(['ps']);
     });
+    expect(cli.calls.filter((call) => call.args[1] === 'inspect')).toHaveLength(1);
+    // Every Docker call of the operation names the context it started with.
+    expect(cli.calls.find((call) => call.args[0] === 'ps')?.options.env?.DOCKER_CONTEXT).toBe('desktop-linux');
     expect(operationDockerTarget()).toBeUndefined();
   });
 
@@ -284,24 +341,24 @@ describe('DockerTargets.withOperation (an operation keeps the host it started wi
     const plain = setup();
     await plain.docker.run(['ps']);
     expect(plain.cli.calls[0].options.env).not.toHaveProperty('DOCKER_CONTEXT');
-    const withHost = setup({ PATH: '/usr/bin', DOCKER_HOST: 'ssh://me@other' });
+    const withHost = setup({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///run/user/1000/docker.sock' });
     await withHost.targets.withOperation(() => withHost.docker.run(['ps']));
     const ps = withHost.cli.calls.find((call) => call.args[0] === 'ps');
     expect(ps?.options.env).not.toHaveProperty('DOCKER_CONTEXT');
-    expect(ps?.options.env?.DOCKER_HOST).toBe('ssh://me@other');
+    expect(ps?.options.env?.DOCKER_HOST).toBe('unix:///run/user/1000/docker.sock');
   });
 
   it('keeps an explicit environment of a call (docker --config for a pull) as the caller built it', async () => {
-    const { targets, cli, docker } = setup();
-    cli.context = 'devspaces-remote-26f8567f';
+    const { targets, cli, docker, choice } = setup();
+    choice.host = 'box';
     await targets.withOperation(() => docker.run(['--config', '/tmp/x', 'pull', 'img'], { env: { DOCKER_HOST: 'ssh://box' } }));
     const pull = cli.calls.find((call) => call.args.includes('pull'));
     expect(pull?.options.env).toEqual({ DOCKER_HOST: 'ssh://box' });
   });
 
-  it('a timer that an operation started reads the context again after the operation ended', async () => {
-    const { targets, cli, docker } = setup();
-    cli.context = 'devspaces-remote-26f8567f';
+  it('a timer that an operation started reads the Docker host again after the operation ended', async () => {
+    const { targets, cli, docker, choice } = setup();
+    choice.host = 'box';
     let later: Promise<string> | undefined;
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => {
@@ -313,21 +370,22 @@ describe('DockerTargets.withOperation (an operation keeps the host it started wi
         return targets.host();
       });
     });
-    cli.context = 'default';
+    choice.host = undefined;
     release();
     await expect(later).resolves.toBe('');
     expect(cli.calls.find((call) => call.args[0] === 'ps')?.options.env).not.toHaveProperty('DOCKER_CONTEXT');
+    expect(cli.calls.find((call) => call.args[0] === 'ps')?.options.env).not.toHaveProperty('DOCKER_HOST');
   });
 });
 
 // The view shows the Docker host of every read.
 describe('DockerTargets.onDidResolve', () => {
   it('gives every read target to the listener until it is removed', async () => {
-    const { targets, cli } = setup();
+    const { targets, choice } = setup();
     const seen: string[] = [];
     const remove = targets.onDidResolve((target) => seen.push(`${target.kind}:${target.host}`));
     await targets.resolve();
-    cli.context = 'devspaces-remote-26f8567f';
+    choice.host = 'box';
     await targets.resolve();
     remove();
     await targets.resolve();
@@ -351,29 +409,48 @@ describe('DockerTargets.resolve with overlapping reads', () => {
   it('does not let an older read that finishes later overwrite a newer one', async () => {
     const results = [
       { exitCode: 0, stdout: JSON.stringify({ Name: 'default', Endpoints: { docker: { Host: 'unix:///var/run/docker.sock' } } }), stderr: '', timedOut: false },
-      { exitCode: 0, stdout: JSON.stringify({ Name: 'devspaces-remote-26f8567f', Endpoints: { docker: { Host: 'ssh://box' } } }), stderr: '', timedOut: false },
+      { exitCode: 0, stdout: JSON.stringify({ Name: 'desktop-linux', Endpoints: { docker: { Host: 'unix:///home/me/.docker/desktop/docker.sock' } } }), stderr: '', timedOut: false },
     ];
     const gates: Array<(value: RunResult) => void> = [];
     const docker = { isInstalled: () => true, run: async (): Promise<RunResult> => new Promise<RunResult>((resolve) => gates.push(resolve)) };
     const targets = new DockerTargets(docker, {}, silentLogger, 'linux');
-    const seen: string[] = [];
-    targets.onDidResolve((target) => seen.push(target.host));
+    const seen: Array<string | undefined> = [];
+    targets.onDidResolve((target) => seen.push(target.context));
     const older = targets.resolve();
     const newer = targets.resolve();
+    // Both reads ask for the Docker host of Devspaces first.
+    await vi.waitFor(() => expect(gates).toHaveLength(2));
     gates[1](results[1]);
     await newer;
     gates[0](results[0]);
-    await expect(older).resolves.toMatchObject({ kind: 'local' });
-    expect(seen).toEqual(['box']);
-    expect(targets.last?.host).toBe('box');
+    await expect(older).resolves.toMatchObject({ kind: 'local', context: 'default' });
+    expect(seen).toEqual(['desktop-linux']);
+    expect(targets.last?.context).toBe('desktop-linux');
   });
 });
 
-// The engine of a window's own Docker context, whatever context is current.
+// The engine of a Docker host, whatever host Devspaces uses now (the heartbeats, the window of a devspace).
+describe('DockerTargets.ofHost', () => {
+  it('gives a host of the list over SSH without a call, and the local Docker of the current context for ""', async () => {
+    const { targets, cli, choice } = setup();
+    choice.host = 'other-box';
+    const seen: string[] = [];
+    targets.onDidResolve((target) => seen.push(target.host));
+    await expect(targets.ofHost('box')).resolves.toEqual(remoteDockerTarget('box'));
+    expect(cli.calls).toEqual([]);
+    cli.context = 'desktop-linux';
+    await expect(targets.ofHost('')).resolves.toMatchObject({ kind: 'local', host: '', context: 'desktop-linux' });
+    expect(cli.calls).toHaveLength(1);
+    expect(targets.last).toBeUndefined();
+    expect(seen).toEqual([]);
+  });
+});
+
+// The engine of a named Docker context (the context `default` for the heartbeats), whatever context is current.
 describe('DockerTargets.ofContext', () => {
   it('reads the named context, not the current one, and changes neither `last` nor tells a listener', async () => {
     const { targets, cli } = setup();
-    cli.context = 'devspaces-remote-26f8567f';
+    cli.context = 'box';
     const seen: string[] = [];
     targets.onDidResolve((target) => seen.push(target.host));
     await expect(targets.ofContext('desktop-linux')).resolves.toEqual({

@@ -34,16 +34,19 @@ export interface DockerHostRow {
 }
 
 /**
- * The Docker host of the first row: the local Docker, a remote host, an endpoint that is not supported, or a docker
- * command that uses Podman (podmanDockerTarget).
+ * The Docker host of the first row: the local Docker, a remote host of the list of Devspaces, an endpoint that is not
+ * supported, a docker command that uses Podman (podmanDockerTarget), or a Docker context or DOCKER_HOST of the user
+ * that reaches a host over SSH (`sshContext`, isDockerContextHostTarget).
  */
 export interface ShownDockerHost {
-  kind: 'local' | 'remote' | 'unsupported' | 'podman';
+  kind: 'local' | 'remote' | 'unsupported' | 'podman' | 'sshContext';
   /**
-   * The remote host, or the endpoint that is not supported; empty for the local Docker, for a current Docker context
-   * that could not be read (kind `unsupported`), and for Podman.
+   * The remote host, the SSH host of the Docker context of the user, or the endpoint that is not supported; empty for
+   * the local Docker, for a current Docker context that could not be read (kind `unsupported`), and for Podman.
    */
   host: string;
+  /** Kind `sshContext`: the Docker context of the user; undefined when DOCKER_HOST decides. */
+  context?: string;
 }
 
 export const DOCKER_HOST_ROW_ID = 'dockerHost';
@@ -56,9 +59,11 @@ export const DockerHostRowTexts = {
         ? `Remote Docker host: ${shown.host}`
         : shown.kind === 'podman'
           ? Messages.podmanNotSupportedLabel
-          : shown.host === ''
-            ? Messages.dockerContextUnreadableLabel
-            : `Docker endpoint not supported: ${shown.host}`,
+          : shown.kind === 'sshContext'
+            ? `Docker is set to ${shown.host} over SSH`
+            : shown.host === ''
+              ? Messages.dockerContextUnreadableLabel
+              : `Docker endpoint not supported: ${shown.host}`,
   tooltip: (shown: ShownDockerHost) =>
     shown.kind === 'local'
       ? 'Docker runs on this computer. Click to use a remote Docker host.'
@@ -66,9 +71,11 @@ export const DockerHostRowTexts = {
         ? `Docker runs on ${shown.host} over SSH. Click to choose another host or the local Docker.`
         : shown.kind === 'podman'
           ? Messages.podmanNotSupportedTooltip
-          : shown.host === ''
-            ? Messages.dockerContextUnreadableTooltip
-            : 'Docker is set to an endpoint that Devspaces does not support (only the local Docker and SSH hosts). Click to choose the Docker host.',
+          : shown.kind === 'sshContext'
+            ? `${shown.context === undefined ? 'DOCKER_HOST' : `The Docker context ${shown.context}`} of this computer reaches ${shown.host} over SSH. Devspaces uses a remote host only from its own list, so it does nothing with Docker now. Click to choose the Docker host.`
+            : shown.host === ''
+              ? Messages.dockerContextUnreadableTooltip
+              : 'Docker is set to an endpoint that Devspaces does not support (only the local Docker and SSH hosts). Click to choose the Docker host.',
 } as const;
 
 // The monitors of the rows, switched off, with the connection sign for a remote host and the warning sign for an
@@ -78,6 +85,7 @@ const DOCKER_HOST_ICONS: Record<ShownDockerHost['kind'], string> = {
   remote: MonitorIcons.remote,
   unsupported: MonitorIcons.warning,
   podman: MonitorIcons.warning,
+  sshContext: MonitorIcons.warning,
 };
 
 /** Command handlers of row actions receive a RepositoryRow as the first argument. */
@@ -122,8 +130,8 @@ export class RepositoriesTreeProvider implements vscode.TreeDataProvider<TreeNod
    * empty view keeps its welcome content (sign-in, Docker setup).
    */
   setDockerHost(host: ShownDockerHost | undefined): void {
-    if (host?.kind === this.dockerHost?.kind && host?.host === this.dockerHost?.host) return;
-    this.dockerHost = host === undefined ? undefined : { kind: host.kind, host: host.host };
+    if (host?.kind === this.dockerHost?.kind && host?.host === this.dockerHost?.host && host?.context === this.dockerHost?.context) return;
+    this.dockerHost = host === undefined ? undefined : { kind: host.kind, host: host.host, ...(host.context === undefined ? {} : { context: host.context }) };
     this.changeEmitter.fire(undefined);
   }
 

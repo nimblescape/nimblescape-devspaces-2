@@ -2,15 +2,15 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// Docker on another computer through the Docker context, against the real Docker engine. The "remote computer" is an
-// SSH server in a container (test/docker/sshd: Alpine with openssh-server and the Docker CLI, key authentication only)
-// whose Docker socket is the socket of the engine of the runner. A test SSH config names it; a wrapper `ssh` first on
-// PATH adds `-F <config>`, so the Docker CLI's ssh uses it and the SSH config of the user is not touched. The context
-// of the host (named after the SSH alias, `devspaces-test-remote`, with `ssh://devspaces-test-remote` and the description
-// of Devspaces) is created in a Docker configuration folder of this file only. Checked: the test of a host and the
-// plain reasons of its failures (unknown host key, login failed, unreachable), the context switch and the detection of
-// the remote mode, the open pipeline of a seeded devspace through the context (every Docker call goes through SSH:
-// the SSH server logs each connection), the containers and volumes on the engine reached through SSH, the token file in
+// Docker on another computer over SSH, a host of the list of Devspaces, against the real Docker engine. The "remote
+// computer" is an SSH server in a container (test/docker/sshd: Alpine with openssh-server and the Docker CLI, key
+// authentication only) whose Docker socket is the socket of the engine of the runner. A test SSH config names it; a
+// wrapper `ssh` first on PATH adds `-F <config>`, so the Docker CLI's ssh uses it and the SSH config of the user is not
+// touched. The Docker host of Devspaces (`devspaces-test-remote`, the SSH alias) is kept in a remote-docker.json of this
+// file, and the Docker configuration folder is one of this file only. Checked: the test of a host and the plain reasons
+// of its failures (unknown host key, login failed, unreachable), the choice of the host and the detection of the
+// remote mode without any Docker context, the open pipeline of a seeded devspace on that host (every Docker call goes
+// through SSH: the SSH server logs each connection), the containers and volumes on the engine reached through SSH, the token file in
 // the tmpfs, and the Docker host recorded in the registry. The operations are the flows of the worker, as the window
 // sends them (workerWindow.ts): the worker on the remote engine runs behind the relay, started with one SSH login (`ssh
 // … sh -s` and the start script, as extension.ts), and talks to its socket there (so not every Docker call is an SSH
@@ -23,19 +23,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // The Docker CLI of the extension (BootstrapDocker).
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { findExecutable } from '../../src/core/docker/dockerCli';
-import { ownContextDescription, remoteContextNames } from '../../src/core/docker/dockerHost';
 import { ensureDockerRunning } from '../../src/core/docker/dockerStart';
 import { DockerTargets } from '../../src/core/docker/dockerTargets';
-import {
-  findRemoteContext,
-  isOwnContext,
-  listContextInfos,
-  startDockerFor,
-  testRemoteDockerHost,
-  useContext,
-  useRemoteContext,
-  type SshCheckDeps,
-} from '../../src/core/docker/remoteDocker';
+import { listContextInfos, startDockerFor, testRemoteDockerHost, type SshCheckDeps } from '../../src/core/docker/remoteDocker';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
 import {
   HELPER_DOCKER_SOCKET,
@@ -91,7 +81,7 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-describe('Docker on another computer through the Docker context', () => {
+describe('Docker on another computer over SSH, a host of the list of Devspaces', () => {
   const { run, env: localEnv, cli: localCli, log } = dockerTestContext('remoteHost');
   const runner = new NodeProcessRunner();
   const timings = new Timings();
@@ -102,11 +92,12 @@ describe('Docker on another computer through the Docker context', () => {
   const volumeName = resourceName(REPOSITORY, devspaceId);
   const containerName = volumeName;
 
-  // The environment of this file: its own Docker configuration (the context of the host lives there), the wrapper
-  // `ssh` first on PATH, and neither DOCKER_HOST nor DOCKER_CONTEXT, so the current context decides.
+  // The environment of this file: its own Docker configuration, the wrapper `ssh` first on PATH, and neither DOCKER_HOST
+  // nor DOCKER_CONTEXT, so the current context decides the local Docker.
   const env: NodeJS.ProcessEnv = { ...localEnv };
   let docker: BootstrapDocker;
   let targets: DockerTargets;
+  let state: RemoteDockerState;
   let sshDeps: () => SshCheckDeps;
   let sshLog = '';
 
@@ -176,7 +167,8 @@ describe('Docker on another computer through the Docker context', () => {
     delete env.DOCKER_HOST;
     delete env.DOCKER_CONTEXT;
     docker = new BootstrapDocker(runner, run.dockerPath, env, log);
-    targets = new DockerTargets(docker, env, log);
+    state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
+    targets = new DockerTargets(docker, env, log, process.platform, state);
     // The SSH check before the Docker calls uses the wrapper `ssh` (the test SSH config).
     sshDeps = () => ({ runner, sshPath: findExecutable('ssh', env, process.platform), env });
 
@@ -221,31 +213,36 @@ describe('Docker on another computer through the Docker context', () => {
     }
   });
 
-  it('switches the context to ssh://<alias>: the remote mode follows it, and back', async () => {
+  it('uses a host of the list over SSH without a Docker context, and the local Docker again', async () => {
     await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local', host: '' });
-    // The context is named after the SSH alias (the first of remoteContextNames, free in the Docker configuration of
-    // this file) and marked as one of Devspace by its description.
-    const context = await useRemoteContext(docker, ALIAS);
-    expect(context).toBe(ALIAS);
-    expect(remoteContextNames(ALIAS)[0]).toBe(ALIAS);
-    await expect(findRemoteContext(docker, ALIAS)).resolves.toBe(ALIAS);
-    await expect(isOwnContext(docker, ALIAS)).resolves.toBe(true);
-    expect((await listContextInfos(docker)).find((info) => info.name === ALIAS)).toEqual({
-      name: ALIAS,
-      description: ownContextDescription(ALIAS),
-      endpoint: `ssh://${ALIAS}`,
-    });
-    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: ALIAS, endpoint: `ssh://${ALIAS}`, context: ALIAS });
-    await useContext(docker, 'default');
-    await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local' });
-    // The existing context is taken again, no second one is created.
-    await expect(useRemoteContext(docker, ALIAS)).resolves.toBe(ALIAS);
-    expect((await listContextInfos(docker)).filter((info) => info.endpoint === `ssh://${ALIAS}`).map((info) => info.name)).toEqual([ALIAS]);
+    await state.setDockerHost(ALIAS);
+    await expect(targets.resolve()).resolves.toEqual({ kind: 'remote', host: ALIAS, endpoint: `ssh://${ALIAS}` });
+    // Each call of an operation there gets DOCKER_HOST=ssh://<alias>: the engine answers through the SSH server.
+    const before = acceptedConnections();
+    const info = await targets.withOperation(() => docker.run(['info', '--format', '{{json .ID}}']));
+    expect(info.exitCode, info.stderr).toBe(0);
+    expect(acceptedConnections()).toBeGreaterThan(before);
+    // No Docker context was made, and the current one is still `default`.
+    expect((await listContextInfos(docker)).map((context) => context.name)).toEqual(['default']);
+    await state.setDockerHost(undefined);
+    await expect(targets.resolve()).resolves.toMatchObject({ kind: 'local', context: 'default' });
+    // A context of the user with the SSH host is not the local Docker: it is offered for the list, not used.
+    const context = async (args: string[]): Promise<void> => {
+      const result = await docker.run(['context', ...args]);
+      expect(result.exitCode, result.stderr).toBe(0);
+    };
+    await context(['create', 'mine', '--docker', `host=ssh://${ALIAS}`]);
+    await context(['use', 'mine']);
+    try {
+      await expect(targets.resolve()).resolves.toMatchObject({ kind: 'unsupported', sshHost: ALIAS, context: 'mine' });
+    } finally {
+      await context(['use', 'default']);
+      await context(['rm', 'mine']);
+    }
   });
 
-  it.skipIf(skipped)('opens a seeded devspace through the context: containers, volumes, and the token on the engine reached through SSH', async () => {
-    await useRemoteContext(docker, ALIAS);
-    const state = new RemoteDockerState(path.join(dir, 'remote-docker.json'));
+  it.skipIf(skipped)('opens a seeded devspace on the host: containers, volumes, and the token on the engine reached through SSH', async () => {
+    await state.setDockerHost(ALIAS);
     const sshPath = findExecutable('ssh', env, process.platform);
     // The real worker of the engine reached through SSH (as extension.ts: the socket of that computer), whose batch
     // helper runs the helper steps of the open; there is no other path. The window of the shared harness, whose
@@ -338,12 +335,12 @@ describe('Docker on another computer through the Docker context', () => {
     expectLabelledDevspaceImage(localCli, await registry.get(devspaceId));
 
     // Back on the local Docker, the devspace of the remote host is never acted on.
-    await useContext(docker, 'default');
+    await state.setDockerHost(undefined);
     await expect(targets.withOperation(() => service.stop(devspaceId))).rejects.toMatchObject({ code: 'otherDockerHost' });
     expect(localCli.container(containerName)?.State.Running).toBe(true);
 
     // On the remote host again, the stop goes through SSH.
-    await useRemoteContext(docker, ALIAS);
+    await state.setDockerHost(ALIAS);
     await targets.withOperation(() => service.stop(devspaceId));
     expect(localCli.container(containerName)?.State.Running).toBe(false);
     // The stop ran in the worker on the remote engine (no local worker was started).

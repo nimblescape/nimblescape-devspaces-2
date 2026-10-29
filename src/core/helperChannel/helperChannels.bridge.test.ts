@@ -5,12 +5,12 @@
 // The probes of the mutation testing of the bridge fallback of openHelperChannel (a daemon without its default bridge
 // network), and of the number of a worker name in use. No Docker: the processes of the channel are stand-ins.
 import { describe, expect, it } from 'vitest';
-import { dockerTargetOf, remoteContextNames, type DockerTarget } from '../docker/dockerHost';
+import { remoteDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import { silentLogger, type StartedProcess } from '../ports';
 import { openHelperChannel } from './helperChannels';
 import { CHANNEL_PROTOCOL_VERSION, encodeMessage, parseClientMessage } from './protocol';
 
-const REMOTE: DockerTarget = dockerTargetOf('ssh://build-box', remoteContextNames('build-box')[0]);
+const REMOTE: DockerTarget = remoteDockerTarget('build-box');
 const ENGINE = '"7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11" "/var/lib/docker"';
 /** The same engine as the worker answers it (ProbeValue.engine: the values of `GET /info`). */
 const ENGINE_IDENTITY = { id: '7b1c7a44-2f0e-4d38-9d1d-3a8f7b0e8c11', rootDir: '/var/lib/docker' };

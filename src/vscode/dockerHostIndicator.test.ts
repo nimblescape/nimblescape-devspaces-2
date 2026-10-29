@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
-import { dockerTargetOf, LOCAL_DOCKER_TARGET } from '../core/docker/dockerHost';
+import { dockerTargetOf, LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../core/docker/dockerHost';
 import { UNREADABLE_DOCKER_TARGET, podmanDockerTarget } from '../core/docker/dockerTargets';
 import { Messages } from '../core/messages';
 import { silentLogger } from '../core/ports';
@@ -22,7 +22,7 @@ describe('DockerHostIndicator', () => {
 
   it('shows the remote host next to the view name and in the title', () => {
     const view: { description?: string; title?: string } = {};
-    new DockerHostIndicator(view, silentLogger).update(dockerTargetOf('ssh://machines', 'devspaces-remote-5709ff28'));
+    new DockerHostIndicator(view, silentLogger).update(remoteDockerTarget('machines'));
     expect(view.description).toBe(DockerHostTexts.remote('machines'));
     expect(view.description).toBe('Remote: machines');
     // The merged header of the single view shows the title, not the description.
@@ -69,6 +69,24 @@ describe('DockerHostIndicator', () => {
     ]);
   });
 
+  // Devspaces uses a remote host only from its own list: a Docker context or DOCKER_HOST of the user on an SSH host is
+  // shown as such, not as a remote host of Devspaces.
+  it('says that Docker is set to an SSH host that is not in the list, in the title and the first row', () => {
+    const view: { description?: string; title?: string } = {};
+    const rows: Array<ShownDockerHost | undefined> = [];
+    const indicator = new DockerHostIndicator(view, silentLogger, (host) => rows.push(host));
+    indicator.update(dockerTargetOf('ssh://me@box', 'mine'));
+    expect(view.description).toBeUndefined();
+    expect(view.title).toBe('me@box over SSH (not in the list)');
+    indicator.update(dockerTargetOf('ssh://me@box', 'mine'));
+    // The same host from DOCKER_HOST is another row (its tooltip names DOCKER_HOST).
+    indicator.update(dockerTargetOf('ssh://me@box', undefined));
+    expect(rows).toEqual([
+      { kind: 'sshContext', host: 'me@box', context: 'mine' },
+      { kind: 'sshContext', host: 'me@box' },
+    ]);
+  });
+
   // Without a Docker CLI the target reads as the local Docker; the header then names no Docker host (not "Local Docker"
   // above the Docker setup), and the list has no host row.
   it('names no Docker host while no Docker CLI is found, and names it again once one is', () => {
@@ -86,7 +104,7 @@ describe('DockerHostIndicator', () => {
 
   // The title bar has no icon for the Docker host, so no context key is set for one.
   it('sets no context key', () => {
-    new DockerHostIndicator({}, silentLogger).update(dockerTargetOf('ssh://machines', 'a'));
+    new DockerHostIndicator({}, silentLogger).update(remoteDockerTarget('machines'));
     expect(fakeVscode.commands.executeCommand.mock.calls.filter((call: unknown[]) => call[0] === 'setContext')).toEqual([]);
   });
 
@@ -95,9 +113,9 @@ describe('DockerHostIndicator', () => {
   it('gives the list the Docker host for its first row, and only when it changed', () => {
     const rows: Array<ShownDockerHost | undefined> = [];
     const indicator = new DockerHostIndicator({}, silentLogger, (host) => rows.push(host));
-    indicator.update(dockerTargetOf('ssh://htldvmhn', 'devspaces-remote-2e9f507b'));
-    indicator.update(dockerTargetOf('ssh://htldvmhn', 'devspaces-remote-2e9f507b'));
-    indicator.update(dockerTargetOf('ssh://machines', 'devspaces-remote-5709ff28'));
+    indicator.update(remoteDockerTarget('htldvmhn'));
+    indicator.update(remoteDockerTarget('htldvmhn'));
+    indicator.update(remoteDockerTarget('machines'));
     indicator.update(LOCAL_DOCKER_TARGET);
     indicator.update(LOCAL_DOCKER_TARGET);
     expect(rows).toEqual([

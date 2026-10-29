@@ -3,8 +3,8 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // "Remove Devspaces from This Docker Engine…" (controller.ts): what Devspaces keeps on a Docker engine besides the
-// devspaces, and its removal. With the Docker CLI of the extension (BootstrapDocker.run, within the operation: with the
-// Docker context of the engine), never through the worker, which the removal ends: besides the bootstrap
+// devspaces, and its removal. With the Docker CLI of the extension (BootstrapDocker.run, within the operation: on the
+// Docker host of the engine), never through the worker, which the removal ends: besides the bootstrap
 // (bootstrapDocker.ts), the one place where the extension runs Docker commands without the worker. The caller checks
 // first that the engine answers (Docker is never started for this). Removes, in this order: the Monitor containers, the
 // helper containers (the workers of every window and their batch helpers), the helper images (never with force, and
@@ -17,7 +17,7 @@ import { isAbortError, type Logger, type RunOptions, type RunResult } from '../p
 import { LABEL_MONITOR, LABEL_MONITOR_OWNER, REMOTE_MONITOR_VOLUME } from '../remoteMonitor/protocol';
 import { isRecord } from '../valueChecks';
 import { IMAGE_IN_USE_PATTERN, commandText, parseJsonLines, type BootstrapDocker } from './bootstrapDocker';
-import { describeDockerHost } from './dockerHost';
+import { describeDockerHost, sshEndpoint } from './dockerHost';
 import { DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
 
 /**
@@ -168,18 +168,18 @@ export async function engineInventory(
   };
 }
 
-/** `docker` with `--context <context>` for a remote engine, so that a command of the log reaches the same engine. */
-function dockerWord(context: string | undefined): string {
-  return context === undefined ? 'docker' : `docker --context ${context}`;
+/** `docker` with `-H ssh://<host>` for a remote engine, so that a command of the log reaches the same engine. */
+function dockerWord(remoteHost: string | undefined): string {
+  return remoteHost === undefined ? 'docker' : `docker -H ${sshEndpoint(remoteHost)}`;
 }
 
 /**
- * The command that removes an item that is left (`context`: the Docker context of a remote engine). For the containers
+ * The command that removes an item that is left (`remoteHost`: the SSH host of a remote engine). For the containers
  * or images of a label that could not be listed (`label=<key>`), the command removes all of them; for the images with
  * `docker image prune`, which removes an image with all its tags and leaves an image that a container uses.
  */
-export function manualCommand(item: Pick<RemovalItem, 'kind' | 'name'>, context?: string): string {
-  const docker = dockerWord(context);
+export function manualCommand(item: Pick<RemovalItem, 'kind' | 'name'>, remoteHost?: string): string {
+  const docker = dockerWord(remoteHost);
   const byLabel = item.name.startsWith('label=');
   switch (item.kind) {
     case 'container':
@@ -195,8 +195,8 @@ export function manualCommand(item: Pick<RemovalItem, 'kind' | 'name'>, context?
  * The commands that remove all that this removal removes, for the log of a removal that ended early. The section
  * "Uninstall" of docs/guide.md shows the same commands.
  */
-export function uninstallCommands(context?: string): string[] {
-  const docker = dockerWord(context);
+export function uninstallCommands(remoteHost?: string): string[] {
+  const docker = dockerWord(remoteHost);
   return [
     `${docker} rm -f $(${docker} ps -aq --filter label=${LABEL_MONITOR})`,
     `${docker} rm -f $(${docker} ps -aq --filter label=${LABEL_HELPER_RUN})`,
@@ -233,8 +233,8 @@ export interface RemovalOptions {
   /** Asked after a removal that failed: whether the engine still answers. When it does not, the removal ends. */
   answers(signal: AbortSignal | undefined): Promise<boolean>;
   logger: Logger;
-  /** The Docker context of a remote engine, for the commands in the log. */
-  context?: string;
+  /** The SSH host of a remote engine, for the commands in the log. */
+  remoteHost?: string;
   /** Before each removal, what it removes (itemText), for the progress. */
   onItem?(text: string): void;
   /** Cancel: the removal ends before its next call. */
@@ -273,7 +273,7 @@ class RemovalRun {
   /** Logs `item`; after a failure, false when the engine does not answer anymore (the run ends). */
   private async record(item: RemovalItem): Promise<boolean> {
     this.items.push(item);
-    const { logger, context } = this.options;
+    const { logger, remoteHost } = this.options;
     const text = itemText(item);
     switch (item.outcome) {
       case 'removed':
@@ -283,10 +283,10 @@ class RemovalRun {
         logger.info(`${capitalized(text)} was not there anymore.`);
         return true;
       case 'inUse':
-        logger.warn(`${capitalized(text)} is in use and was not removed (${item.detail ?? ''}). Remove it later with: ${manualCommand(item, context)}`);
+        logger.warn(`${capitalized(text)} is in use and was not removed (${item.detail ?? ''}). Remove it later with: ${manualCommand(item, remoteHost)}`);
         return true;
       case 'failed':
-        logger.warn(`${capitalized(text)} could not be removed (${item.detail ?? ''}). Remove it with: ${manualCommand(item, context)}`);
+        logger.warn(`${capitalized(text)} could not be removed (${item.detail ?? ''}). Remove it with: ${manualCommand(item, remoteHost)}`);
         break;
     }
     let answers = false;
@@ -390,18 +390,18 @@ export async function removeEngineInfrastructure(docker: Pick<BootstrapDocker, '
 /** The result; for a removal that ended early, the log names the commands that remove the rest. */
 function finish(run: RemovalRun, options: RemovalOptions): RemovalResult {
   const result = run.result();
-  if (result.ended !== undefined) options.logger.warn(removalEndedNote(result.ended, options.context));
+  if (result.ended !== undefined) options.logger.warn(removalEndedNote(result.ended, options.remoteHost));
   return result;
 }
 
 /**
  * The log line of a removal that ended early (`ended`): why, and the commands that remove the rest
- * (uninstallCommands, with the Docker context `context` of a remote engine). Also for a removal that the user
+ * (uninstallCommands, with the SSH host `remoteHost` of a remote engine). Also for a removal that the user
  * cancelled while it deleted the devspaces, before anything else was removed (Controller.removeFromEngine).
  */
-export function removalEndedNote(ended: NonNullable<RemovalResult['ended']>, context?: string): string {
+export function removalEndedNote(ended: NonNullable<RemovalResult['ended']>, remoteHost?: string): string {
   const why = ended === 'cancelled' ? 'The removal was cancelled.' : 'The removal ended: Docker does not answer anymore.';
-  return `${why} The rest can be removed with these commands (the error "requires at least 1 argument" means there is nothing to remove):\n${uninstallCommands(context).join('\n')}`;
+  return `${why} The rest can be removed with these commands (the error "requires at least 1 argument" means there is nothing to remove):\n${uninstallCommands(remoteHost).join('\n')}`;
 }
 
 /**

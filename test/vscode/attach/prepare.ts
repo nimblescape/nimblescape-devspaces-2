@@ -33,7 +33,7 @@ import * as childProcess from 'child_process';
 import { downloadAndUnzipVSCode, resolveCliArgsFromVSCodeExecutablePath } from '@vscode/test-electron';
 import { BootstrapDocker } from '../../../src/core/docker/bootstrapDocker';
 import { findDockerCli } from '../../../src/core/docker/dockerCli';
-import { ensureRemoteContext, useContext } from '../../../src/core/docker/remoteDocker';
+import { sshEndpoint } from '../../../src/core/docker/dockerHost';
 import { DEVCONTAINER_CLI_VERSION, helperImageTag } from '../../../src/core/helper/helperImage';
 import { HelperImages } from '../../../src/core/helper/helperImages';
 import { LABEL_DEVSPACE_ID, LABEL_HELPER, LABEL_OWNER_ID, LABEL_REPOSITORY, WORKSPACES_ROOT, newDevspaceId, repositoryFolder, resourceName } from '../../../src/core/names';
@@ -218,10 +218,11 @@ async function prepareLocal(docker: BootstrapDocker, started: number): Promise<R
 
 /**
  * The run `remote`: the other computer (REMOTE_HOST_DOCKERFILE) with the host REMOTE_HOST in the SSH config of the runner
- * (its own key and known_hosts file in ~/.ssh), the Docker context of that host as the extension makes it
- * (ensureRemoteContext), the helper image and the devspace on its engine, and on the engine of the runner a container
- * with the name of the devspace container. The context of the host becomes the current context last, as after "Use a
- * Remote Docker Host…": every Docker call of the runner without a context goes to the other computer from then on.
+ * (its own key and known_hosts file in ~/.ssh), the helper image and the devspace on its engine (reached with
+ * DOCKER_HOST=ssh://REMOTE_HOST, as the extension reaches a host of its list), and on the engine of the runner a
+ * container with the name of the devspace container. The current Docker context of the runner stays `default`:
+ * .vscode-test.mjs makes REMOTE_HOST the Docker host of Devspaces in its storage folder, as "Use a Remote Docker Host…"
+ * does, which changes no Docker context.
  */
 async function prepareRemote(local: BootstrapDocker, dockerPath: string, started: number): Promise<Record<string, unknown>> {
   await local.runChecked(['build', '-t', REMOTE_HOST_IMAGE, '-'], { input: REMOTE_HOST_DOCKERFILE, timeoutMs: 300_000 });
@@ -251,12 +252,14 @@ async function prepareRemote(local: BootstrapDocker, dockerPath: string, started
   fs.chmodSync(config, 0o600);
   log.info(`${config}: ${entry.join('; ')}`);
 
-  const context = await ensureRemoteContext(local, REMOTE_HOST);
-  const remote = new BootstrapDocker(new NodeProcessRunner(), dockerPath, { ...process.env, DOCKER_CONTEXT: context }, log);
+  const endpoint = sshEndpoint(REMOTE_HOST);
+  const remoteEnv: NodeJS.ProcessEnv = { ...process.env, DOCKER_HOST: endpoint };
+  delete remoteEnv.DOCKER_CONTEXT;
+  const remote = new BootstrapDocker(new NodeProcessRunner(), dockerPath, remoteEnv, log);
   for (const deadline = Date.now() + REMOTE_ENGINE_WAIT_MS; ; ) {
     const info = await remote.run(['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 30_000 });
     if (info.exitCode === 0) {
-      log.info(`The Docker engine ${info.stdout.trim()} of ${REMOTE_HOST} answers through the context ${context}.`);
+      log.info(`The Docker engine ${info.stdout.trim()} of ${REMOTE_HOST} answers through ${endpoint}.`);
       break;
     }
     if (Date.now() > deadline) throw new Error(`The Docker engine of ${REMOTE_HOST} does not answer: ${(info.stderr || info.stdout).trim()}`);
@@ -264,8 +267,6 @@ async function prepareRemote(local: BootstrapDocker, dockerPath: string, started
   }
   const { devspaceId, name, folder } = await seedDevspace(remote, await helperImage(remote, started));
   await local.runChecked(['run', '-d', '--name', name, '--entrypoint', 'sh', REMOTE_HOST_IMAGE, '-c', 'exec tail -f /dev/null']);
-  await useContext(local, context);
-  log.info(`The current Docker context is ${context}.`);
   // After the last SSH login of the preparation: remote.test.ts counts the logins from this time.
   const preparedAt = new Date().toISOString();
   // The window reaches the engine through its Docker pipe, as a window that Devspaces opens (windowPipe.ts): the address
@@ -282,7 +283,6 @@ async function prepareRemote(local: BootstrapDocker, dockerPath: string, started
       dockerHost,
       user: 'node',
       devspaceId,
-      dockerContext: context,
       remoteHost: REMOTE_HOST,
       remoteHostContainer: REMOTE_HOST_CONTAINER,
       preparedAt,

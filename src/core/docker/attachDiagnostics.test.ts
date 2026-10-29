@@ -5,12 +5,12 @@
 import { describe, expect, it } from 'vitest';
 import type { RunOptions, RunResult } from '../ports';
 import { attachDiagnostics } from './attachDiagnostics';
-import { dockerTargetOf, remoteContextNames } from './dockerHost';
+import { dockerTargetOf } from './dockerHost';
 import { operationDockerTarget, runWithDockerTarget } from './dockerTargets';
 
 const NAME = 'devspaces-acme-api-a1b2c3d4';
-// The Docker context of a host is named after it (remoteContextNames).
-const CONTEXT = remoteContextNames('build-box')[0];
+// The local Docker context that the operation of the devspace read.
+const CONTEXT = 'desktop-linux';
 
 function ok(stdout: string): RunResult {
   return { exitCode: 0, stdout, stderr: '', timedOut: false };
@@ -31,7 +31,7 @@ function fakeDocker(answers: (args: readonly string[]) => RunResult | Error) {
 }
 
 describe('attachDiagnostics', () => {
-  it('reports the variables, the current context, and both inspects of a remote devspace', async () => {
+  it('reports the variables, the current context, and both inspects of a devspace whose operation named a context', async () => {
     const docker = fakeDocker((args) => {
       const text = args.join(' ');
       if (text === 'context show') return ok('machines\n');
@@ -68,7 +68,7 @@ describe('attachDiagnostics', () => {
 
   it('runs its calls outside of the operation, so they are not pinned to its context', async () => {
     const docker = fakeDocker(() => ok(''));
-    await runWithDockerTarget(dockerTargetOf('ssh://build-box', CONTEXT), () => attachDiagnostics(docker, {}, NAME, CONTEXT, 'linux'));
+    await runWithDockerTarget(dockerTargetOf('unix:///var/run/docker.sock', CONTEXT), () => attachDiagnostics(docker, {}, NAME, CONTEXT, 'linux'));
     expect(docker.calls.map((call) => call.operationContext)).toEqual([undefined, undefined, undefined, undefined]);
   });
 

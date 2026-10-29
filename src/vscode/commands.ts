@@ -53,14 +53,12 @@ export const Commands = {
   dockerSetupStart: 'devspaces.dockerSetup.start',
   dockerSetupInstallWsl: 'devspaces.dockerSetup.installWsl',
   dockerSetupShow: 'devspaces.dockerSetup.show',
-  // Docker on another computer through the Docker context, and back.
+  // Docker on another computer over SSH (a host of the list of Devspaces), and back.
   useRemoteDockerHost: 'devspaces.useRemoteDockerHost',
   useLocalDocker: 'devspaces.useLocalDocker',
   // The choice of the Docker host, the command of the first row of the view (hidden in the Command Palette): another
   // remote host, or the local Docker.
   chooseDockerHost: 'devspaces.chooseDockerHost',
-  // Forgets every "Don't Ask Again" of the Docker host questions.
-  askAgainDockerHost: 'devspaces.askAgainDockerHost',
   // The command of a repository row (TreeItem.command, hidden in the Command Palette): a double-click runs Start
   // (rowActivation.ts).
   rowActivated: 'devspaces.rowActivated',
