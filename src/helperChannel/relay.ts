@@ -94,7 +94,8 @@ export class Relay {
     if (stream.target === 'docker') return this.connect(stream);
     if (this.worker === undefined) return this.startWorker(stream);
     // The extension opens the next worker of the connection while the last one still ends (its channel was closed or
-    // lost): the stream waits for that end (at most RELAY_WORKER_STOP_MS), so that it needs no new connection. Its data
+    // lost): the stream waits for that end (at most RELAY_WORKER_STOP_MS after the stream of the last worker closed),
+    // so that it needs no new connection; the extension limits its own wait for the answer of the worker. Its data
     // waits in the stream. A newer worker stream takes its place.
     this.waiting?.close('a newer worker stream came');
     this.waiting = stream;

@@ -202,7 +202,14 @@ describe('the Docker pipe', () => {
     for (let index = 0; index < PIPE_LOGGED_CONNECTIONS + 3; index += 1) await expect(exchange(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('hello');
     expect(log.lines.filter((line) => line === 'info Docker pipe of devspaces-api: GET /_ping')).toHaveLength(PIPE_LOGGED_CONNECTIONS);
     expect(log.lines).toContain('info The Docker pipe of devspaces-api logs no further connection one by one, only their number each hour.');
-    await vi.waitFor(() => expect(log.lines).toContain('info The Docker pipe of devspaces-api had 3 more connections.'));
+    // The counts of the hours (here 200 ms) add up to the connections that were not logged one by one.
+    const counted = () =>
+      log.lines.map((line) => /^info The Docker pipe of devspaces-api had (\d+) more connections\.$/.exec(line)?.[1]).reduce((sum, count) => sum + Number(count ?? 0), 0);
+    await vi.waitFor(() => expect(counted()).toBe(3));
+    // The number since the last count also at the close.
+    for (let index = 0; index < 2; index += 1) await expect(exchange(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('hello');
+    pipe.close();
+    expect(counted()).toBe(5);
   });
 
   it('refuses a folder that is a link', async () => {

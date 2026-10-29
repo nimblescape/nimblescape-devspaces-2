@@ -2,9 +2,11 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as fs from 'fs';
 import * as os from 'os';
+import * as path from 'path';
 import { describe, expect, it } from 'vitest';
-import { MAX_SOCKET_PATH_BYTES, dockerPipeAddress, dockerPipeBase, dockerPipeId, parseDockerPipeHost } from './pipeAddress';
+import { MAX_SOCKET_PATH_BYTES, dockerPipeAddress, dockerPipeBase, dockerPipeId, existingFolder, parseDockerPipeHost } from './pipeAddress';
 
 const ID = '0123456789abcdef';
 
@@ -49,6 +51,18 @@ describe('the address of the Docker pipe', () => {
     expect(dockerPipeBase({ XDG_RUNTIME_DIR: '/run/user/1000' }, '/tmp/user', (folder) => folder !== '/run/user/1000')).toBe('/tmp/user');
     // On this computer, without a test of its own: a folder that does not exist is never taken.
     expect(dockerPipeBase({ XDG_RUNTIME_DIR: '/nonexistent-devspaces-test' }, os.tmpdir())).toBe(os.tmpdir().replace(/\/+$/, ''));
+  });
+
+  // The user root may write in every folder.
+  it.skipIf(process.getuid?.() === 0 || process.platform === 'win32')('never lies in a folder in which this user cannot make a folder', () => {
+    const readOnly = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-base-'));
+    try {
+      fs.chmodSync(readOnly, 0o500);
+      expect(existingFolder(readOnly)).toBe(false);
+      expect(dockerPipeBase({ XDG_RUNTIME_DIR: readOnly }, os.tmpdir())).toBe(os.tmpdir().replace(/\/+$/, ''));
+    } finally {
+      fs.rmSync(readOnly, { recursive: true, force: true });
+    }
   });
 
   it('is read back from the host in the authority of a window, and nothing else is', () => {

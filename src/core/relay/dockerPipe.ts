@@ -16,6 +16,8 @@ import { bridgeStream } from './bridge';
 import type { RelayConnection } from './connection';
 import type { DockerPipeAddress } from './pipeAddress';
 
+/** The errors of a connect to a socket file that nobody serves (or a file that is no socket). */
+const STALE_SOCKET_CODES = new Set(['ECONNREFUSED', 'ENOENT', 'ENOTSOCK']);
 /** The end of the error output of a `docker system dial-stdio` that is logged when it fails. */
 const DIAL_STDERR_TAIL = 2048;
 /**
@@ -121,8 +123,10 @@ export class DockerPipe {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.refreshTimer);
+    this.logCount();
     // Node.js removes the socket file of a server at its close, before it closes the socket: so a new window never
-    // finds this socket after the close.
+    // finds this socket after the close. It removes the file at the address also when another file replaced the socket
+    // (refresh logged it); only a program of this user can do that in the private folder.
     this.server?.close();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
@@ -363,7 +367,10 @@ async function preparePrivateFolder(folder: string): Promise<void> {
   if ((stat.mode & 0o077) !== 0) await fs.promises.chmod(folder, 0o700);
 }
 
-/** Removes the socket at `socketPath` when no program serves it (an extension host that ended). Throws when one does. */
+/**
+ * Removes the socket at `socketPath` when no program serves it (an extension host that ended: the connect is refused).
+ * Throws when one does, also when its connect fails otherwise (for example while its queue of connections is full).
+ */
 async function removeStaleSocket(socketPath: string): Promise<void> {
   try {
     await fs.promises.lstat(socketPath);
@@ -376,7 +383,7 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
       probe.destroy();
       resolve(true);
     });
-    probe.once('error', () => resolve(false));
+    probe.once('error', (error: NodeJS.ErrnoException) => resolve(!STALE_SOCKET_CODES.has(error.code ?? '')));
   });
   if (served) throw new PipeInUseError(socketPath);
   await fs.promises.unlink(socketPath);

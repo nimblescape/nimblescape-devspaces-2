@@ -50,18 +50,20 @@ export function dockerPipeId(computerId: string, host: string, containerName: st
 /**
  * The folder for the folders of the Unix sockets: XDG_RUNTIME_DIR (private to the user on Linux), else the temporary
  * folder of Node.js (private to the user on macOS), else /tmp; the first that is an absolute path, gives a socket path
- * of at most MAX_SOCKET_PATH_BYTES, and is a folder (`isFolder`; XDG_RUNTIME_DIR can name a folder that does not exist,
- * for example after `su`).
+ * of at most MAX_SOCKET_PATH_BYTES, and is a folder of which this user can make folders (`isFolder`; XDG_RUNTIME_DIR can
+ * name a folder that does not exist or belongs to another user, for example after `su`).
  */
 export function dockerPipeBase(env: NodeJS.ProcessEnv, tmpdir: string, isFolder: (folder: string) => boolean = existingFolder): string {
   const candidates = [env.XDG_RUNTIME_DIR, tmpdir].map((value) => value?.trim().replace(/\/+$/, '')).filter((value): value is string => !!value);
   return candidates.find((base) => path.posix.isAbsolute(base) && socketPathFits(base) && isFolder(base)) ?? FALLBACK_BASE;
 }
 
-/** True when `folder` exists and is a folder. */
+/** True when `folder` exists, is a folder, and this user can make a folder in it. */
 export function existingFolder(folder: string): boolean {
   try {
-    return fs.statSync(folder).isDirectory();
+    if (!fs.statSync(folder).isDirectory()) return false;
+    fs.accessSync(folder, fs.constants.W_OK | fs.constants.X_OK);
+    return true;
   } catch {
     return false;
   }
