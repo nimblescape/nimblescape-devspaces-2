@@ -263,7 +263,8 @@ describe('the Docker pipe', () => {
     const fail = () => runner.startBytes('sh', ['-c', 'echo "ssh: connect to host build-box port 22: Connection refused" >&2; exit 255']);
     await listen(failingAddress, processDockerDial(fail, log, 'build-box'));
     await expect(refused(failingAddress.path, 'x')).resolves.toBe('');
-    expect(log.lines).toContain('warn The Docker connection of build-box ended: ssh: connect to host build-box port 22: Connection refused');
+    // At the end of the program, which can come after the end of the connection.
+    await vi.waitFor(() => expect(log.lines).toContain('warn The Docker connection of build-box ended: ssh: connect to host build-box port 22: Connection refused'));
   });
 
   it('ends the connection when the program ended, also while the client still sends', async () => {
