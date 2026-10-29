@@ -55,8 +55,11 @@ export function relayAccess(
 /** The connections of the relay of this window, by the Docker host (DockerTarget.host). */
 export class RelayConnections {
   private readonly current = new Map<string, RelayConnection>();
-  /** Every connection that is not closed yet, with the time since when it has no stream. */
-  private readonly all = new Map<RelayConnection, { host: string; idleSince?: number }>();
+  /**
+   * Every connection that is not closed yet, with the time since when it has no stream and the number of streams that
+   * were opened on it at the last sweep.
+   */
+  private readonly all = new Map<RelayConnection, { host: string; idleSince?: number; opened: number }>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private disposed = false;
 
@@ -82,7 +85,7 @@ export class RelayConnections {
       return;
     }
     this.current.set(host, connection);
-    this.all.set(connection, { host });
+    this.all.set(connection, { host, opened: connection.streamsOpened });
     connection.onClose(() => {
       this.all.delete(connection);
       if (this.current.get(host) === connection) this.current.delete(host);
@@ -94,12 +97,17 @@ export class RelayConnections {
     for (const [connection, entry] of [...this.all]) if (entry.host === host) connection.close(reason);
   }
 
-  /** Closes the connections that had no stream for RELAY_IDLE_CLOSE_MS (measured at the sweeps). */
+  /**
+   * Closes the connections that had no stream for RELAY_IDLE_CLOSE_MS (measured at the sweeps; a stream that was opened
+   * and ended between two sweeps counts as use).
+   */
   sweep(): void {
     const now = (this.options.now ?? Date.now)();
     const idleMs = this.options.idleCloseMs ?? RELAY_IDLE_CLOSE_MS;
     for (const [connection, entry] of [...this.all]) {
-      if (connection.streamCount > 0) {
+      const opened = connection.streamsOpened;
+      if (connection.streamCount > 0 || opened !== entry.opened) {
+        entry.opened = opened;
         entry.idleSince = undefined;
         continue;
       }

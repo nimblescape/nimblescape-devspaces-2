@@ -449,15 +449,12 @@ export interface HelperChannelsOptions {
 }
 
 /**
- * The key of the engine of a target: its Docker context and its endpoint. By the context alone, a context of the user
- * that is pointed to another host under the same name (`docker context update`) would keep the channel to the old
- * engine, and the calls through it would go there. The channel of the old endpoint gets no new operation and is closed
- * by the sweep after CHANNEL_IDLE_CLOSE_MS. Not seen: an SSH alias of `~/.ssh/config` pointed to another machine (the
- * same endpoint).
- */
-/**
- * One channel per engine: the local Docker by its context and endpoint; an SSH host by its host alone, whatever context
- * names it, because its worker runs behind the one connection of the relay to the host, which runs one worker at a time.
+ * The key of the engine of a target, one channel per engine. The local Docker by its Docker context and its endpoint:
+ * by the context alone, a context of the user that is pointed to another host under the same name (`docker context
+ * update`) would keep the channel to the old engine, and the calls through it would go there; the channel of the old
+ * endpoint gets no new operation and is closed by the sweep after CHANNEL_IDLE_CLOSE_MS. An SSH host by its host alone,
+ * whatever context names it, because its worker runs behind the one connection of the relay to the host, which runs one
+ * worker at a time. Not seen: an SSH alias of `~/.ssh/config` pointed to another machine (the same host).
  */
 function keyOf(target: DockerTarget): string {
   return target.kind === 'remote' ? JSON.stringify(['remote', target.host]) : JSON.stringify([target.context ?? null, target.endpoint]);

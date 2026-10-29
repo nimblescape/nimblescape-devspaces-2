@@ -10,6 +10,7 @@ import { RELAY_IDLE_CLOSE_MS, RelayConnections, relayAccess } from './connection
 /** A connection of the test: its streams are set by the test; close and killNow end it. */
 class FakeConnection {
   streamCount = 0;
+  streamsOpened = 0;
   isOpen = true;
   readonly ends: string[] = [];
   private listener: ((reason: string) => void) | undefined;
@@ -87,7 +88,16 @@ describe('RelayConnections', () => {
     now += 1;
     connections.sweep();
     expect(connection.ends).toEqual([]);
+    // A short stream that ended between two sweeps starts the count again too.
     now += RELAY_IDLE_CLOSE_MS;
+    connection.streamsOpened++;
+    connections.sweep();
+    now += 1;
+    connections.sweep();
+    now += RELAY_IDLE_CLOSE_MS - 1;
+    connections.sweep();
+    expect(connection.ends).toEqual([]);
+    now += 1;
     connections.sweep();
     expect(connection.ends).toEqual(['close closed after a time without use']);
     expect(connections.get('build-box')).toBeUndefined();

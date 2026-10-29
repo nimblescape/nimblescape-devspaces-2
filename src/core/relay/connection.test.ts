@@ -44,6 +44,10 @@ class FakeTransport implements StartedByteProcess {
 
   onDrain(): void {}
 
+  pauseStdout(): void {}
+
+  resumeStdout(): void {}
+
   end(): void {
     this.inputEnded = true;
     const relay = this.relay;

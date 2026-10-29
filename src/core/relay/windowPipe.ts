@@ -7,6 +7,7 @@
 // (pipeAddress.ts). Each connection goes through the connection of the relay to the host of the devspace; on an engine
 // with the removal mark, through its own `docker system dial-stdio` over SSH, so that no worker sets Devspaces up there
 // again. No `vscode`.
+import type * as net from 'net';
 import { dockerHostOf, sshTargetOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import type { Logger, StartedByteProcess } from '../ports';
@@ -14,6 +15,11 @@ import type { Devspace } from '../types';
 import type { RelayConnection } from './connection';
 import { DockerPipe, processDockerDial, relayDockerDial } from './dockerPipe';
 import { dockerPipeAddress, dockerPipeBase, dockerPipeId, parseDockerPipeHost } from './pipeAddress';
+
+/** How long the answer of WindowPipeDeps.engineRemoved holds for the next connections of the pipe. */
+const ENGINE_REMOVED_HOLD_MS = 2_000;
+/** After the connection of the relay could not be had, the connections log in themselves for this long before it is tried again. */
+export const RELAY_RETRY_AFTER_MS = 60_000;
 
 export interface WindowPipeDeps {
   logger: Logger;
@@ -26,21 +32,29 @@ export interface WindowPipeDeps {
   relayConnection(devspace: Devspace): Promise<RelayConnection>;
   /** `ssh … docker system dial-stdio` on the host of `devspace`; undefined without `ssh` or for a host it cannot reach. */
   dialStdio(devspace: Devspace): StartedByteProcess | undefined;
+  /** Only for the tests (DockerPipeOptions.inUseWaitMs, RELAY_RETRY_AFTER_MS). */
+  inUseWaitMs?: number;
+  relayRetryAfterMs?: number;
 }
 
 /**
  * The address of the Docker pipe of the window of `devspace` (its container `containerName`), for `settings.host` in
  * the authority: for a devspace on an SSH host (sshTargetOf) when `ssh` is found (the connection of the relay needs it);
- * undefined otherwise, and the window names a Docker context as before.
+ * undefined otherwise, and the window names a Docker context as before. `current`, the Docker host in the authority of
+ * this window, when it is the pipe of this devspace: an extension host with another runtime or temporary folder made
+ * it, and the same URI reloads this window instead of opening it again.
  */
 export function windowDockerHost(
   devspace: Devspace,
   containerName: string,
-  deps: { computerId(): string; platform: NodeJS.Platform; env: NodeJS.ProcessEnv; tmpdir: string; sshFound(): boolean },
+  deps: { computerId(): string; platform: NodeJS.Platform; env: NodeJS.ProcessEnv; tmpdir: string; sshFound(): boolean; current?: string },
 ): string | undefined {
   const host = dockerHostOf(devspace);
   if (host === '' || sshTargetOf(host) === undefined || !deps.sshFound()) return undefined;
-  return dockerPipeAddress(dockerPipeId(deps.computerId(), host, containerName), deps.platform, dockerPipeBase(deps.env, deps.tmpdir)).dockerHost;
+  const id = dockerPipeId(deps.computerId(), host, containerName);
+  const current = deps.current === undefined ? undefined : parseDockerPipeHost(deps.current, deps.platform);
+  if (current?.id === id) return current.dockerHost;
+  return dockerPipeAddress(id, deps.platform, dockerPipeBase(deps.env, deps.tmpdir)).dockerHost;
 }
 
 /**
@@ -84,14 +98,32 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
       logger,
       host,
     );
-    const pipe = await DockerPipe.listen({
-      address,
-      // Each connection again: the removal mark can come or go while the window is open.
-      connect: async (socket) => ((await deps.engineRemoved(devspace)) ? direct(socket) : relay(socket)),
-      logger,
-      name: containerName,
-      platform: deps.platform,
-    });
+    // The removal mark can come or go while the window is open: read again after ENGINE_REMOVED_HOLD_MS.
+    let removed: { at: number; answer: Promise<boolean> } | undefined;
+    const engineRemoved = (): Promise<boolean> => {
+      const now = Date.now();
+      if (removed === undefined || Math.abs(now - removed.at) >= ENGINE_REMOVED_HOLD_MS) removed = { at: now, answer: deps.engineRemoved(devspace) };
+      return removed.answer;
+    };
+    // Without the connection of the relay, the window still works: each connection logs in as without the pipe, and
+    // the relay is tried again after RELAY_RETRY_AFTER_MS.
+    let withoutRelaySince: number | undefined;
+    const connect = async (socket: net.Socket): Promise<void> => {
+      if (await engineRemoved()) return direct(socket);
+      if (withoutRelaySince !== undefined && Math.abs(Date.now() - withoutRelaySince) < (deps.relayRetryAfterMs ?? RELAY_RETRY_AFTER_MS)) return direct(socket);
+      try {
+        await relay(socket);
+      } catch (error) {
+        if (withoutRelaySince === undefined) {
+          logger.warn(`The Docker pipe of ${containerName} goes without the connection of the relay, with an SSH login for each Docker connection: ${errorMessage(error)}`);
+        }
+        withoutRelaySince = Date.now();
+        return direct(socket);
+      }
+      if (withoutRelaySince !== undefined) logger.info(`The Docker pipe of ${containerName} goes through the connection of the relay again.`);
+      withoutRelaySince = undefined;
+    };
+    const pipe = await DockerPipe.listen({ address, connect, logger, name: containerName, platform: deps.platform, inUseWaitMs: deps.inUseWaitMs });
     return { kind: 'served', pipe };
   } catch (error) {
     return refuse(errorMessage(error));

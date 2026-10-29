@@ -321,6 +321,8 @@ describe('the helper channel with the real Docker engine', () => {
       // Every connection of the Docker CLI ended with it; the worker stream stays.
       await waitUntil(() => pipe!.connectionCount === 0, 'the end of the connections of the pipe');
       expect(connections.get('runner-engine')?.streamCount).toBe(1);
+      // The worker stream and at least one Docker stream for each of the four calls.
+      expect(connections.get('runner-engine')?.streamsOpened).toBeGreaterThanOrEqual(5);
       channel.close();
     } finally {
       cli.run(['rm', '-f', sleeper]);

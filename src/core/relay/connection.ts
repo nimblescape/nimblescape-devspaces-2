@@ -61,6 +61,7 @@ export class RelayConnection {
   private readonly stderrListeners = new Set<(text: string) => void>();
   private readonly closeListeners = new Set<(reason: string) => void>();
   private closedReason: string | undefined;
+  private opened = 0;
 
   private constructor(
     private readonly process: StartedByteProcess,
@@ -100,6 +101,7 @@ export class RelayConnection {
   openWorker(): StartedProcess {
     if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
     const stream = this.mux.open('worker');
+    this.opened++;
     const stdout = decodedOutput();
     let settle: (result: { exitCode: number | null; error?: Error }) => void = () => {};
     const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => {
@@ -150,12 +152,19 @@ export class RelayConnection {
    */
   openDocker(): MuxStream {
     if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
-    return this.mux.open('docker');
+    const stream = this.mux.open('docker');
+    this.opened++;
+    return stream;
   }
 
   /** The streams that are open now: the worker and the Docker streams (RelayConnections closes an idle connection). */
   get streamCount(): number {
     return this.closedReason === undefined ? (this.mux?.streamCount ?? 0) : 0;
+  }
+
+  /** How many streams were opened on the connection so far (a short stream between two looks still counts as use). */
+  get streamsOpened(): number {
+    return this.opened;
   }
 
   /** Ends the connection: every stream is lost, and the transport is stopped when it does not end by itself. */

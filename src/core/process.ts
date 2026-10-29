@@ -253,6 +253,8 @@ export class NodeProcessRunner implements ProcessRunner {
       },
       kill: started.kill,
       onStdout: (listener, onEnd) => stdout.listen((chunk) => (chunk === null ? onEnd() : listener(chunk))),
+      pauseStdout: () => child.stdout.pause(),
+      resumeStdout: () => child.stdout.resume(),
       onStderr: stderr.listen,
       exited: started.exited,
       pid: child.pid,

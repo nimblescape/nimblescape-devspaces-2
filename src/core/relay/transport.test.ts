@@ -51,6 +51,8 @@ describe('openRelayConnection', () => {
       end: () => {},
       kill: () => {},
       onStdout: () => {},
+      pauseStdout: () => {},
+      resumeStdout: () => {},
       onStderr: () => {},
       exited: new Promise((resolve) => (finish = resolve)),
     };

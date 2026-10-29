@@ -156,6 +156,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
     assert.ok(log.includes(`The Docker pipe of ${containerName} listens on ${dockerHost}.`), 'The Docker pipe of the window did not listen');
     assert.ok(log.includes(`Docker pipe of ${containerName}: `), 'No Docker call came through the Docker pipe of the window');
     assert.ok(!log.includes(`The Docker pipe of ${containerName} could not reach`), 'A Docker call through the Docker pipe failed');
+    assert.ok(!log.includes(`The Docker pipe of ${containerName} goes without the connection of the relay`), 'The Docker pipe went without the relay');
     // Each line of a worker names its engine: the operations ran on the other computer, none on the local Docker.
     assert.ok(log.includes(`[${remoteHost}] open#`), `No operation open on ${remoteHost} in the log`);
     assert.doesNotMatch(log, /\[the local Docker\]/);

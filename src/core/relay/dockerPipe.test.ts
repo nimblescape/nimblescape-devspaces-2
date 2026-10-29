@@ -139,8 +139,44 @@ describe('the Docker pipe', () => {
     fs.renameSync(`${address.path}.kept`, address.path);
     const first = await listen(address, async () => {});
     expect(fs.statSync(folder).mode & 0o777).toBe(0o700);
-    await expect(DockerPipe.listen({ address, connect: async () => {}, logger: silentLogger, name: 'other window' })).rejects.toThrow('is in use: another window serves it');
+    await expect(DockerPipe.listen({ address, connect: async () => {}, logger: silentLogger, name: 'other window', inUseWaitMs: 0 })).rejects.toThrow(
+      'is in use: another window serves it',
+    );
     first.close();
+  });
+
+  it('waits while another program serves the address, and listens once it ended (the extension host before a reload)', async () => {
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const log = logger();
+    const before = await DockerPipe.listen({ address, connect: async () => {}, logger: silentLogger, name: 'devspaces-api' });
+    setTimeout(() => before.close(), 300);
+    const after = await listen(address, async () => {}, log);
+    expect(log.lines).toEqual([
+      `info ${address.dockerHost} is in use. The Docker pipe of devspaces-api waits up to 15 s for the program that serves it to end.`,
+      `info The Docker pipe of devspaces-api listens on ${address.dockerHost}.`,
+    ]);
+    expect(after.connectionCount).toBe(0);
+    expect(fs.lstatSync(address.path).isSocket()).toBe(true);
+  });
+
+  it('gives the socket and its folder a new time, and listens again when the socket was removed', async () => {
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const folder = address.folder as string;
+    const log = logger();
+    const pipe = await DockerPipe.listen({ address, connect: async (socket) => void socket.end('hello'), logger: log, name: 'devspaces-api', refreshIntervalMs: 50 });
+    cleanups.push(() => pipe.close());
+    const old = new Date('2026-01-01T00:00:00Z');
+    fs.utimesSync(folder, old, old);
+    fs.utimesSync(address.path, old, old);
+    await vi.waitFor(() => {
+      expect(fs.statSync(folder).mtimeMs).toBeGreaterThan(old.getTime());
+      expect(fs.statSync(address.path).mtimeMs).toBeGreaterThan(old.getTime());
+    });
+    // A cleanup of the temporary folder removed the socket and its folder.
+    fs.rmSync(folder, { recursive: true });
+    await vi.waitFor(() => expect(log.lines.at(-1)).toBe(`info The socket of the Docker pipe of devspaces-api was removed. The pipe listens again on ${address.dockerHost}.`));
+    expect(fs.statSync(folder).mode & 0o777).toBe(0o700);
+    await expect(exchange(address.path, 'x')).resolves.toBe('hello');
   });
 
   it('refuses a folder that is a link', async () => {
@@ -198,6 +234,43 @@ describe('the Docker pipe', () => {
     await listen(failingAddress, processDockerDial(fail, log, 'build-box'));
     await expect(refused(failingAddress.path, 'x')).resolves.toBe('');
     expect(log.lines).toContain('warn The Docker connection of build-box ended: ssh: connect to host build-box port 22: Connection refused');
+  });
+
+  it('lets the program wait while the client reads slower than the program writes', async () => {
+    const runner = new NodeProcessRunner();
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const calls: string[] = [];
+    const start = () => {
+      const started = runner.startBytes('head', ['-c', '8000000', '/dev/zero']);
+      return {
+        ...started,
+        pauseStdout: () => {
+          calls.push('pause');
+          started.pauseStdout();
+        },
+        resumeStdout: () => {
+          calls.push('resume');
+          started.resumeStdout();
+        },
+      };
+    };
+    await listen(address, processDockerDial(start, silentLogger, 'build-box'));
+    const received = await new Promise<number>((resolve, reject) => {
+      const client = net.connect({ path: address.path, allowHalfOpen: true });
+      let bytes = 0;
+      client.pause();
+      client.on('data', (chunk: Buffer) => (bytes += chunk.length));
+      client.on('end', () => {
+        client.end();
+        resolve(bytes);
+      });
+      client.on('error', reject);
+      client.write('x');
+      // The client reads only after a while: the program waits in the meantime.
+      setTimeout(() => client.resume(), 300);
+    });
+    expect(received).toBe(8_000_000);
+    expect(calls.slice(0, 2)).toEqual(['pause', 'resume']);
   });
 
   it('ends every connection at close', async () => {

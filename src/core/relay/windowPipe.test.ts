@@ -12,6 +12,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NodeProcessRunner } from '../process';
 import { silentLogger, type Logger } from '../ports';
 import type { Devspace } from '../types';
+import type { RelayConnection } from './connection';
+import { MemoryPipe } from './memoryPipe.testkit';
+import { Mux } from './mux';
 import { dockerPipeAddress, dockerPipeId, parseDockerPipeHost } from './pipeAddress';
 import { serveWindowPipe, windowDockerHost, type WindowPipe, type WindowPipeDeps } from './windowPipe';
 
@@ -67,6 +70,35 @@ async function serve(dockerHost: string, shown: Devspace | undefined, windowDeps
   return served;
 }
 
+/** The extension and the relay in memory; the relay answers each Docker stream with `relay: ` and what it got. */
+function echoRelay(): RelayConnection {
+  const up = new MemoryPipe();
+  const down = new MemoryPipe();
+  const relay = new Mux({
+    side: 'relay',
+    link: down.link,
+    accept: (stream) => {
+      let got = '';
+      stream.onData((chunk) => {
+        got += chunk.toString();
+        stream.consumed(chunk.length);
+      });
+      stream.onEnd(() => {
+        stream.write(Buffer.from(`relay: ${got}`));
+        stream.end();
+      });
+    },
+  });
+  const extension = new Mux({ side: 'extension', link: up.link });
+  up.target = relay;
+  down.target = extension;
+  cleanups.push(() => {
+    relay.close('the test ended');
+    extension.close('the test ended');
+  });
+  return { openDocker: () => extension.open('docker') } as unknown as RelayConnection;
+}
+
 /** Sends `text` through the socket, ends it, and resolves with what came back once it closed. */
 function roundTrip(socketPath: string, text: string): Promise<string> {
   return new Promise((resolve) => {
@@ -88,6 +120,17 @@ describe('windowDockerHost', () => {
     expect(address).toBe(dockerPipeAddress(dockerPipeId(COMPUTER, 'me@build-box:2222', CONTAINER), 'linux', '/run/user/1000').dockerHost);
     expect(parseDockerPipeHost(address as string, 'linux')).toBeDefined();
     expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, platform: 'win32' })).toMatch(/^npipe:\/\/\/\/\.\/pipe\/devspaces-[0-9a-f]{16}$/);
+  });
+
+  it('keeps the address in the authority of this window when it is the pipe of the devspace (another runtime folder made it)', () => {
+    const id = dockerPipeId(COMPUTER, 'build-box', CONTAINER);
+    const made = dockerPipeAddress(id, 'linux', '/tmp').dockerHost;
+    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: made })).toBe(made);
+    const fresh = dockerPipeAddress(id, 'linux', '/run/user/1000').dockerHost;
+    // Another container, another host, or no pipe: the address of this extension host.
+    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', 'other'), 'linux', '/tmp').dockerHost })).toBe(fresh);
+    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: dockerPipeAddress(dockerPipeId(COMPUTER, 'other-box', CONTAINER), 'linux', '/tmp').dockerHost })).toBe(fresh);
+    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: 'ssh://build-box' })).toBe(fresh);
   });
 
   it('gives none to a local devspace, to a host that is no SSH host, and without ssh', () => {
@@ -117,7 +160,7 @@ describe('serveWindowPipe', () => {
     expect((await serve(address.dockerHost, devspace('build-box'), deps({ logger: log }))).kind).toBe('served');
     expect(log.lines.at(-1)).toBe(`info The Docker pipe of ${CONTAINER} listens on ${address.dockerHost}.`);
     // A second window of the same address: it is in use.
-    expect(await serve(address.dockerHost, devspace('build-box'), deps({ logger: log }))).toEqual({ kind: 'refused', reason: `${address.path} is in use: another window serves it.` });
+    expect(await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, inUseWaitMs: 0 }))).toEqual({ kind: 'refused', reason: `${address.path} is in use: another window serves it.` });
     expect(log.lines.at(-1)).toBe(`${notServed}: ${address.path} is in use: another window serves it.`);
   });
 
@@ -125,22 +168,60 @@ describe('serveWindowPipe', () => {
     const runner = new NodeProcessRunner();
     const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
     let removed = false;
-    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(async () => {
-      throw new Error('The connection to build-box could not be opened: it ended (Permission denied (publickey).)');
-    });
+    const engineRemoved = vi.fn(async () => removed);
+    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(async () => echoRelay());
     const dialStdio = vi.fn<WindowPipeDeps['dialStdio']>(() => runner.startBytes('cat', []));
     const log = logger();
-    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, engineRemoved: async () => removed, relayConnection, dialStdio }));
-    await expect(roundTrip(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('');
+    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, engineRemoved, relayConnection, dialStdio }));
+    await expect(roundTrip(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('relay: GET /_ping HTTP/1.1\r\n\r\n');
     expect(relayConnection).toHaveBeenCalledWith(devspace('build-box'));
-    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: The connection to build-box could not be opened: it ended (Permission denied (publickey).)`);
+    expect(dialStdio).not.toHaveBeenCalled();
+    // The answer about the removal mark holds for the connections of the next 2 seconds.
+    await expect(roundTrip(address.path, 'x')).resolves.toBe('relay: x');
+    expect(engineRemoved).toHaveBeenCalledTimes(1);
+    // A pipe that is served while the engine has the removal mark: each connection runs its own dial-stdio.
     removed = true;
-    await expect(roundTrip(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('GET /_ping HTTP/1.1\r\n\r\n');
+    const marked = dockerPipeAddress(dockerPipeId(COMPUTER, 'marked-box', CONTAINER), 'linux', base());
+    await serve(marked.dockerHost, devspace('marked-box'), deps({ logger: log, engineRemoved, relayConnection, dialStdio }));
+    await expect(roundTrip(marked.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('GET /_ping HTTP/1.1\r\n\r\n');
     expect(dialStdio).toHaveBeenCalledTimes(1);
-    expect(relayConnection).toHaveBeenCalledTimes(1);
+    expect(relayConnection).toHaveBeenCalledTimes(2);
     // Without ssh, the connection ends with the reason.
     dialStdio.mockReturnValue(undefined);
-    await expect(roundTrip(address.path, 'x')).resolves.toBe('');
-    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: ssh was not found, or build-box is no SSH host`);
+    await expect(roundTrip(marked.path, 'x')).resolves.toBe('');
+    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: ssh was not found, or marked-box is no SSH host`);
+  });
+
+  it('goes without the connection of the relay while it cannot be had, and tries it again after a while', async () => {
+    const runner = new NodeProcessRunner();
+    const dialStdio = vi.fn<WindowPipeDeps['dialStdio']>(() => runner.startBytes('cat', []));
+    const failure = new Error('The connection to build-box could not be opened: it ended (Permission denied (publickey).)');
+    const without = `warn The Docker pipe of ${CONTAINER} goes without the connection of the relay, with an SSH login for each Docker connection: ${failure.message}`;
+    // Not again within RELAY_RETRY_AFTER_MS.
+    const log = logger();
+    const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
+    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(async () => {
+      throw failure;
+    });
+    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, relayConnection, dialStdio }));
+    await expect(roundTrip(address.path, 'first')).resolves.toBe('first');
+    await expect(roundTrip(address.path, 'second')).resolves.toBe('second');
+    expect(relayConnection).toHaveBeenCalledTimes(1);
+    expect(dialStdio).toHaveBeenCalledTimes(2);
+    expect(log.lines.filter((line) => line.startsWith('warn'))).toEqual([without]);
+    // Again after the time (here at once): the relay carries the connections again.
+    const again = logger();
+    const retried = dockerPipeAddress(dockerPipeId(COMPUTER, 'other-box', CONTAINER), 'linux', base());
+    relayConnection.mockRejectedValueOnce(failure).mockResolvedValue(echoRelay());
+    await serve(retried.dockerHost, devspace('other-box'), deps({ logger: again, relayConnection, dialStdio, relayRetryAfterMs: 0 }));
+    await expect(roundTrip(retried.path, 'first')).resolves.toBe('first');
+    await expect(roundTrip(retried.path, 'second')).resolves.toBe('relay: second');
+    expect(again.lines.filter((line) => !line.includes('listens on'))).toEqual([
+      without,
+      `info Docker pipe of ${CONTAINER}: a connection`,
+      `info The Docker pipe of ${CONTAINER} goes through the connection of the relay again.`,
+      `info Docker pipe of ${CONTAINER}: a connection`,
+    ]);
   });
 });
+

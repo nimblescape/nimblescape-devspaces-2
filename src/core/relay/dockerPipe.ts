@@ -18,6 +18,17 @@ import type { DockerPipeAddress } from './pipeAddress';
 
 /** The end of the error output of a `docker system dial-stdio` that is logged when it fails. */
 const DIAL_STDERR_TAIL = 2048;
+/**
+ * How long `listen` waits while another program serves the address: the extension host of this window before a reload
+ * can still serve it while the new one starts.
+ */
+export const PIPE_IN_USE_WAIT_MS = 15_000;
+const PIPE_IN_USE_POLL_MS = 250;
+/**
+ * How often the socket and its folder get a new time: the cleanups of temporary folders remove files that nobody used
+ * for days (macOS 3 days, systemd-tmpfiles 10 days), and files in XDG_RUNTIME_DIR that keep their time for 6 hours.
+ */
+export const PIPE_REFRESH_INTERVAL_MS = 60 * 60_000;
 
 export interface DockerPipeOptions {
   address: DockerPipeAddress;
@@ -31,43 +42,54 @@ export interface DockerPipeOptions {
   name: string;
   /** Only for the tests. */
   platform?: NodeJS.Platform;
+  inUseWaitMs?: number;
+  refreshIntervalMs?: number;
+}
+
+/** The address of the pipe is served by another program. */
+class PipeInUseError extends Error {
+  constructor(socketPath: string) {
+    super(`${socketPath} is in use: another window serves it.`);
+  }
 }
 
 /** The pipe that listens. Create it with DockerPipe.listen. */
 export class DockerPipe {
   private readonly sockets = new Set<net.Socket>();
   private closed = false;
+  private server: net.Server | undefined;
+  /** The socket file of `server` (a Unix socket only), so that a socket of another program is never taken for it. */
+  private socketFile: { dev: number; ino: number } | undefined;
+  private refreshTimer: ReturnType<typeof setInterval> | undefined;
 
-  private constructor(
-    private readonly server: net.Server,
-    private readonly options: DockerPipeOptions,
-  ) {}
+  private constructor(private readonly options: DockerPipeOptions) {}
 
   /**
    * Listens on the address: for a Unix socket, in its folder, which is made private to this user first (0700; a folder
    * of another user or a link is refused), after a socket of an earlier extension host that nobody serves was removed.
-   * Rejects when the address is in use (another window serves it) or cannot be had.
+   * While another program serves the address, it waits up to PIPE_IN_USE_WAIT_MS for its end. Rejects when the address
+   * stays in use (another window serves it) or cannot be had.
    */
   static async listen(options: DockerPipeOptions): Promise<DockerPipe> {
-    const { address } = options;
-    if (address.folder !== undefined) {
-      await preparePrivateFolder(address.folder);
-      await removeStaleSocket(address.path);
+    const { address, logger, name } = options;
+    const pipe = new DockerPipe(options);
+    const waitMs = options.inUseWaitMs ?? PIPE_IN_USE_WAIT_MS;
+    const deadline = Date.now() + waitMs;
+    for (let waited = false; ; waited = true) {
+      try {
+        pipe.server = await pipe.serve();
+        break;
+      } catch (error) {
+        if (!(error instanceof PipeInUseError) || Date.now() >= deadline) throw error;
+        if (!waited) logger.info(`${address.dockerHost} is in use. The Docker pipe of ${name} waits up to ${waitMs / 1000} s for the program that serves it to end.`);
+        await new Promise((resolve) => setTimeout(resolve, PIPE_IN_USE_POLL_MS));
+      }
     }
-    const server = net.createServer({ allowHalfOpen: true, pauseOnConnect: true });
-    const pipe = new DockerPipe(server, options);
-    server.on('connection', (socket) => pipe.accept(socket));
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(address.path, () => {
-        server.off('error', reject);
-        resolve();
-      });
-    });
-    server.on('error', (error: Error) => options.logger.warn(`The Docker pipe of ${options.name} failed: ${error.message}`));
-    // The folder already keeps other users away; the socket itself too.
-    if (address.folder !== undefined) await fs.promises.chmod(address.path, 0o600);
-    options.logger.info(`The Docker pipe of ${options.name} listens on ${address.dockerHost}.`);
+    if (address.folder !== undefined) {
+      pipe.refreshTimer = setInterval(() => void pipe.refresh(), options.refreshIntervalMs ?? PIPE_REFRESH_INTERVAL_MS);
+      pipe.refreshTimer.unref?.();
+    }
+    logger.info(`The Docker pipe of ${name} listens on ${address.dockerHost}.`);
     return pipe;
   }
 
@@ -83,17 +105,91 @@ export class DockerPipe {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.server.close();
+    clearInterval(this.refreshTimer);
+    // Node.js removes the socket file of a server at its close, before it closes the socket: so a new window never
+    // finds this socket after the close.
+    this.server?.close();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
-    const { folder, path: socketPath } = this.options.address;
-    if (folder === undefined) return;
-    for (const remove of [() => fs.unlinkSync(socketPath), () => fs.rmdirSync(folder)]) {
-      try {
-        remove();
-      } catch {
-        // Gone already, or the next listen removes it.
+    if (this.options.address.folder === undefined) return;
+    try {
+      fs.rmdirSync(this.options.address.folder);
+    } catch {
+      // Gone already, or not empty: the next listen uses it.
+    }
+  }
+
+  /** A new server that listens on the address (for listen, and again for refresh). */
+  private async serve(): Promise<net.Server> {
+    const { address, logger, name } = this.options;
+    if (address.folder !== undefined) {
+      await preparePrivateFolder(address.folder);
+      await removeStaleSocket(address.path);
+    }
+    const server = net.createServer({ allowHalfOpen: true, pauseOnConnect: true });
+    server.on('connection', (socket) => this.accept(socket));
+    await new Promise<void>((resolve, reject) => {
+      const failed = (error: NodeJS.ErrnoException) => reject(error.code === 'EADDRINUSE' ? new PipeInUseError(address.path) : error);
+      server.once('error', failed);
+      server.listen(address.path, () => {
+        server.off('error', failed);
+        resolve();
+      });
+    });
+    server.on('error', (error: Error) => logger.warn(`The Docker pipe of ${name} failed: ${error.message}`));
+    try {
+      if (address.folder !== undefined) {
+        // The folder already keeps other users away; the socket itself too.
+        await fs.promises.chmod(address.path, 0o600);
+        const stat = await fs.promises.lstat(address.path);
+        this.socketFile = { dev: stat.dev, ino: stat.ino };
       }
+    } catch (error) {
+      // Never a server that nobody closes; its socket file goes with it.
+      server.close();
+      throw error;
+    }
+    return server;
+  }
+
+  /**
+   * Gives the socket and its folder a new time, so that no cleanup of temporary folders removes them. When the socket
+   * was removed anyway, the pipe listens again; another file at the address is left as it is. Never rejects.
+   */
+  private async refresh(): Promise<void> {
+    const { address, logger, name } = this.options;
+    if (address.folder === undefined || this.closed) return;
+    let stat: fs.Stats | undefined;
+    try {
+      stat = await fs.promises.lstat(address.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return;
+    }
+    if (stat !== undefined) {
+      if (stat.dev !== this.socketFile?.dev || stat.ino !== this.socketFile.ino) return;
+      const now = new Date();
+      try {
+        await fs.promises.utimes(address.folder, now, now);
+        await fs.promises.utimes(address.path, now, now);
+      } catch {
+        // The next refresh again.
+      }
+      return;
+    }
+    if (this.closed) return;
+    try {
+      // First the old server (Node.js removes the file of its address at its close), then the new one.
+      this.server?.close();
+      this.server = undefined;
+      const server = await this.serve();
+      if (this.closed) {
+        server.close();
+        return;
+      }
+      this.server = server;
+      logger.info(`The socket of the Docker pipe of ${name} was removed. The pipe listens again on ${address.dockerHost}.`);
+    } catch (error) {
+      logger.warn(`The Docker pipe of ${name} could not listen again on ${address.dockerHost}: ${errorMessage(error)}`);
     }
   }
 
@@ -156,12 +252,22 @@ export function relayDockerDial(connection: () => Promise<RelayConnection>): (so
  */
 export function processDockerDial(start: () => StartedByteProcess, logger: Logger, name: string): (socket: net.Socket) => Promise<void> {
   return async (socket) => {
+    // The Docker CLI gave up already (while the relay was tried): no program that nobody ends.
+    if (socket.destroyed) return;
     const process = start();
     let stderr = '';
     process.onStderr((text) => (stderr = (stderr + text).slice(-DIAL_STDERR_TAIL)));
+    let waiting = false;
     process.onStdout(
       (chunk) => {
-        if (!socket.destroyed) socket.write(chunk);
+        if (socket.destroyed || socket.write(chunk) || waiting) return;
+        // The Docker CLI reads slower than the engine writes: the program waits until the socket drained.
+        waiting = true;
+        process.pauseStdout();
+        socket.once('drain', () => {
+          waiting = false;
+          process.resumeStdout();
+        });
       },
       () => {
         if (!socket.destroyed && !socket.writableEnded) socket.end();
@@ -212,6 +318,6 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
     });
     probe.once('error', () => resolve(false));
   });
-  if (served) throw new Error(`${socketPath} is in use: another window serves it.`);
+  if (served) throw new PipeInUseError(socketPath);
   await fs.promises.unlink(socketPath);
 }

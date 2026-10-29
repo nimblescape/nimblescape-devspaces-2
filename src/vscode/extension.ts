@@ -730,7 +730,14 @@ async function activateExtension(
     dockerTargets: targets,
     // The Docker pipe of the window of a devspace on an SSH host (docs/architecture.md "The Docker pipe").
     windowDockerHost: (devspace, shownContainer) =>
-      windowDockerHost(devspace, shownContainer, { computerId, platform, env, tmpdir: os.tmpdir(), sshFound: () => sshPath() !== undefined }),
+      windowDockerHost(devspace, shownContainer, {
+        computerId,
+        platform,
+        env,
+        tmpdir: os.tmpdir(),
+        sshFound: () => sshPath() !== undefined,
+        current: connection.currentDockerHost(),
+      }),
     remoteDocker: new RemoteDockerCommands({
       docker,
       runner,
