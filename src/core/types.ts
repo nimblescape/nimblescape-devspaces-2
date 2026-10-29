@@ -342,7 +342,10 @@ export interface WindowStatus {
    * its URI. Missing for a window without one.
    */
   dockerContext?: string;
-  /** The same for the Docker host address in the authority (the Docker pipe of the window). */
+  /**
+   * The same for the Docker host address in the authority (`settings.host`): the `unix://` or `npipe://` address of the
+   * Docker pipe of the window on this computer, not the SSH host of its devspace (Devspace.dockerHost).
+   */
   dockerHost?: string;
   /**
    * The devspace that the window is attached to while it works without Devspaces on an engine with the removal mark

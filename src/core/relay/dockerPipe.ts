@@ -27,8 +27,11 @@ const PIPE_IN_USE_POLL_MS = 250;
 /**
  * How often the socket and its folder get a new time: the cleanups of temporary folders remove files that nobody used
  * for days (macOS 3 days, systemd-tmpfiles 10 days), and files in XDG_RUNTIME_DIR that keep their time for 6 hours.
+ * The number of the connections that were not logged one by one is logged as often.
  */
 export const PIPE_REFRESH_INTERVAL_MS = 60 * 60_000;
+/** The first connections of a pipe that are logged one by one (the Dev Containers extension makes many short ones). */
+export const PIPE_LOGGED_CONNECTIONS = 50;
 
 export interface DockerPipeOptions {
   address: DockerPipeAddress;
@@ -64,6 +67,11 @@ export class DockerPipe {
   /** The socket file of `server` (a Unix socket only), so that a socket of another program is never taken for it. */
   private socketFile: { dev: number; ino: number } | undefined;
   private refreshTimer: ReturnType<typeof setInterval> | undefined;
+  /** The connections that were logged one by one (at most PIPE_LOGGED_CONNECTIONS), and those since the last count. */
+  private loggedConnections = 0;
+  private uncountedConnections = 0;
+  /** Another file is at the address of the socket, and this was logged. */
+  private replacedLogged = false;
 
   private constructor(private readonly options: DockerPipeOptions) {}
 
@@ -88,15 +96,16 @@ export class DockerPipe {
         await new Promise((resolve) => setTimeout(resolve, PIPE_IN_USE_POLL_MS));
       }
     }
-    if (address.folder !== undefined) {
-      pipe.refreshTimer = setInterval(() => void pipe.refresh(), options.refreshIntervalMs ?? PIPE_REFRESH_INTERVAL_MS);
-      pipe.refreshTimer.unref?.();
-    }
+    pipe.refreshTimer = setInterval(() => {
+      pipe.logCount();
+      void pipe.refresh();
+    }, options.refreshIntervalMs ?? PIPE_REFRESH_INTERVAL_MS);
+    pipe.refreshTimer.unref?.();
     logger.info(`The Docker pipe of ${name} listens on ${address.dockerHost}.`);
     return pipe;
   }
 
-  /** The connections that are open now. */
+  /** The connections that are open now (for the tests). */
   get connectionCount(): number {
     return this.sockets.size;
   }
@@ -156,9 +165,17 @@ export class DockerPipe {
     return server;
   }
 
+  /** Logs the number of the connections since the last count that were not logged one by one. */
+  private logCount(): void {
+    if (this.uncountedConnections === 0) return;
+    this.options.logger.info(`The Docker pipe of ${this.options.name} had ${this.uncountedConnections} more connections.`);
+    this.uncountedConnections = 0;
+  }
+
   /**
    * Gives the socket and its folder a new time, so that no cleanup of temporary folders removes them. When the socket
-   * was removed anyway, the pipe listens again; another file at the address is left as it is. Never rejects.
+   * was removed anyway, the pipe listens again; another file at the address is left as it is (logged once). Never
+   * rejects.
    */
   private async refresh(): Promise<void> {
     const { address, logger, name } = this.options;
@@ -170,7 +187,16 @@ export class DockerPipe {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return;
     }
     if (stat !== undefined) {
-      if (stat.dev !== this.socketFile?.dev || stat.ino !== this.socketFile.ino) return;
+      if (stat.dev !== this.socketFile?.dev || stat.ino !== this.socketFile.ino) {
+        if (!this.replacedLogged) {
+          logger.warn(
+            `Another file replaced the socket of the Docker pipe of ${name} at ${address.path}. The Docker calls of this window do not reach the pipe until the window is reloaded.`,
+          );
+        }
+        this.replacedLogged = true;
+        return;
+      }
+      this.replacedLogged = false;
       const now = new Date();
       try {
         await fs.promises.utimes(address.folder, now, now);
@@ -215,7 +241,15 @@ export class DockerPipe {
       socket.off('end', endedEmpty);
       socket.pause();
       socket.unshift(chunk);
-      logger.info(`Docker pipe of ${name}: ${requestLine(chunk)}`);
+      if (this.loggedConnections < PIPE_LOGGED_CONNECTIONS) {
+        this.loggedConnections += 1;
+        logger.info(`Docker pipe of ${name}: ${requestLine(chunk)}`);
+        if (this.loggedConnections === PIPE_LOGGED_CONNECTIONS) {
+          logger.info(`The Docker pipe of ${name} logs no further connection one by one, only their number each hour.`);
+        }
+      } else {
+        this.uncountedConnections += 1;
+      }
       this.options.connect(socket).then(
         () => {
           if (!socket.destroyed) socket.resume();
@@ -232,12 +266,12 @@ export class DockerPipe {
 
 /**
  * The method and path of the first request of a connection, for the log: without the query (it may name filters or
- * other values) and without the version of the API; `a connection` when the start is not an HTTP request line.
+ * other values, and make the line long) and without the version of the API; `a connection` when the first 512 bytes
+ * do not start with an HTTP method and a path.
  */
 export function requestLine(chunk: Buffer): string {
-  const end = chunk.indexOf('\r\n');
-  const line = chunk.subarray(0, end < 0 ? Math.min(chunk.length, 512) : Math.min(end, 512)).toString('latin1');
-  const match = /^([A-Z]{3,7}) (\/[^\s?]*)(?:\?\S*)? HTTP\/1\.[01]$/.exec(line);
+  const start = chunk.subarray(0, 512).toString('latin1');
+  const match = /^([A-Z]{3,7}) (\/[^\s?]*)[?\s]/.exec(start);
   if (!match) return 'a connection';
   const [, method, requestPath] = match;
   return `${method} ${requestPath.replace(/^\/v\d+\.\d+(?=\/)/, '').replace(/[^\x21-\x7e]/g, '?')}`;

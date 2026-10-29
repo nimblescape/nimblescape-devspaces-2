@@ -176,7 +176,9 @@ export interface ChannelOpenDeps {
 /**
  * Behind the relay, the answer of the worker to `hello` comes within what is left of CHANNEL_OPEN_TIMEOUT_MS after the
  * open of the connection (RELAY_OPEN_TIMEOUT_MS, the same limit), and gets at least this long: the relay started the
- * container already, so only the worker starts.
+ * container already, so only the worker starts. On the open connection of the engine, it gets only this long: the relay
+ * starts the worker there only after the last worker of the connection ended (at most RELAY_WORKER_STOP_MS, 45 s, for
+ * a worker that hangs), and a new connection is faster then.
  */
 const WORKER_HELLO_BEHIND_RELAY_MS = 15_000;
 
@@ -262,7 +264,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   const shared = relay?.current();
   if (shared !== undefined) {
     try {
-      const channel = await openWorkerOn(shared, deps.logger, name);
+      const channel = await openWorkerOn(shared, deps.logger, name, WORKER_HELLO_BEHIND_RELAY_MS);
       await checkChannelEngine(deps, target, name, channel);
       return channel;
     } catch (error) {

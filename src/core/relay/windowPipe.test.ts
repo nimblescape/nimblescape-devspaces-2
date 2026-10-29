@@ -56,6 +56,7 @@ function deps(overrides: Partial<WindowPipeDeps> = {}): WindowPipeDeps {
     platform: 'linux',
     computerId: () => COMPUTER,
     engineRemoved: async () => false,
+    openRelayConnection: () => undefined,
     relayConnection: async () => {
       throw new Error('no connection in this test');
     },
@@ -271,6 +272,28 @@ describe('serveWindowPipe', () => {
       `info Docker pipe of ${CONTAINER}: a connection`,
       without,
       `info Docker pipe of ${CONTAINER}: a connection`,
+      `info The Docker pipe of ${CONTAINER} goes through the connection of the relay again.`,
+    ]);
+  });
+
+  it('goes through a connection of the relay that another open made at once, also while it waits to try the relay again', async () => {
+    const runner = new NodeProcessRunner();
+    const dialStdio = vi.fn<WindowPipeDeps['dialStdio']>(() => runner.startBytes('cat', []));
+    const log = logger();
+    const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
+    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(async () => {
+      throw new Error('the worker on build-box is still being opened');
+    });
+    let open: RelayConnection | undefined;
+    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, relayConnection, dialStdio, openRelayConnection: () => open }));
+    await expect(roundTrip(address.path, 'first')).resolves.toBe('first');
+    // The worker of an operation opened the connection (relayConnections.get): the next connection uses it, within RELAY_RETRY_AFTER_MS.
+    open = echoRelay();
+    await expect(roundTrip(address.path, 'second')).resolves.toBe('relay: second');
+    expect(relayConnection).toHaveBeenCalledTimes(1);
+    expect(dialStdio).toHaveBeenCalledTimes(1);
+    expect(log.lines.filter((line) => !line.includes('listens on') && !line.includes(': a connection'))).toEqual([
+      `warn The Docker pipe of ${CONTAINER} goes without the connection of the relay, with an SSH login for each Docker connection: the worker on build-box is still being opened`,
       `info The Docker pipe of ${CONTAINER} goes through the connection of the relay again.`,
     ]);
   });

@@ -12,7 +12,7 @@ import { PIPE_LOADER, bundleHash } from '../loader/pipeLoader';
 import { silentLogger, type StartedProcess } from '../ports';
 import { RelayConnectionError, type RelayConnection } from '../relay/connection';
 import type { RelayAccess } from '../relay/connections';
-import { HelperChannelError } from './helperChannel';
+import { HelperChannelError, type HelperChannel } from './helperChannel';
 import { openHelperChannel, type ChannelOpenDeps } from './helperChannels';
 import { CHANNEL_PROTOCOL_VERSION, encodeMessage, parseClientMessage } from './protocol';
 
@@ -212,6 +212,30 @@ describe('openHelperChannel with the connection of the relay', () => {
       expect(failure).toBeUndefined();
       await vi.advanceTimersByTimeAsync(2_000);
       expect(failure).toMatchObject({ code: 'open', message: 'The helper channel to build-box could not be opened: no answer within 15 seconds' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits for the answer to hello on the open connection of the engine only 15 seconds, then opens a new connection', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+    try {
+      // The relay starts the worker only after the last worker of the connection ended: no answer meanwhile.
+      const silent: StartedProcess = { write: () => true, end: () => {}, kill: () => {}, onStdout: () => {}, onStderr: () => {}, exited: new Promise(() => {}) };
+      const shared = fakeConnection(silent);
+      const next = fakeConnection(fakeWorker());
+      const connect = vi.fn<RelayAccess['connect']>(async () => next as unknown as RelayConnection);
+      const relayAccess = access(connect, shared);
+      let channel: HelperChannel | undefined;
+      void openHelperChannel(deps({ relay: () => relayAccess }), REMOTE).then((opened) => (channel = opened));
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(connect).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(relayAccess.retire).toHaveBeenCalledWith(shared);
+      expect(connect).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(channel?.isOpen).toBe(true));
+      expect(relayAccess.use).toHaveBeenCalledWith(next);
+      channel?.close();
     } finally {
       vi.useRealTimers();
     }

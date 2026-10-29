@@ -13,7 +13,7 @@ import { NodeProcessRunner } from '../process';
 import { silentLogger, type Logger } from '../ports';
 import { bridgeStream } from './bridge';
 import type { RelayConnection } from './connection';
-import { DockerPipe, processDockerDial, relayDockerDial, requestLine } from './dockerPipe';
+import { DockerPipe, PIPE_LOGGED_CONNECTIONS, processDockerDial, relayDockerDial, requestLine } from './dockerPipe';
 import { MemoryPipe } from './memoryPipe.testkit';
 import { Mux } from './mux';
 import { dockerPipeAddress, type DockerPipeAddress } from './pipeAddress';
@@ -179,6 +179,32 @@ describe('the Docker pipe', () => {
     await expect(exchange(address.path, 'x')).resolves.toBe('hello');
   });
 
+  it('logs once that another file replaced the socket, and leaves that file as it is', async () => {
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const log = logger();
+    const pipe = await DockerPipe.listen({ address, connect: async (socket) => void socket.end('hello'), logger: log, name: 'devspaces-api', refreshIntervalMs: 20 });
+    cleanups.push(() => pipe.close());
+    const other = path.join(address.folder as string, 'other');
+    fs.writeFileSync(other, 'another program');
+    fs.renameSync(other, address.path);
+    const replaced = `warn Another file replaced the socket of the Docker pipe of devspaces-api at ${address.path}. The Docker calls of this window do not reach the pipe until the window is reloaded.`;
+    await vi.waitFor(() => expect(log.lines).toContain(replaced));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(log.lines.filter((line) => line === replaced)).toHaveLength(1);
+    expect(fs.readFileSync(address.path, 'utf8')).toBe('another program');
+  });
+
+  it('logs the first connections one by one, and the number of the next ones each hour', async () => {
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const log = logger();
+    const pipe = await DockerPipe.listen({ address, connect: async (socket) => void socket.end('hello'), logger: log, name: 'devspaces-api', refreshIntervalMs: 200 });
+    cleanups.push(() => pipe.close());
+    for (let index = 0; index < PIPE_LOGGED_CONNECTIONS + 3; index += 1) await expect(exchange(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('hello');
+    expect(log.lines.filter((line) => line === 'info Docker pipe of devspaces-api: GET /_ping')).toHaveLength(PIPE_LOGGED_CONNECTIONS);
+    expect(log.lines).toContain('info The Docker pipe of devspaces-api logs no further connection one by one, only their number each hour.');
+    await vi.waitFor(() => expect(log.lines).toContain('info The Docker pipe of devspaces-api had 3 more connections.'));
+  });
+
   it('refuses a folder that is a link', async () => {
     const parent = base();
     const address = dockerPipeAddress(ID, 'linux', parent);
@@ -311,5 +337,7 @@ describe('the request line in the log', () => {
     expect(requestLine(Buffer.from('GET /info HTTP/1.0'))).toBe('GET /info');
     expect(requestLine(Buffer.from('\x16\x03\x01 binary'))).toBe('a connection');
     expect(requestLine(Buffer.from(`GET /${'a'.repeat(600)} HTTP/1.1\r\n`))).toBe('a connection');
+    // A long query: only the method and the path count.
+    expect(requestLine(Buffer.from(`GET /v1.47/containers/json?filters=${'x'.repeat(800)} HTTP/1.1\r\n`))).toBe('GET /containers/json');
   });
 });

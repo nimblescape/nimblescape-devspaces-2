@@ -71,7 +71,8 @@ export class ConnectionAdapter {
 
   /**
    * The Docker host address named in the authority of this window (`settings.host`, authority.ts: the address of the
-   * Docker pipe of a remote devspace), or `undefined` for a window without one.
+   * Docker pipe of a remote devspace on this computer), or `undefined` for a window without one. Not the SSH host of a
+   * devspace (Devspace.dockerHost, Controller.currentDockerHost).
    */
   currentDockerHost(): string | undefined {
     const shown = this.shownAttachedUri();

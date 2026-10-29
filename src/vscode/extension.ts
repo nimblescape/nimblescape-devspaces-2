@@ -844,9 +844,48 @@ async function activateExtension(
   // closes the window of a devspace that the signed-in account may not use (Controller.workWithoutDevspaces), and the
   // window of a container whose owner cannot be read (Controller.leaveUnknownOwner).
   const onRemovedEngine = labeled.kind !== 'none' || (currentDevspace !== undefined && (await engineRemoved({ host: dockerHostOf(currentDevspace) })));
+  // The Docker pipe in the authority of this window (docs/architecture.md "The Docker pipe"): served before activate()
+  // returns, because the Dev Containers extension reaches the engine of the devspace through it once VS Code resolves
+  // the authority; and before the session starts, so that a window whose pipe is refused is never the window of its
+  // devspace in its status file.
+  let pipeRefused: string | undefined;
+  const pipeHost = connection.currentDockerHost();
+  if (pipeHost !== undefined && containerName) {
+    const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
+      logger,
+      platform,
+      computerId,
+      engineRemoved: (devspace) => engineRemoved({ host: dockerHostOf(devspace) }),
+      openRelayConnection: (devspace) => relayConnections.get(dockerHostOf(devspace)),
+      relayConnection: async (devspace) => {
+        const host = dockerHostOf(devspace);
+        const open = relayConnections.get(host);
+        if (open !== undefined) return open;
+        // The worker of the engine opens the connection; the engine as for the heartbeats of a devspace that this
+        // window does not show: the current one when it is on the host, else the context of the host.
+        const target = await resolveHeartbeatEngine(devspace, { connected: false }, engineSources);
+        if (target === undefined) throw new Error(`Docker is set to another host, and no Docker context of ${host} was found`);
+        await channels.ensure(target);
+        const opened = relayConnections.get(host);
+        if (opened === undefined) throw new Error(`the worker on ${host} runs without the connection of the relay`);
+        return opened;
+      },
+      dialStdio: (devspace) => {
+        const ssh = sshPath();
+        const address = sshTargetOf(dockerHostOf(devspace));
+        if (ssh === undefined || address === undefined) return undefined;
+        return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
+      },
+    });
+    // Closed at once when the window closes (the release of deactivate() does not use it), so that the extension host of
+    // the window after a reload can serve the address.
+    if (served.kind === 'served') context.subscriptions.push({ dispose: () => served.pipe.close() });
+    if (served.kind === 'refused' && labeled.kind !== 'unreadable') pipeRefused = served.reason;
+  }
+
   // Writes the window status file and cleans up the storage folder. Its result is the pending connection file of this
   // window's devspace, which the first status write removes (role A).
-  const started = sessionCoordinator.start(onRemovedEngine ? null : (currentDevspace?.id ?? null));
+  const started = sessionCoordinator.start(onRemovedEngine || pipeRefused !== undefined ? null : (currentDevspace?.id ?? null));
   controller.setReady(started);
 
   const focusThrottle = new Throttle(FOCUS_REFRESH_INTERVAL_MS);
@@ -980,46 +1019,12 @@ async function activateExtension(
     background(logDocker(), 'log the Docker of this window');
   }
 
-  // The Docker pipe in the authority of this window (docs/architecture.md "The Docker pipe"): served before activate()
-  // returns, because the Dev Containers extension reaches the engine of the devspace through it once VS Code resolves
-  // the authority.
-  const pipeHost = connection.currentDockerHost();
-  if (pipeHost !== undefined && containerName) {
-    const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
-      logger,
-      platform,
-      computerId,
-      engineRemoved: (devspace) => engineRemoved({ host: dockerHostOf(devspace) }),
-      relayConnection: async (devspace) => {
-        const host = dockerHostOf(devspace);
-        const open = relayConnections.get(host);
-        if (open !== undefined) return open;
-        // The worker of the engine opens the connection; the engine as for the heartbeats of a devspace that this
-        // window does not show: the current one when it is on the host, else the context of the host.
-        const target = await resolveHeartbeatEngine(devspace, { connected: false }, engineSources);
-        if (target === undefined) throw new Error(`Docker is set to another host, and no Docker context of ${host} was found`);
-        await channels.ensure(target);
-        const opened = relayConnections.get(host);
-        if (opened === undefined) throw new Error(`the worker on ${host} runs without the connection of the relay`);
-        return opened;
-      },
-      dialStdio: (devspace) => {
-        const ssh = sshPath();
-        const address = sshTargetOf(dockerHostOf(devspace));
-        if (ssh === undefined || address === undefined) return undefined;
-        return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
-      },
-    });
-    // Closed at once when the window closes (the release of deactivate() does not use it), so that the extension host of
-    // the window after a reload can serve the address.
-    if (served.kind === 'served') context.subscriptions.push({ dispose: () => served.pipe.close() });
-    // Without its pipe, the window must not connect. The window of a container whose owner cannot be read leaves below,
-    // after the token left the container.
-    if (served.kind === 'refused' && labeled.kind !== 'unreadable') {
-      await started;
-      await controller.leaveWithoutDockerPipe(containerName, served.reason);
-      return;
-    }
+  // Without its Docker pipe, the window must not connect. The window of a container whose owner cannot be read leaves
+  // below, after the token left the container.
+  if (pipeRefused !== undefined && containerName) {
+    await started;
+    await controller.leaveWithoutDockerPipe(containerName, pipeRefused);
+    return;
   }
 
   if (windowDevspace && containerName) {

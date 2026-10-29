@@ -33,6 +33,8 @@ export interface WindowPipeDeps {
   computerId(): string;
   /** True while the engine of `devspace` has the removal mark ("Remove Devspaces from This Docker Engine…"). */
   engineRemoved(devspace: Devspace): Promise<boolean>;
+  /** The open connection of the relay to the host of `devspace`, or undefined; asks nothing. */
+  openRelayConnection(devspace: Devspace): RelayConnection | undefined;
   /** The open connection of the relay to the host of `devspace`, or a new one (the worker of the engine opens it). */
   relayConnection(devspace: Devspace): Promise<RelayConnection>;
   /** `ssh … docker system dial-stdio` on the host of `devspace`; undefined without `ssh` or for a host it cannot reach. */
@@ -119,9 +121,14 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
       if (removed === undefined || Math.abs(now - removed.at) >= ENGINE_REMOVED_HOLD_MS) removed = { at: now, answer: deps.engineRemoved(devspace) };
       return removed.answer;
     };
-    // Without the connection of the relay, the window still works: each connection logs in as without the pipe, and
-    // the relay is tried again after RELAY_RETRY_AFTER_MS.
+    // Without the connection of the relay, the window still works: each connection logs in as without the pipe until
+    // the connection of the relay is open (also by another open, for example the worker of an operation), and the
+    // relay is tried again after RELAY_RETRY_AFTER_MS.
     let withoutRelaySince: number | undefined;
+    const throughRelayAgain = () => {
+      if (withoutRelaySince !== undefined) logger.info(`The Docker pipe of ${containerName} goes through the connection of the relay again.`);
+      withoutRelaySince = undefined;
+    };
     // One open of the connection of the relay at a time, for every connection of the pipe that waits for it. Once a
     // connection waited RELAY_WAIT_MS for it, the next ones log in themselves at once while it goes on. Its end decides,
     // also when no connection waits for it any more.
@@ -133,8 +140,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
         current.connection.then(
           () => {
             if (opening === current) opening = undefined;
-            if (withoutRelaySince !== undefined) logger.info(`The Docker pipe of ${containerName} goes through the connection of the relay again.`);
-            withoutRelaySince = undefined;
+            throughRelayAgain();
           },
           (error: unknown) => {
             if (opening === current) opening = undefined;
@@ -148,8 +154,22 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
       return opening;
     };
     const waitMs = deps.relayWaitMs ?? RELAY_WAIT_MS;
+    const throughRelay = async (connection: RelayConnection, socket: net.Socket): Promise<void> => {
+      try {
+        relayDockerDial(connection, socket);
+      } catch (error) {
+        // The connection ended meanwhile, or has no stream left: this connection only.
+        logger.warn(`A Docker connection of ${containerName} goes without the connection of the relay: ${errorMessage(error)}`);
+        return direct(socket);
+      }
+    };
     const connect = async (socket: net.Socket): Promise<void> => {
       if (await engineRemoved()) return direct(socket);
+      const open = deps.openRelayConnection(devspace);
+      if (open !== undefined) {
+        throughRelayAgain();
+        return throughRelay(open, socket);
+      }
       if (withoutRelaySince !== undefined && Math.abs(Date.now() - withoutRelaySince) < (deps.relayRetryAfterMs ?? RELAY_RETRY_AFTER_MS)) return direct(socket);
       const pending = relayConnection();
       if (pending.waited) return direct(socket);
@@ -169,13 +189,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
       }
       // The end of the open logged it.
       if ('error' in outcome) return direct(socket);
-      try {
-        relayDockerDial(outcome.connection, socket);
-      } catch (error) {
-        // The connection ended meanwhile, or has no stream left: this connection only.
-        logger.warn(`A Docker connection of ${containerName} goes without the connection of the relay: ${errorMessage(error)}`);
-        return direct(socket);
-      }
+      return throughRelay(outcome.connection, socket);
     };
     const pipe = await DockerPipe.listen({ address, connect, logger, name: containerName, platform: deps.platform, inUseWaitMs: deps.inUseWaitMs });
     return { kind: 'served', pipe };
