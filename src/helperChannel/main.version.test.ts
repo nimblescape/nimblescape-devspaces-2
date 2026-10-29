@@ -40,6 +40,7 @@ function start(version: string | undefined): void {
   vi.spyOn(process.stdout, 'on').mockImplementation((() => process.stdout) as never);
   vi.spyOn(process.stdin, 'on').mockImplementation((() => process.stdin) as never);
   vi.spyOn(process.stdin, 'resume').mockImplementation(() => process.stdin);
+  vi.spyOn(process.stdin, 'setEncoding').mockImplementation(() => process.stdin);
   vi.stubEnv('DEVSPACES_VERSION', version);
   startChannel();
   expect(servers).toHaveLength(1);

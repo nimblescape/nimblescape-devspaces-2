@@ -85,7 +85,10 @@ export interface MuxStream {
   end(): void;
   /** The relay, a worker stream: the worker ended, after what waits (EXIT); the stream ends. */
   exit(exit: WorkerExit): void;
-  /** Ends both directions at once (CLOSE with `reason`); what waits is dropped. No listener is called. */
+  /**
+   * Ends both directions at once (CLOSE with `reason`); what waits is dropped. No listener is called, except a drain
+   * listener that waits (it finds the stream closed).
+   */
   close(reason?: string): void;
   /** The reader took `bytes` of the data (onData): the other side may send that many more. */
   consumed(bytes: number): void;

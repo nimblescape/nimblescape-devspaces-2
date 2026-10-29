@@ -10,8 +10,9 @@
 //
 // The start (pipe loading): the container runs the pipe loader (src/core/loader/pipeLoader.ts) with
 // CHANNEL_SCRIPT_PATH, the hash of the script, and CHANNEL_ENTRY. The first line that the extension writes is the
-// script as a JSON string (encodeBundle); the loader checks its hash, stores it at CHANNEL_SCRIPT_PATH, and calls its
-// `startChannel` with the rest of the input. So the script has no length limit of the command line.
+// script as a JSON string (encodeBundle); the loader checks its hash, stores it at CHANNEL_SCRIPT_PATH, puts the rest of
+// the input that it read back in front of the standard input, and calls its `startChannel`. So the script has no length
+// limit of the command line.
 //
 // The container must end by itself when the connection is lost (nothing on the Docker host can clean up after it). Four
 // independent ways, each enough alone:
