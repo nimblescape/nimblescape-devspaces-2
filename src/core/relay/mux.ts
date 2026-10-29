@@ -453,13 +453,13 @@ export class Mux implements StreamHost {
     this.parser.push(chunk);
   }
 
-  /** The input ended: every stream is lost. */
+  /** The input ended: every stream is lost. Within a frame, or before the HELLO of the relay, as a failure. */
   inputEnded(): void {
     if (this.ended !== undefined) return;
-    const withinFrame = this.parser.buffered > 0;
-    const reason = withinFrame ? 'the connection ended within a frame' : 'the connection ended';
+    const reason = !this.ready ? 'the connection ended before the hello of the relay' : this.parser.buffered > 0 ? 'the connection ended within a frame' : 'the connection ended';
+    const failed = !this.ready || this.parser.buffered > 0;
     this.shutDown(reason);
-    this.options.onClose?.(reason, withinFrame);
+    this.options.onClose?.(reason, failed);
   }
 
   /** Ends the connection from this side: every stream is lost with `reason`, the output ends. */
@@ -573,7 +573,8 @@ export class Mux implements StreamHost {
     if (this.ended !== undefined || !this.ready) return;
     const now = Date.now();
     if (now - this.lastReceived >= this.silenceMs) return this.fail(`no frame came within ${Math.round(this.silenceMs / 1000)} seconds`);
-    if (now - this.lastSent >= this.pingIntervalMs) {
+    // While the link holds frames that wait, it is not idle; a ping would only wait behind them.
+    if (!this.congested && now - this.lastSent >= this.pingIntervalMs) {
       this.control(encodeFrame('ping', 0));
       this.pump();
     }

@@ -172,7 +172,9 @@ function parseJsonObject(payload: Buffer): Record<string, unknown> | undefined {
 /**
  * Reads frames from the bytes of a connection as they come, in pieces of any size. A header of an unknown kind or with
  * a payload longer than MAX_FRAME_PAYLOAD ends the reading: `onError` once, and every later piece is ignored. A payload
- * within one piece is a part of that piece (no copy); one that spans pieces is copied together.
+ * that is at least half of its piece is a part of that piece (no copy); a smaller one is copied, so that a payload that
+ * a reader holds keeps at most twice its size in memory (the credit of a stream counts payloads); one that spans pieces
+ * is copied together.
  */
 export class FrameParser {
   private readonly header = Buffer.alloc(FRAME_HEADER_LENGTH);
@@ -219,7 +221,8 @@ export class FrameParser {
       if (length > MAX_FRAME_PAYLOAD) return this.fail(`a frame of ${length} bytes`);
       if (chunk.length - at >= length) {
         // The whole payload is in this piece.
-        this.onFrame({ kind, stream, payload: chunk.subarray(at, at + length) });
+        const part = chunk.subarray(at, at + length);
+        this.onFrame({ kind, stream, payload: 2 * length >= chunk.length ? part : Buffer.from(part) });
         at += length;
       } else this.partial = { kind, stream, payload: Buffer.allocUnsafe(length), filled: 0 };
     }

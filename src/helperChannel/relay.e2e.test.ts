@@ -177,9 +177,11 @@ describeUnix('the relay in a Node.js process', () => {
     expect(stderr()).toBe('');
   });
 
+  // The loader passes what it read together with the bundle line, and the relay refuses it; a later read is read as
+  // frames, which these bytes break (`x` is no kind of frame).
   it('exits with a line when input came before its HELLO', { timeout: SLOW_TEST_MS }, async () => {
-    const { exited, stderr } = start(`${encodeBundle(script)}x`);
+    const { exited, stderr } = start(`${encodeBundle(script)}${'x'.repeat(16)}`);
     expect(await exited).toEqual({ code: RELAY_FAILURE_EXIT_CODE, signal: null });
-    expect(stderr()).toBe('devspace relay: input came before the hello of the relay\n');
+    expect(stderr()).toMatch(/^devspace relay: (?:input came before the hello of the relay|the other side sent a frame of the unknown kind 120)\n$/);
   });
 });

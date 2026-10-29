@@ -70,6 +70,23 @@ describe('the frames of the relay', () => {
     expect(parsed.frames.map((frame) => frame.kind)).toEqual(['ping']);
   });
 
+  it('copy a payload that is less than half of its piece, so that a held payload does not keep the piece', () => {
+    const payloads: Buffer[] = [];
+    const parser = new FrameParser(
+      (frame) => payloads.push(frame.payload),
+      () => {},
+    );
+    const small = encodeFrame('data', 1, Buffer.from('ab'));
+    const piece = Buffer.concat([small, encodeFrame('ping', 0), encodeFrame('ping', 0)]);
+    parser.push(piece);
+    piece.fill(0);
+    expect(payloads[0].toString()).toBe('ab');
+    const large = encodeFrame('data', 1, Buffer.alloc(1000, 1));
+    parser.push(large);
+    // At least half of the piece: a part of it.
+    expect(payloads[3].buffer).toBe(large.buffer);
+  });
+
   it('count the bytes of a frame that did not come whole yet', () => {
     const parser = new FrameParser(
       () => {},
