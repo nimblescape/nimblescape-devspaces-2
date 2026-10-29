@@ -8,11 +8,11 @@
 // Every bundle is readable JavaScript: not minified, and with the names of the source (`keepNames`), so that anyone can
 // read the code of the package. Only a development build writes source maps.
 //
-// The worker's bundle, dist/helperChannel.js, is the program of four uses, each with its own entry
-// (src/helperChannel/main.ts): the worker (startChannel), the batch helpers (startBatchHelper), the Monitor
-// (startMonitor, and `node /opt/devspace/monitor.js <subcommand>`) and the threads of the host access analysis. Nothing
-// in it runs with `eval`. It holds fixed scripts as text, which run with `node -e` or `sh -c`: the one-line pipe
-// loader, and the scripts that the worker and the steps of the batch helpers run in containers.
+// The worker's bundle, dist/helperChannel.js, is the program of five uses, each with its own entry
+// (src/helperChannel/main.ts): the worker (startChannel), the relay (startRelay), the batch helpers (startBatchHelper),
+// the Monitor (startMonitor, and `node /opt/devspace/monitor.js <subcommand>`) and the threads of the host access
+// analysis. Nothing in it runs with `eval`. It holds fixed scripts as text, which run with `node -e` or `sh -c`: the
+// one-line pipe loader, and the scripts that the worker and the steps of the batch helpers run in containers.
 import { fileURLToPath } from 'url';
 import { buildDefines } from './buildDefines.mjs';
 

@@ -95,14 +95,27 @@ After an installation or update, the extension builds a missing image in the bac
 
 The worker, its batch helpers, and the Monitor all get their code the same way (`src/core/loader/pipeLoader.ts`). The container runs a one-line `node -e` loader with the path, the SHA-256 hash, and the entry function of its bundle on its command line. The writer sends the bundle as the first line of standard input. The loader checks its length and hash, stores it in the container (`/opt/devspace/channel.js`, `batch.js`, or `monitor.js`), and calls its entry with the rest of the input. A container that restarts with a stored file of the right hash starts it without reading its input, which is how the Monitor survives a restart by Docker. Every failure of the loader exits with code 3. No code goes into an argument or a variable of a container.
 
-The worker's bundle, `dist/helperChannel.js`, is one program with four uses, each with its own entry (`src/helperChannel/main.ts`):
+The worker's bundle, `dist/helperChannel.js`, is one program with five uses, each with its own entry (`src/helperChannel/main.ts`):
 
 - **Worker**: `startChannel`.
+- **Relay**: `startRelay` (`src/helperChannel/relay.ts`, see [The relay](#the-relay)). Nothing starts it yet.
 - **Batch helpers**: `startBatchHelper`.
 - **Monitor**: `startMonitor` (`src/remoteMonitor/main.ts`). The commands over `docker exec` run `node /opt/devspace/monitor.js <command>`.
 - **Host access analysis**: threads of the worker (`src/core/helper/configurationAnalysisWorker.ts`). The worker starts each thread from its own stored file, after it checked the SHA-256 hash of that file again.
 
 Nothing in the bundle runs with `eval`. The bundle holds fixed scripts as text, which run with `node -e` or `sh -c`: the one-line pipe loader, and the scripts that the worker and the steps of the batch helpers run in containers.
+
+### The relay
+
+The relay is an entry of the worker's bundle (`src/helperChannel/relay.ts`; its frames and streams are in `src/core/relay/`, the same code for both sides). Nothing starts it yet. A later version runs it as the first program of the worker container, so that one connection to a remote engine (one SSH login) carries the worker channel and the Docker connections of the window.
+
+- **Start**: the pipe loader stores the bundle and calls `startRelay`. The loader reads its input as UTF-8, and the relay switches it to bytes (`latin1`, one character per byte), so the extension writes nothing after the bundle line until the relay sent its HELLO. Input before the HELLO ends the relay with exit code 1.
+- **Frames** (`frames.ts`): each frame has a header of 9 bytes (its kind, the number of its stream, and the length of its payload) and a payload of at most 64 KiB. The kinds are HELLO, OPEN, DATA, END, CLOSE, CREDIT, EXIT, and PING. Stream 0 is the connection itself (HELLO, PING); the extension opens the streams 1, 2, 3, … in this order, at most 256 at a time. Both sides check every frame and end the connection at a frame that breaks the rules. The reason of CLOSE is one line of plain text.
+- **Targets**: OPEN names one of two targets. `worker` starts the worker as a process of the relay, with the pipe loader and the same stored file, hash, and environment, so the worker starts as it does without the relay. At most one worker runs at a time. Its stream ends with EXIT (its exit code or signal) after its last output, and the end of the stream ends the input of the worker. When the worker ended by its own rules, the next worker stream starts a new worker on the same connection. `docker` connects the stream to the Docker socket of the container (`/var/run/docker.sock`). The relay opens no other socket, host, or port.
+- **Flow control** (`mux.ts`): each direction of a stream has a credit of 256 KiB. The sender sends at most that many bytes that the receiver did not take yet, and then waits for CREDIT. END ends one direction after its data (Docker needs this for `docker exec -i`, when the input ends before the output); CLOSE ends both directions at once. The frames of the connection (CREDIT, OPEN, CLOSE, PING) go first, then the worker stream, then the other streams in turn, one frame each, so a large Docker transfer does not delay the worker channel.
+- **Lifetime**: each side sends PING when it sent nothing else for 15 seconds, and ends the connection when no frame came for 60 seconds (the extension counts from the HELLO on). The relay ends when its input ends, after a frame that breaks the rules, after this silence, and at SIGTERM, SIGINT, and SIGHUP. It closes every stream, ends the worker as at the end of its input (and with SIGTERM), and exits when the worker ended, after 45 seconds with SIGKILL.
+
+The design ([remote-devspaces-one-ssh-login.md](design/remote-devspaces-one-ssh-login.md#the-relay)) calls the worker channel "stream 0". Here the worker has a stream of its own with the target `worker`, so that a new worker gets a new stream on the same connection.
 
 ### The batch helper
 
@@ -309,8 +322,8 @@ The extension contributes eight icons (`contributes.icons`) from the font `resou
 | Folder | Content |
 |---|---|
 | `src/vscode/` | The VS Code adapters: activation, controller, sidebar, status bar, dialogs, settings, Docker setup, remote host commands. |
-| `src/core/` | The logic without `vscode`: discovery, pipeline, policy, image check, helper, session, storage, worker flows, Docker bootstrap. |
-| `src/helperChannel/` | The entry of the worker and the batch helper, its Engine API client, and its operations. |
+| `src/core/` | The logic without `vscode`: discovery, pipeline, policy, image check, helper, session, storage, worker flows, Docker bootstrap, the frames and streams of the relay. |
+| `src/helperChannel/` | The entries of the worker, the relay, and the batch helper, the Engine API client of the worker, and its operations. |
 | `src/remoteMonitor/` | The Monitor: ticks, background run, images, prepares. |
 | `resources/` | The helper Dockerfile, the icon font and icon, and the repository groups editor. |
 | `scripts/` | Build helpers, the icon font, `install-local.mjs`, `uninstall-local.mjs`, `marketplace-setup.sh`, and `purge-docker-context.sh`. |
@@ -320,6 +333,6 @@ The extension contributes eight icons (`contributes.icons`) from the font `resou
 
 ## Testing
 
-- **Unit tests** (`npm test`, vitest, `src/**/*.test.ts`): no VS Code and no Docker. The logic is tested through its ports with fakes (a fake engine, a fake extension side, a fake `vscode`). Some tests run the real bundles: the pipe loader in a Node.js process, the worker and the batch helper against a fake engine on a Unix socket, and `flock` with real processes on Linux. Bundle tests check, on esbuild's metafile, that the extension's bundle contains no pipeline or Docker code beyond the bootstrap. A test checks the SPDX license header of every source file.
+- **Unit tests** (`npm test`, vitest, `src/**/*.test.ts`): no VS Code and no Docker. The logic is tested through its ports with fakes (a fake engine, a fake extension side, a fake `vscode`). Some tests run the real bundles: the pipe loader in a Node.js process, the worker, the relay, and the batch helper against a fake engine on a Unix socket, and `flock` with real processes on Linux. Bundle tests check, on esbuild's metafile, that the extension's bundle contains no pipeline or Docker code beyond the bootstrap. A test checks the SPDX license header of every source file.
 - **Docker tests** (`npm run test:docker`, `test/docker/`): run the real worker, batch helper, and Monitor against the running Docker engine, one file at a time: the clone, the open flow (first open, update, removed container, older container, delete), container-only Git and the token, the host access policy, Docker Compose, locks, the VS Code server store, and a remote host through an SSH server in a container (`test/docker/sshd`) with its own SSH config and Docker context. They use a Docker configuration without credentials and fail when they leave a Docker object behind.
 - **CI** (`.github/workflows/ci.yml`): on every pull request and every push to `main`, the job `test` runs `npm ci`, `npm run typecheck`, `npm test`, and `npm run package`; the job `docker` runs `npm run test:docker` with the Docker Engine of the runner, as three jobs side by side, one for each group of test files (`DEVSPACE_TEST_GROUP`, named in `vitest.docker.config.mts`; the group `other` runs every file that no group names). Both run on the Node.js 24 release of `.node-version`. Dependabot proposes each new version of the Dev Container CLI in its own pull request, so the Docker tests check it.

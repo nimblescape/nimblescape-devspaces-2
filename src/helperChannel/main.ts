@@ -9,7 +9,9 @@
 // modules of src/core. The worker starts no `docker` process: its operations act on the engine through the port over
 // the Engine API.
 //
-// The same file is the program of three more uses, each with its own entry:
+// The same file is the program of four more uses, each with its own entry:
+// - the relay: startRelay (RELAY_ENTRY, relay.ts), the first program of a worker container whose connection carries
+//   several streams; it starts the worker (startChannel) as a process of its own, with the same stored file;
 // - the batch helper: startBatchHelper (BATCH_ENTRY), which the worker starts with its own script (batch.ts);
 // - the Monitor: startMonitor (REMOTE_MONITOR_ENTRY, src/remoteMonitor/main.ts), which the worker gives the Monitor
 //   container as its script; there `node /opt/devspace/monitor.js <subcommand>` runs the file as the main module, and
@@ -34,6 +36,8 @@ import { ChannelServer, type OperationHandler } from './server';
 
 /** The entry of the Monitor (REMOTE_MONITOR_ENTRY) in this file. */
 export { startMonitor } from '../remoteMonitor/main';
+/** The entry of the relay (RELAY_ENTRY) in this file. */
+export { startRelay } from './relay';
 
 /**
  * The shorter times of the Docker tests: DEVSPACE_CHANNEL_SILENCE_MS (500..60000 ms) for the silence; the idle time is
