@@ -13,11 +13,17 @@ import type { RelayConnection } from './connection';
 export const RELAY_IDLE_CLOSE_MS = 10 * 60_000;
 /** How often the connections without a stream are looked for. */
 export const RELAY_SWEEP_INTERVAL_MS = 60_000;
+/**
+ * A new worker starts on a connection only for this long after its open (as HELPER_IMAGE_RECHECK_MS): the container of
+ * the connection runs the helper image of that time, and another window or computer may have built it again since.
+ */
+export const RELAY_WORKER_MAX_AGE_MS = 60 * 60_000;
 
 export interface RelayConnectionsOptions {
   logger: Logger;
   idleCloseMs?: number;
   sweepIntervalMs?: number;
+  workerMaxAgeMs?: number;
   /** Only for the tests. */
   now?: () => number;
 }
@@ -63,10 +69,10 @@ export function relayAccess(
 export class RelayConnections {
   private readonly current = new Map<string, RelayConnection>();
   /**
-   * Every connection that is not closed yet: its host, the time since when it has no stream, the number of streams that
-   * were opened on it at the last sweep, and whether new workers may start on it.
+   * Every connection that is not closed yet: its host, the time of its open, the time since when it has no stream, the
+   * number of streams that were opened on it at the last sweep, and whether new workers may start on it.
    */
-  private readonly all = new Map<RelayConnection, { host: string; idleSince?: number; opened: number; retired: boolean }>();
+  private readonly all = new Map<RelayConnection, { host: string; addedAt: number; idleSince?: number; opened: number; retired: boolean }>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private disposed = false;
 
@@ -81,10 +87,12 @@ export class RelayConnections {
     return connection?.isOpen ? connection : undefined;
   }
 
-  /** The open connection to `host` on which a new worker may start (not retired), or undefined. */
+  /** The open connection to `host` on which a new worker may start (not retired, opened within RELAY_WORKER_MAX_AGE_MS), or undefined. */
   forWorker(host: string): RelayConnection | undefined {
     const connection = this.get(host);
-    return connection !== undefined && this.all.get(connection)?.retired === false ? connection : undefined;
+    const entry = connection === undefined ? undefined : this.all.get(connection);
+    if (entry === undefined || entry.retired) return undefined;
+    return Math.abs(this.now() - entry.addedAt) < (this.options.workerMaxAgeMs ?? RELAY_WORKER_MAX_AGE_MS) ? connection : undefined;
   }
 
   /**
@@ -96,7 +104,7 @@ export class RelayConnections {
       connection.killNow();
       return false;
     }
-    this.all.set(connection, { host, opened: connection.streamsOpened, retired: false });
+    this.all.set(connection, { host, addedAt: this.now(), opened: connection.streamsOpened, retired: false });
     connection.onClose(() => {
       this.all.delete(connection);
       if (this.current.get(host) === connection) this.current.delete(host);
@@ -136,7 +144,7 @@ export class RelayConnections {
    * and ended between two sweeps counts as use).
    */
   sweep(): void {
-    const now = (this.options.now ?? Date.now)();
+    const now = this.now();
     const idleMs = this.options.idleCloseMs ?? RELAY_IDLE_CLOSE_MS;
     for (const [connection, entry] of [...this.all]) {
       const opened = connection.streamsOpened;
@@ -150,6 +158,10 @@ export class RelayConnections {
       this.options.logger.info(`The connection to ${entry.host} was closed after a time without use.`);
       connection.close('closed after a time without use');
     }
+  }
+
+  private now(): number {
+    return (this.options.now ?? Date.now)();
   }
 
   /** Stops every connection at once (the window closes; no timer of the extension host runs after it). */

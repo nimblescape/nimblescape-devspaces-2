@@ -259,6 +259,21 @@ describe('the Docker pipe', () => {
     expect(log.lines).toContain('warn The Docker connection of build-box ended: ssh: connect to host build-box port 22: Connection refused');
   });
 
+  it('ends the connection when the program ended, also while the client still sends', async () => {
+    const runner = new NodeProcessRunner();
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const pipe = await listen(address, processDockerDial(() => runner.startBytes('head', ['-c', '1']), silentLogger, 'build-box'));
+    const closed = new Promise<void>((resolve) => {
+      const client = net.connect({ path: address.path, allowHalfOpen: true });
+      client.on('error', () => {});
+      client.on('close', () => resolve());
+      // More than the pipes hold, and no end: the socket waits for a drain of the program, which ended.
+      client.write(Buffer.alloc(4_000_000));
+    });
+    await closed;
+    await vi.waitFor(() => expect(pipe.connectionCount).toBe(0));
+  });
+
   it('lets the program wait while the client reads slower than the program writes', async () => {
     const runner = new NodeProcessRunner();
     const address = dockerPipeAddress(ID, 'linux', base());
@@ -312,6 +327,20 @@ describe('the Docker pipe', () => {
     expect(connect).not.toHaveBeenCalled();
     await expect(exchange(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('answer');
     expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes a connection whose first bytes do not come in time', async () => {
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const connect = vi.fn(async () => {});
+    const pipe = await DockerPipe.listen({ address, connect, logger: silentLogger, name: 'devspaces-api', firstBytesTimeoutMs: 50 });
+    cleanups.push(() => pipe.close());
+    await new Promise<void>((resolve) => {
+      const client = net.connect(address.path);
+      client.on('error', () => {});
+      client.on('close', () => resolve());
+    });
+    await vi.waitFor(() => expect(pipe.connectionCount).toBe(0));
+    expect(connect).not.toHaveBeenCalled();
   });
 
   it('ends every connection at close', async () => {

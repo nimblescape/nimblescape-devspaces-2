@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { silentLogger } from '../ports';
 import type { RelayConnection } from './connection';
-import { RELAY_IDLE_CLOSE_MS, RelayConnections, relayAccess } from './connections';
+import { RELAY_IDLE_CLOSE_MS, RELAY_WORKER_MAX_AGE_MS, RelayConnections, relayAccess } from './connections';
 
 /** A connection of the test: its streams are set by the test; close and killNow end it. */
 class FakeConnection {
@@ -184,5 +184,18 @@ describe('RelayConnections', () => {
     connections.retireAll();
     expect(connections.forWorker('other')).toBeUndefined();
     expect([connections.get('build-box'), connections.get('other')]).toEqual([box, other]);
+  });
+
+  it('starts new workers on a connection only for RELAY_WORKER_MAX_AGE_MS after its open, and keeps its Docker streams', () => {
+    let now = 0;
+    const connections = registry(() => now);
+    const box = new FakeConnection();
+    box.streamCount = 1;
+    addUsed(connections, 'build-box', box);
+    now = RELAY_WORKER_MAX_AGE_MS - 1;
+    expect(connections.forWorker('build-box')).toBe(box);
+    now = RELAY_WORKER_MAX_AGE_MS;
+    expect(connections.forWorker('build-box')).toBeUndefined();
+    expect(connections.get('build-box')).toBe(box);
   });
 });

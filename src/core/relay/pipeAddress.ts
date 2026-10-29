@@ -58,7 +58,8 @@ export function dockerPipeBase(env: NodeJS.ProcessEnv, tmpdir: string, isFolder:
   return candidates.find((base) => path.posix.isAbsolute(base) && socketPathFits(base) && isFolder(base)) ?? FALLBACK_BASE;
 }
 
-function existingFolder(folder: string): boolean {
+/** True when `folder` exists and is a folder. */
+export function existingFolder(folder: string): boolean {
   try {
     return fs.statSync(folder).isDirectory();
   } catch {

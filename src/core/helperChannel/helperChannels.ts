@@ -262,7 +262,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   // The open connection of the engine (an earlier worker opened it, and the Docker pipe of the window keeps it): the
   // worker starts in its container, without a new login, and keeps the name of that container.
   const shared = relay?.current();
-  if (shared !== undefined) {
+  if (relay !== undefined && shared !== undefined) {
     try {
       const channel = await openWorkerOn(shared, deps.logger, name, WORKER_HELLO_BEHIND_RELAY_MS);
       await checkChannelEngine(deps, target, name, channel);
@@ -270,7 +270,7 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
     } catch (error) {
       // The open connection keeps its streams and stays the one of the Docker pipe (its engine passed the checks when
       // it was opened, and the container of the window runs there); the worker opens a new connection at once.
-      relay?.retire(shared);
+      relay.retire(shared);
       deps.logger.warn(`The worker on ${name} could not be opened on the open connection of the relay, so it opens a new connection: ${errorMessage(error)}`);
     }
   }

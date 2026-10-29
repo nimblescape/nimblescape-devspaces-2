@@ -12,11 +12,11 @@ import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
-import { describeDockerHost, dockerHostOf, isOnDockerHost, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
+import { classifyDockerEndpoint, describeDockerHost, dockerHostOf, isOnDockerHost, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
-import { SshLoginCache, findRemoteContext, noPromptEnv, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { SshLoginCache, findRemoteContext, listContextInfos, noPromptEnv, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { openRelayConnection, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
@@ -45,7 +45,7 @@ import { NodeProcessRunner } from '../core/process';
 import { nodeSshConfigFiles, parseSshConfig } from '../core/sshConfig';
 import { ClosingWork } from '../core/session/closingWork';
 import { heartbeatWiring } from '../core/session/heartbeatWiring';
-import { WindowHeartbeats, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
+import { WindowHeartbeats, hostEngine, resolveHeartbeatEngine } from '../core/session/windowHeartbeats';
 import { isHandedOffStop, releaseDevspace } from '../core/session/windowRelease';
 import { readOrCreateComputerId } from '../core/storage/computerId';
 import { DockerEngineRecords } from '../core/storage/dockerEngineRecords';
@@ -455,7 +455,7 @@ async function activateExtension(
   const repairSessionMonitor = heartbeats.repair(async (target, signal) => monitorCalls.monitorEnsure(target, await monitorSettings.forTarget(target), signal));
   // Set below (the coordinator makes the ID of this window).
   let windowCoordinator: SessionCoordinator | undefined;
-  // The engine of a devspace for its heartbeats and for the Docker pipe of its window (resolveHeartbeatEngine).
+  // The engine of a devspace for its heartbeats and for the Docker pipe of its window (resolveHeartbeatEngine, hostEngine).
   const engineSources = {
     windowContext: (shown: Devspace) => (connection.currentContainerName() === shown.containerName ? connection.currentDockerContext() : undefined),
     current: () => outsideOperation(() => targets.resolve()),
@@ -855,24 +855,23 @@ async function activateExtension(
       logger,
       platform,
       computerId,
-      engineRemoved: (devspace) => engineRemoved({ host: dockerHostOf(devspace) }),
-      openRelayConnection: (devspace) => relayConnections.get(dockerHostOf(devspace)),
-      relayConnection: async (devspace) => {
-        const host = dockerHostOf(devspace);
-        const open = relayConnections.get(host);
-        if (open !== undefined) return open;
+      knownHosts: async () =>
+        (await listContextInfos(docker)).map((info) => classifyDockerEndpoint(info.endpoint)).filter((endpoint) => endpoint.kind === 'remote').map((endpoint) => endpoint.host),
+      engineRemoved: (host) => engineRemoved({ host }),
+      openRelayConnection: (host) => relayConnections.get(host),
+      relayConnection: async (host) => {
         // The worker of the engine opens the connection; the engine as for the heartbeats of a devspace that this
         // window does not show: the current one when it is on the host, else the context of the host.
-        const target = await resolveHeartbeatEngine(devspace, { connected: false }, engineSources);
+        const target = await hostEngine(host, engineSources);
         if (target === undefined) throw new Error(`Docker is set to another host, and no Docker context of ${host} was found`);
         await channels.ensure(target);
         const opened = relayConnections.get(host);
         if (opened === undefined) throw new Error(`the worker on ${host} runs without the connection of the relay`);
         return opened;
       },
-      dialStdio: (devspace) => {
+      dialStdio: (host) => {
         const ssh = sshPath();
-        const address = sshTargetOf(dockerHostOf(devspace));
+        const address = sshTargetOf(host);
         if (ssh === undefined || address === undefined) return undefined;
         return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
       },

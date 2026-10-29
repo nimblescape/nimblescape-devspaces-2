@@ -144,7 +144,11 @@ describeUnix('the connection of the relay through sh -s', () => {
     const channel = await HelperChannel.open(worker, undefined, { logger, name: 'fake-host', openTimeoutMs: 20_000 });
     const relayPid = process.pid!;
     const workerPid = Number(childProcess.execFileSync('pgrep', ['-P', String(relayPid)], { encoding: 'utf8' }).trim());
+    // The worker channel closes only its stream (the connection carries the Docker streams of the window too); then
+    // RelayConnections.dispose stops the transport at once.
     channel.closeNow();
+    expect(connection.isOpen).toBe(true);
+    connection.killNow();
     await process.exited;
     await waitUntil(() => !alive(workerPid), 'the end of the worker');
     expect(connection.isOpen).toBe(false);

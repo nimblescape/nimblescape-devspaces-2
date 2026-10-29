@@ -32,6 +32,8 @@ const PIPE_IN_USE_POLL_MS = 250;
 export const PIPE_REFRESH_INTERVAL_MS = 60 * 60_000;
 /** The first connections of a pipe that are logged one by one (the Dev Containers extension makes many short ones). */
 export const PIPE_LOGGED_CONNECTIONS = 50;
+/** A connection whose first bytes do not come within this long is closed (a Docker client asks at once). */
+export const PIPE_FIRST_BYTES_TIMEOUT_MS = 30_000;
 
 export interface DockerPipeOptions {
   address: DockerPipeAddress;
@@ -47,6 +49,7 @@ export interface DockerPipeOptions {
   platform?: NodeJS.Platform;
   inUseWaitMs?: number;
   refreshIntervalMs?: number;
+  firstBytesTimeoutMs?: number;
 }
 
 /**
@@ -237,7 +240,10 @@ export class DockerPipe {
     // that closes at once, as the check of another extension host whether the address is in use, opens nothing.
     const endedEmpty = () => socket.destroy();
     socket.once('end', endedEmpty);
+    const silent = setTimeout(() => socket.destroy(), this.options.firstBytesTimeoutMs ?? PIPE_FIRST_BYTES_TIMEOUT_MS);
+    socket.once('close', () => clearTimeout(silent));
     socket.once('data', (chunk: Buffer) => {
+      clearTimeout(silent);
       socket.off('end', endedEmpty);
       socket.pause();
       socket.unshift(chunk);
@@ -330,7 +336,15 @@ export function processDockerDial(start: () => StartedByteProcess, logger: Logge
       if (error !== undefined || (exitCode !== 0 && exitCode !== null)) {
         logger.warn(`The Docker connection of ${name} ended: ${error ? error.message : stderr.trim() || `exit code ${exitCode}`}`);
       }
-      if (!socket.destroyed && !socket.writableEnded) socket.end();
+      // Nothing more comes from the engine, and nothing that the client still sends goes there (also not while the
+      // socket waits for a drain of the program): the connection ends once its output is written.
+      if (socket.destroyed) return;
+      if (socket.writableFinished) {
+        socket.destroy();
+        return;
+      }
+      socket.once('finish', () => socket.destroy());
+      if (!socket.writableEnded) socket.end();
     });
   };
 }

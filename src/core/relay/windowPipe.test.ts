@@ -55,6 +55,7 @@ function deps(overrides: Partial<WindowPipeDeps> = {}): WindowPipeDeps {
     logger: silentLogger,
     platform: 'linux',
     computerId: () => COMPUTER,
+    knownHosts: async () => [],
     engineRemoved: async () => false,
     openRelayConnection: () => undefined,
     relayConnection: async () => {
@@ -132,6 +133,8 @@ describe('windowDockerHost', () => {
     expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', 'other'), 'linux', '/tmp').dockerHost })).toBe(fresh);
     expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: dockerPipeAddress(dockerPipeId(COMPUTER, 'other-box', CONTAINER), 'linux', '/tmp').dockerHost })).toBe(fresh);
     expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: 'ssh://build-box' })).toBe(fresh);
+    // The folder of its socket folder is gone (for example another login session): the address of this extension host.
+    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: made, isFolder: (folder) => folder !== '/tmp' })).toBe(fresh);
   });
 
   it('gives none to a local devspace, to a host that is no SSH host, and without ssh', () => {
@@ -146,8 +149,9 @@ describe('serveWindowPipe', () => {
     const log = logger();
     const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
     const notMade = `it was not made on this computer for the devspace of the container ${CONTAINER}.`;
+    const unknown = `the devspace of the container ${CONTAINER} is not known, and the address was not made on this computer for a known host.`;
     expect(await serve('ssh://build-box', devspace('build-box'), deps({ logger: log }))).toEqual({ kind: 'other' });
-    expect(await serve(address.dockerHost, undefined, deps({ logger: log }))).toEqual({ kind: 'refused', reason: `the devspace of the container ${CONTAINER} is not known.` });
+    expect(await serve(address.dockerHost, undefined, deps({ logger: log, knownHosts: async () => ['other-box'] }))).toEqual({ kind: 'refused', reason: unknown });
     expect(await serve(address.dockerHost, devspace('other-box'), deps({ logger: log }))).toEqual({ kind: 'refused', reason: notMade });
     expect(await serve(address.dockerHost, devspace(), deps({ logger: log }))).toEqual({ kind: 'refused', reason: notMade });
     expect(await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, computerId: () => 'f'.repeat(32) }))).toEqual({ kind: 'refused', reason: notMade });
@@ -155,9 +159,18 @@ describe('serveWindowPipe', () => {
     const notServed = `warn The Docker pipe ${address.dockerHost} of this window is not served`;
     expect(log.lines).toEqual([
       'info The authority of this window names the Docker host ssh://build-box; it is no Docker pipe of Devspaces.',
-      `${notServed}: the devspace of the container ${CONTAINER} is not known.`,
+      `${notServed}: ${unknown}`,
       ...Array(3).fill(`${notServed}: ${notMade}`),
     ]);
+    // A devspace that the registry lost: the pipe goes to the known host for which this computer made the address.
+    const found = logger();
+    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(async () => echoRelay());
+    const recovered = await serve(address.dockerHost, undefined, deps({ logger: found, knownHosts: async () => ['other-box', 'build-box'], relayConnection }));
+    expect(recovered.kind).toBe('served');
+    expect(found.lines[0]).toBe(`info The devspace of the container ${CONTAINER} is not known. Its Docker pipe goes to build-box, for which this computer made the address.`);
+    await expect(roundTrip(address.path, 'x')).resolves.toBe('relay: x');
+    expect(relayConnection).toHaveBeenCalledWith('build-box');
+    if (recovered.kind === 'served') recovered.pipe.close();
     expect((await serve(address.dockerHost, devspace('build-box'), deps({ logger: log }))).kind).toBe('served');
     expect(log.lines.at(-1)).toBe(`info The Docker pipe of ${CONTAINER} listens on ${address.dockerHost}.`);
     // A second window of the same address: it is in use.
@@ -175,7 +188,7 @@ describe('serveWindowPipe', () => {
     const log = logger();
     await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, engineRemoved, relayConnection, dialStdio }));
     await expect(roundTrip(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('relay: GET /_ping HTTP/1.1\r\n\r\n');
-    expect(relayConnection).toHaveBeenCalledWith(devspace('build-box'));
+    expect(relayConnection).toHaveBeenCalledWith('build-box');
     expect(dialStdio).not.toHaveBeenCalled();
     // The answer about the removal mark holds for the connections of the next 2 seconds.
     await expect(roundTrip(address.path, 'x')).resolves.toBe('relay: x');

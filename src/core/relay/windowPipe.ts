@@ -8,13 +8,14 @@
 // with the removal mark, through its own `docker system dial-stdio` over SSH, so that no worker sets Devspaces up there
 // again. No `vscode`.
 import type * as net from 'net';
+import * as path from 'path';
 import { dockerHostOf, sshTargetOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import type { Logger, StartedByteProcess } from '../ports';
 import type { Devspace } from '../types';
 import type { RelayConnection } from './connection';
 import { DockerPipe, processDockerDial, relayDockerDial } from './dockerPipe';
-import { dockerPipeAddress, dockerPipeBase, dockerPipeId, parseDockerPipeHost } from './pipeAddress';
+import { dockerPipeAddress, dockerPipeBase, dockerPipeId, existingFolder, parseDockerPipeHost } from './pipeAddress';
 
 /** How long the answer of WindowPipeDeps.engineRemoved holds for the next connections of the pipe. */
 const ENGINE_REMOVED_HOLD_MS = 2_000;
@@ -31,14 +32,19 @@ export interface WindowPipeDeps {
   platform: NodeJS.Platform;
   /** The ID of this computer (computer.id). */
   computerId(): string;
-  /** True while the engine of `devspace` has the removal mark ("Remove Devspaces from This Docker Engine…"). */
-  engineRemoved(devspace: Devspace): Promise<boolean>;
-  /** The open connection of the relay to the host of `devspace`, or undefined; asks nothing. */
-  openRelayConnection(devspace: Devspace): RelayConnection | undefined;
-  /** The open connection of the relay to the host of `devspace`, or a new one (the worker of the engine opens it). */
-  relayConnection(devspace: Devspace): Promise<RelayConnection>;
-  /** `ssh … docker system dial-stdio` on the host of `devspace`; undefined without `ssh` or for a host it cannot reach. */
-  dialStdio(devspace: Devspace): StartedByteProcess | undefined;
+  /**
+   * The SSH hosts that this computer knows (of its Docker contexts), to find the host of a pipe whose devspace is not
+   * known (the registry lost it): the one for which this computer made the address.
+   */
+  knownHosts(): Promise<string[]>;
+  /** True while the engine on the SSH host `host` has the removal mark ("Remove Devspaces from This Docker Engine…"). */
+  engineRemoved(host: string): Promise<boolean>;
+  /** The open connection of the relay to `host`, or undefined; asks nothing. */
+  openRelayConnection(host: string): RelayConnection | undefined;
+  /** The open connection of the relay to `host`, or a new one (the worker of the engine opens it). */
+  relayConnection(host: string): Promise<RelayConnection>;
+  /** `ssh … docker system dial-stdio` on `host`; undefined without `ssh` or for a host it cannot reach. */
+  dialStdio(host: string): StartedByteProcess | undefined;
   /** Only for the tests (DockerPipeOptions.inUseWaitMs, RELAY_RETRY_AFTER_MS, RELAY_WAIT_MS). */
   inUseWaitMs?: number;
   relayRetryAfterMs?: number;
@@ -49,8 +55,8 @@ export interface WindowPipeDeps {
  * The address of the Docker pipe of the window of `devspace` (its container `containerName`), for `settings.host` in
  * the authority: for a devspace on an SSH host (sshTargetOf) when `ssh` is found (the connection of the relay needs it);
  * undefined otherwise, and the window names a Docker context as before. `current`, the Docker host in the authority of
- * this window, when it is the pipe of this devspace: an extension host with another runtime or temporary folder made
- * it, and the same URI reloads this window instead of opening it again.
+ * this window, when it is the pipe of this devspace and the folder of its socket folder exists: an extension host with
+ * another runtime or temporary folder made it, and the same URI reloads this window instead of opening it again.
  */
 export function windowDockerHost(
   devspace: Devspace,
@@ -69,9 +75,11 @@ export function windowDockerHost(
   const host = dockerHostOf(devspace);
   if (host === '' || sshTargetOf(host) === undefined || !deps.sshFound()) return undefined;
   const id = dockerPipeId(deps.computerId(), host, containerName);
+  const isFolder = deps.isFolder ?? existingFolder;
   const current = deps.current === undefined ? undefined : parseDockerPipeHost(deps.current, deps.platform);
-  if (current?.id === id) return current.dockerHost;
-  return dockerPipeAddress(id, deps.platform, dockerPipeBase(deps.env, deps.tmpdir, deps.isFolder)).dockerHost;
+  // A window whose runtime folder is gone (for example another login session) gets an address that it can serve.
+  if (current?.id === id && (current.folder === undefined || isFolder(path.posix.dirname(current.folder)))) return current.dockerHost;
+  return dockerPipeAddress(id, deps.platform, dockerPipeBase(deps.env, deps.tmpdir, isFolder)).dockerHost;
 }
 
 /**
@@ -84,9 +92,9 @@ export type WindowPipe = { kind: 'other' } | { kind: 'served'; pipe: DockerPipe 
 
 /**
  * Serves the Docker pipe `dockerHost` of the authority of this window, whose container is `containerName` and whose
- * devspace is `devspace`: only when it was made on this computer for this devspace (not another computer, another
- * host, or an unknown devspace), and when it can listen (for example not while another program serves it). Never
- * throws.
+ * devspace is `devspace`: only when it was made on this computer for this devspace (not another computer or another
+ * host), and when it can listen (for example not while another program serves it). For a devspace that is not known
+ * (the registry lost it), the host is the known host for which this computer made the address. Never throws.
  */
 export async function serveWindowPipe(dockerHost: string, containerName: string, devspace: Devspace | undefined, deps: WindowPipeDeps): Promise<WindowPipe> {
   const { logger } = deps;
@@ -99,15 +107,26 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
     logger.warn(`The Docker pipe ${dockerHost} of this window is not served: ${reason}`);
     return { kind: 'refused', reason };
   };
-  if (devspace === undefined) return refuse(`the devspace of the container ${containerName} is not known.`);
-  const host = dockerHostOf(devspace);
   try {
-    if (host === '' || address.id !== dockerPipeId(deps.computerId(), host, containerName)) {
-      return refuse(`it was not made on this computer for the devspace of the container ${containerName}.`);
+    let host: string;
+    if (devspace !== undefined) {
+      host = dockerHostOf(devspace);
+      if (host === '' || address.id !== dockerPipeId(deps.computerId(), host, containerName)) {
+        return refuse(`it was not made on this computer for the devspace of the container ${containerName}.`);
+      }
+    } else {
+      const known = await deps.knownHosts().catch((error: unknown) => {
+        logger.warn(`The Docker contexts could not be read for the Docker pipe ${dockerHost}: ${errorMessage(error)}`);
+        return [];
+      });
+      const found = known.find((candidate) => address.id === dockerPipeId(deps.computerId(), candidate, containerName));
+      if (found === undefined) return refuse(`the devspace of the container ${containerName} is not known, and the address was not made on this computer for a known host.`);
+      host = found;
+      logger.info(`The devspace of the container ${containerName} is not known. Its Docker pipe goes to ${host}, for which this computer made the address.`);
     }
     const direct = processDockerDial(
       () => {
-        const process = deps.dialStdio(devspace);
+        const process = deps.dialStdio(host);
         if (process === undefined) throw new Error(`ssh was not found, or ${host} is no SSH host`);
         return process;
       },
@@ -118,7 +137,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
     let removed: { at: number; answer: Promise<boolean> } | undefined;
     const engineRemoved = (): Promise<boolean> => {
       const now = Date.now();
-      if (removed === undefined || Math.abs(now - removed.at) >= ENGINE_REMOVED_HOLD_MS) removed = { at: now, answer: deps.engineRemoved(devspace) };
+      if (removed === undefined || Math.abs(now - removed.at) >= ENGINE_REMOVED_HOLD_MS) removed = { at: now, answer: deps.engineRemoved(host) };
       return removed.answer;
     };
     // Without the connection of the relay, the window still works: each connection logs in as without the pipe until
@@ -135,7 +154,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
     let opening: { connection: Promise<RelayConnection>; waited: boolean } | undefined;
     const relayConnection = () => {
       if (opening === undefined) {
-        const current = { connection: deps.relayConnection(devspace), waited: false };
+        const current = { connection: deps.relayConnection(host), waited: false };
         opening = current;
         current.connection.then(
           () => {
@@ -165,7 +184,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
     };
     const connect = async (socket: net.Socket): Promise<void> => {
       if (await engineRemoved()) return direct(socket);
-      const open = deps.openRelayConnection(devspace);
+      const open = deps.openRelayConnection(host);
       if (open !== undefined) {
         throughRelayAgain();
         return throughRelay(open, socket);

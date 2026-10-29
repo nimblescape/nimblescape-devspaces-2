@@ -96,7 +96,9 @@ export class RelayConnection {
    * A stream to the worker as the program of a helper channel (HelperChannel.open without its bundle line): the relay
    * starts the worker from the stored file. Its output is the output of the worker; its error output is the error
    * output of the connection (the relay, the worker, and the transport share it); its end is the EXIT of the worker,
-   * or the close of the stream or of the connection. `kill` closes the stream, and the relay stops the worker.
+   * or the close of the stream or of the connection. `kill` closes the stream, and the relay stops the worker. It has
+   * no `killNow`: the connection carries the Docker streams of the window too, and RelayConnections.dispose stops the
+   * transport at once when the window closes.
    */
   openWorker(): StartedProcess {
     const stream = this.openMux().open('worker');
@@ -129,10 +131,6 @@ export class RelayConnection {
       kill: () => {
         stream.close('stopped by the extension');
         settle({ exitCode: null });
-      },
-      killNow: () => {
-        settle({ exitCode: null });
-        this.killNow();
       },
       onStdout: stdout.listen,
       onStderr: (listener) => {
