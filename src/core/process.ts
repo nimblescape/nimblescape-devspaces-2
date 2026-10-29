@@ -5,7 +5,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import * as path from 'path';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
-import { abortError, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedByteProcess, type StartedProcess } from './ports';
+import { abortError, heldOutput, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedByteProcess, type StartedProcess } from './ports';
 
 /**
  * A program printed more than MAX_CAPTURED_OUTPUT_BYTES on its standard output. It was stopped,
@@ -346,22 +346,6 @@ export class NodeProcessRunner implements ProcessRunner {
     };
     return { child, exited, killNow, kill, ended: () => ended };
   }
-}
-
-/** Output that comes before its listener is set waits for it, in order. One listener. */
-function heldOutput<T>(): { deliver(value: T): void; listen(listener: (value: T) => void): void } {
-  let listener: ((value: T) => void) | undefined;
-  const held: T[] = [];
-  return {
-    deliver: (value) => {
-      if (listener) listener(value);
-      else held.push(value);
-    },
-    listen: (next) => {
-      listener = next;
-      for (const value of held.splice(0)) next(value);
-    },
-  };
 }
 
 /**

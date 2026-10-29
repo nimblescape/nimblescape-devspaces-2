@@ -124,6 +124,27 @@ describe('openHelperChannel with the connection of the relay', () => {
     channel.close();
   });
 
+  it('gives the answer to hello what is left of the time of the open, at least 15 seconds', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+    try {
+      // A worker that never answers.
+      const silent: StartedProcess = { write: () => true, end: () => {}, kill: () => {}, onStdout: () => {}, onStderr: () => {}, exited: new Promise(() => {}) };
+      const relay = (): RelayConnect => async () => {
+        // The login and the start of the container took 110 seconds.
+        await new Promise((resolve) => setTimeout(resolve, 110_000));
+        return fakeConnection(silent) as unknown as RelayConnection;
+      };
+      let failure: unknown;
+      void openHelperChannel(deps({ relay }), REMOTE).catch((error: unknown) => (failure = error));
+      await vi.advanceTimersByTimeAsync(110_000 + 14_000);
+      expect(failure).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(failure).toMatchObject({ code: 'open', message: 'The helper channel to build-box could not be opened: no answer within 15 seconds' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('fails the open with the reason of the connection', async () => {
     const relay = (): RelayConnect => async () => {
       throw new RelayConnectionError('The connection to build-box could not be opened: it ended (ssh: connect to host build-box port 22: Connection refused)');

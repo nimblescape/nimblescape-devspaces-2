@@ -181,6 +181,25 @@ export interface ProgressReporter {
 
 export const silentProgress: ProgressReporter = { step() {}, detail() {} };
 
+/**
+ * Output of a started program (StartedProcess.onStdout, onStderr) that comes before its listener is set waits for it,
+ * in order. One listener.
+ */
+export function heldOutput<T>(): { deliver(value: T): void; listen(listener: (value: T) => void): void } {
+  let listener: ((value: T) => void) | undefined;
+  const held: T[] = [];
+  return {
+    deliver: (value) => {
+      if (listener) listener(value);
+      else held.push(value);
+    },
+    listen: (next) => {
+      listener = next;
+      for (const value of held.splice(0)) next(value);
+    },
+  };
+}
+
 export interface Credentials {
   username: string;
   password: string;

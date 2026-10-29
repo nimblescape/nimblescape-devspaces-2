@@ -8,8 +8,8 @@
 // line for the pipe loader, and from then on both directions carry the frames of the streams (mux.ts). The connection
 // is open once the HELLO of the relay came. A stream to the target `worker` is the program of a helper channel
 // (openWorker). No `vscode`.
-import { MAX_BUNDLE_LINE_LENGTH, encodeBundle, readableStderr } from '../loader/pipeLoader';
-import type { Logger, StartedByteProcess, StartedProcess } from '../ports';
+import { encodeBundle, readableStderr } from '../loader/pipeLoader';
+import { heldOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
 import { Mux } from './mux';
 
 /** The longest time from the start of the transport to the HELLO of the relay: the login, the start, the bundle. */
@@ -20,6 +20,11 @@ export const MAX_OUTPUT_BEFORE_MARKER = 64 * 1024;
 export const RELAY_CLOSE_KILL_MS = 5_000;
 /** The end of the error output that is kept for the reason of a failure. */
 const STDERR_TAIL_LENGTH = 8 * 1024;
+/**
+ * After the end of the output of an open connection, the end of the transport (with its error output as the reason)
+ * is awaited this long before the connection ends without it.
+ */
+const EXIT_REASON_WAIT_MS = 1_000;
 
 /** The connection could not be opened; the message says why (with the error output of the transport). */
 export class RelayConnectionError extends Error {
@@ -61,9 +66,8 @@ export class RelayConnection {
 
   /**
    * Starts the connection on `process` and resolves once the relay said HELLO. Rejects with RelayConnectionError, and
-   * stops the process, when the bundle is longer than the pipe loader takes, when the transport ends before, when the
-   * login prints more than MAX_OUTPUT_BEFORE_MARKER before the marker, when the relay breaks the rules, and after
-   * `openTimeoutMs`.
+   * stops the process, when the transport ends before, when the login prints more than MAX_OUTPUT_BEFORE_MARKER before
+   * the marker, when the relay breaks the rules, and after `openTimeoutMs`.
    */
   static open(process: StartedByteProcess, options: RelayConnectionOptions): Promise<RelayConnection> {
     return new RelayConnection(process, options).start();
@@ -94,12 +98,9 @@ export class RelayConnection {
     if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
     const stream = this.mux.open('worker');
     const decoder = new TextDecoder('utf-8');
-    let stdoutListener: ((text: string) => void) | undefined;
-    let heldStdout = '';
+    const stdout = heldOutput<string>();
     const deliver = (text: string) => {
-      if (text === '') return;
-      if (stdoutListener) stdoutListener(text);
-      else heldStdout += text;
+      if (text !== '') stdout.deliver(text);
     };
     let settle: (result: { exitCode: number | null; error?: Error }) => void = () => {};
     const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => {
@@ -133,12 +134,7 @@ export class RelayConnection {
         this.killNow();
         settle({ exitCode: null });
       },
-      onStdout: (listener) => {
-        stdoutListener = listener;
-        const text = heldStdout;
-        heldStdout = '';
-        if (text !== '') listener(text);
-      },
+      onStdout: stdout.listen,
       onStderr: (listener) => {
         if (stderrListener) this.stderrListeners.delete(stderrListener);
         stderrListener = listener;
@@ -164,8 +160,6 @@ export class RelayConnection {
     const { process, options } = this;
     const { logger, name } = options;
     const timeoutMs = options.openTimeoutMs ?? RELAY_OPEN_TIMEOUT_MS;
-    // The loader limits the escaped line (the memory guard of the pipe loader), so the same is checked here.
-    const bundleLine = encodeBundle(options.bundle);
     return new Promise<RelayConnection>((resolve, reject) => {
       let settled = false;
       const fail = (reason: string) => {
@@ -185,12 +179,16 @@ export class RelayConnection {
       let before: Buffer | undefined = Buffer.alloc(0);
       process.onStdout(
         (chunk) => {
+          // After a failed open, nothing more is kept or read.
+          if (this.closedReason !== undefined) return;
           if (before === undefined) {
             this.mux?.input(chunk);
             return;
           }
           before = Buffer.concat([before, chunk]);
-          const at = markerAt(before, marker);
+          // Also after text without a line feed (`printf Welcome` in a login script). The marker is random, so no
+          // other output has it.
+          const at = before.indexOf(marker);
           if (at < 0) {
             if (before.length > MAX_OUTPUT_BEFORE_MARKER + marker.length) fail(`the login printed more than ${MAX_OUTPUT_BEFORE_MARKER / 1024} KiB before the start`);
             return;
@@ -200,7 +198,7 @@ export class RelayConnection {
           const rest = before.subarray(at + marker.length);
           before = undefined;
           // The first line of the pipe loader, then the frames (the extension sends none before the HELLO of the relay).
-          process.write(Buffer.from(bundleLine, 'utf8'));
+          process.write(Buffer.from(encodeBundle(options.bundle), 'utf8'));
           this.mux = new Mux({
             side: 'extension',
             link: {
@@ -224,9 +222,15 @@ export class RelayConnection {
           });
           if (rest.length > 0) this.mux.input(rest);
         },
-        // Before the HELLO, the end of the transport says why (its error output).
+        // The end of the transport says why (its error output): before the HELLO, the open fails with it; after, the
+        // connection ends with it when the transport ends within EXIT_REASON_WAIT_MS.
         () => {
-          if (settled) this.mux?.inputEnded();
+          if (!settled) return;
+          let wait: ReturnType<typeof setTimeout> | undefined;
+          void Promise.race([process.exited, new Promise((resolve) => (wait = setTimeout(resolve, EXIT_REASON_WAIT_MS)))]).then(() => {
+            clearTimeout(wait);
+            this.mux?.inputEnded();
+          });
         },
       );
       void process.exited.then(({ exitCode, error }) => {
@@ -234,7 +238,6 @@ export class RelayConnection {
         if (!settled) fail(`it ended (${why})`);
         else this.shutdown(`the connection ended (${why})`);
       });
-      if (bundleLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) return fail(`the bundle is too long (${bundleLine.length - 1} characters as JSON)`);
       process.write(Buffer.from(options.startScript, 'utf8'));
     });
   }
@@ -250,12 +253,4 @@ export class RelayConnection {
     for (const listener of [...this.closeListeners]) listener(reason);
     this.closeListeners.clear();
   }
-}
-
-/** Where the line `marker` (with its line feed) starts in `output`: at its start or after a line feed; -1 when not. */
-function markerAt(output: Buffer, marker: Buffer): number {
-  for (let at = output.indexOf(marker); at >= 0; at = output.indexOf(marker, at + 1)) {
-    if (at === 0 || output[at - 1] === 0x0a) return at;
-  }
-  return -1;
 }
