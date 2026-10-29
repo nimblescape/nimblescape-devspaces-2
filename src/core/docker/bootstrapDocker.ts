@@ -327,7 +327,10 @@ export class BootstrapDocker {
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
     try {
       // The environment after the lookup: a CLI that was found again has its own (dockerProcessEnv).
-      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.operationEnv(viaPipe) });
+      const call = options.env === undefined ? this.callEnv(viaPipe) : { env: options.env };
+      // Each such call is one SSH login of the Docker CLI (`ssh … docker system dial-stdio`), which SSH servers limit.
+      if (call.login !== undefined) this.logger.info(`docker ${dockerCommandWords(args).join(' ')} logs in to ${call.login} with the Docker context.`);
+      return await this.runner.run(dockerPath, args, { ...options, env: call.env });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
@@ -364,20 +367,26 @@ export class BootstrapDocker {
    * context name.
    */
   private operationEnv(viaPipe: boolean): NodeJS.ProcessEnv {
+    return this.callEnv(viaPipe).env;
+  }
+
+  /** operationEnv, and the SSH host that a call with it logs in to with the Docker context (a remote target without the pipe). */
+  private callEnv(viaPipe: boolean): { env: NodeJS.ProcessEnv; login?: string } {
     const target = operationDockerTarget();
-    if (target === undefined) return this.env;
+    if (target === undefined) return { env: this.env };
     const pipe = viaPipe && target.kind === 'remote' ? this.pipeOf(target) : undefined;
     if (pipe !== undefined) {
       const env: NodeJS.ProcessEnv = { ...this.env };
       for (const name of PIPE_CLEARED_VARIABLES) deleteEnv(env, name);
       env.DOCKER_HOST = pipe;
-      return env;
+      return { env };
     }
-    if (target.context === undefined) return this.env;
+    const login = target.kind === 'remote' ? target.host : undefined;
+    if (target.context === undefined) return { env: this.env, login };
     const env: NodeJS.ProcessEnv = { ...this.env };
     deleteEnv(env, 'DOCKER_CONTEXT');
     env.DOCKER_CONTEXT = target.context;
-    return env;
+    return { env, login };
   }
 
   /** The Docker pipe of the extension for `target` (dockerPipe), or undefined (also when the lookup fails, logged). */

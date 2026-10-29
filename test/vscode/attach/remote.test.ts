@@ -36,6 +36,13 @@ const LOGINS_QUIET_MS = 15_000;
 const LOGINS_WAIT_MS = 90_000;
 /** The longest command of a session in the timeline. */
 const SESSION_TEXT_LENGTH = 200;
+/**
+ * The lines of the Devspaces log that the timeline shows next to the logins: the Docker calls that log in with the
+ * Docker context, and the connections of the relay and the Docker pipes.
+ */
+const LOGIN_LOG_LINE = /logs? in|SSH login|without the connection of the relay|The connection to \S+ (is open|could not be opened)|Docker pipe of .* listens/;
+/** The most lines of the Devspaces log in the timeline. */
+const LOGIN_LOG_LINES = 60;
 
 /**
  * The log of the container of the other computer since `since` (ISO 8601), with the time of each line: its standard
@@ -64,7 +71,12 @@ function remoteHostLog(container: string, since: string): Promise<string> {
  */
 function logLineTime(log: string, pattern: RegExp, near: number): number | undefined {
   const line = log.split('\n').find((text) => pattern.test(text));
-  const match = line === undefined ? undefined : /^\[(\d\d):(\d\d):(\d\d)\]/.exec(line);
+  return line === undefined ? undefined : lineTime(line, near);
+}
+
+/** The time of a line of the Devspaces log (see logLineTime), or undefined for a line without a time. */
+function lineTime(line: string, near: number): number | undefined {
+  const match = /^\[(\d\d):(\d\d):(\d\d)\]/.exec(line);
   if (!match) return undefined;
   const date = new Date(near);
   date.setHours(Number(match[1]), Number(match[2]), Number(match[3]), 0);
@@ -108,7 +120,15 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
 
     // The worker of the open starts before Dev Containers attaches: the logins until the devspace was ready are those
     // of Devspaces (the log of Devspaces has whole seconds, so this count may include the logins of one more second).
-    const ready = logLineTime(channelLog('Devspaces'), / is ready in the container /, connected);
+    const devspacesLog = channelLog('Devspaces');
+    const ready = logLineTime(devspacesLog, / is ready in the container /, connected);
+    // The lines of the log about logins and connections since the start of the extension host (whole seconds).
+    const loginLines = devspacesLog
+      .split('\n')
+      .filter((line) => LOGIN_LOG_LINE.test(line))
+      .map((line) => ({ time: lineTime(line, connected), text: `(Devspaces) ${line.replace(/^\[[^\]]*\]\s*/, '').slice(0, SESSION_TEXT_LENGTH)}` }))
+      .filter((entry): entry is { time: number; text: string } => entry.time !== undefined && entry.time >= started - 1_000)
+      .slice(0, LOGIN_LOG_LINES);
     const seconds = (time: number) => ((time - started) / 1000).toFixed(1);
     const lastLogin = events.filter((event) => event.kind === 'login').at(-1)?.time;
     const rows: [string, string, string][] = [
@@ -123,6 +143,7 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
     const timeline = [
       ...events.filter((event) => event.kind === 'session').map((event) => ({ time: event.time, text: event.text.slice(0, SESSION_TEXT_LENGTH) })),
       ...(ready === undefined ? [] : [{ time: ready, text: '(Devspaces: the devspace is ready)' }]),
+      ...loginLines,
       { time: connected, text: '(the window is connected, the tests start)' },
     ]
       .sort((a, b) => a.time - b.time)

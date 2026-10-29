@@ -76,6 +76,21 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     expect(envs[1].DOCKER_HOST).toBe(PIPE);
   });
 
+  it('logs each call of an operation on an SSH host that logs in with the Docker context, never a call through the pipe', async () => {
+    const { runner } = recorder();
+    const lines: string[] = [];
+    const logger: Logger = { ...silentLogger, info: (message) => lines.push(message) };
+    let pipe: string | undefined;
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'linux', { dockerPipe: () => pipe });
+    await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
+    pipe = PIPE;
+    await runWithDockerTarget(REMOTE, () => docker.run(['image', 'inspect', 'x']));
+    await runWithDockerTarget(REMOTE, () => docker.runWithContext(['info']));
+    await runWithDockerTarget(LOCAL_DOCKER_TARGET, () => docker.run(['image', 'inspect', 'x']));
+    await docker.run(['image', 'inspect', 'x']);
+    expect(lines).toEqual(['docker image inspect logs in to build-box with the Docker context.', 'docker info logs in to build-box with the Docker context.']);
+  });
+
   it('starts the worker (standard input open) never through the pipe', async () => {
     const { runner, starts } = recorder();
     const dockerPipe = vi.fn(() => PIPE);
