@@ -200,6 +200,29 @@ describe('the ssh check before the Docker calls', () => {
     expect(viaDockerPipe.mock.calls.map(([host]) => host)).toEqual(['box', 'other']);
   });
 
+  it('is the login of the shell before the relay when the host has one, except for the test before a switch', async () => {
+    const runner = sshRunner();
+    const sshLogins = new SshLoginCache();
+    const login = vi.fn(async (host: string): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined> =>
+      host === 'box' ? { ok: true } : host === 'down' ? { ok: false, detail: 'ssh: connect to host down port 22: Connection refused', timedOut: false } : undefined,
+    );
+    const shells = { login, run: vi.fn(async () => undefined) };
+    const deps = { runner, sshPath: '/usr/bin/ssh', env: {}, sshLogins, shells };
+    const signal = new AbortController().signal;
+    await expect(checkSshLogin('box', deps, { signal })).resolves.toEqual({ ok: true });
+    expect(login).toHaveBeenCalledWith('box', signal);
+    expect(sshLogins.isFresh('box')).toBe(true);
+    await expect(checkSshLogin('down', deps)).resolves.toEqual({ ok: false, problem: 'unreachable', detail: 'ssh: connect to host down port 22: Connection refused' });
+    login.mockResolvedValueOnce({ ok: false, detail: 'ssh did not answer within 30 seconds.', timedOut: true });
+    await expect(checkSshLogin('slow', deps)).resolves.toEqual({ ok: false, problem: 'unreachable', detail: 'ssh did not answer within 30 seconds.' });
+    expect(runner.run).not.toHaveBeenCalled();
+    // A host without a shell (no transport), and the test before a switch: `ssh … true`.
+    await expect(checkSshLogin('other', deps)).resolves.toEqual({ ok: true });
+    await expect(checkSshLogin('box', deps, { useCache: false })).resolves.toEqual({ ok: true });
+    expect(runner.run).toHaveBeenCalledTimes(2);
+    expect(login.mock.calls.map(([host]) => host)).toEqual(['box', 'down', 'slow', 'other']);
+  });
+
   it('runs before docker -H ssh://… info of the test, always connects, and stops at its failure', async () => {
     const sshLogins = new SshLoginCache();
     sshLogins.remember('box');
@@ -245,6 +268,17 @@ describe('readRootlessSocket', () => {
     expect(file).toBe('/usr/bin/ssh');
     expect(args).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', 'printf %s "$XDG_RUNTIME_DIR"']);
     expect(options?.env?.SSH_ASKPASS_REQUIRE).toBe('never');
+  });
+
+  it('asks the shell before the relay when the host has one', async () => {
+    const runner = { run: vi.fn(async () => ok('/run/user/9')) };
+    const run = vi.fn(async (host: string, _command: string, _options?: Pick<RunOptions, 'timeoutMs' | 'signal'>) => (host === 'box' ? ok('/run/user/1001') : undefined));
+    const shells = { login: vi.fn(async () => undefined), run };
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'box', {}, undefined, shells)).resolves.toEqual({ ok: true, socket: '/run/user/1001/docker.sock' });
+    expect(run).toHaveBeenCalledWith('box', 'printf %s "$XDG_RUNTIME_DIR"', { timeoutMs: 30_000, signal: undefined });
+    expect(runner.run).not.toHaveBeenCalled();
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'other', {}, undefined, shells)).resolves.toEqual({ ok: true, socket: '/run/user/9/docker.sock' });
+    expect(runner.run).toHaveBeenCalledTimes(1);
   });
 
   it('fails without ssh, for an unusable host, and without XDG_RUNTIME_DIR', async () => {

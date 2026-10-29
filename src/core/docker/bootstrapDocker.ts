@@ -10,9 +10,10 @@
 // other Docker action runs in the worker, except "Remove Devspaces from This Docker Engine…", which ends the worker and
 // removes what Devspaces keeps on the engine with `run` of this CLI (engineRemoval.ts; it adds no member here). A call
 // of an operation on an SSH host goes through the Docker pipe of the extension for the host while a connection of the
-// relay to it is open (BootstrapDockerOptions.dockerPipe), without an SSH login of its own. A call
-// that does not only read is logged with its command (directCommandName), never its arguments. Output is read as JSON
-// (`docker --version` as its one line), never as a table. No `vscode`.
+// relay to it is open (BootstrapDockerOptions.dockerPipe), without an SSH login of its own; before that connection, a
+// call that only reads runs on the shell before the relay (BootstrapDockerOptions.remoteShell, isShellCall), whose
+// login the connection then takes over. A call that does not only read is logged with its command (directCommandName),
+// never its arguments. Output is read as JSON (`docker --version` as its one line), never as a table. No `vscode`.
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { CommandError, errorMessage, UserFacingError } from '../errors';
@@ -175,6 +176,18 @@ export interface BootstrapDockerOptions {
    * the Docker context of the operation. Not for the start of the worker (`start`), whose standard input stays open.
    */
   dockerPipe?: (target: DockerTarget) => string | undefined;
+  /**
+   * The target of the current Docker context as it was read last (DockerTargets.last), only for the log line of a call
+   * outside an operation that logs in to an SSH host.
+   */
+  lastTarget?: () => DockerTarget | undefined;
+  /**
+   * `docker <args>` on the computer of the remote engine `target`, on the shell before the relay of its host
+   * (RemoteShells.docker): for a call of an operation there that only reads (isShellCall) while the host has no Docker
+   * pipe of the extension, so that the checks before a connection of the relay need no SSH login of their own.
+   * Undefined when the host has no shell (the call uses the Docker context of the operation).
+   */
+  remoteShell?: (target: DockerTarget, args: readonly string[], options: Pick<RunOptions, 'timeoutMs' | 'signal'>) => Promise<RunResult | undefined>;
   /** Only for tests. Default: SSH_DROP_RETRY_DELAY_MS. */
   sshDropRetryDelayMs?: number;
   /** Only for tests. Default: cliFileIdentity. */
@@ -206,6 +219,23 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): 
   });
 }
 
+/** False for a Docker call that does not reach the engine: a command of the Docker contexts, or only global options. */
+function reachesEngine(args: readonly string[]): boolean {
+  const [command] = dockerCommandWords(args);
+  return command !== undefined && command !== 'context';
+}
+
+/**
+ * A call that may run with the Docker CLI of the other computer, on the shell before the relay (runOnShell): it only
+ * reads (isReadOnlyDockerCall) and reaches the engine, starts with its command (no global option, which names files or
+ * an endpoint of this computer), and is no `docker version`, whose client part is that of the CLI that runs it.
+ */
+export function isShellCall(args: readonly string[]): boolean {
+  const [command] = dockerCommandWords(args);
+  if (args.length === 0 || args[0].startsWith('-') || command === 'version') return false;
+  return reachesEngine(args) && isReadOnlyDockerCall(args);
+}
+
 /**
  * The variables of the Docker CLI that a call through the Docker pipe of the extension goes without: the pipe is its
  * endpoint (DOCKER_HOST), and the TLS settings of an endpoint of the user do not apply to it.
@@ -223,6 +253,8 @@ export class BootstrapDocker {
   private readonly onCliLost: BootstrapDockerOptions['onCliLost'];
   private readonly onCliFound: BootstrapDockerOptions['onCliFound'];
   private readonly dockerPipe: BootstrapDockerOptions['dockerPipe'];
+  private readonly lastTarget: BootstrapDockerOptions['lastTarget'];
+  private readonly remoteShell: BootstrapDockerOptions['remoteShell'];
   private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
   private readonly fileIdentity: (path: string) => Promise<string | undefined>;
@@ -256,6 +288,8 @@ export class BootstrapDocker {
     this.onCliLost = options.onCliLost;
     this.onCliFound = options.onCliFound;
     this.dockerPipe = options.dockerPipe;
+    this.lastTarget = options.lastTarget;
+    this.remoteShell = options.remoteShell;
     this.sshDropRetryDelayMs = options.sshDropRetryDelayMs ?? SSH_DROP_RETRY_DELAY_MS;
     this.fileIdentity = options.fileIdentity ?? cliFileIdentity;
     // The caller has just looked the CLI up.
@@ -327,7 +361,13 @@ export class BootstrapDocker {
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
     try {
       // The environment after the lookup: a CLI that was found again has its own (dockerProcessEnv).
-      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.operationEnv(viaPipe) });
+      const call = options.env === undefined ? this.callEnv(viaPipe) : { env: options.env };
+      const onShell = call.shellTarget === undefined ? undefined : await this.runOnShell(call.shellTarget, args, options);
+      if (onShell !== undefined) return onShell;
+      // Each such call is one SSH login of the Docker CLI (`ssh … docker system dial-stdio`), which SSH servers limit.
+      // The commands of the Docker contexts and `docker --version` do not reach the engine.
+      if (call.login !== undefined && reachesEngine(args)) this.logger.info(`${commandText(args)} logs in to ${call.login} with the Docker context${call.outside ? ' (outside an operation)' : ''}.`);
+      return await this.runner.run(dockerPath, args, { ...options, env: call.env });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
@@ -364,20 +404,50 @@ export class BootstrapDocker {
    * context name.
    */
   private operationEnv(viaPipe: boolean): NodeJS.ProcessEnv {
+    return this.callEnv(viaPipe).env;
+  }
+
+  /**
+   * operationEnv, and the SSH host that a call with it logs in to with the Docker context: the remote target of the
+   * operation without the pipe (`shellTarget`, for runOnShell), or outside an operation (`outside`) the remote target of
+   * the current Docker context as it was read last (lastTarget).
+   */
+  private callEnv(viaPipe: boolean): { env: NodeJS.ProcessEnv; login?: string; outside?: true; shellTarget?: DockerTarget } {
     const target = operationDockerTarget();
-    if (target === undefined) return this.env;
+    if (target === undefined) {
+      const last = this.lastTarget?.();
+      return last?.kind === 'remote' ? { env: this.env, login: last.host, outside: true } : { env: this.env };
+    }
     const pipe = viaPipe && target.kind === 'remote' ? this.pipeOf(target) : undefined;
     if (pipe !== undefined) {
       const env: NodeJS.ProcessEnv = { ...this.env };
       for (const name of PIPE_CLEARED_VARIABLES) deleteEnv(env, name);
       env.DOCKER_HOST = pipe;
-      return env;
+      return { env };
     }
-    if (target.context === undefined) return this.env;
+    const remote = target.kind === 'remote' ? { login: target.host, shellTarget: target } : {};
+    if (target.context === undefined) return { env: this.env, ...remote };
     const env: NodeJS.ProcessEnv = { ...this.env };
     deleteEnv(env, 'DOCKER_CONTEXT');
     env.DOCKER_CONTEXT = target.context;
-    return env;
+    return { env, ...remote };
+  }
+
+  /**
+   * `docker <args>` on the shell before the relay of the SSH host of `target` (remoteShell), for a call that only reads
+   * (isShellCall) without input, folder or output listeners; undefined when it cannot go there, and the call logs in
+   * with the Docker context then. A failure of the shell itself is logged and gives undefined too.
+   */
+  private async runOnShell(target: DockerTarget, args: readonly string[], options: RunOptions): Promise<RunResult | undefined> {
+    if (this.remoteShell === undefined || !isShellCall(args)) return undefined;
+    if (options.input !== undefined || options.cwd !== undefined || options.onStdout !== undefined || options.onStderr !== undefined) return undefined;
+    try {
+      return await this.remoteShell(target, args, { timeoutMs: options.timeoutMs, signal: options.signal });
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      this.logger.warn(`docker ${dockerCommandWords(args).join(' ')} could not run on the shell before the relay on ${target.host}, so it logs in with the Docker context: ${errorMessage(error)}`);
+      return undefined;
+    }
   }
 
   /** The Docker pipe of the extension for `target` (dockerPipe), or undefined (also when the lookup fails, logged). */

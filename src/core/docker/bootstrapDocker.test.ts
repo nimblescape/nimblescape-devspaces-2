@@ -887,8 +887,11 @@ describe('BootstrapDocker: every call runs directly', () => {
       'runOnce',
       'start',
       'operationEnv',
+      'callEnv',
       // The lookup of the Docker pipe of the extension (dockerPipe), no Docker call.
       'pipeOf',
+      // The same call of `run` on the shell before the relay (remoteShell), no call of its own.
+      'runOnShell',
       'processEnv',
       'lookUpCliNow',
       'reportCliLost',

@@ -19,11 +19,14 @@
 // (checkSshLogin), on every platform: BatchMode makes ssh fail at once instead of asking, and its error names the
 // reason (host key, login, unreachable, closed before the login). It is one connection instead of the several of the
 // Docker CLI, which also lowers the risk of a lock-out by PerSourcePenalties. A success is kept for SSH_CHECK_CACHE_MS
-// per host (SshLoginCache), a failure never. While the Docker calls of the extension to the host go through its Docker
-// pipe (HostPipes, BootstrapDocker), the check is skipped: the Docker CLI starts no ssh for them, and the connection of
-// the relay behind the pipe logged in with the options of this check. The few calls of such an operation that still log
-// in with the Docker context come right after such a login to the same host: the checks of a new connection after the
-// login of its transport, and the calls after the connection ended.
+// per host (SshLoginCache), a failure never. Before an operation, the check is the login of the shell before the relay
+// (RemoteShellAccess: `ssh … sh -s` with the same options, which the next connection of the relay takes over), so that
+// the checks and the connection share one login; the test of a host before a switch (useCache false) keeps `true`.
+// While the Docker calls of the extension to the host go through its Docker pipe (HostPipes, BootstrapDocker), the
+// check is skipped: the Docker CLI starts no ssh for them, and the connection of the relay behind the pipe logged in
+// with the options of this check. The few calls of such an operation that still log in with the Docker context come
+// right after such a login to the same host: a build of the helper image, the calls that change something, and the
+// calls after the connection ended.
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
@@ -159,17 +162,21 @@ export async function readRootlessSocket(
   host: string,
   env: NodeJS.ProcessEnv,
   signal?: AbortSignal,
+  shells?: RemoteShellAccess,
 ): Promise<{ ok: true; socket: string } | { ok: false; problem: DockerHostProblem; detail: string }> {
   if (sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
   const target = sshTargetOf(host);
   if (!target) return { ok: false, problem: 'unknown', detail: `${host} is no SSH alias or address that Devspaces can use.` };
   let result: RunResult;
   try {
-    result = await runner.run(sshPath, sshCommandArgs(target, RUNTIME_DIR_COMMAND), {
-      env: noPromptEnv(env),
-      timeoutMs: SSH_TIMEOUT_MS,
-      signal,
-    });
+    // On the shell before the relay when the host has one (`shells`), else with a login of its own.
+    result =
+      (await shells?.run(host, RUNTIME_DIR_COMMAND, { timeoutMs: SSH_TIMEOUT_MS, signal })) ??
+      (await runner.run(sshPath, sshCommandArgs(target, RUNTIME_DIR_COMMAND), {
+        env: noPromptEnv(env),
+        timeoutMs: SSH_TIMEOUT_MS,
+        signal,
+      }));
   } catch (error) {
     if (isAbortError(error)) throw error;
     const detail = errorMessage(error);
@@ -218,6 +225,21 @@ export class SshLoginCache {
   }
 }
 
+/**
+ * The shells before the relay (RemoteShells): one SSH login per host for the checks before a connection of the relay,
+ * which that connection then takes over.
+ */
+export interface RemoteShellAccess {
+  /**
+   * The login of the shell to `host` (the open shell, or a new one): undefined when the host has no transport (then the
+   * caller uses its own `ssh`); a failure has the error output of `ssh`, `timedOut` when it did not answer in time.
+   * Rejects only with an AbortError.
+   */
+  login(host: string, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined>;
+  /** `command` (one line for the shell) on the shell of `host`, as RemoteShells.run; undefined without a transport. */
+  run(host: string, command: string, options?: Pick<RunOptions, 'timeoutMs' | 'signal'>): Promise<RunResult | undefined>;
+}
+
 /** What the SSH check before a Docker call over SSH needs. */
 export interface SshCheckDeps {
   runner: ProcessRunner;
@@ -231,6 +253,11 @@ export interface SshCheckDeps {
    * Docker CLI starts no `ssh` then, so the check is skipped.
    */
   viaDockerPipe?(host: string): boolean;
+  /**
+   * The shells before the relay: the check is the login of the shell of the host (the checks after it run there, and
+   * the next connection of the relay takes it over), instead of `ssh … true`.
+   */
+  shells?: RemoteShellAccess;
 }
 
 export type SshLoginCheck =
@@ -239,7 +266,8 @@ export type SshLoginCheck =
 
 /**
  * The SSH check before a Docker call to `host` (see the module comment): `ssh -o BatchMode=yes -o ConnectTimeout=15 -T
- * [-p port] [-l user] -- <host> true`, without questions. `useCache`: a success of the last SSH_CHECK_CACHE_MS counts,
+ * [-p port] [-l user] -- <host> true`, without questions, or the login of the shell before the relay with the same
+ * options (`deps.shells`, not for `useCache` false). `useCache`: a success of the last SSH_CHECK_CACHE_MS counts,
  * and so do Docker calls that go through the Docker pipe of the extension (the test before a switch always connects). A
  * host that is no usable alias or address (for example of a context of the user with a path) is left to the Docker CLI.
  */
@@ -253,6 +281,16 @@ export async function checkSshLogin(
   const target = sshTargetOf(host);
   if (!target) return { ok: true, skipped: 'notAnSshTarget' };
   if (deps.sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
+  // The login of the shell before the relay is the check (not for the test before a switch, which always logs in anew).
+  const shell = options.useCache === false ? undefined : await deps.shells?.login(host, options.signal);
+  if (shell !== undefined) {
+    if (shell.ok) {
+      deps.sshLogins?.remember(host);
+      return { ok: true };
+    }
+    deps.sshLogins?.forget(host);
+    return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
+  }
   let result: RunResult;
   try {
     result = await deps.runner.run(deps.sshPath, sshCommandArgs(target, 'true'), {
@@ -311,6 +349,8 @@ export interface RemoteReachabilityDeps {
   sshLogins?: SshLoginCache;
   /** True while the Docker calls of the extension to `host` go through its Docker pipe (SshCheckDeps.viaDockerPipe). */
   viaDockerPipe?(host: string): boolean;
+  /** The shells before the relay (SshCheckDeps.shells), also for the runtime folder of a rootless engine. */
+  shells?: RemoteShellAccess;
 }
 
 /**
@@ -351,7 +391,7 @@ export async function recordRootlessSocket(
     return;
   }
   if ((await deps.state.rootlessSocket(host)) !== undefined) return;
-  const read = await readRootlessSocket(deps.runner, deps.sshPath, host, deps.env, signal);
+  const read = await readRootlessSocket(deps.runner, deps.sshPath, host, deps.env, signal, deps.shells);
   if (!read.ok) {
     deps.logger.warn(`The socket of the rootless Docker engine on ${host} could not be read: ${read.detail}`);
     throw dockerHostUnreachable(host, read.problem, read.detail);
