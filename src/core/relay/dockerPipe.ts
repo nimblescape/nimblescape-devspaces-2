@@ -33,8 +33,8 @@ export const PIPE_REFRESH_INTERVAL_MS = 60 * 60_000;
 export interface DockerPipeOptions {
   address: DockerPipeAddress;
   /**
-   * Connects one connection of the pipe, a paused socket, with the Docker engine (relayDockerDial, processDockerDial).
-   * Rejects when it cannot; the socket is destroyed then.
+   * Connects one connection of the pipe, a paused socket whose first bytes came, with the Docker engine (relayDockerDial,
+   * processDockerDial). Rejects when it cannot; the socket is destroyed then.
    */
   connect(socket: net.Socket): Promise<void>;
   logger: Logger;
@@ -46,7 +46,10 @@ export interface DockerPipeOptions {
   refreshIntervalMs?: number;
 }
 
-/** The address of the pipe is served by another program. */
+/**
+ * The address of the pipe is served by another program; `listen` waits for its end. Also when the folder of the socket
+ * was removed between its check and the listen (the extension host before a reload closed its pipe meanwhile).
+ */
 class PipeInUseError extends Error {
   constructor(socketPath: string) {
     super(`${socketPath} is in use: another window serves it.`);
@@ -129,7 +132,8 @@ export class DockerPipe {
     const server = net.createServer({ allowHalfOpen: true, pauseOnConnect: true });
     server.on('connection', (socket) => this.accept(socket));
     await new Promise<void>((resolve, reject) => {
-      const failed = (error: NodeJS.ErrnoException) => reject(error.code === 'EADDRINUSE' ? new PipeInUseError(address.path) : error);
+      const failed = (error: NodeJS.ErrnoException) =>
+        reject(error.code === 'EADDRINUSE' || (error.code === 'ENOENT' && address.folder !== undefined) ? new PipeInUseError(address.path) : error);
       server.once('error', failed);
       server.listen(address.path, () => {
         server.off('error', failed);
@@ -203,16 +207,26 @@ export class DockerPipe {
     socket.on('close', () => this.sockets.delete(socket));
     // The connection reports its own errors (bridgeStream); without a listener, an error would end the extension host.
     socket.on('error', () => {});
-    socket.once('data', (chunk: Buffer) => logger.info(`Docker pipe of ${name}: ${requestLine(chunk)}`));
-    this.options.connect(socket).then(
-      () => {
-        if (!socket.destroyed) socket.resume();
-      },
-      (error: unknown) => {
-        logger.warn(`The Docker pipe of ${name} could not reach the Docker engine: ${errorMessage(error)}`);
-        socket.destroy();
-      },
-    );
+    // The engine is reached only after the first bytes of the client (a Docker client always asks first): a connection
+    // that closes at once, as the check of another extension host whether the address is in use, opens nothing.
+    const endedEmpty = () => socket.destroy();
+    socket.once('end', endedEmpty);
+    socket.once('data', (chunk: Buffer) => {
+      socket.off('end', endedEmpty);
+      socket.pause();
+      socket.unshift(chunk);
+      logger.info(`Docker pipe of ${name}: ${requestLine(chunk)}`);
+      this.options.connect(socket).then(
+        () => {
+          if (!socket.destroyed) socket.resume();
+        },
+        (error: unknown) => {
+          logger.warn(`The Docker pipe of ${name} could not reach the Docker engine: ${errorMessage(error)}`);
+          socket.destroy();
+        },
+      );
+    });
+    socket.resume();
   }
 }
 
@@ -230,19 +244,17 @@ export function requestLine(chunk: Buffer): string {
 }
 
 /**
- * The connect of the pipe through the relay: one Docker stream of the connection that `connection` gives (the open one
- * of the host, or a new one), connected with the socket. Rejects when no connection can be had or it has no stream left.
+ * Connects `socket`, a connection of the pipe, with a new Docker stream of `connection` (the connection of the relay to
+ * the host). Throws when the connection is closed or has no stream left.
  */
-export function relayDockerDial(connection: () => Promise<RelayConnection>): (socket: net.Socket) => Promise<void> {
-  return async (socket) => {
-    const stream = (await connection()).openDocker();
-    // The Docker CLI gave up while the connection was opened.
-    if (socket.destroyed) {
-      stream.close('the connection closed');
-      return;
-    }
-    bridgeStream(stream, socket, socket);
-  };
+export function relayDockerDial(connection: RelayConnection, socket: net.Socket): void {
+  const stream = connection.openDocker();
+  // The Docker CLI gave up meanwhile.
+  if (socket.destroyed) {
+    stream.close('the connection closed');
+    return;
+  }
+  bridgeStream(stream, socket, socket);
 }
 
 /**

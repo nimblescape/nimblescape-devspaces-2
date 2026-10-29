@@ -306,7 +306,7 @@ describe('the helper channel with the real Docker engine', () => {
     try {
       const { channel } = await open([], { relay: connections });
       const address = dockerPipeAddress('0123456789abcdef', process.platform, folder);
-      pipe = await DockerPipe.listen({ address, connect: relayDockerDial(async () => connections.get('runner-engine')!), logger: log, name: 'the test' });
+      pipe = await DockerPipe.listen({ address, connect: async (socket) => relayDockerDial(connections.get('runner-engine')!, socket), logger: log, name: 'the test' });
       const viaPipe = (args: string[], input?: string) => byteRunner.run(run.dockerPath, ['-H', address.dockerHost, ...args], { env, input, timeoutMs: 120_000 });
       const version = await timings.measure('docker version through the pipe', () => viaPipe(['version', '--format', '{{.Server.Version}}']));
       expect({ exitCode: version.exitCode, stdout: version.stdout.trim() }).toEqual({ exitCode: 0, stdout: cli.ok(['version', '--format', '{{.Server.Version}}']) });

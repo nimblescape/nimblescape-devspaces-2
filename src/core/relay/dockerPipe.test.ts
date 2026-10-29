@@ -189,9 +189,9 @@ describe('the Docker pipe', () => {
   it('carries a connection through the relay, both directions and their ends, and logs its request line', async () => {
     const target = await engine();
     const log = logger();
-    const connection = vi.fn(async () => relayConnection(target.path));
+    const connection = vi.fn(() => relayConnection(target.path));
     const address = dockerPipeAddress(ID, 'linux', base());
-    const pipe = await listen(address, relayDockerDial(connection), log);
+    const pipe = await listen(address, async (socket) => relayDockerDial(connection(), socket), log);
     const request = 'GET /v1.47/containers/json?all=1 HTTP/1.1\r\nHost: api.moby.localhost\r\n\r\n';
     await expect(exchange(address.path, request)).resolves.toBe(`answer to ${request}`);
     expect(target.requests).toEqual([request]);
@@ -206,17 +206,14 @@ describe('the Docker pipe', () => {
   it('ends a connection when the engine cannot be reached, with the reason in the log', async () => {
     const log = logger();
     const address = dockerPipeAddress(ID, 'linux', base());
-    await listen(
-      address,
-      relayDockerDial(async () => {
-        throw new Error('The connection to build-box could not be opened: it ended (Permission denied (publickey).)');
-      }),
-      log,
-    );
+    const closed = {
+      openDocker: () => {
+        throw new Error('The connection to build-box is closed.');
+      },
+    } as unknown as RelayConnection;
+    await listen(address, async (socket) => relayDockerDial(closed, socket), log);
     await expect(refused(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('');
-    expect(log.lines).toContain(
-      'warn The Docker pipe of devspaces-api could not reach the Docker engine: The connection to build-box could not be opened: it ended (Permission denied (publickey).)',
-    );
+    expect(log.lines).toContain('warn The Docker pipe of devspaces-api could not reach the Docker engine: The connection to build-box is closed.');
   });
 
   it('carries a connection through a program of its own (`cat` in place of `docker system dial-stdio`)', async () => {
@@ -271,6 +268,24 @@ describe('the Docker pipe', () => {
     });
     expect(received).toBe(8_000_000);
     expect(calls.slice(0, 2)).toEqual(['pause', 'resume']);
+  });
+
+  it('reaches the engine only after the first bytes of a connection', async () => {
+    const address = dockerPipeAddress(ID, 'linux', base());
+    const connect = vi.fn(async (socket: net.Socket) => void socket.end('answer'));
+    const pipe = await listen(address, connect);
+    // A check whether the address is in use: it connects and closes at once.
+    await new Promise<void>((resolve) => {
+      const probe = net.connect(address.path);
+      probe.on('connect', () => probe.destroy());
+      probe.on('close', () => resolve());
+    });
+    // A client that ends without a request.
+    await expect(exchange(address.path, '')).resolves.toBe('');
+    await vi.waitFor(() => expect(pipe.connectionCount).toBe(0));
+    expect(connect).not.toHaveBeenCalled();
+    await expect(exchange(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('answer');
+    expect(connect).toHaveBeenCalledTimes(1);
   });
 
   it('ends every connection at close', async () => {

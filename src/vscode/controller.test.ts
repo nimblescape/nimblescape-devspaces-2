@@ -6562,6 +6562,14 @@ describe('the Docker host of the current Docker context', () => {
       expect(h.connection.open).toHaveBeenCalledWith('devspaces-acme-api-a1b2c3d4', '/workspaces/api', { context: 'build-box' });
     });
 
+    it('creates the context of the host also for a window with the Docker pipe, which names the pipe', async () => {
+      const pipe = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
+      recreateHarness({ leaveCheckMs: 100, windowDockerHost: () => pipe });
+      contextsAre([{ Name: 'default', DockerEndpoint: 'unix:///var/run/docker.sock' }]);
+      expect(await reopen()).toEqual([`context create build-box --description ${ownContextDescription('build-box')} --docker host=ssh://build-box`]);
+      expect(h.connection.open).toHaveBeenCalledWith('devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: pipe });
+    });
+
     it('creates the name with the pair of the host when a context with the name points elsewhere', async () => {
       recreateHarness({ leaveCheckMs: 100 });
       contextsAre([{ Name: 'build-box', Description: 'mine', DockerEndpoint: 'ssh://me@elsewhere' }]);

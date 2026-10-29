@@ -199,13 +199,18 @@ describe('serveWindowPipe', () => {
     const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
     let open: (connection: RelayConnection) => void = () => {};
     const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(() => new Promise((resolve) => (open = resolve)));
-    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, relayConnection, dialStdio, relayWaitMs: 50 }));
+    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, relayConnection, dialStdio, relayWaitMs: 1_000 }));
     // Two connections while the worker opens the connection: one open, and each logs in itself after the wait.
     await expect(Promise.all([roundTrip(address.path, 'first'), roundTrip(address.path, 'second')])).resolves.toEqual(['first', 'second']);
     expect(relayConnection).toHaveBeenCalledTimes(1);
     expect(log.lines.filter((line) => line.includes('is not open'))).toEqual([
-      `info The connection of the relay to build-box is not open after 0.05 s. Until it is, each Docker connection of ${CONTAINER} logs in itself.`,
+      `info The connection of the relay to build-box is not open after 1 s. Until it is, each Docker connection of ${CONTAINER} logs in itself.`,
     ]);
+    // The next one logs in itself at once while the open goes on.
+    const startedAt = Date.now();
+    await expect(roundTrip(address.path, 'between')).resolves.toBe('between');
+    expect(Date.now() - startedAt).toBeLessThan(900);
+    expect(relayConnection).toHaveBeenCalledTimes(1);
     // The open goes on; the next connections go through the connection that it opened (as relayConnections.get).
     const opened = echoRelay();
     open(opened);
@@ -244,10 +249,10 @@ describe('serveWindowPipe', () => {
     await expect(roundTrip(retried.path, 'first')).resolves.toBe('first');
     await expect(roundTrip(retried.path, 'second')).resolves.toBe('relay: second');
     expect(again.lines.filter((line) => !line.includes('listens on'))).toEqual([
+      `info Docker pipe of ${CONTAINER}: a connection`,
       without,
       `info Docker pipe of ${CONTAINER}: a connection`,
       `info The Docker pipe of ${CONTAINER} goes through the connection of the relay again.`,
-      `info Docker pipe of ${CONTAINER}: a connection`,
     ]);
   });
 });

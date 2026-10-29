@@ -4032,6 +4032,8 @@ export class Controller implements vscode.Disposable {
    * - outside an operation, the one in the authority of this window when it shows the same container;
    * - the current context, when that is on the devspace's host (read outside any operation);
    * - else the one that "Use a Remote Docker Host…" creates for the host (ensureRemoteContext: created when missing).
+   * Also for a window with the Docker pipe, the context is created when missing: the heartbeats of the devspace and the
+   * worker that opens the connection of the relay find the engine of the host through it.
    */
   private async windowArgs(
     devspace: Devspace,
@@ -4040,22 +4042,26 @@ export class Controller implements vscode.Disposable {
   ): Promise<[containerName: string, folder: string, docker?: WindowDocker]> {
     const host = dockerHostOf(devspace);
     if (host === '') return [containerName, folder];
+    const context = await this.windowContext(devspace, containerName, host);
     const pipe = this.deps.windowDockerHost?.(devspace, containerName);
     if (pipe !== undefined) return [containerName, folder, { host: pipe }];
-    const withContext = (context: string | undefined): [string, string, WindowDocker?] =>
-      context === undefined ? [containerName, folder] : [containerName, folder, { context }];
+    return context === undefined ? [containerName, folder] : [containerName, folder, { context }];
+  }
+
+  /** The Docker context of the window of `devspace` on `host` (see windowArgs); undefined when DOCKER_HOST decides. */
+  private async windowContext(devspace: Devspace, containerName: string, host: string): Promise<string | undefined> {
     const target = operationDockerTarget();
-    if (target && isOnDockerHost(devspace, target.host)) return withContext(target.context);
+    if (target && isOnDockerHost(devspace, target.host)) return target.context;
     if (this.deps.connection.currentContainerName() === containerName) {
       const own = this.deps.connection.currentDockerContext();
-      if (own !== undefined) return withContext(own);
+      if (own !== undefined) return own;
     }
     const targets = this.deps.dockerTargets;
     if (targets) {
       const current = await outsideOperation(() => targets.resolve());
-      if (isOnDockerHost(devspace, current.host)) return withContext(current.context);
+      if (isOnDockerHost(devspace, current.host)) return current.context;
     }
-    return withContext(await ensureRemoteContext(this.deps.docker, host));
+    return ensureRemoteContext(this.deps.docker, host);
   }
 
   /**
