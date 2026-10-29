@@ -22,8 +22,8 @@ export const RELAY_CLOSE_KILL_MS = 5_000;
 /** The end of the error output that is kept for the reason of a failure. */
 const STDERR_TAIL_LENGTH = 8 * 1024;
 /**
- * After the end of the output of an open connection, the end of the transport (with its error output as the reason)
- * is awaited this long before the connection ends without it.
+ * After the end of the output of the transport, its end (with its error output and exit code as the reason) is awaited
+ * this long. Then an open that did not get the HELLO fails with the error output so far, and an open connection ends.
  */
 const EXIT_REASON_WAIT_MS = 1_000;
 
@@ -50,6 +50,7 @@ export interface RelayConnectionOptions {
   /** Only for the tests. */
   pingIntervalMs?: number;
   silenceMs?: number;
+  exitReasonWaitMs?: number;
 }
 
 /** One open connection of the relay. Create it with RelayConnection.open. */
@@ -233,7 +234,7 @@ export class RelayConnection {
           const wait = setTimeout(() => {
             if (!settled) fail(`its output ended (${this.stderrReason() || 'no error output'})`);
             else this.mux?.inputEnded();
-          }, EXIT_REASON_WAIT_MS);
+          }, options.exitReasonWaitMs ?? EXIT_REASON_WAIT_MS);
           wait.unref?.();
           void process.exited.then(() => clearTimeout(wait));
         },
