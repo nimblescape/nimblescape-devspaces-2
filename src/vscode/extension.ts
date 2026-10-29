@@ -499,7 +499,7 @@ async function activateExtension(
             // within a flow of the user.
             const start = () => {
               const started = startLogin(target.host);
-              if (started === undefined) throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ssh was not found.`);
+              if (started === undefined) throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ssh was not found, or it is no SSH alias or address.`);
               return started;
             };
             return relayAccess(relayConnections, target.host, (command, bundle) =>

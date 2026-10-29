@@ -142,7 +142,8 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     };
     const sshLogins = new SshLoginCache();
     await expect(testRemoteDockerHost(docker, 'me@box:2222', { ...sshDeps(), shells, sshLogins })).resolves.toEqual({ ok: true, version: '28.1.0', rootless: true });
-    expect(shells.login).toHaveBeenCalledWith('me@box:2222', undefined);
+    // Always a new login, also when a shell to the host is open.
+    expect(shells.login).toHaveBeenCalledWith('me@box:2222', undefined, { fresh: true });
     expect(commands).toEqual([`'docker' 'info' '--format' '${ENGINE_INFO_FORMAT}'`]);
     expect(docker.calls).toEqual([]);
     expect(sshLogins.isFresh('me@box:2222')).toBe(true);

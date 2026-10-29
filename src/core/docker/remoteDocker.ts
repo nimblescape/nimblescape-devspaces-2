@@ -141,8 +141,8 @@ export async function testRemoteDockerHost(
 ): Promise<EngineCheck> {
   const timeoutMs = options.timeoutMs ?? REMOTE_INFO_TIMEOUT_MS;
   if (ssh.shells !== undefined && ssh.sshPath !== undefined && sshTargetOf(host) !== undefined) {
-    // An open shell is a login that runs now, so it counts as the test of the login (no cached success).
-    const shell = await ssh.shells.login(host, options.signal);
+    // Always a new login, as checkSshLogin without its cache: the test sees the SSH configuration and the host of now.
+    const shell = await ssh.shells.login(host, options.signal, { fresh: true });
     if (shell !== undefined) {
       if (!shell.ok) {
         ssh.sshLogins?.forget(host);
@@ -254,11 +254,11 @@ export class SshLoginCache {
  */
 export interface RemoteShellAccess {
   /**
-   * The login of the shell to `host` (the open shell, or a new one): undefined when the host has no transport (then the
-   * caller uses its own `ssh`); a failure has the error output of `ssh`, `timedOut` when it did not answer in time.
-   * Rejects only with an AbortError.
+   * The login of the shell to `host` (the open shell, or a new one; with `fresh` always a new one): undefined when the
+   * host has no transport (then the caller uses its own `ssh`); a failure has the error output of `ssh`, `timedOut` when
+   * it did not answer in time. Rejects only with an AbortError.
    */
-  login(host: string, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined>;
+  login(host: string, signal?: AbortSignal, options?: { fresh?: boolean }): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined>;
   /** `command` (one line for the shell) on the shell of `host`, as RemoteShells.run; undefined without a transport. */
   run(host: string, command: string, options?: Pick<RunOptions, 'timeoutMs' | 'signal'>): Promise<RunResult | undefined>;
 }

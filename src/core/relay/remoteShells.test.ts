@@ -103,6 +103,20 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
+  // The test of a host sees the SSH configuration and the host of now.
+  it('logs in anew with fresh, and ends the open shell at once', async () => {
+    const { registry, logins, processes } = shells();
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    await expect(registry.login('box', undefined, { fresh: true })).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['box', 'box']);
+    await processes[0].exited;
+    // The calls after it use the new login, and so does a login without fresh.
+    await expect(registry.run('box', 'printf two')).resolves.toMatchObject({ stdout: 'two' });
+    await expect(registry.login('box')).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['box', 'box']);
+    registry.dispose();
+  });
+
   it('shares the login of a flow with the other calls of the same flow, also after a failure', async () => {
     const logins: string[] = [];
     const registry = new RemoteShells({
