@@ -320,7 +320,8 @@ export class BootstrapDocker {
    */
   canRunRemote(): boolean {
     this.lookUpCliIfMissing();
-    return this.ownCliPath() !== undefined || this.path !== undefined;
+    // The Docker CLI of this computer first: the one of Devspaces is looked up on disk at each call.
+    return this.path !== undefined || this.ownCliPath() !== undefined;
   }
 
   /**

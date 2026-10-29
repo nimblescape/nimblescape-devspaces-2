@@ -630,11 +630,11 @@ export class Sidebar implements vscode.Disposable {
       unread = { dockerHost, reachable: true, removed: true };
     } else if (!runtime) {
       // refreshStates gives `undefined` both when Docker does not run and when Docker failed. Only the first means
-      // "nothing runs" (a connection that was lost must not keep showing Connected).
-      // Asked on the engine whose states were read: outside of an operation, `docker info` reaches the Docker of this
-      // computer, also while Devspaces uses a remote host.
+      // "nothing runs" (a connection that was lost must not keep showing Connected). When refreshStates found that
+      // Docker does not answer, it is not asked again; else it is asked on the engine whose states were read: outside
+      // of an operation, `docker info` reaches the Docker of this computer, also while Devspaces uses a remote host.
       const answers = async (): Promise<boolean> => docker.isInstalled() && (await docker.isRunning());
-      const running = await (target ? runWithDockerTarget(target, answers) : answers());
+      const running = states.dockerStopped === true ? false : await (target ? runWithDockerTarget(target, answers) : answers());
       if (!running) runtime = dockerStoppedRuntime(await registry.list());
       // The states that could not be read are shown as unknown, with the reason: an engine that answers but whose
       // worker could not read them, or a remote engine that does not answer (its containers may run). Only the local

@@ -481,6 +481,12 @@ describe('Sidebar', () => {
     expect(rowOf('acme/api').state).toBe('stopped');
     expect(rowOf('acme/api').contextValue).toContain('canStart');
     expect(h.helperBuilds.status).not.toHaveBeenCalled();
+    // Docker did not answer in refreshStates already: it is not asked again (each ask waits for its time limit).
+    asked.length = 0;
+    h.service.refreshStates.mockResolvedValue({ runtime: undefined, branches: new Map(), dockerStopped: true });
+    await h.sidebar.refreshStates();
+    expect(asked).toEqual([]);
+    expect(rowOf('acme/api').description).toContain(`${StateTexts.unknown} (devspace cannot be reached)`);
     // The local Docker that does not run: nothing runs, so Stopped, never unknown.
     h.dockerHost.value = '';
     await h.registry.add(devspace(OLD, 'acme/web'));
