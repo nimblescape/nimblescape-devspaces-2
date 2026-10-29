@@ -251,7 +251,9 @@ async function openBehindRelay(
  * after the checks), then checks with
  * the operation `probe` that the worker reaches its engine, and that it is the engine of `target`: the engine identity
  * of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a socket mount of another engine,
- * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). The worker reads its identity over
+ * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). While the host has an open
+ * connection of the relay, that call goes through it (the Docker pipe of the extension, BootstrapDocker), whose engine
+ * passed this check at its own open; else it logs in with the Docker context. The worker reads its identity over
  * the Engine API (`GET /info`), so both are compared as their values (sameEngine; the Docker CLI prints them as JSON in
  * Go's form, which escapes `<`, `>` and `&`), and the value of the worker is checked (parseProbeValue) as everything
  * that it answers. Throws HelperChannelError('open').

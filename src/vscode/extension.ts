@@ -20,6 +20,8 @@ import { SshLoginCache, findRemoteContext, listContextInfos, noPromptEnv, startD
 import { openRelayConnection, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
+import { HostPipes } from '../core/relay/hostPipes';
+import { dockerPipeBase } from '../core/relay/pipeAddress';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -34,7 +36,7 @@ import { Messages } from '../core/messages';
 import { nodeHttpsTransport, takeUserAgentVersion } from '../core/http';
 import { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
-import { isoTime, systemClock } from '../core/ports';
+import { isoTime, systemClock, type StartedByteProcess } from '../core/ports';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
 import { monitorSettingsOf } from './monitorSettings';
 import { REMOTE_MONITOR_VOLUME } from '../core/remoteMonitor/protocol';
@@ -199,10 +201,14 @@ async function activateExtension(
   let backgroundPrebuild: HelperPrebuild | undefined;
   let daemonRunning = false;
   const adapterOptions = dockerAdapterOptions(() => dockerSetup);
+  // The Docker pipes of the extension, one per SSH host, set below.
+  let hostPipes: HostPipes | undefined;
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload. The
-  // Docker CLI of the extension is only the bootstrap's (BootstrapDocker).
+  // Docker CLI of the extension is only the bootstrap's (BootstrapDocker). Its calls of an operation on an SSH host go
+  // through the Docker pipe of the extension for the host while a connection of the relay to it is open.
   const docker = new BootstrapDocker(runner, dockerPath, env, logger, platform, {
     ...adapterOptions,
+    dockerPipe: (target) => hostPipes?.dockerHost(target.host),
     onCliFound: shareDockerFolder,
     onDaemonStatus: (running) => {
       if (running && !daemonRunning) helperChannels?.clearFailures();
@@ -229,9 +235,39 @@ async function activateExtension(
     }
   };
   const sshPath = (): string | undefined => findExecutable('ssh', env, platform);
-  // The SSH check before the Docker calls to a remote host; a success counts for a minute per host.
+  // `ssh … docker system dial-stdio` on an SSH host, for a connection of a Docker pipe without the relay. ssh is found
+  // once: a window that works without the relay makes many short Docker connections.
+  let dialSsh: string | undefined;
+  const dialStdio = (host: string): StartedByteProcess | undefined => {
+    dialSsh ??= sshPath();
+    const address = sshTargetOf(host);
+    if (dialSsh === undefined || address === undefined) return undefined;
+    return runner.startBytes(dialSsh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
+  };
+  // The connections of the relay of this window, one per remote host: its worker channel, its Docker pipe and the
+  // Docker pipe of the extension for the host share it. The pipe of the extension for a host listens from the first
+  // connection to the host that passed its checks until the window closes.
+  const relayConnections = new RelayConnections({ logger, onUse: (host) => void hostPipes?.serve(host) });
+  hostPipes = new HostPipes({
+    logger,
+    platform,
+    base: () => dockerPipeBase(env, os.tmpdir()),
+    relayConnection: (host) => relayConnections.get(host),
+    dialStdio,
+  });
+  // The SSH check before the Docker calls to a remote host; a success counts for a minute per host, and an open
+  // connection of the relay to the host makes it needless.
   const sshLogins = new SshLoginCache();
-  const remoteDeps = (): RemoteReachabilityDeps => ({ docker, runner, state: remoteState, logger, sshPath: sshPath(), env, sshLogins });
+  const remoteDeps = (): RemoteReachabilityDeps => ({
+    docker,
+    runner,
+    state: remoteState,
+    logger,
+    sshPath: sshPath(),
+    env,
+    sshLogins,
+    relayOpen: (host) => relayConnections.get(host) !== undefined,
+  });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
   const sessionFiles = new SessionFiles(paths);
@@ -252,8 +288,6 @@ async function activateExtension(
   // ghcr.io login it could use (the GitHub sign-in is the ghcr.io login of the operations in the worker only).
   const registryClient = new RegistryClient(nodeHttpsTransport, credentials.provider(), logger);
   const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
-  // The connections of the relay of this window, one per remote host: its worker channel and its Docker pipe share it.
-  const relayConnections = new RelayConnections({ logger });
   // The helper image of the bootstrap, apart from the steps of the workspace helper (the worker's).
   const helper = new HelperImages({
     docker,
@@ -418,6 +452,7 @@ async function activateExtension(
       dispose: () => {
         channels.dispose();
         relayConnections.dispose();
+        hostPipes?.dispose();
       },
     }),
   );
@@ -849,7 +884,6 @@ async function activateExtension(
   // the authority; and before the session starts, so that a window whose pipe is refused is never the window of its
   // devspace in its status file.
   let pipeRefused: string | undefined;
-  let pipeSsh: string | undefined;
   const pipeHost = connection.currentDockerHost();
   if (pipeHost !== undefined && containerName) {
     const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
@@ -874,14 +908,7 @@ async function activateExtension(
         if (opened === undefined) throw new Error(`the worker on ${host} runs without the connection of the relay`);
         return opened;
       },
-      dialStdio: (host) => {
-        // Found once: a window that works without the relay makes many short Docker connections.
-        pipeSsh ??= sshPath();
-        const ssh = pipeSsh;
-        const address = sshTargetOf(host);
-        if (ssh === undefined || address === undefined) return undefined;
-        return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
-      },
+      dialStdio,
     });
     // Closed at once when the window closes (the release of deactivate() does not use it), so that the extension host of
     // the window after a reload can serve the address.

@@ -19,7 +19,9 @@
 // (checkSshLogin), on every platform: BatchMode makes ssh fail at once instead of asking, and its error names the
 // reason (host key, login, unreachable, closed before the login). It is one connection instead of the several of the
 // Docker CLI, which also lowers the risk of a lock-out by PerSourcePenalties. A success is kept for SSH_CHECK_CACHE_MS
-// per host (SshLoginCache), a failure never.
+// per host (SshLoginCache), a failure never. While a connection of the relay to the host is open, the check is
+// skipped: that connection logged in without questions, and the Docker calls of an operation go through it (the Docker
+// pipe of the extension, BootstrapDocker), so the Docker CLI starts no ssh.
 import { errorMessage, UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import { isAbortError, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
@@ -222,17 +224,19 @@ export interface SshCheckDeps {
   env: NodeJS.ProcessEnv;
   /** Keeps successes for a while; without it, every check opens a connection. */
   sshLogins?: SshLoginCache;
+  /** True while a connection of the relay to `host` is open (RelayConnections.get); the check is skipped then. */
+  relayOpen?(host: string): boolean;
 }
 
 export type SshLoginCheck =
-  | { ok: true; skipped?: 'cached' | 'notAnSshTarget' }
+  | { ok: true; skipped?: 'cached' | 'relayOpen' | 'notAnSshTarget' }
   | { ok: false; problem: DockerHostProblem; detail: string };
 
 /**
  * The SSH check before a Docker call to `host` (see the module comment): `ssh -o BatchMode=yes -o ConnectTimeout=15 -T
- * [-p port] [-l user] -- <host> true`, without questions. `useCache`: a success of the last SSH_CHECK_CACHE_MS counts
- * (the test before a switch always connects). A host that is no usable alias or address (for example of a context of
- * the user with a path) is left to the Docker CLI.
+ * [-p port] [-l user] -- <host> true`, without questions. `useCache`: a success of the last SSH_CHECK_CACHE_MS counts,
+ * and an open connection of the relay to the host (the test before a switch always connects). A host that is no usable
+ * alias or address (for example of a context of the user with a path) is left to the Docker CLI.
  */
 export async function checkSshLogin(
   host: string,
@@ -240,6 +244,7 @@ export async function checkSshLogin(
   options: { signal?: AbortSignal; useCache?: boolean } = {},
 ): Promise<SshLoginCheck> {
   if (options.useCache !== false && deps.sshLogins?.isFresh(host)) return { ok: true, skipped: 'cached' };
+  if (options.useCache !== false && deps.relayOpen?.(host) === true) return { ok: true, skipped: 'relayOpen' };
   const target = sshTargetOf(host);
   if (!target) return { ok: true, skipped: 'notAnSshTarget' };
   if (deps.sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
@@ -299,6 +304,8 @@ export interface RemoteReachabilityDeps {
   env: NodeJS.ProcessEnv;
   /** The successes of the SSH check, per host (one cache for the extension). */
   sshLogins?: SshLoginCache;
+  /** True while a connection of the relay to `host` is open (SshCheckDeps.relayOpen). */
+  relayOpen?(host: string): boolean;
 }
 
 /**

@@ -40,15 +40,21 @@ const SESSION_TEXT_LENGTH = 200;
 /**
  * The log of the container of the other computer since `since` (ISO 8601), with the time of each line: its standard
  * output and standard error, where sshd writes. The container runs on the Docker engine of the runner (the context
- * `default`), so this read is no SSH login.
+ * `default`), so this read is no SSH login. Read without blocking the extension host, whose Docker pipe serves the
+ * window meanwhile.
  */
-function remoteHostLog(container: string, since: string): string {
-  const result = childProcess.spawnSync('docker', ['--context', DEFAULT_CONTEXT_NAME, 'logs', '--timestamps', '--since', since, container], {
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
+function remoteHostLog(container: string, since: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(
+      'docker',
+      ['--context', DEFAULT_CONTEXT_NAME, 'logs', '--timestamps', '--since', since, container],
+      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) reject(new Error(`docker logs ${container}: ${stderr || error.message}`));
+        else resolve(`${stdout}\n${stderr}`);
+      },
+    );
   });
-  assert.strictEqual(result.status, 0, `docker logs ${container}: ${result.stderr}`);
-  return `${result.stdout}\n${result.stderr}`;
 }
 
 /**
@@ -85,12 +91,12 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
     const started = connected - process.uptime() * 1000;
     await connectedFolder();
     assert.ok(remoteHostContainer && preparedAt, 'The seed names no container of the other computer and no time of the preparation (prepare.ts)');
-    let output = remoteHostLog(remoteHostContainer, preparedAt);
+    let output = await remoteHostLog(remoteHostContainer, preparedAt);
     let events = sshLogEvents(output);
     const quietSince = () => Math.max(connected, events.filter((event) => event.kind === 'login').at(-1)?.time ?? connected);
     while (Date.now() - quietSince() < LOGINS_QUIET_MS && Date.now() - connected < LOGINS_WAIT_MS) {
       await new Promise((resolve) => setTimeout(resolve, 2_000));
-      output = remoteHostLog(remoteHostContainer, preparedAt);
+      output = await remoteHostLog(remoteHostContainer, preparedAt);
       events = sshLogEvents(output);
     }
     const settled = Date.now() - quietSince() >= LOGINS_QUIET_MS;

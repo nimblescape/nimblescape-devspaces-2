@@ -6,6 +6,7 @@
 // connection per Docker host, which the worker channel and the Docker pipe of the host share, so that a window logs in
 // to a host once. A connection ends after RELAY_IDLE_CLOSE_MS without a stream, at `close`, and at once at `dispose`.
 // No `vscode`.
+import { errorMessage } from '../errors';
 import type { Logger } from '../ports';
 import type { RelayConnection } from './connection';
 
@@ -24,6 +25,11 @@ export interface RelayConnectionsOptions {
   idleCloseMs?: number;
   sweepIntervalMs?: number;
   workerMaxAgeMs?: number;
+  /**
+   * A connection to `host` became the current one (`use`): the Docker pipe of the extension for the host is served
+   * (HostPipes.serve). Its errors are logged.
+   */
+  onUse?(host: string): void;
   /** Only for the tests. */
   now?: () => number;
 }
@@ -117,7 +123,13 @@ export class RelayConnections {
    * the host stays until its streams ended and it was idle, so a stream on it is not lost.
    */
   use(host: string, connection: RelayConnection): void {
-    if (this.all.get(connection)?.host === host && connection.isOpen) this.current.set(host, connection);
+    if (this.all.get(connection)?.host !== host || !connection.isOpen) return;
+    this.current.set(host, connection);
+    try {
+      this.options.onUse?.(host);
+    } catch (error) {
+      this.options.logger.warn(`The use of the connection to ${host} could not be reported: ${errorMessage(error)}`);
+    }
   }
 
   /** No new worker starts on `connection`; it still carries its streams and the Docker streams until a new one is used. */
