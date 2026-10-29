@@ -24,17 +24,23 @@
 # version. The VSIX of the job "test" stays a
 # workflow artifact for inspection. This workflow publishes nothing: the
 # release workflow calls it for the commit of a version and publishes the VSIX
-# of that call. A change of this file changes the release process: its pull
-# request needs a dry run (rule 4). The workflow "VS Code versions" calls it
+# of that call. A push or a pull request that changes only documentation,
+# Markdown files and the files of docs/, starts no run; the release calls this
+# workflow for each version, where these path filters do not apply. A change
+# of this file changes the release process: its pull request needs a dry run
+# (rule 4). The workflow "VS Code versions" calls it
 # once per week with another VS Code version for the VS Code jobs; such a call
 # runs only the job "test", for the VSIX, and the VS Code jobs.
 
 name: CI
 
 on:
+  # A change of only documentation, Markdown files and the files of docs/, starts no run.
   push:
     branches: [main]
+    paths-ignore: ['docs/**', '**.md']
   pull_request:
+    paths-ignore: ['docs/**', '**.md']
   workflow_dispatch:
   # The release workflow calls this workflow for the commit of a version,
   # because its push of that commit starts no workflow.
