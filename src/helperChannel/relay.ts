@@ -25,6 +25,8 @@ import { Mux, type FrameLink, type MuxStream } from '../core/relay/mux';
  * runs within its own time limits (fatalHandler of main.ts).
  */
 export const RELAY_WORKER_STOP_MS = CHANNEL_KILL_GRACE_MS + CHANNEL_CLEANUP_TIMEOUT_MS + 10_000;
+/** The relay exits this long after the SIGKILL of a worker that did not end, in case its end never shows. */
+export const RELAY_EXIT_MARGIN_MS = 5_000;
 /** The exit code of the relay when the connection broke the rules or went silent, or its start failed. */
 export const RELAY_FAILURE_EXIT_CODE = 1;
 
@@ -109,9 +111,18 @@ export class Relay {
       return stream.close(`the worker cannot be started: ${(error as Error).message}`);
     }
     this.worker = worker;
-    // Its end is EXIT, after all its output; a closed stream ends its input and stops it.
-    bridgeStream(stream, worker.stdout, worker.stdin, { pipeEndsStream: false, onClosed: () => worker.kill('SIGTERM') });
+    // Its end is EXIT, after all its output. A closed stream ends its input and stops it, with SIGKILL after
+    // RELAY_WORKER_STOP_MS, so that a worker that does not end refuses the next worker stream only that long.
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    bridgeStream(stream, worker.stdout, worker.stdin, {
+      pipeEndsStream: false,
+      onClosed: () => {
+        worker.kill('SIGTERM');
+        killTimer = setTimeout(() => worker.kill('SIGKILL'), this.deps.workerStopMs ?? RELAY_WORKER_STOP_MS);
+      },
+    });
     worker.onClosed((exit, error) => {
+      clearTimeout(killTimer);
       if (this.worker === worker) this.worker = undefined;
       if (error) stream.close(`the worker cannot be started: ${error.message}`);
       else stream.exit(exit);
@@ -131,13 +142,10 @@ export class Relay {
     }
     this.stopping = { code: failed ? RELAY_FAILURE_EXIT_CODE : 0 };
     if (reason !== undefined) this.deps.log(`devspace relay: ${reason}`);
-    // The mux lost every stream: the Docker connections are destroyed, the worker's input ended and it got SIGTERM.
-    const worker = this.worker;
-    if (worker === undefined) return this.exitNow();
-    this.stopping.timer = setTimeout(() => {
-      worker.kill('SIGKILL');
-      this.exitNow();
-    }, this.deps.workerStopMs ?? RELAY_WORKER_STOP_MS);
+    // The mux lost every stream: the Docker connections are destroyed, and the worker's input ended; it got SIGTERM,
+    // and SIGKILL follows after RELAY_WORKER_STOP_MS (startWorker). The relay exits when it ended.
+    if (this.worker === undefined) return this.exitNow();
+    this.stopping.timer = setTimeout(() => this.exitNow(), (this.deps.workerStopMs ?? RELAY_WORKER_STOP_MS) + RELAY_EXIT_MARGIN_MS);
   }
 
   private exitNow(): void {
@@ -166,7 +174,10 @@ export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
     if (child.pid === undefined) settle({ code: null, signal: null }, error);
   });
   child.once('close', (code, signal) => settle({ code, signal }));
-  if (!child.stdin || !child.stdout) throw new Error('it got no pipes (too many open files)');
+  if (!child.stdin || !child.stdout) {
+    child.kill('SIGKILL');
+    throw new Error('it got no pipes (too many open files)');
+  }
   return {
     stdin: child.stdin,
     stdout: child.stdout,

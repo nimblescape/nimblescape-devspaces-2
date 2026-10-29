@@ -11,6 +11,7 @@
 // when no frame came for RELAY_SILENCE_MS; the extension from the HELLO on (until then its caller limits the wait, which
 // may include a login). No `vscode`.
 import {
+  FRAME_HEADER_LENGTH,
   FrameParser,
   MAX_STREAMS,
   MAX_FRAME_PAYLOAD,
@@ -29,6 +30,7 @@ import {
   encodeFrame,
   encodeHello,
   encodeTarget,
+  frameWithHeader,
   type Frame,
   type RelayTarget,
   type WorkerExit,
@@ -127,22 +129,14 @@ class ByteQueue {
     this.length = 0;
   }
 
-  /** The next `size` bytes (1 to `length`), as one buffer. */
-  take(size: number): Buffer {
+  /** Copies the next `size` bytes (1 to `length`) into `target` at `offset`, and takes them. */
+  takeInto(target: Buffer, offset: number, size: number): void {
     this.length -= size;
-    const first = this.pieces[this.head];
-    let out: Buffer;
-    if (first.length >= size) {
-      out = first.subarray(0, size);
-      this.advance(first, size);
-    } else {
-      out = Buffer.allocUnsafe(size);
-      for (let at = 0; at < size; ) {
-        const piece = this.pieces[this.head];
-        const used = piece.copy(out, at, 0, Math.min(piece.length, size - at));
-        at += used;
-        this.advance(piece, used);
-      }
+    for (let at = 0; at < size; ) {
+      const piece = this.pieces[this.head];
+      const used = piece.copy(target, offset + at, 0, Math.min(piece.length, size - at));
+      at += used;
+      this.advance(piece, used);
     }
     // The array drops the pieces that were taken once they are the larger part (each piece is moved a bounded number
     // of times).
@@ -150,7 +144,6 @@ class ByteQueue {
       this.pieces = this.pieces.slice(this.head);
       this.head = 0;
     }
-    return out;
   }
 
   private advance(piece: Buffer, used: number): void {
@@ -266,7 +259,9 @@ class Stream implements MuxStream {
   takeFrame(): Buffer {
     if (this.queue.length > 0) {
       const size = Math.min(MAX_FRAME_PAYLOAD, this.credit, this.queue.length);
-      const frame = encodeFrame('data', this.id, this.queue.take(size));
+      // The bytes go from the queue straight into the frame.
+      const frame = frameWithHeader('data', this.id, size);
+      this.queue.takeInto(frame, FRAME_HEADER_LENGTH, size);
       this.credit -= size;
       if (this.queue.length < STREAM_WINDOW) this.drained();
       return frame;

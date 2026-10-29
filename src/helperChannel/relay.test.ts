@@ -9,21 +9,26 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { PassThrough } from 'stream';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { encodeFrame } from '../core/relay/frames';
 import type { WorkerExit } from '../core/relay/frames';
 import { MemoryPipe, settle } from '../core/relay/memoryPipe.testkit';
 import { Mux, type MuxStream } from '../core/relay/mux';
-import { RELAY_FAILURE_EXIT_CODE, Relay, type RelayWorker } from './relay';
+import { RELAY_EXIT_MARGIN_MS, RELAY_FAILURE_EXIT_CODE, Relay, type RelayWorker } from './relay';
 
-/** A worker process of the test: its input and output in memory, its end when the test says. */
+/**
+ * A worker process of the test: its input and output in memory, its end when the test says, or at SIGKILL (unless
+ * `hang`).
+ */
 class FakeWorker implements RelayWorker {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly signals: string[] = [];
   input = '';
   inputEnded = false;
+  hang = false;
   private listener: ((exit: WorkerExit, error?: Error) => void) | undefined;
+  private ended = false;
 
   constructor() {
     this.stdin.on('data', (chunk: Buffer) => (this.input += chunk.toString()));
@@ -32,6 +37,7 @@ class FakeWorker implements RelayWorker {
 
   kill(signal: NodeJS.Signals): void {
     this.signals.push(signal);
+    if (signal === 'SIGKILL' && !this.hang) this.end({ code: null, signal });
   }
 
   onClosed(listener: (exit: WorkerExit, error?: Error) => void): void {
@@ -40,6 +46,8 @@ class FakeWorker implements RelayWorker {
 
   /** The process ends after its output. */
   end(exit: WorkerExit, error?: Error): void {
+    if (this.ended) return;
+    this.ended = true;
     this.stdout.end();
     this.listener?.(exit, error);
   }
@@ -54,6 +62,7 @@ describeUnix('the relay', () => {
   /** What each connection to the socket sent, by the order of the connections. */
   const received: string[] = [];
   const relays: Relay[] = [];
+  const allWorkers: FakeWorker[] = [];
 
   beforeAll(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-relay-'));
@@ -73,7 +82,9 @@ describeUnix('the relay', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     for (const relay of relays.splice(0)) relay.shutdown('the test ended');
+    for (const worker of allWorkers.splice(0)) worker.end({ code: 0, signal: null });
   });
 
   function start(options: { spawn?: () => RelayWorker; workerStopMs?: number; socket?: string } = {}) {
@@ -90,6 +101,7 @@ describeUnix('the relay', () => {
         (() => {
           const worker = new FakeWorker();
           workers.push(worker);
+          allWorkers.push(worker);
           return worker;
         }),
       log: (line) => lines.push(line),
@@ -207,13 +219,43 @@ describeUnix('the relay', () => {
   });
 
   it('stops a worker that does not end with SIGKILL after the stop time, and exits', async () => {
-    const { relay, extension, workers, exits } = start({ workerStopMs: 50 });
+    const { relay, extension, workers, exits, lines } = start({ workerStopMs: 50 });
     watch(extension.open('worker'));
     await until(() => workers.length === 1, 'the worker');
     relay.shutdown('stopped by SIGTERM');
     await until(() => exits.length > 0, 'the exit');
     expect(workers[0].signals).toEqual(['SIGTERM', 'SIGKILL']);
     expect(exits).toEqual([0]);
+    expect(lines).toEqual(['devspace relay: stopped by SIGTERM']);
+  });
+
+  it('exits a little after the SIGKILL when the end of the worker never shows', async () => {
+    const { relay, extension, workers, exits } = start({ workerStopMs: 50 });
+    watch(extension.open('worker'));
+    await until(() => workers.length === 1, 'the worker');
+    workers[0].hang = true;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    relay.shutdown('stopped by SIGTERM');
+    vi.advanceTimersByTime(50);
+    expect(workers[0].signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(exits).toEqual([]);
+    vi.advanceTimersByTime(RELAY_EXIT_MARGIN_MS);
+    expect(exits).toEqual([0]);
+  });
+
+  it('stops the worker of a stream that the extension closed, with SIGKILL when it does not end, and then starts the next', async () => {
+    const { extension, workers } = start({ workerStopMs: 50 });
+    const first = extension.open('worker');
+    watch(first);
+    await until(() => workers.length === 1, 'the worker');
+    first.close('the channel was closed');
+    const refused = watch(extension.open('worker'));
+    await until(() => refused.length > 0, 'the refusal while the first worker stops');
+    expect(refused).toEqual(['close a worker runs already']);
+    await until(() => workers[0].signals.length === 2, 'the SIGKILL');
+    expect(workers[0].signals).toEqual(['SIGTERM', 'SIGKILL']);
+    watch(extension.open('worker'));
+    await until(() => workers.length === 2, 'the next worker');
   });
 
   it('exits at once without a worker; after a frame that breaks the rules with a line and RELAY_FAILURE_EXIT_CODE', () => {
