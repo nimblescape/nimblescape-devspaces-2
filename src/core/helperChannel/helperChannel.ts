@@ -341,9 +341,10 @@ export class HelperChannel {
   /**
    * Starts the channel on `process` (`docker run -i … node -e PIPE_LOADER …`, channelRunArgs): writes the script as the
    * first line (encodeBundle; the loader checks it against the hash of its command line), sends `hello`, and
-   * waits for its answer. Throws HelperChannelError('open') and stops the process when that fails.
+   * waits for its answer. Throws HelperChannelError('open') and stops the process when that fails. `script` undefined:
+   * `process` is a worker that runs already (a stream of the relay, RelayConnection.openWorker), so no first line.
    */
-  static async open(process: StartedProcess, script: string, options: HelperChannelOptions): Promise<HelperChannel> {
+  static async open(process: StartedProcess, script: string | undefined, options: HelperChannelOptions): Promise<HelperChannel> {
     const channel = new HelperChannel(process, options);
     await channel.start(script);
     return channel;
@@ -374,7 +375,7 @@ export class HelperChannel {
     return () => this.closeListeners.delete(listener);
   }
 
-  private async start(script: string): Promise<void> {
+  private async start(script: string | undefined): Promise<void> {
     const { logger, name } = this.options;
     const splitter = new LineSplitter(MAX_SERVER_LINE, (line) => this.onLine(line), () => this.lose('a line of the helper is too long'));
     this.process.onStdout((text) => splitter.push(text));
@@ -396,7 +397,7 @@ export class HelperChannel {
     });
     // The loader limits the escaped line, so the same is checked here (the memory guard of the pipe loader,
     // MAX_BUNDLE_LINE_LENGTH).
-    const scriptLine = encodeBundle(script);
+    const scriptLine = script === undefined ? '' : encodeBundle(script);
     if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
       this.lose('the script is too long');
       throw new HelperChannelError('open', `The script of the helper channel is too long (${scriptLine.length - 1} characters as JSON).`);
@@ -409,7 +410,7 @@ export class HelperChannel {
       openTimer = setTimeout(() => reject(new Error(`no answer within ${openTimeoutMs / 1000} seconds`)), openTimeoutMs);
       removeCloseListener = this.onClose((reason) => reject(new Error(reason)));
     });
-    this.process.write(scriptLine);
+    if (scriptLine !== '') this.process.write(scriptLine);
     this.send({ t: 'hello', protocol: CHANNEL_PROTOCOL_VERSION });
     let answer: Extract<ServerMessage, { t: 'hello' }>;
     try {

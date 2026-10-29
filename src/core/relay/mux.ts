@@ -65,6 +65,8 @@ export interface MuxOptions {
    * the other side could not be written, or no frame came in time (`failed` true); not after `close`.
    */
   onClose?(reason: string, failed: boolean): void;
+  /** The extension: the HELLO of the relay came, and the frames of the streams go from now on. */
+  onHello?(): void;
   pingIntervalMs?: number;
   silenceMs?: number;
 }
@@ -578,6 +580,7 @@ export class Mux implements StreamHost {
       if (version !== RELAY_PROTOCOL_VERSION) return this.fail(`the relay speaks version ${version}, not ${RELAY_PROTOCOL_VERSION}`);
       this.ready = true;
       this.pump();
+      this.options.onHello?.();
       return;
     }
     if (frame.kind === 'ping') {

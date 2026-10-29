@@ -27,6 +27,7 @@ import { DevspaceRegistry } from '../../src/core/storage/registry';
 import { SessionFiles } from '../../src/core/storage/sessionFiles';
 import type { ExtensionSettings } from '../../src/core/types';
 import type { DockerTarget } from '../../src/core/docker/dockerHost';
+import type { RelayTransport } from '../../src/core/relay/transport';
 import type { VscodeServerRef } from '../../src/core/helperChannel/protocol';
 import { extensionFlow, extensionHostSide } from '../../src/vscode/hostSide';
 import { readBaseline } from './dockerRun';
@@ -103,6 +104,8 @@ export interface WorkerWindowOptions {
   socketPath?: (target: DockerTarget) => Promise<string>;
   /** `none` for a window whose workers have no network (the offline scenarios). */
   network?: 'none';
+  /** The transport of the connection of the relay for a target (workerLocks); default none (the Docker CLI). */
+  relay?: (target: DockerTarget) => RelayTransport | undefined;
   /** The start of Docker before an open (default: nothing, the engine of the tests runs). */
   startDocker?: DevspaceOperationsDeps['startDocker'];
   /**
@@ -121,7 +124,7 @@ export function workerWindow(context: DockerTestContext, docker: BootstrapDocker
   const owner = { windowId: options.windowId ?? `docker-test-${options.name}`, pid: process.pid };
   const targets = new DockerTargets(docker, env, log);
   const socketPath = options.socketPath ?? (async (target: DockerTarget) => helperDockerSocket(env, process.platform, target.endpoint));
-  const locks = workerLocks({ run, cli, log }, docker, targets, options.name, socketPath, options.network === undefined ? {} : { network: options.network });
+  const locks = workerLocks({ run, cli, log }, docker, targets, options.name, socketPath, { network: options.network, relay: options.relay });
   const memory = windowLifecycleMemory();
   const auth = options.auth ?? fakeAuth;
   const steps: FlowStep[] = [];

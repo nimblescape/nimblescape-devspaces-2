@@ -13,6 +13,8 @@ import { runWithDockerTarget } from '../docker/dockerTargets';
 import { isPodmanDockerTarget, isUnreadableDockerTarget, type DockerTarget } from '../docker/dockerHost';
 import type { HelperMaintenance } from '../helper/helperImages';
 import { bundleHash, loaderCommand } from '../loader/pipeLoader';
+import type { RelayConnection } from '../relay/connection';
+import { RELAY_ENTRY } from '../relay/frames';
 import { HELPER_DOCKER_SOCKET, LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN, VSCODE_STORE_DIR, freeWorkerNumber, workerName, workerNameStart } from '../names';
 import { errorMessage, isUserFacingError } from '../errors';
 import { VERSION_ENV, isDevspacesVersion, userAgentVersion } from '../http';
@@ -64,8 +66,8 @@ export const CHANNEL_PASSIVE_OPEN_WAIT_MS = 30_000;
  * (`stateVolume`), and the shared VS Code server store (`vscodeVolume`) at VSCODE_STORE_DIR. Its only variable is
  * VERSION_ENV with the version of Devspaces (`version`, when it is a version x.y.z), for the header User-Agent of its
  * HTTPS requests. The command is the pipe loader with CHANNEL_SCRIPT_PATH, the hash of the script (`scriptHash`,
- * bundleHash), and CHANNEL_ENTRY; the script itself comes as the first line of the input (HelperChannel.open), never on
- * the command line.
+ * bundleHash), and `entry` (CHANNEL_ENTRY, or RELAY_ENTRY for the relay in front of the worker); the script itself
+ * comes as the first line of the input (HelperChannel.open, RelayConnection.open), never on the command line.
  */
 export function channelRunArgs(p: {
   tag: string;
@@ -77,6 +79,7 @@ export function channelRunArgs(p: {
   scriptHash: string;
   network?: 'bridge' | 'none';
   version?: string;
+  entry?: string;
 }): string[] {
   // --mount is CSV: a path with a comma or a quote would change the mount.
   if (/[",]/.test(p.socketPath)) throw new HelperChannelError('open', `The Docker socket path ${p.socketPath} cannot be mounted.`);
@@ -119,13 +122,25 @@ export function channelRunArgs(p: {
     `type=volume,source=${p.vscodeVolume},target=${VSCODE_STORE_DIR},volume-nocopy`,
     ...(isDevspacesVersion(p.version) ? ['--env', `${VERSION_ENV}=${p.version}`] : []),
     p.tag,
-    ...loaderCommand({ path: CHANNEL_SCRIPT_PATH, hash: p.scriptHash, entry: CHANNEL_ENTRY }),
+    ...loaderCommand({ path: CHANNEL_SCRIPT_PATH, hash: p.scriptHash, entry: p.entry ?? CHANNEL_ENTRY }),
   ];
 }
+
+/**
+ * Opens a connection of the relay (ChannelOpenDeps.relay): starts `command` (`docker run …`) on the computer of the
+ * engine and writes `bundle` as the first line of its pipe loader.
+ */
+export type RelayConnect = (command: readonly string[], bundle: string) => Promise<RelayConnection>;
 
 export interface ChannelOpenDeps {
   /** BootstrapDocker.start: `docker <args>` with the environment of the operation (its Docker context). */
   start(args: readonly string[]): StartedProcess | undefined;
+  /**
+   * The connection of the relay to the engine of `target` (docs/architecture.md "The connection of the relay"), for a
+   * remote engine: its worker starts behind the relay with one login (`ssh … sh -s`), not with the Docker CLI.
+   * Undefined when the engine has no transport (a host that is no SSH alias or address, no `ssh`): `start` then.
+   */
+  relay?(target: DockerTarget): RelayConnect | undefined;
   /**
    * BootstrapDocker.run: `docker <args>` without the worker, with the environment of the operation (the engine identity
    * of the open).
@@ -184,7 +199,31 @@ function identityText(identity: EngineIdentity): string {
 }
 
 /**
- * Opens a channel to the engine of `target`: starts the container with the Docker context of `target`, then checks with
+ * A channel whose worker runs behind the relay: one connection for the channel, which ends when the worker ended (its
+ * EXIT, or the stream was closed). A failure of the connection (also a refusal of `docker run`, in its message) is a
+ * HelperChannelError('open'), so the retries of openHelperChannel (another name, no network) see it as from `start`.
+ */
+async function openBehindRelay(connect: RelayConnect, command: readonly string[], script: string, logger: Logger, name: string): Promise<HelperChannel> {
+  let connection: RelayConnection;
+  try {
+    connection = await connect(command, script);
+  } catch (error) {
+    throw new HelperChannelError('open', errorMessage(error));
+  }
+  let worker: StartedProcess;
+  try {
+    worker = connection.openWorker();
+  } catch (error) {
+    connection.close();
+    throw new HelperChannelError('open', errorMessage(error));
+  }
+  void worker.exited.then(() => connection.close('the worker ended'));
+  return HelperChannel.open(worker, undefined, { logger, name });
+}
+
+/**
+ * Opens a channel to the engine of `target`: starts the container with the Docker context of `target` (a remote engine
+ * with a transport: behind the relay, ChannelOpenDeps.relay), then checks with
  * the operation `probe` that the worker reaches its engine, and that it is the engine of `target`: the engine identity
  * of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a socket mount of another engine,
  * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). The worker reads its identity over
@@ -205,10 +244,13 @@ export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTar
   const name = engineName(target);
   const label = channelLabelValue(script);
   const scriptHash = bundleHash(script);
+  const relay = target.kind === 'remote' ? deps.relay?.(target) : undefined;
   const startNamed = async (network: 'bridge' | 'none', containerName: string): Promise<HelperChannel> => {
     // The version of this extension (activate), which the worker names in the header User-Agent and passes on.
     const version = userAgentVersion();
-    const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, vscodeVolume: deps.vscodeVolume, containerName, label, scriptHash, network, version });
+    const entry = relay === undefined ? CHANNEL_ENTRY : RELAY_ENTRY;
+    const args = channelRunArgs({ tag, socketPath, stateVolume: deps.stateVolume, vscodeVolume: deps.vscodeVolume, containerName, label, scriptHash, network, version, entry });
+    if (relay !== undefined) return openBehindRelay(relay, ['docker', ...args], script, deps.logger, name);
     const process = await runWithDockerTarget(target, async () => deps.start(args));
     if (process === undefined) throw new HelperChannelError('open', 'The Docker CLI cannot be started.');
     return HelperChannel.open(process, script, { logger: deps.logger, name });

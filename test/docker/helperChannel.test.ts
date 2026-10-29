@@ -34,8 +34,9 @@ import {
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
 import { LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN } from '../../src/core/names';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
-import type { StartedProcess } from '../../src/core/ports';
+import type { StartOptions, StartedByteProcess, StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
+import { openRelayConnection } from '../../src/core/relay/transport';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { Timings, dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 
@@ -76,7 +77,8 @@ async function sweepThrough(channel: HelperChannel): Promise<unknown> {
 
 describe('the helper channel with the real Docker engine', () => {
   const { run, env, cli, log } = dockerTestContext('helperChannel');
-  const docker = new BootstrapDocker(new NodeProcessRunner(), run.dockerPath, env, log);
+  const byteRunner = new NodeProcessRunner();
+  const docker = new BootstrapDocker(byteRunner, run.dockerPath, env, log);
   const timings = new Timings();
   const socket = helperDockerSocket(env, process.platform, run.dockerHost);
   // A remote target without a context name: the calls go to the engine of the runner.
@@ -93,18 +95,38 @@ describe('the helper channel with the real Docker engine', () => {
   /** The label of the run, on every channel container of this file. */
   const runLabelArgs = ['--label', `${TEST_RUN_LABEL}=${run.runId}`];
 
-  /** Opens a channel as the extension does; `extraArgs` go before the image (for example `-e`), `process` is kept. */
-  async function open(extraArgs: string[] = []): Promise<{ channel: HelperChannel; process: StartedProcess; name: string }> {
+  /**
+   * Opens a channel as the extension does; `extraArgs` go before the image (for example `-e`), `process` is kept.
+   * `relay`: the worker behind the relay, on a connection whose transport is a local `sh -s` (in place of `ssh … sh
+   * -s`); `transport` is that process.
+   */
+  async function open(
+    extraArgs: string[] = [],
+    options: { relay?: boolean } = {},
+  ): Promise<{ channel: HelperChannel; process: StartedProcess; name: string; transport?: StartedByteProcess }> {
     let started: StartedProcess | undefined;
+    let transport: StartedByteProcess | undefined;
     let name = '';
+    const testArgs = (args: readonly string[]) => {
+      const all = [...args];
+      all.splice(all.indexOf(helperTag), 0, ...runLabelArgs, ...extraArgs);
+      name = all[all.indexOf('--name') + 1];
+      return all;
+    };
     const channel = await openHelperChannel(
       {
         start: (args) => {
-          const all = [...args];
-          all.splice(all.indexOf(helperTag), 0, ...runLabelArgs, ...extraArgs);
-          name = all[all.indexOf('--name') + 1];
-          started = docker.start(all);
+          started = docker.start(testArgs(args));
           return started;
+        },
+        relay: () => {
+          if (!options.relay) return undefined;
+          const runner = {
+            startBytes: (file: string, args: readonly string[], startOptions?: StartOptions) => (transport = byteRunner.startBytes(file, args, startOptions)),
+          };
+          // The Docker CLI of the run, with the environment of the run.
+          return (command, bundle) =>
+            openRelayConnection(runner, { file: 'sh', args: ['-s'], env }, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: 'runner-engine' });
         },
         // The engine identity of the open is compared with one call without the worker.
         runDirect: (args, options) => docker.run(args, options),
@@ -121,7 +143,7 @@ describe('the helper channel with the real Docker engine', () => {
       },
       target,
     );
-    return { channel, process: started!, name };
+    return { channel, process: started!, name, transport };
   }
 
   beforeAll(async () => {
@@ -195,6 +217,30 @@ describe('the helper channel with the real Docker engine', () => {
     // The end of the input ends it at once; at the latest the silence (CHANNEL_SILENCE_EXIT_MS) does.
     await timings.measure('end after a hard kill of docker run', () =>
       waitUntil(() => cli.container(name) === undefined, 'the removal of the container', 120_000),
+    );
+  });
+
+  it('runs the worker behind the relay: the relay container ends after the close of the channel and after a hard kill of its transport', async () => {
+    const { channel, name, transport } = await timings.measure('open a channel behind the relay', () => open([], { relay: true }));
+    expect(transport).toBeDefined();
+    const details = cli.container(name)!;
+    expect(details.State.Running).toBe(true);
+    expect(details.HostConfig.AutoRemove).toBe(true);
+    // The relay is the first program of the container; it stored the bundle, and the worker runs from that file.
+    expect(details.Config.Cmd).toEqual(['node', '-e', PIPE_LOADER, '/opt/devspace/channel.js', bundleHash(script), 'startRelay']);
+    const probe = parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: 30_000 }));
+    expect(probe?.engine).toEqual(engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS])));
+    // The close of the channel ends the worker, then the connection, then the relay.
+    channel.close();
+    await expect(transport!.exited).resolves.toEqual({ exitCode: 0 });
+    await timings.measure('end of the relay after close', () => waitUntil(() => cli.container(name) === undefined, 'the removal of the container'));
+
+    const second = await open([], { relay: true });
+    expect(cli.container(second.name)?.State.Running).toBe(true);
+    // SIGKILL of the transport, which `exec` made the `docker run` process: the engine sees its connection end.
+    process.kill(second.transport!.pid!, 'SIGKILL');
+    await timings.measure('end of the relay after a hard kill of its transport', () =>
+      waitUntil(() => cli.container(second.name) === undefined, 'the removal of the container', 120_000),
     );
   });
 
