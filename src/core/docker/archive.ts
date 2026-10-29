@@ -130,7 +130,8 @@ export async function extractTarGzEntry(archive: string, entry: string, target: 
         if (size > MAX_HEADER_RECORD) throw new Error(`The archive ${archive} has a header record of ${size} bytes.`);
         const data = await reader.read(padded);
         if (data === undefined) throw new Error(`The archive ${archive} ends in a header record.`);
-        longName = type === 'L' ? tarText(data.subarray(0, size)) : (paxPath(data.subarray(0, size)) ?? longName);
+        // An empty record changes nothing.
+        longName = (type === 'L' ? tarText(data.subarray(0, size)) : paxPath(data.subarray(0, size))) || longName;
         continue;
       }
       // ustar: a prefix of the name in the field at 345 (POSIX `ustar\0`; the GNU form `ustar  \0` has none there).

@@ -810,13 +810,6 @@ async function activateExtension(
     revealRow: (rowId) => revealRow(view, tree, rowId),
     development: context.extensionMode === vscode.ExtensionMode.Development,
     dockerTargets: targets,
-    // Before a window with a Docker pipe opens: the Docker CLI of Devspaces for its Dev Containers extension, so that
-    // the new window finds it installed. A failure is logged; that window tries again.
-    prepareDockerPipeWindow: async () => {
-      if (ownDockerCliDownload(platform, process.arch) === undefined) return;
-      if (presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) !== undefined) return;
-      await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli, showFailure: false });
-    },
     // The Docker pipe of the window of a devspace on an SSH host (docs/architecture.md "The Docker pipe").
     windowDockerHost: (devspace, shownContainer) =>
       windowDockerHost(devspace, shownContainer, {

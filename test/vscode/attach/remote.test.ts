@@ -14,8 +14,8 @@
 // before it attaches (controller.ts, onWindowHost).
 // The first test counts the SSH logins of the open on the other computer, writes them to the log of the test and to the
 // summary of the CI job, and allows one: the checks before the relay run on the shell whose login the relay takes over.
-// The window attaches with the Docker CLI of Devspaces (src/core/docker/ownDockerCli.ts), which it downloads before the
-// Dev Containers extension resolves it, because VS Code starts directly in that window.
+// The window attaches with the Docker CLI of Devspaces (src/core/docker/ownDockerCli.ts), which it downloads at its start,
+// before the Dev Containers extension resolves it.
 import * as assert from 'assert';
 import * as childProcess from 'child_process';
 import * as crypto from 'crypto';

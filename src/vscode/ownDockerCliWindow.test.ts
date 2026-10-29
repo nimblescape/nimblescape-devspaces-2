@@ -63,22 +63,6 @@ describe('installOwnDockerCliWithProgress', () => {
     expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
   });
 
-  it('shows one notification for the calls at the same time', async () => {
-    const runs = scriptWithProgress();
-    let finish: (cli: string) => void = () => undefined;
-    install.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
-    const first = installOwnDockerCliWithProgress({ ...options, logger: silentLogger, fallback: undefined });
-    const second = installOwnDockerCliWithProgress({ ...options, logger: silentLogger, fallback: undefined, showFailure: false });
-    await vi.waitFor(() => expect(install).toHaveBeenCalledTimes(1));
-    finish('/s/docker-cli/1.2.3/docker');
-    await expect(Promise.all([first, second])).resolves.toEqual(['/s/docker-cli/1.2.3/docker', '/s/docker-cli/1.2.3/docker']);
-    expect(runs).toHaveLength(1);
-    // Afterwards, a new call starts a new one.
-    install.mockResolvedValue('/s/docker-cli/1.2.3/docker');
-    await installOwnDockerCliWithProgress({ ...options, logger: silentLogger, fallback: undefined });
-    expect(runs).toHaveLength(2);
-  });
-
   it('says which Docker CLI the window uses when the download fails', async () => {
     scriptWithProgress();
     install.mockRejectedValue(new Error('offline'));
@@ -90,7 +74,7 @@ describe('installOwnDockerCliWithProgress', () => {
     expect(fakeVscode.window.showErrorMessage).toHaveBeenCalledWith(OwnDockerCliTexts.failedWithoutFallback('offline'));
   });
 
-  it('stops the download with Cancel, and only logs a failure with showFailure false', async () => {
+  it('stops the download with Cancel, and says so', async () => {
     const runs = scriptWithProgress();
     install.mockImplementation(
       (given: InstallOwnDockerCliOptions) =>
@@ -100,9 +84,8 @@ describe('installOwnDockerCliWithProgress', () => {
         }),
     );
     const { logger, warnings } = logged();
-    await expect(installOwnDockerCliWithProgress({ ...options, logger, fallback: undefined, showFailure: false })).resolves.toBeUndefined();
+    await expect(installOwnDockerCliWithProgress({ ...options, logger, fallback: '/usr/bin/docker' })).resolves.toBeUndefined();
     expect(warnings).toEqual([`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be installed: ${OwnDockerCliTexts.cancelled}`]);
-    expect(fakeVscode.window.showWarningMessage).not.toHaveBeenCalled();
-    expect(fakeVscode.window.showErrorMessage).not.toHaveBeenCalled();
+    expect(fakeVscode.window.showWarningMessage).toHaveBeenCalledWith(OwnDockerCliTexts.failedWithFallback(OwnDockerCliTexts.cancelled));
   });
 });
