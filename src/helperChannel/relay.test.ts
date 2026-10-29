@@ -18,7 +18,7 @@ import { RELAY_EXIT_MARGIN_MS, RELAY_FAILURE_EXIT_CODE, Relay, type RelayWorker 
 
 /**
  * A worker process of the test: its input and output in memory, its end when the test says, or at SIGKILL (unless
- * `hang`).
+ * `hang`). As a real process, it reports its end once its output closed: read to its end, or destroyed.
  */
 class FakeWorker implements RelayWorker {
   readonly stdin = new PassThrough();
@@ -48,8 +48,10 @@ class FakeWorker implements RelayWorker {
   end(exit: WorkerExit, error?: Error): void {
     if (this.ended) return;
     this.ended = true;
+    const report = () => this.listener?.(exit, error);
+    if (this.stdout.destroyed) return report();
+    this.stdout.once('close', report);
     this.stdout.end();
-    this.listener?.(exit, error);
   }
 }
 

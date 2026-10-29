@@ -401,8 +401,9 @@ export class Mux implements StreamHost {
   private congested = false;
   private pumping = false;
   private ended: string | undefined;
-  private lastSent = Date.now();
-  private lastReceived = Date.now();
+  // A monotonic clock (performance.now()), which a step of the wall clock does not change.
+  private lastSent = performance.now();
+  private lastReceived = performance.now();
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly pingIntervalMs: number;
   private readonly silenceMs: number;
@@ -448,7 +449,7 @@ export class Mux implements StreamHost {
   /** Bytes of the other side, as they come. */
   input(chunk: Buffer): void {
     if (this.ended !== undefined) return;
-    this.lastReceived = Date.now();
+    this.lastReceived = performance.now();
     this.parser.push(chunk);
   }
 
@@ -484,7 +485,7 @@ export class Mux implements StreamHost {
     this.pumping = true;
     try {
       for (let frame = this.nextFrame(); frame !== undefined; frame = this.nextFrame()) {
-        this.lastSent = Date.now();
+        this.lastSent = performance.now();
         let written: boolean;
         try {
           written = this.options.link.write(frame);
@@ -570,7 +571,7 @@ export class Mux implements StreamHost {
 
   private tick(): void {
     if (this.ended !== undefined || !this.ready) return;
-    const now = Date.now();
+    const now = performance.now();
     if (now - this.lastReceived >= this.silenceMs) return this.fail(`no frame came within ${Math.round(this.silenceMs / 1000)} seconds`);
     // While the link holds frames that wait, it is not idle; a ping would only wait behind them.
     if (!this.congested && now - this.lastSent >= this.pingIntervalMs) {
