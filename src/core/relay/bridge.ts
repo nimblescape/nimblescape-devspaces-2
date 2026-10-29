@@ -22,8 +22,9 @@ export interface BridgeOptions {
  * keeps its flow: `readable` pauses while the stream holds a window of bytes that the other side has no credit for, and
  * the other side gets credit for bytes only after `writable` took them. The end of `readable` ends the direction of
  * this side (END), and the end of the other side's direction ends `writable`. An error of the pipe, or its close before
- * the end of `readable`, closes the stream with the error as its reason; the close of the stream by the other side, or
- * the loss of the connection, destroys the pipe.
+ * the end of `readable`, closes the stream with the error as its reason (after the end of `readable`, an error drops
+ * only what comes from the other side); the close of the stream by the other side, or the loss of the connection,
+ * destroys the pipe.
  */
 export function bridgeStream(stream: MuxStream, readable: Readable, writable: Writable, options: BridgeOptions = {}): void {
   const pipeEndsStream = options.pipeEndsStream ?? true;
@@ -35,6 +36,9 @@ export function bridgeStream(stream: MuxStream, readable: Readable, writable: Wr
   };
   const fail = (reason: string) => {
     if (!pipeEndsStream || !stream.isOpen) return;
+    // After the end of `readable`, its data and END wait in the stream: an error of the other direction (EPIPE when the
+    // engine closed its socket after its answer) does not drop them; what comes from the other side is dropped.
+    if (readable.readableEnded) return;
     stream.close(reason);
     destroy();
   };

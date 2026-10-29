@@ -435,10 +435,14 @@ export class Mux implements StreamHost {
     return this.streams.size;
   }
 
-  /** The extension: opens a stream to `target` in the container. Its frames go once the relay said HELLO. */
+  /**
+   * The extension: opens a stream to `target` in the container. Its frames go once the relay said HELLO. Throws when
+   * the connection ended or MAX_STREAMS streams are open.
+   */
   open(target: RelayTarget): MuxStream {
     if (this.side !== 'extension') throw new Error('Only the extension opens streams of the relay.');
     if (this.ended !== undefined) throw new Error(`The connection of the relay ended: ${this.ended}`);
+    if (this.streams.size >= MAX_STREAMS) throw new Error(`The connection of the relay has ${MAX_STREAMS} streams open.`);
     const stream = new Stream(this, ++this.lastId, target);
     this.add(stream);
     this.control(encodeFrame('open', stream.id, encodeTarget(target)));
@@ -450,7 +454,12 @@ export class Mux implements StreamHost {
   input(chunk: Buffer): void {
     if (this.ended !== undefined) return;
     this.lastReceived = performance.now();
-    this.parser.push(chunk);
+    try {
+      this.parser.push(chunk);
+    } catch (error) {
+      // A listener failed within the chunk: the rest of the chunk is lost, so the frames that follow cannot be read.
+      this.fail(`an error while a frame was handled: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /** The input ended: every stream is lost. Within a frame, or before the HELLO of the relay, as a failure. */
@@ -558,11 +567,8 @@ export class Mux implements StreamHost {
     const target = decodeTarget(frame.payload);
     if (this.side !== 'relay' || target === undefined || frame.stream <= this.lastId) return this.fail(`the other side sent an invalid open of the stream ${frame.stream}`);
     this.lastId = frame.stream;
-    if (this.streams.size >= MAX_STREAMS) {
-      this.control(encodeFrame('close', frame.stream, encodeCloseReason(`the relay has ${MAX_STREAMS} streams open`)));
-      this.pump();
-      return;
-    }
+    // The extension opens no more (open); its count of open streams is never below this one.
+    if (this.streams.size >= MAX_STREAMS) return this.fail(`the other side opened more than ${MAX_STREAMS} streams`);
     const stream = new Stream(this, frame.stream, target);
     this.add(stream);
     if (this.options.accept) this.options.accept(stream);
