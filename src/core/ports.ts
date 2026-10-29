@@ -165,6 +165,12 @@ export interface StartedByteProcess {
   readonly pid?: number;
   /** Its output as it comes, then `onEnd` at its end. One listener each. */
   onStdout(listener: (chunk: Buffer) => void, onEnd: () => void): void;
+  /**
+   * Stops reading its output until resumeStdout: what it writes waits in the pipe, and the program waits when the pipe
+   * is full (for a reader that holds more than it wants).
+   */
+  pauseStdout(): void;
+  resumeStdout(): void;
   /** Its error output, decoded as UTF-8, as it comes. One listener. */
   onStderr(listener: (text: string) => void): void;
   /** Resolves when it ended: its exit code (null after a signal), or the error of its start. */

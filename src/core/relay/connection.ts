@@ -8,10 +8,11 @@
 // bundle line for the pipe loader, and from then on both directions carry the frames of the streams (mux.ts). The
 // connection is open once the HELLO of the relay came. The error output of the transport (the messages of `ssh`, the
 // relay, and the worker) is kept as the reason of a failure, as the error output of the Docker CLI before. A stream to
-// the target `worker` is the program of a helper channel (openWorker). No `vscode`.
+// the target `worker` is the program of a helper channel (openWorker); a stream to the target `docker` is one
+// connection of the Docker pipe of the window (openDocker, dockerPipe.ts). No `vscode`.
 import { readableStderr } from '../loader/pipeLoader';
 import { decodedOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
-import { Mux } from './mux';
+import { Mux, type MuxStream } from './mux';
 
 /** The longest time from the start of the transport to the HELLO of the relay: the login, the start, the bundle. */
 export const RELAY_OPEN_TIMEOUT_MS = 120_000;
@@ -60,6 +61,7 @@ export class RelayConnection {
   private readonly stderrListeners = new Set<(text: string) => void>();
   private readonly closeListeners = new Set<(reason: string) => void>();
   private closedReason: string | undefined;
+  private opened = 0;
 
   private constructor(
     private readonly process: StartedByteProcess,
@@ -94,11 +96,13 @@ export class RelayConnection {
    * A stream to the worker as the program of a helper channel (HelperChannel.open without its bundle line): the relay
    * starts the worker from the stored file. Its output is the output of the worker; its error output is the error
    * output of the connection (the relay, the worker, and the transport share it); its end is the EXIT of the worker,
-   * or the close of the stream or of the connection. `kill` closes the stream, and the relay stops the worker.
+   * or the close of the stream or of the connection. `kill` closes the stream, and the relay stops the worker. It has
+   * no `killNow`: the connection carries the Docker streams of the window too, and RelayConnections.dispose stops the
+   * transport at once when the window closes.
    */
   openWorker(): StartedProcess {
-    if (this.mux === undefined || this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed.`);
-    const stream = this.mux.open('worker');
+    const stream = this.openMux().open('worker');
+    this.opened++;
     const stdout = decodedOutput();
     let settle: (result: { exitCode: number | null; error?: Error }) => void = () => {};
     const exited = new Promise<{ exitCode: number | null; error?: Error }>((resolve) => {
@@ -128,10 +132,6 @@ export class RelayConnection {
         stream.close('stopped by the extension');
         settle({ exitCode: null });
       },
-      killNow: () => {
-        settle({ exitCode: null });
-        this.killNow();
-      },
       onStdout: stdout.listen,
       onStderr: (listener) => {
         if (stderrListener) this.stderrListeners.delete(stderrListener);
@@ -141,6 +141,33 @@ export class RelayConnection {
       },
       exited,
     };
+  }
+
+  /**
+   * A stream to the Docker socket of the container: one connection of the Docker pipe of the window (dockerPipe.ts).
+   * Throws when the connection is closed or has MAX_STREAMS streams.
+   */
+  openDocker(): MuxStream {
+    const stream = this.openMux().open('docker');
+    this.opened++;
+    return stream;
+  }
+
+  /** The mux of the open connection; throws when the connection is closed, with its reason. */
+  private openMux(): Mux {
+    if (this.closedReason !== undefined) throw new Error(`The connection to ${this.options.name} is closed (${this.closedReason}).`);
+    if (this.mux === undefined) throw new Error(`The connection to ${this.options.name} is not open yet.`);
+    return this.mux;
+  }
+
+  /** The streams that are open now: the worker and the Docker streams (RelayConnections closes an idle connection). */
+  get streamCount(): number {
+    return this.closedReason === undefined ? (this.mux?.streamCount ?? 0) : 0;
+  }
+
+  /** How many streams were opened on the connection so far (a short stream between two looks still counts as use). */
+  get streamsOpened(): number {
+    return this.opened;
   }
 
   /** Ends the connection: every stream is lost, and the transport is stopped when it does not end by itself. */

@@ -59,7 +59,7 @@
 // monitor does not write over the newer record (SEQ_ORDER_WINDOW_MS). No `vscode`; never throws (except from a `deps`
 // call that throws, which a tick logs).
 import { BUSY_MARK_MAX_AGE_MS } from '../busy';
-import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
+import { DEFAULT_CONTEXT_NAME, describeDockerHost, dockerHostOf, isOnDockerHost, sameDockerHost, sshEndpoint, type DockerTarget } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { Messages } from '../messages';
 import { systemClock, type Clock, type Logger } from '../ports';
@@ -247,15 +247,22 @@ export async function resolveHeartbeatEngine(devspace: Devspace, use: { connecte
     const target = await sources.ofContext(own);
     return target !== undefined && target.kind !== 'unsupported' && isOnDockerHost(devspace, target.host) ? target : undefined;
   }
-  const current = await sources.current();
-  if (current.kind !== 'unsupported' && isOnDockerHost(devspace, current.host)) return current;
-  if (host !== '') {
-    const context = await sources.remoteContext(host);
-    return context === undefined ? undefined : { kind: 'remote', host, endpoint: sshEndpoint(host), context };
-  }
-  if (!use.connected) return undefined;
+  const target = await hostEngine(host, sources);
+  if (target !== undefined || host !== '' || !use.connected) return target;
   const local = await sources.ofContext(DEFAULT_CONTEXT_NAME);
   return local?.kind === 'local' ? local : undefined;
+}
+
+/**
+ * The engine on the Docker host `host` ('' = the local Docker) without the context of a window: the current target when
+ * it is on the host, else for an SSH host its existing context; else undefined.
+ */
+export async function hostEngine(host: string, sources: Pick<HeartbeatEngineSources, 'current' | 'remoteContext'>): Promise<DockerTarget | undefined> {
+  const current = await sources.current();
+  if (current.kind !== 'unsupported' && sameDockerHost(host, current.host)) return current;
+  if (host === '') return undefined;
+  const context = await sources.remoteContext(host);
+  return context === undefined ? undefined : { kind: 'remote', host, endpoint: sshEndpoint(host), context };
 }
 
 export class WindowHeartbeats {

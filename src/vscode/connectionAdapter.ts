@@ -8,7 +8,7 @@
 import * as vscode from 'vscode';
 import { ATTACHED_CONTAINER } from '../core/devContainers';
 import { silentLogger, type Logger } from '../core/ports';
-import { containerNameOfUri, decodeAuthorityParts, folderUriParts, REMOTE_SCHEME } from './connection/authority';
+import { containerNameOfUri, decodeAuthorityParts, folderUriParts, REMOTE_SCHEME, type WindowDocker } from './connection/authority';
 
 /** Opens a folder or workspace URI (built-in command of VS Code). */
 export const OPEN_FOLDER_COMMAND = 'vscode.openFolder';
@@ -62,11 +62,21 @@ export class ConnectionAdapter {
 
   /**
    * The Docker context named in the authority of this window (`settings.context`, authority.ts), or `undefined` for a
-   * window without one (the local Docker, DOCKER_HOST, or no attached container).
+   * window without one (the local Docker, DOCKER_HOST, the Docker pipe, or no attached container).
    */
   currentDockerContext(): string | undefined {
     const shown = this.shownAttachedUri();
     return shown ? decodeAuthorityParts(shown.authority)?.dockerContext : undefined;
+  }
+
+  /**
+   * The Docker host address named in the authority of this window (`settings.host`, authority.ts: the address of the
+   * Docker pipe of a remote devspace on this computer), or `undefined` for a window without one. Not the SSH host of a
+   * devspace (Devspace.dockerHost, Controller.currentDockerHost).
+   */
+  currentDockerHost(): string | undefined {
+    const shown = this.shownAttachedUri();
+    return shown ? decodeAuthorityParts(shown.authority)?.dockerHost : undefined;
   }
 
   /**
@@ -108,12 +118,12 @@ export class ConnectionAdapter {
    * When this window has exactly this folder open already (Reconnect after the connection was lost),
    * `vscode.openFolder` would only focus the window, so the window is reloaded instead: the reload connects again.
    *
-   * `dockerContext`: the Docker context of a devspace on another Docker host, named in the authority so that the
-   * Dev Containers extension attaches through it (authority.ts). A window with the same folder under another context
-   * (or none) is not "this folder": it opens the new URI.
+   * `docker`: how the Dev Containers extension reaches the engine of a devspace on another Docker host (its Docker
+   * context, or the Docker pipe of the window), named in the authority so that it attaches through it (authority.ts).
+   * A window with the same folder under another context or host (or none) is not "this folder": it opens the new URI.
    */
-  async open(containerName: string, remoteWorkspaceFolder: string, dockerContext?: string): Promise<void> {
-    const parts = folderUriParts(containerName, remoteWorkspaceFolder, dockerContext);
+  async open(containerName: string, remoteWorkspaceFolder: string, docker?: WindowDocker): Promise<void> {
+    const parts = folderUriParts(containerName, remoteWorkspaceFolder, docker);
     if (this.hasFolderOpen(parts)) {
       this.logger.info(`Reloading the window to connect it to ${containerName} again.`);
       await vscode.commands.executeCommand(RELOAD_WINDOW_COMMAND);
@@ -134,8 +144,8 @@ export class ConnectionAdapter {
    * main process looks for a window with the same folder URI before it opens a new one, also with `forceNewWindow` (the
    * same assumption as in `open`). The caller does not open a devspace that another window uses.
    */
-  async openInNewWindow(containerName: string, remoteWorkspaceFolder: string, dockerContext?: string): Promise<void> {
-    const uri = vscode.Uri.from(folderUriParts(containerName, remoteWorkspaceFolder, dockerContext));
+  async openInNewWindow(containerName: string, remoteWorkspaceFolder: string, docker?: WindowDocker): Promise<void> {
+    const uri = vscode.Uri.from(folderUriParts(containerName, remoteWorkspaceFolder, docker));
     this.logger.info(`Connecting a new window to ${containerName} (${uri.toString()}).`);
     await vscode.commands.executeCommand(OPEN_FOLDER_COMMAND, uri, { forceNewWindow: true });
   }
@@ -155,7 +165,7 @@ export class ConnectionAdapter {
     await vscode.commands.executeCommand(CLOSE_WINDOW_COMMAND);
   }
 
-  /** The window shows exactly this folder of this container, through the same Docker context (a folder window). */
+  /** The window shows exactly this folder of this container, through the same Docker context or host (a folder window). */
   private hasFolderOpen(target: { authority: string; path: string }): boolean {
     const folders = vscode.workspace.workspaceFolders;
     if (vscode.workspace.workspaceFile || folders?.length !== 1) return false;
@@ -168,6 +178,7 @@ export class ConnectionAdapter {
       targetParts !== undefined &&
       currentParts.containerName === targetParts.containerName &&
       currentParts.dockerContext === targetParts.dockerContext &&
+      currentParts.dockerHost === targetParts.dockerHost &&
       withoutTrailingSlash(current.path) === withoutTrailingSlash(target.path)
     );
   }

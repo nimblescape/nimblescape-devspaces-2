@@ -164,16 +164,36 @@ describeUnix('the relay', () => {
     stream.write(Buffer.from('{"t":"hello","protocol":3}\n'));
     await until(() => (workers[0]?.input ?? '') !== '', 'the input of the worker');
     expect(workers[0].input).toBe('{"t":"hello","protocol":3}\n');
-    const second = watch(extension.open('worker'));
-    await until(() => second.length > 0, 'the refusal of a second worker');
-    expect(second).toEqual(['close a worker runs already']);
+    // A second worker stream waits for the end of the first worker; its data waits in the stream.
+    const secondStream = extension.open('worker');
+    const second = watch(secondStream);
+    secondStream.write(Buffer.from('{"t":"hello","protocol":3}\n'));
+    await settle();
+    expect(workers).toHaveLength(1);
+    expect(second).toEqual([]);
     workers[0].stdout.write('{"t":"hello"}\n');
     workers[0].end({ code: 0, signal: null });
     await until(() => events.length >= 2, 'the exit of the worker');
     expect(events).toEqual(['{"t":"hello"}\n', 'exit {"code":0,"signal":null}']);
-    // The next worker stream starts a new worker on the same connection.
-    extension.open('worker');
-    await until(() => workers.length === 2, 'the second worker');
+    // Then the waiting stream starts a new worker on the same connection, with the data that waited.
+    await until(() => (workers[1]?.input ?? '') !== '', 'the input of the second worker');
+    expect(workers[1].input).toBe('{"t":"hello","protocol":3}\n');
+  });
+
+  it('closes a waiting worker stream when a newer one comes, and starts nothing for one that the extension closed', async () => {
+    const { extension, workers } = start();
+    watch(extension.open('worker'));
+    await until(() => workers.length === 1, 'the worker');
+    const older = watch(extension.open('worker'));
+    const closed = extension.open('worker');
+    watch(closed);
+    await until(() => older.length > 0, 'the close of the older waiting stream');
+    expect(older).toEqual(['close a newer worker stream came']);
+    closed.close('the channel was closed');
+    await settle();
+    workers[0].end({ code: 0, signal: null });
+    await settle();
+    expect(workers).toHaveLength(1);
   });
 
   it('ends the input of the worker at the end of its stream', async () => {
@@ -261,13 +281,12 @@ describeUnix('the relay', () => {
     watch(first);
     await until(() => workers.length === 1, 'the worker');
     first.close('the channel was closed');
-    const refused = watch(extension.open('worker'));
-    await until(() => refused.length > 0, 'the refusal while the first worker stops');
-    expect(refused).toEqual(['close a worker runs already']);
+    const next = watch(extension.open('worker'));
     await until(() => workers[0].signals.length === 2, 'the SIGKILL');
     expect(workers[0].signals).toEqual(['SIGTERM', 'SIGKILL']);
-    watch(extension.open('worker'));
+    // The next worker stream waited for the end of the stopped worker (at its SIGKILL).
     await until(() => workers.length === 2, 'the next worker');
+    expect(next).toEqual([]);
   });
 
   it('sends no signal to a worker that ended while its EXIT waited behind its output, when the extension closes the stream', async () => {

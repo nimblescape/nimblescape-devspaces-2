@@ -209,6 +209,22 @@ describe('SessionCoordinator', () => {
     expect(readStatus(h)).not.toHaveProperty('dockerContext');
   });
 
+  // The same for the Docker pipe in the window's authority.
+  it('writes the Docker host of the window into its status file, only for a window attached to a devspace', async () => {
+    const pipe = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
+    h.coordinator.dispose();
+    h.coordinator = h.create({ windowDockerHost: () => pipe });
+    await h.coordinator.start(ID_A);
+    expect(readStatus(h)).toMatchObject({ devspaceId: ID_A, dockerHost: pipe });
+    expect(readStatus(h)).not.toHaveProperty('dockerContext');
+    h.coordinator.dispose();
+    h.coordinator = h.create({ windowDockerHost: () => pipe });
+    await h.coordinator.start(null);
+    expect(readStatus(h)).not.toHaveProperty('dockerHost');
+    await h.coordinator.setPlainDevspace(ID_A);
+    expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, dockerHost: pipe });
+  });
+
   it('start resolves with the fresh pending file of its devspace that it removes, so the caller knows the pipeline ran', async () => {
     await h.sessionFiles.writePending(ID_A, 'window-0');
     expect(await h.coordinator.start(ID_A)).toEqual({ devspaceId: ID_A, windowId: 'window-0', createdAt: iso(T0) });
@@ -332,8 +348,11 @@ describe('SessionCoordinator', () => {
     expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, state: 'active' });
     expect(isWindowStatus(readStatus(h))).toBe(true);
     h.clock.time = T0 + 20;
-    await nextHeartbeat(coordinator);
-    expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, updatedAt: iso(T0 + 20) });
+    // A heartbeat that began before the new time can end after it: the next ones write the new time.
+    await vi.waitFor(async () => {
+      await nextHeartbeat(coordinator);
+      expect(readStatus(h)).toMatchObject({ devspaceId: null, plainDevspaceId: ID_A, updatedAt: iso(T0 + 20) });
+    });
     // The devspace of the window, which the heartbeats send (WindowHeartbeatsDeps.connected), stays none.
     expect(coordinator.devspaceId).toBeNull();
     await coordinator.setPlainDevspace(null);

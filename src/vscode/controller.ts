@@ -48,6 +48,7 @@ import { decideReopen, pipelineJustRan, sortPendingOperations } from './activati
 import type { VsCodeGitHubAuth } from './auth';
 import { Commands, type CommandName } from './commands';
 import type { ConnectionAdapter } from './connectionAdapter';
+import type { WindowDocker } from './connection/authority';
 import { ControllerTexts } from './controllerTexts';
 import {
   DISCONNECT_REQUEST_MAX_AGE_MS,
@@ -161,6 +162,13 @@ export interface ControllerDeps {
    * Docker.
    */
   dockerTargets?: Pick<DockerTargets, 'resolve' | 'current' | 'withOperation'>;
+  /**
+   * The address of the Docker pipe of the window of `devspace` with its container `containerName` (docs/architecture.md
+   * "The Docker pipe"), which the authority of its window names (`settings.host`): for a devspace on an SSH host that
+   * the connection of the relay reaches; undefined for every other devspace, whose window names its Docker context.
+   * Default: none.
+   */
+  windowDockerHost?: (devspace: Devspace, containerName: string) => string | undefined;
   /** "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
   remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'askAgain' | 'offerSwitchBack'>;
   /**
@@ -653,6 +661,19 @@ export class Controller implements vscode.Disposable {
       `This window of ${repository} works without Devspaces: Devspaces was removed from ${engine}. No background updates and no stop on close; a Start of ${repository} sets Devspaces up there again.`,
     );
     this.inform(ControllerTexts.windowOnRemovedEngine(engine));
+  }
+
+  /**
+   * Role A whose Docker pipe this window does not serve (windowPipe.ts, `refused`): through the authority, the Dev
+   * Containers extension would reach no engine, or on Windows a named pipe of that name that another program serves.
+   * The window closes its remote connection before VS Code resolves the authority, with a message, and runs no open
+   * pipeline.
+   */
+  async leaveWithoutDockerPipe(containerName: string, reason: string): Promise<void> {
+    // Nor does a restore of the registry adopt the devspace for this window.
+    this.attaching = true;
+    this.logger.info(`The window closes its remote connection: its Docker pipe is not served (${reason})`);
+    await this.leaveDevspace(ControllerTexts.dockerPipeNotServed(containerName));
   }
 
   /**
@@ -4003,45 +4024,63 @@ export class Controller implements vscode.Disposable {
 
   /**
    * The arguments of ConnectionAdapter.open and openInNewWindow for `devspace`: the container, the folder, and for
-   * a devspace on another Docker host its Docker context (without it in the authority, the Dev Containers extension
-   * asks the local Docker first and reports the container as one that "no longer exists"). The context, in this order:
+   * a devspace on another Docker host how the Dev Containers extension reaches its engine (without it in the authority,
+   * it asks the local Docker first and reports the container as one that "no longer exists"). The Docker pipe of the
+   * window when the devspace has one (windowDockerHost), else its Docker context, in this order:
    * - the one of the running operation, when that is on the devspace's host (a context that the user made; none when
    *   DOCKER_HOST decides);
    * - outside an operation, the one in the authority of this window when it shows the same container;
    * - the current context, when that is on the devspace's host (read outside any operation);
    * - else the one that "Use a Remote Docker Host…" creates for the host (ensureRemoteContext: created when missing).
+   * Also for a window with the Docker pipe, the context is created when missing, as far as it can be: the heartbeats of
+   * the devspace and the worker that opens the connection of the relay find the engine of the host through it.
    */
   private async windowArgs(
     devspace: Devspace,
     containerName: string,
     folder: string,
-  ): Promise<[containerName: string, folder: string, dockerContext?: string]> {
+  ): Promise<[containerName: string, folder: string, docker?: WindowDocker]> {
     const host = dockerHostOf(devspace);
     if (host === '') return [containerName, folder];
-    const withContext = (context: string | undefined): [string, string, string?] =>
-      context === undefined ? [containerName, folder] : [containerName, folder, context];
+    const pipe = this.deps.windowDockerHost?.(devspace, containerName);
+    if (pipe === undefined) {
+      const context = await this.windowContext(devspace, containerName, host);
+      return context === undefined ? [containerName, folder] : [containerName, folder, { context }];
+    }
+    try {
+      await this.windowContext(devspace, containerName, host);
+    } catch (error) {
+      this.logger.warn(`The Docker context of ${host} could not be made (${errorMessage(error)}). The window connects through its Docker pipe.`);
+    }
+    return [containerName, folder, { host: pipe }];
+  }
+
+  /** The Docker context of the window of `devspace` on `host` (see windowArgs); undefined when DOCKER_HOST decides. */
+  private async windowContext(devspace: Devspace, containerName: string, host: string): Promise<string | undefined> {
     const target = operationDockerTarget();
-    if (target && isOnDockerHost(devspace, target.host)) return withContext(target.context);
+    if (target && isOnDockerHost(devspace, target.host)) return target.context;
     if (this.deps.connection.currentContainerName() === containerName) {
       const own = this.deps.connection.currentDockerContext();
-      if (own !== undefined) return withContext(own);
+      if (own !== undefined) return own;
     }
     const targets = this.deps.dockerTargets;
     if (targets) {
       const current = await outsideOperation(() => targets.resolve());
-      if (isOnDockerHost(devspace, current.host)) return withContext(current.context);
+      if (isOnDockerHost(devspace, current.host)) return current.context;
     }
-    return withContext(await ensureRemoteContext(this.deps.docker, host));
+    return ensureRemoteContext(this.deps.docker, host);
   }
 
   /**
-   * The arguments that show the other window `other` of `devspace`: exactly the URI of that window, with the context
-   * of its status file (none for a window without one), so that VS Code finds it. The status is the one read for the
-   * decision (no second read).
+   * The arguments that show the other window `other` of `devspace`: exactly the URI of that window, with the context or
+   * the Docker host of its status file (neither for a window without one), so that VS Code finds it. The status is the
+   * one read for the decision (no second read).
    */
-  private otherWindowArgs(devspace: Devspace, folder: string, other: WindowStatus): [containerName: string, folder: string, dockerContext?: string] {
-    if (dockerHostOf(devspace) === '' || other.dockerContext === undefined) return [devspace.containerName, folder];
-    return [devspace.containerName, folder, other.dockerContext];
+  private otherWindowArgs(devspace: Devspace, folder: string, other: WindowStatus): [containerName: string, folder: string, docker?: WindowDocker] {
+    if (dockerHostOf(devspace) === '') return [devspace.containerName, folder];
+    if (other.dockerContext !== undefined) return [devspace.containerName, folder, { context: other.dockerContext }];
+    if (other.dockerHost !== undefined) return [devspace.containerName, folder, { host: other.dockerHost }];
+    return [devspace.containerName, folder];
   }
 
   /**

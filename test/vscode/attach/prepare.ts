@@ -39,7 +39,9 @@ import { HelperImages } from '../../../src/core/helper/helperImages';
 import { LABEL_DEVSPACE_ID, LABEL_HELPER, LABEL_OWNER_ID, LABEL_REPOSITORY, WORKSPACES_ROOT, newDevspaceId, repositoryFolder, resourceName } from '../../../src/core/names';
 import type { Logger } from '../../../src/core/ports';
 import { NodeProcessRunner } from '../../../src/core/process';
-import { folderUriParts } from '../../../src/vscode/connection/authority';
+import { dockerPipeAddress, dockerPipeBase, dockerPipeId } from '../../../src/core/relay/pipeAddress';
+import { newComputerId } from '../../../src/core/storage/computerId';
+import { folderUriParts, type WindowDocker } from '../../../src/vscode/connection/authority';
 import { answerAttachQuestion } from '../../../scripts/attachQuestion.mjs';
 
 /** The checkout: the bundle runs from out/test/vscode/attach/. */
@@ -164,8 +166,8 @@ interface TestVscode {
   extensionsDir: string;
 }
 
-function folderUri(containerName: string, folder: string, dockerContext?: string): string {
-  const parts = folderUriParts(containerName, folder, dockerContext);
+function folderUri(containerName: string, folder: string, docker?: WindowDocker): string {
+  const parts = folderUriParts(containerName, folder, docker);
   return `${parts.scheme}://${parts.authority}${parts.path}`;
 }
 
@@ -266,11 +268,18 @@ async function prepareRemote(local: BootstrapDocker, dockerPath: string, started
   log.info(`The current Docker context is ${context}.`);
   // After the last SSH login of the preparation: remote.test.ts counts the logins from this time.
   const preparedAt = new Date().toISOString();
+  // The window reaches the engine through its Docker pipe, as a window that Devspaces opens (windowPipe.ts): the address
+  // that this computer makes for the devspace, with the ID of this computer that .vscode-test.mjs writes into the
+  // storage folder of the extension before VS Code starts.
+  const computerId = newComputerId();
+  const dockerHost = dockerPipeAddress(dockerPipeId(computerId, REMOTE_HOST, name), process.platform, dockerPipeBase(process.env, os.tmpdir())).dockerHost;
   return {
     remote: {
       containerName: name,
       folder,
-      folderUri: folderUri(name, folder, context),
+      folderUri: folderUri(name, folder, { host: dockerHost }),
+      computerId,
+      dockerHost,
       user: 'node',
       devspaceId,
       dockerContext: context,

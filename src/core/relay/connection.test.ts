@@ -44,6 +44,10 @@ class FakeTransport implements StartedByteProcess {
 
   onDrain(): void {}
 
+  pauseStdout(): void {}
+
+  resumeStdout(): void {}
+
   end(): void {
     this.inputEnded = true;
     const relay = this.relay;
@@ -337,7 +341,7 @@ describe('RelayConnection', () => {
     // A listener after the end is called at once; no new stream.
     connection.onClose((reason) => reasons.push(`late: ${reason}`));
     expect(reasons).toEqual(['the window closed', 'late: the window closed']);
-    expect(() => connection.openWorker()).toThrow('The connection to build-box is closed.');
+    expect(() => connection.openWorker()).toThrow('The connection to build-box is closed (the window closed).');
   });
 
   it('ends when the transport ends, with its error output as the reason', async () => {
@@ -356,18 +360,21 @@ describe('RelayConnection', () => {
     expect(transport.kills).toBe(0);
   });
 
-  it('stops the transport at once at killNow', async () => {
+  it('closes only the worker stream when the worker is stopped at once, and keeps the connection for its other streams', async () => {
     const { transport, connection } = await opened();
     const worker = connection.openWorker();
+    expect(worker.killNow).toBeUndefined();
     const reasons: string[] = [];
     connection.onClose((reason) => reasons.push(reason));
-    worker.killNow!();
-    expect(connection.isOpen).toBe(false);
-    expect(reasons).toEqual(['stopped by the extension']);
+    worker.kill();
     await expect(worker.exited).resolves.toEqual({ exitCode: null });
-    expect(transport.killsNow).toBe(1);
-    await transport.exited;
     await settle();
+    expect(connection.isOpen).toBe(true);
+    expect(reasons).toEqual([]);
+    expect(transport.killsNow).toBe(0);
+    // The window closes: RelayConnections.dispose stops the transport at once.
+    connection.killNow();
     expect(connection.isOpen).toBe(false);
+    expect(transport.killsNow).toBe(1);
   });
 });

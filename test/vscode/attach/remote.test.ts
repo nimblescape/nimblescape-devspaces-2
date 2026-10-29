@@ -5,13 +5,13 @@
 /// <reference types="mocha" />
 // Attach tests in the window of a devspace on the Docker engine of another computer (.vscode-test.mjs, label attach,
 // DEVSPACE_TEST_ATTACH=remote): Docker uses that engine over SSH (its Docker context is the current context, as after
-// "Use a Remote Docker Host…"), and VS Code starts in the window of the devspace there, whose folder URI names that
-// context. prepare.ts made the devspace without container, so the extension restores it from its volume labels on that
-// engine and runs the open pipeline there before the window connects; the Dev Containers extension attaches through
-// the context of the URI. The engine of the runner has a container with the name of the devspace container, which the
-// window must not use. The current context is the one of the URI, so these tests do not tell whether Dev Containers
-// reads the context from the URI or follows the current context; the window of another Docker host than the current
-// one closes before it attaches (controller.ts, onWindowHost).
+// "Use a Remote Docker Host…"), and VS Code starts in the window of the devspace there, whose folder URI names the
+// Docker pipe of the window (`settings.host`, src/core/relay/windowPipe.ts). prepare.ts made the devspace without
+// container, so the extension restores it from its volume labels on that engine and runs the open pipeline there
+// before the window connects; the Dev Containers extension attaches through the Docker pipe, which the extension serves
+// through the connection of the relay of its worker. The engine of the runner has a container with the name of the
+// devspace container, which the window must not use. The window of another Docker host than the current one closes
+// before it attaches (controller.ts, onWindowHost).
 // The first test counts the SSH logins of the open on the other computer and writes them to the log of the test and to
 // the summary of the CI job; it sets no limit yet.
 import * as assert from 'assert';
@@ -67,7 +67,7 @@ function logLineTime(log: string, pattern: RegExp, near: number): number | undef
 }
 
 describe('the window of a devspace on a Docker engine over SSH', () => {
-  const { containerName, dockerContext = '', remoteHost = '', remoteHostContainer = '', preparedAt = '' } = seed();
+  const { containerName, dockerContext = '', remoteHost = '', dockerHost = '', remoteHostContainer = '', preparedAt = '' } = seed();
   let failed = false;
 
   afterEach(function () {
@@ -143,15 +143,20 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
   });
 
   it('connects after the extension restored the devspace on that engine and ran its open pipeline there', async () => {
-    assert.ok(dockerContext && remoteHost, 'The seed names no Docker context and no host (prepare.ts, DEVSPACE_TEST_ATTACH_PREPARE=remote)');
+    assert.ok(dockerContext && remoteHost && dockerHost, 'The seed names no Docker context, host, or Docker pipe (prepare.ts, DEVSPACE_TEST_ATTACH_PREPARE=remote)');
     const folder = await connectedFolder();
-    assert.deepStrictEqual(decodeAuthorityParts(folder.authority), { containerName, dockerContext });
+    assert.deepStrictEqual(decodeAuthorityParts(folder.authority), { containerName, dockerHost });
     const extension = vscode.extensions.getExtension(EXTENSION_ID);
     assert.ok(extension?.isActive, `${EXTENSION_ID} is not active`);
     const log = channelLog('Devspaces');
     assert.match(log, /1 devspaces were restored from the labels of their volumes\./);
     assert.match(log, /The open pipeline of devspaces-test\/attach runs before it connects\./);
     assert.match(log, /devspaces-test\/attach is ready in the container /);
+    // The Dev Containers extension reached the engine through the Docker pipe of the window, which the extension served.
+    assert.ok(log.includes(`The Docker pipe of ${containerName} listens on ${dockerHost}.`), 'The Docker pipe of the window did not listen');
+    assert.ok(log.includes(`Docker pipe of ${containerName}: `), 'No Docker call came through the Docker pipe of the window');
+    assert.ok(!log.includes(`The Docker pipe of ${containerName} could not reach`), 'A Docker call through the Docker pipe failed');
+    assert.ok(!log.includes(`The Docker pipe of ${containerName} goes without the connection of the relay`), 'The Docker pipe went without the relay');
     // Each line of a worker names its engine: the operations ran on the other computer, none on the local Docker.
     assert.ok(log.includes(`[${remoteHost}] open#`), `No operation open on ${remoteHost} in the log`);
     assert.doesNotMatch(log, /\[the local Docker\]/);

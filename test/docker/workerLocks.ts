@@ -23,6 +23,7 @@ import { helperImageTag } from '../../src/core/helper/helperImage';
 import type { HelperBatchSession } from '../../src/core/helperChannel/helperChannel';
 import { HelperChannels, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import { NodeProcessRunner } from '../../src/core/process';
+import { RelayConnections, relayAccess } from '../../src/core/relay/connections';
 import { openRelayConnection, type RelayTransport } from '../../src/core/relay/transport';
 import { LABEL_CHANNEL_STEP, LABEL_HELPER_CHANNEL } from '../../src/core/names';
 import { LOCK_BUSY_EXIT, LOCK_STATE_DIR } from '../../src/core/helperChannel/protocol';
@@ -93,6 +94,8 @@ export function workerLocks(
     workerNames.push(all[all.indexOf('--name') + 1]);
     return all;
   };
+  // The connections of the relay of this window, as extension.ts.
+  const relayConnections = new RelayConnections({ logger: log });
   const channels = new HelperChannels({
     logger: log,
     open: (target) =>
@@ -102,7 +105,9 @@ export function workerLocks(
           relay: (target) => {
             const transport = options.relay?.(target);
             if (transport === undefined) return undefined;
-            return (command, bundle) => openRelayConnection(runner, transport, testArgs(command), bundle, { logger: log, name: target.host });
+            return relayAccess(relayConnections, target.host, (command, bundle) =>
+              openRelayConnection(runner, transport, testArgs(command), bundle, { logger: log, name: target.host }),
+            );
           },
           runDirect: (args, options) => docker.run(args, options),
           logger: log,
@@ -133,6 +138,7 @@ export function workerLocks(
     refresh: async (devspaces) => channels.refresh(await targets.current(), devspaces),
     dispose: async () => {
       channels.dispose();
+      relayConnections.dispose();
       const deadline = Date.now() + 60_000;
       while (leftovers().length > 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
       return leftovers();

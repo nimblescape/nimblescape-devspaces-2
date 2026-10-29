@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { encodeAuthority } from './connection/authority';
+import { encodeAuthority, type WindowDocker } from './connection/authority';
 import { CLOSE_REMOTE_COMMAND, CLOSE_WINDOW_COMMAND, ConnectionAdapter, OPEN_FOLDER_COMMAND, RELOAD_WINDOW_COMMAND } from './connectionAdapter';
 
 interface FakeUri {
@@ -56,8 +56,8 @@ vi.mock('vscode', () => fake.vscode);
 
 const NAME = 'devspaces-acme-api-3f2a9c1e';
 
-function remoteFolder(name: string, folder = '/workspaces/api', dockerContext?: string): { uri: FakeUri } {
-  return { uri: fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(name, dockerContext), path: folder }) };
+function remoteFolder(name: string, folder = '/workspaces/api', docker?: WindowDocker): { uri: FakeUri } {
+  return { uri: fake.uri({ scheme: 'vscode-remote', authority: encodeAuthority(name, docker), path: folder }) };
 }
 
 describe('ConnectionAdapter', () => {
@@ -95,22 +95,22 @@ describe('ConnectionAdapter', () => {
 
   // The Docker context of a remote devspace is part of the window's authority.
   it('opens the folder URI with the Docker context, in this window and in a new one', async () => {
-    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b');
-    await new ConnectionAdapter().openInNewWindow(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b');
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' });
+    await new ConnectionAdapter().openInNewWindow(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' });
     for (const call of fake.state.commands) {
-      expect((call as [string, FakeUri])[1]).toMatchObject({ authority: encodeAuthority(NAME, 'devspaces-remote-2e9f507b'), path: '/workspaces/api' });
+      expect((call as [string, FakeUri])[1]).toMatchObject({ authority: encodeAuthority(NAME, { context: 'devspaces-remote-2e9f507b' }), path: '/workspaces/api' });
     }
     expect(fake.state.commands).toHaveLength(2);
   });
 
   it('reloads only a window with the same context; a window without it (or with another) opens the new URI', async () => {
     fake.state.remoteName = 'attached-container';
-    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b')];
-    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b');
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' })];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' });
     fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
-    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b');
-    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devspaces-remote-5709ff28')];
-    await new ConnectionAdapter().open(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b');
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' });
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', { context: 'devspaces-remote-5709ff28' })];
+    await new ConnectionAdapter().open(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' });
     expect(fake.state.commands.map((call) => call[0])).toEqual([RELOAD_WINDOW_COMMAND, OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
   });
 
@@ -167,13 +167,30 @@ describe('ConnectionAdapter', () => {
   // The context in the window's own authority.
   it('reads the Docker context of the attached window, and none without one or outside an attached window', () => {
     fake.state.remoteName = 'attached-container';
-    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devspaces-remote-5709ff28')];
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', { context: 'devspaces-remote-5709ff28' })];
     expect(new ConnectionAdapter().currentDockerContext()).toBe('devspaces-remote-5709ff28');
     fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api')];
     expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
     fake.state.remoteName = 'ssh-remote';
-    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', 'devspaces-remote-5709ff28')];
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', { context: 'devspaces-remote-5709ff28' })];
     expect(new ConnectionAdapter().currentDockerContext()).toBeUndefined();
+  });
+
+  // The Docker pipe in the window's own authority.
+  it('reads the Docker host of the attached window, and reloads only a window with the same host', async () => {
+    const pipe = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
+    fake.state.remoteName = 'attached-container';
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', { host: pipe })];
+    const adapter = new ConnectionAdapter();
+    expect([adapter.currentDockerHost(), adapter.currentDockerContext()]).toEqual([pipe, undefined]);
+    await adapter.open(NAME, '/workspaces/api', { host: pipe });
+    // The same devspace through its context: another URI.
+    await adapter.open(NAME, '/workspaces/api', { context: 'devspaces-remote-5709ff28' });
+    fake.state.workspaceFolders = [remoteFolder(NAME, '/workspaces/api', { context: 'devspaces-remote-5709ff28' })];
+    expect(adapter.currentDockerHost()).toBeUndefined();
+    await adapter.open(NAME, '/workspaces/api', { host: pipe });
+    expect(fake.state.commands.map((call) => call[0])).toEqual([RELOAD_WINDOW_COMMAND, OPEN_FOLDER_COMMAND, OPEN_FOLDER_COMMAND]);
+    expect((fake.state.commands[2] as [string, FakeUri])[1]).toMatchObject({ authority: encodeAuthority(NAME, { host: pipe }) });
   });
 
   // A local workspace file of remote folders reads the authority of its first folder.

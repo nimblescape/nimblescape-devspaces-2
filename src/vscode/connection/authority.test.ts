@@ -46,7 +46,7 @@ describe('Docker context in the authority', () => {
   const OWN_FORM = '{"containerName":"/devspaces-majikmate-module-oop-a1b86a08","settings":{"context":"devspaces-remote-2e9f507b"}}';
 
   it('encodes the context exactly as the Dev Containers extension does', () => {
-    expect(encodeAuthority('devspaces-majikmate-module-oop-a1b86a08', 'devspaces-remote-2e9f507b')).toBe(`attached-container+${hexOf(OWN_FORM)}`);
+    expect(encodeAuthority('devspaces-majikmate-module-oop-a1b86a08', { context: 'devspaces-remote-2e9f507b' })).toBe(`attached-container+${hexOf(OWN_FORM)}`);
   });
 
   it('leaves settings out without a context', () => {
@@ -54,7 +54,7 @@ describe('Docker context in the authority', () => {
   });
 
   it('rejects an empty context', () => {
-    expect(() => encodeAuthority(NAME, ' ')).toThrow();
+    expect(() => encodeAuthority(NAME, { context: ' ' })).toThrow('The Docker context is empty.');
   });
 
   it('decodes the name and the context, and the name alone for decodeAuthority', () => {
@@ -65,7 +65,27 @@ describe('Docker context in the authority', () => {
   });
 
   it('puts the context into the folder URI', () => {
-    expect(folderUriParts(NAME, '/workspaces/api', 'devspaces-remote-2e9f507b').authority).toBe(encodeAuthority(NAME, 'devspaces-remote-2e9f507b'));
+    expect(folderUriParts(NAME, '/workspaces/api', { context: 'devspaces-remote-2e9f507b' }).authority).toBe(encodeAuthority(NAME, { context: 'devspaces-remote-2e9f507b' }));
+  });
+});
+
+// The Docker pipe of a remote devspace window: Dev Containers 0.470.0 gives its Docker calls DOCKER_HOST from it.
+describe('Docker host in the authority', () => {
+  const PIPE = 'unix:///run/user/1000/devspaces-0123456789abcdef/docker.sock';
+
+  it('encodes the host as settings.host, and decodes it back', () => {
+    const authority = encodeAuthority(NAME, { host: PIPE });
+    expect(authority).toBe(`attached-container+${hexOf(JSON.stringify({ containerName: `/${NAME}`, settings: { host: PIPE } }))}`);
+    expect(decodeAuthorityParts(authority)).toEqual({ containerName: NAME, dockerHost: PIPE });
+    expect(folderUriParts(NAME, '/workspaces/api', { host: PIPE }).authority).toBe(authority);
+    expect(() => encodeAuthority(NAME, { host: '' })).toThrow('The Docker host is empty.');
+  });
+
+  it('reads only the context of an authority with both, as Dev Containers uses only that one', () => {
+    const both = `attached-container+${hexOf(JSON.stringify({ containerName: `/${NAME}`, settings: { context: 'my-box', host: PIPE } }))}`;
+    expect(decodeAuthorityParts(both)).toEqual({ containerName: NAME, dockerContext: 'my-box' });
+    const other = `attached-container+${hexOf(JSON.stringify({ containerName: `/${NAME}`, settings: { host: 42 } }))}`;
+    expect(decodeAuthorityParts(other)).toEqual({ containerName: NAME });
   });
 });
 

@@ -44,6 +44,8 @@ export interface SessionCoordinatorDeps {
   settings: () => ExtensionSettings;
   /** The Docker context in the authority of this window (ConnectionAdapter.currentDockerContext), for its status file. */
   windowDockerContext?: () => string | undefined;
+  /** The Docker host address in the authority of this window (ConnectionAdapter.currentDockerHost), for its status file. */
+  windowDockerHost?: () => string | undefined;
   clock?: Clock;
   // For tests:
   /** Default: `crypto.randomUUID()`. */
@@ -504,7 +506,9 @@ export class SessionCoordinator implements vscode.Disposable {
     const generation = ++this.writeGeneration;
     const plainDevspaceId = this.plainDevspaceId;
     // Also for a window that works without Devspaces: another window that shows it opens exactly its URI.
-    const dockerContext = devspaceId === null && plainDevspaceId === null ? undefined : this.deps.windowDockerContext?.();
+    const shown = devspaceId !== null || plainDevspaceId !== null;
+    const dockerContext = shown ? this.deps.windowDockerContext?.() : undefined;
+    const dockerHost = shown ? this.deps.windowDockerHost?.() : undefined;
     const status: WindowStatus = {
       windowId: this.windowId,
       pid: this.pid,
@@ -512,6 +516,7 @@ export class SessionCoordinator implements vscode.Disposable {
       state: 'active',
       updatedAt: isoTime(this.clock),
       ...(dockerContext ? { dockerContext } : {}),
+      ...(dockerHost ? { dockerHost } : {}),
       ...(plainDevspaceId !== null ? { plainDevspaceId } : {}),
     };
     const file = this.paths.sessionFile(this.windowId);
