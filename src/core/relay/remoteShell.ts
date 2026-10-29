@@ -13,6 +13,7 @@ import { randomBytes } from 'crypto';
 import { errorMessage } from '../errors';
 import { readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
+import type { SshLoginPrompts } from '../sshAskpass';
 import { MAX_OUTPUT_BEFORE_MARKER } from './connection';
 import { shellWord } from './startScript';
 
@@ -82,6 +83,11 @@ export interface RemoteShellOptions {
   idleCloseMs?: number;
   /** Called once when the shell ends or is taken over. */
   onEnd?: () => void;
+  /**
+   * The questions of a login that may ask in VS Code (sshAskpass.ts): while one is open, the time limit of the login
+   * stops, and it starts anew when the question closes.
+   */
+  prompts?: SshLoginPrompts;
   /** Only for the tests. */
   closeKillMs?: number;
 }
@@ -154,10 +160,13 @@ export class RemoteShell {
       let stderrReady = false;
       let settled = false;
       const timeoutMs = options.loginTimeoutMs ?? SHELL_LOGIN_TIMEOUT_MS;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let stopPrompts: (() => void) | undefined;
       const settle = (error?: Error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        stopPrompts?.();
         signal?.removeEventListener('abort', onAbort);
         this.onLogin = undefined;
         if (error === undefined) {
@@ -170,7 +179,21 @@ export class RemoteShell {
         reject(error);
       };
       const fail = (detail: string, timedOut = false) => settle(new RemoteShellError(detail, timedOut));
-      const timer = setTimeout(() => fail(`ssh did not answer within ${timeoutMs / 1000} seconds.`, true), timeoutMs);
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fail(`ssh did not answer within ${timeoutMs / 1000} seconds.`, true), timeoutMs);
+      };
+      arm();
+      // A question in VS Code waits for the user: no time limit while it is open, the full one again after it.
+      stopPrompts = options.prompts?.onPrompt((open) => {
+        if (settled) return;
+        if (open) {
+          clearTimeout(timer);
+          timer = undefined;
+        } else {
+          arm();
+        }
+      });
       const onAbort = () => settle(abortError());
       if (signal?.aborted) {
         settle(abortError());

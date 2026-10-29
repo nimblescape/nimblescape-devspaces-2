@@ -141,7 +141,7 @@ describeUnix('the connection of the relay through sh -s', () => {
   it('starts on the login of the shell before the relay, after the checks on that shell', { timeout: SLOW_TEST_MS }, async () => {
     logLines.length = 0;
     const startsBefore = started.length;
-    const shells = new RemoteShells({ logger, start: () => runner.startBytes(transport.file, transport.args, { env: transport.env }) });
+    const shells = new RemoteShells({ logger, start: () => ({ process: runner.startBytes(transport.file, transport.args, { env: transport.env }) }) });
     // The checks before the relay: commands of the shell on the one login.
     await expect(shells.run('fake-host', `printf '%s' "$PPID" >/dev/null; printf checked`)).resolves.toMatchObject({ exitCode: 0, stdout: 'checked' });
     await expect(shells.run('fake-host', 'cat', { input: 'input of a check\n' })).resolves.toMatchObject({ exitCode: 0, stdout: 'input of a check\n' });

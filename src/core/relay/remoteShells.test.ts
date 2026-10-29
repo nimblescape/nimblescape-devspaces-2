@@ -25,7 +25,7 @@ function shells(options: { script?: string; noTransport?: string[]; logger?: Log
       logins.push(host);
       const process = runner.startBytes('sh', ['-c', options.script ?? 'exec sh -s']);
       processes.push(process);
-      return process;
+      return { process };
     },
     idleCloseMs: options.idleCloseMs,
     loginTimeoutMs: 5_000,

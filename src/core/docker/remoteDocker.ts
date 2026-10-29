@@ -50,6 +50,7 @@ import {
   type DockerHostProblem,
   type DockerTarget,
 } from './dockerHost';
+import { dockerShellCommand } from '../relay/remoteShell';
 import { runWithDockerTarget } from './dockerTargets';
 
 /** Time limit of `docker info` on a remote host: an SSH connection plus the question (the CLI gives ssh 30 s to connect). */
@@ -60,6 +61,8 @@ export const SSH_TIMEOUT_MS = 30_000;
 export const CONTEXT_COMMAND_TIMEOUT_MS = 15_000;
 /** `docker info` in one line of JSON: the server version and the security options (`name=rootless`). */
 export const ENGINE_INFO_FORMAT = '{"version":{{json .ServerVersion}},"securityOptions":{{json .SecurityOptions}}}';
+/** `docker info` with ENGINE_INFO_FORMAT as one command of the shell before the relay. */
+const ENGINE_INFO_COMMAND = dockerShellCommand(['info', '--format', ENGINE_INFO_FORMAT]) as string;
 
 /** The part of BootstrapDocker used here. */
 export interface RemoteDockerCli {
@@ -124,9 +127,11 @@ async function runEngineInfo(
 }
 
 /**
- * The test before a host becomes the Docker host of Devspaces: the SSH check (checkSshLogin), then
- * `docker -H ssh://<host> info`, without questions (see the module comment). The current context is not used and not
- * changed.
+ * The test before a host becomes the Docker host of Devspaces. With the shells before the relay (`ssh.shells`): one
+ * login, the shell of the host (in a flow of the user, it may ask for a password or an unknown host key in VS Code),
+ * and `docker info` of the Docker CLI of the host on it, which the start script of the relay uses too. Without them: the
+ * SSH check (checkSshLogin), then `docker -H ssh://<host> info`, without questions (see the module comment). The
+ * current context is not used and not changed.
  */
 export async function testRemoteDockerHost(
   docker: RemoteDockerCli,
@@ -134,10 +139,19 @@ export async function testRemoteDockerHost(
   ssh: SshCheckDeps,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<EngineCheck> {
+  const timeoutMs = options.timeoutMs ?? REMOTE_INFO_TIMEOUT_MS;
+  if (ssh.shells !== undefined && ssh.sshPath !== undefined && sshTargetOf(host) !== undefined) {
+    const shell = await ssh.shells.login(host, options.signal);
+    if (shell !== undefined) {
+      if (!shell.ok) return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
+      ssh.sshLogins?.remember(host);
+      const result = await ssh.shells.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal: options.signal });
+      if (result !== undefined) return engineCheckOf(result, timeoutMs);
+    }
+  }
   // Our own ssh without questions first; it always connects (no cached success).
   const login = await checkSshLogin(host, ssh, { signal: options.signal, useCache: false });
   if (!login.ok) return login;
-  const timeoutMs = options.timeoutMs ?? REMOTE_INFO_TIMEOUT_MS;
   const env = noPromptEnv(docker.processEnv());
   // -H decides the endpoint; DOCKER_CONTEXT would conflict with it.
   for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT' || key.toUpperCase() === 'DOCKER_HOST') delete env[key];

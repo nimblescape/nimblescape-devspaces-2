@@ -34,6 +34,17 @@ describe('sshRelayTransport', () => {
     ]);
   });
 
+  // A login of a flow of the user: ssh may ask, through the helper of askpassEnv, in VS Code.
+  it('leaves out BatchMode and takes the environment of the questions for a login that may ask', () => {
+    const prompts = { env: vi.fn((base: NodeJS.ProcessEnv) => ({ ...base, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' })) };
+    expect(sshRelayTransport(remoteDockerTarget('me@box:2222'), '/usr/bin/ssh', env, prompts)).toEqual({
+      file: '/usr/bin/ssh',
+      args: ['-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', RELAY_SHELL_COMMAND],
+      env: { ...env, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' },
+    });
+    expect(prompts.env).toHaveBeenCalledWith(env);
+  });
+
   it('has no transport for the local engine and for a host that is no SSH alias or address', () => {
     expect(sshRelayTransport(LOCAL_DOCKER_TARGET, '/usr/bin/ssh', env)).toBeUndefined();
     expect(sshRelayTransport({ kind: 'remote', host: 'box/path', endpoint: 'ssh://box/path' }, '/usr/bin/ssh', env)).toBeUndefined();

@@ -6,12 +6,19 @@
 // host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
 // it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
+import type { SshLoginPrompts } from '../sshAskpass';
 import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } from './remoteShell';
+
+/** A login that started: its process, and the questions it may ask in VS Code (a login of a flow of the user). */
+export interface RemoteShellStart {
+  process: StartedByteProcess;
+  prompts?: SshLoginPrompts;
+}
 
 export interface RemoteShellsOptions {
   logger: Logger;
   /** Starts the login `ssh … sh -s` to `host` (sshRelayTransport); undefined when the host has no transport. */
-  start(host: string): StartedByteProcess | undefined;
+  start(host: string): RemoteShellStart | undefined;
   /** Only for the tests. */
   loginTimeoutMs?: number;
   idleCloseMs?: number;
@@ -52,14 +59,15 @@ export class RemoteShells {
     const current = this.entries.get(host);
     if (current?.shell?.isOpen) return Promise.resolve(current.shell);
     if (current?.opening) return untilAborted(current.opening, signal);
-    const process = this.options.start(host);
-    if (process === undefined) return Promise.resolve(undefined);
+    const started = this.options.start(host);
+    if (started === undefined) return Promise.resolve(undefined);
+    const { process, prompts } = started;
     const entry: Entry = { process };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
-    entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget }).then(
+    entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
       (shell) => {
         entry.shell = shell;
         entry.opening = undefined;

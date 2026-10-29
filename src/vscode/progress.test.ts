@@ -8,6 +8,7 @@ vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode)
 
 import { Messages } from '../core/messages';
 import type { ProgressReporter } from '../core/ports';
+import { sshPromptsAllowed } from '../core/sshAskpass';
 import { currentOperation, onDidChangeBusy, progressMessage, runWithProgress, withNotificationProgress, type BusyChange } from './progress';
 import { EventEmitter, fakeVscode, resetFakeVscode } from './testing/fakeVscode';
 
@@ -58,6 +59,13 @@ describe('withNotificationProgress', () => {
     await withNotificationProgress({ title: 'Testing the connection to build-box…' }, async () => undefined);
     expect(runs[0].options.cancellable).toBe(false);
   });
+
+  // The test of a remote host is a flow of the user: its SSH login may ask for a password or a host key in VS Code.
+  it('runs the task as a flow of the user, whose SSH logins may ask', async () => {
+    scriptWithProgress();
+    expect(await withNotificationProgress({ title: 'Testing the connection to build-box…' }, async () => sshPromptsAllowed())).toBe(true);
+    expect(sshPromptsAllowed()).toBe(false);
+  });
 });
 
 describe('progressMessage', () => {
@@ -98,6 +106,13 @@ describe('runWithProgress', () => {
       `Opening acme/api… Downloading the new image. ${Messages.newerImage}`,
       'Opening acme/api… Starting devspace.',
     ]);
+  });
+
+  // A Start, an Open or a Stop of the user: the SSH login of its engine may ask in VS Code.
+  it('runs the task as a flow of the user, whose SSH logins may ask', async () => {
+    scriptWithProgress();
+    expect(await runWithProgress({ title: 'Starting acme/api…', task: async () => sshPromptsAllowed() })).toBe(true);
+    expect(sshPromptsAllowed()).toBe(false);
   });
 
   it('aborts the signal when the user selects Cancel', async () => {
