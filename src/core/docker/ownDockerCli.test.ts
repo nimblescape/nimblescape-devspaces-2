@@ -115,9 +115,12 @@ describe('the pin of the Docker CLI', () => {
 });
 
 describe('dockerCliPlatformKey and ownDockerCliDownload', () => {
-  it('maps the platforms of VS Code to the builds of Docker, with the x86_64 build for Windows on Arm', () => {
-    expect(dockerCliPlatformKey('win32', 'x64')).toBe('windows-x86_64');
-    expect(dockerCliPlatformKey('win32', 'arm64')).toBe('windows-x86_64');
+  it('maps the platforms of VS Code to the builds of Docker, with the x86_64 build for Windows 11 on Arm', () => {
+    expect(dockerCliPlatformKey('win32', 'x64', '10.0.19045')).toBe('windows-x86_64');
+    expect(dockerCliPlatformKey('win32', 'arm64', '10.0.22631')).toBe('windows-x86_64');
+    // Windows 10 on Arm runs no x64 program.
+    expect(dockerCliPlatformKey('win32', 'arm64', '10.0.19045')).toBeUndefined();
+    expect(dockerCliPlatformKey('win32', 'arm64', '')).toBeUndefined();
     expect(dockerCliPlatformKey('darwin', 'x64')).toBe('mac-x86_64');
     expect(dockerCliPlatformKey('darwin', 'arm64')).toBe('mac-aarch64');
     expect(dockerCliPlatformKey('linux', 'x64')).toBe('linux-x86_64');
@@ -128,7 +131,7 @@ describe('dockerCliPlatformKey and ownDockerCliDownload', () => {
   });
 
   it('names the archive type and the program in it', () => {
-    expect(ownDockerCliDownload('win32', 'arm64')).toMatchObject({ kind: 'zip', entry: 'docker/docker.exe', version: pin.version, url: pin.files['windows-x86_64'].url });
+    expect(ownDockerCliDownload('win32', 'arm64', undefined, '10.0.26100')).toMatchObject({ kind: 'zip', entry: 'docker/docker.exe', version: pin.version, url: pin.files['windows-x86_64'].url });
     expect(ownDockerCliDownload('darwin', 'arm64')).toMatchObject({ kind: 'tgz', entry: 'docker/docker', sha256: pin.files['mac-aarch64'].sha256 });
     expect(ownDockerCliDownload('linux', 'arm')).toBeUndefined();
     expect(ownDockerCliPath('/s/docker-cli', 'linux', '1.2.3')).toBe(path.join('/s/docker-cli', '1.2.3', 'docker'));
@@ -171,7 +174,7 @@ describe('installOwnDockerCli', () => {
     const windows = zip('docker/docker.exe', PROGRAM);
     const windowsPin = pinOf('1.2.3', 'windows-x86_64', windows, 'zip');
     const { get } = serving({ [windowsPin.files['windows-x86_64'].url]: windows });
-    const target = await installOwnDockerCli({ folder, platform: 'win32', arch: 'arm64', logger: silentLogger, pin: windowsPin, get });
+    const target = await installOwnDockerCli({ folder, platform: 'win32', arch: 'x64', logger: silentLogger, pin: windowsPin, get });
     expect(target).toBe(path.join(folder, '1.2.3', 'docker.exe'));
     expect(fs.readFileSync(target)).toEqual(PROGRAM);
   });

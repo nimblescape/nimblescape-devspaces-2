@@ -8,10 +8,11 @@
 // platform are pinned in dockerCliPin.json (written by scripts/docker-cli-pin.mjs: Docker publishes no checksums for
 // these files). The download is checked against the pin before anything is taken out of it, and only the `docker`
 // program is kept: `<global storage>/docker-cli/<version>/docker[.exe]`. A new version comes only with a new version of
-// Devspaces; the folders of older versions are removed. Windows on Arm runs the x86_64 build (Docker publishes no other).
+// Devspaces; the folders of older versions are removed. Windows 11 on Arm runs the x86_64 build (Docker publishes no other).
 // No `vscode`.
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { Logger } from '../ports';
 import { compareVersions } from '../vscodeExtensions';
@@ -51,13 +52,21 @@ export interface DockerCliDownload extends PinnedFile {
   entry: string;
 }
 
+/** The first build of Windows 11, the first Windows on Arm that runs x64 programs in emulation. */
+const WINDOWS_11_BUILD = 22000;
+
 /**
  * The key of the platform in the pin (`windows-x86_64`, `mac-aarch64`, …), or undefined where Docker publishes no
- * static build that runs. Windows on Arm gets the x86_64 build, which Windows 11 runs in emulation.
+ * static build that runs. Windows on Arm gets the x86_64 build, which Windows 11 runs in emulation (Windows 10 on Arm
+ * does not); `release` is os.release(), for Windows `10.0.<build>`.
  */
-export function dockerCliPlatformKey(platform: NodeJS.Platform, arch: string): string | undefined {
+export function dockerCliPlatformKey(platform: NodeJS.Platform, arch: string, release: string = os.release()): string | undefined {
   const cpu = arch === 'x64' ? 'x86_64' : arch === 'arm64' ? 'aarch64' : undefined;
-  if (platform === 'win32') return arch === 'x64' || arch === 'arm64' ? 'windows-x86_64' : undefined;
+  if (platform === 'win32') {
+    if (arch === 'x64') return 'windows-x86_64';
+    const build = Number.parseInt(release.split('.')[2] ?? '', 10);
+    return arch === 'arm64' && build >= WINDOWS_11_BUILD ? 'windows-x86_64' : undefined;
+  }
   if (cpu === undefined) return undefined;
   if (platform === 'darwin') return `mac-${cpu}`;
   if (platform === 'linux') return `linux-${cpu}`;
@@ -65,8 +74,8 @@ export function dockerCliPlatformKey(platform: NodeJS.Platform, arch: string): s
 }
 
 /** The download of the Docker CLI for the platform from `current` (the pin by default), or undefined (none). */
-export function ownDockerCliDownload(platform: NodeJS.Platform, arch: string, current: DockerCliPin = pin): DockerCliDownload | undefined {
-  const key = dockerCliPlatformKey(platform, arch);
+export function ownDockerCliDownload(platform: NodeJS.Platform, arch: string, current: DockerCliPin = pin, release?: string): DockerCliDownload | undefined {
+  const key = dockerCliPlatformKey(platform, arch, release);
   const file = key === undefined ? undefined : current.files[key];
   if (file === undefined) return undefined;
   const zip = platform === 'win32';

@@ -184,24 +184,26 @@ async function activateExtension(
   // with the Docker CLI of Devspaces, one tested version (docs/architecture.md "The Docker CLI of Devspaces"): its folder
   // goes first in PATH of this extension host, before the Dev Containers extension resolves the window. Devspaces itself
   // keeps the Docker CLI of this computer when it has one. A CLI that is not installed yet is downloaded below, before
-  // activate() returns.
+  // the first Docker call of the activation.
   const pipeWindow = connection.currentDockerHost() !== undefined;
+  const ownCliBuild = pipeWindow && ownDockerCliDownload(platform, process.arch) !== undefined;
+  if (pipeWindow && !ownCliBuild) {
+    logger.info(`Docker publishes no Docker CLI for ${platform} on ${process.arch} that runs here, so this window uses the Docker CLI of this computer.`);
+  }
   const useOwnDockerCli = (cli: string): void => {
     putFolderFirstInPath(process.env, platform, path.dirname(cli));
     logger.info(`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces is first in PATH of this window: ${cli}`);
   };
-  const ownCli = pipeWindow ? presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) : undefined;
+  const ownCli = ownCliBuild ? presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) : undefined;
   if (ownCli !== undefined) useOwnDockerCli(ownCli);
-  if (pipeWindow && ownDockerCliDownload(platform, process.arch) === undefined) {
-    logger.info(`Docker publishes no Docker CLI for ${platform} on ${process.arch}, so this window uses the Docker CLI of this computer.`);
-  }
   const dockerPath = installedCli ?? ownCli;
   // Windows: the Dev Containers extension, which connects the windows to the containers, runs in this extension host and
   // looks up `docker` in its PATH and in C:\Program Files\Docker\Docker\resources\bin only. A CLI that Devspaces found
   // elsewhere, for example of a per-user Docker Desktop installed after VS Code (or the browser that opened a link of
   // Devspaces) started, gets its folder at the end of PATH of this extension host, so that the Dev Containers extension
   // uses the same CLI. Devspaces activates before the Dev Containers extension resolves the window of a devspace
-  // (ATTACHED_CONTAINER_ACTIVATION_EVENT), and this runs before the first await of the activation.
+  // (ATTACHED_CONTAINER_ACTIVATION_EVENT), and this runs before the first await of the activation (the download of the
+  // Docker CLI of Devspaces comes later).
   const shareDockerFolder = (cli: string): void => {
     if (addDockerFolderToPath(process.env, platform, cli)) {
       logger.info(`The folder of the Docker CLI was added to PATH of the extension host: ${path.win32.dirname(cli)}`);
@@ -899,6 +901,17 @@ async function activateExtension(
     promise.catch((error: unknown) => logger.error(`Could not ${what}.`, error));
   };
 
+  // The Docker CLI of Devspaces that this window needs and does not have yet: downloaded now, with a progress notification
+  // (its link Show details needs the commands above), before the Docker calls below and before activate() returns. On a
+  // computer without a Docker CLI, the Docker calls of Devspaces take it at once.
+  if (ownCliBuild && ownCli === undefined) {
+    const cli = await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli });
+    if (cli !== undefined) {
+      useOwnDockerCli(cli);
+      if (installedCli === undefined) docker.lookUpCliNow();
+    }
+  }
+
   // The devspace of this window: the container of its folder URI, if the registry knows it.
   const containerName = connection.currentContainerName();
   // Before the first use of Devspaces (no registry.json and no marker of it), the activation asks Docker nothing in the
@@ -930,10 +943,6 @@ async function activateExtension(
   // devspace in its status file.
   let pipeRefused: string | undefined;
   const pipeHost = connection.currentDockerHost();
-  if (pipeWindow && ownCli === undefined && ownDockerCliDownload(platform, process.arch) !== undefined) {
-    const cli = await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli });
-    if (cli !== undefined) useOwnDockerCli(cli);
-  }
   if (pipeHost !== undefined && containerName) {
     const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
       logger,

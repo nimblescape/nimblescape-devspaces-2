@@ -144,7 +144,8 @@ export async function extractTarGzEntry(archive: string, entry: string, target: 
         const file = await fs.promises.open(target, 'wx', 0o755);
         try {
           const complete = await reader.pass(size, async (chunk) => {
-            await file.write(chunk);
+            // A write may take only a part of the chunk.
+            for (let at = 0; at < chunk.length; ) at += (await file.write(chunk, at)).bytesWritten;
           });
           if (!complete) throw new Error(`The archive ${archive} ends in ${entry}.`);
         } finally {
