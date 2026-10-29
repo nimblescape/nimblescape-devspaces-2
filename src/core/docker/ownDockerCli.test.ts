@@ -170,10 +170,14 @@ describe('installOwnDockerCli', () => {
     expect(urls).toEqual([url]);
   });
 
-  it('takes the program out of the zip archive on Windows 11 on Arm, and refuses Windows 10 on Arm', async () => {
+  it('takes the program out of the zip archive on Windows, also on Windows 11 on Arm, and refuses Windows 10 on Arm', async () => {
     const windows = zip('docker/docker.exe', PROGRAM);
     const windowsPin = pinOf('1.2.3', 'windows-x86_64', windows, 'zip');
     const { get, urls } = serving({ [windowsPin.files['windows-x86_64'].url]: windows });
+    const x64 = await installOwnDockerCli({ folder, platform: 'win32', arch: 'x64', release: '10.0.19045', logger: silentLogger, pin: windowsPin, get });
+    expect(fs.readFileSync(x64)).toEqual(PROGRAM);
+    fs.rmSync(x64);
+    urls.length = 0;
     const arm = { folder, platform: 'win32' as const, arch: 'arm64', logger: silentLogger, pin: windowsPin, get };
     await expect(installOwnDockerCli({ ...arm, release: '10.0.19045' })).rejects.toThrow('Docker publishes no Docker CLI for win32 on arm64');
     expect(urls).toEqual([]);

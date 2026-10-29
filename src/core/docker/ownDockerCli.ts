@@ -142,7 +142,7 @@ export function installOwnDockerCli(options: InstallOwnDockerCliOptions): Promis
 
 async function installNow(options: InstallOwnDockerCliOptions, current: DockerCliPin, target: string): Promise<string> {
   const { folder, platform, arch, logger } = options;
-  const download = ownDockerCliDownload(platform, arch, { pin: current, release: options.release });
+  const download = ownDockerCliDownload(platform, arch, options);
   if (download === undefined) throw new Error(`Docker publishes no Docker CLI for ${platform} on ${arch}.`);
   if (await isFile(target)) return target;
   const versionFolder = path.dirname(target);

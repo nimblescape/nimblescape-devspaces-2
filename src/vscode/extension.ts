@@ -184,7 +184,7 @@ async function activateExtension(
   // with the Docker CLI of Devspaces, one tested version (docs/architecture.md "The Docker CLI of Devspaces"): its folder
   // goes first in PATH of this extension host, before the Dev Containers extension resolves the window. Devspaces itself
   // keeps the Docker CLI of this computer when it has one. A CLI that is not installed yet is downloaded below, before
-  // the first Docker call of the activation.
+  // the window looks up its devspace and serves its pipe.
   const pipeWindow = connection.currentDockerHost() !== undefined;
   const ownCliBuild = pipeWindow && ownDockerCliDownload(platform, process.arch) !== undefined;
   if (pipeWindow && !ownCliBuild) {
