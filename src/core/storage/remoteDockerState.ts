@@ -228,10 +228,13 @@ function normalize(value: unknown): RemoteDockerStateFile {
   const offered = hostNames(record.offered);
   if (offered !== undefined) result.offered = offered;
   if (Array.isArray(record.hosts)) {
+    // One record per host: the first one, which rootlessSocket reads.
+    const seen = new Set<string>();
     result.hosts = record.hosts.flatMap((entry): RemoteDockerHostRecord[] => {
       if (typeof entry !== 'object' || entry === null) return [];
       const { host, rootlessSocket } = entry as Record<string, unknown>;
-      if (typeof host !== 'string' || host === '') return [];
+      if (typeof host !== 'string' || host === '' || seen.has(host)) return [];
+      seen.add(host);
       return [typeof rootlessSocket === 'string' && rootlessSocket.startsWith('/') ? { host, rootlessSocket } : { host }];
     });
   }

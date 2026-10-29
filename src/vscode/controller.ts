@@ -3952,7 +3952,10 @@ export class Controller implements vscode.Disposable {
     return this.withTargetOf(devspace, fn);
   }
 
-  /** Runs `fn` as one operation on the Docker host of `devspace` (withHostOf), without one on the current host. */
+  /**
+   * Runs `fn` as one operation on the Docker host of `devspace` (withHostOf), or on the current host when there is no
+   * devspace (withDockerTarget).
+   */
   private withTargetOf<T>(devspace: Devspace | undefined, fn: () => Promise<T>): Promise<T> {
     return devspace === undefined ? this.withDockerTarget(fn) : this.withHostOf(devspace, fn);
   }

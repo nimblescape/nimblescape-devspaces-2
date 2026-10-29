@@ -96,8 +96,12 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
     expect(fs.readFileSync(path.join(dir, copies[0]), 'utf8')).toBe('{"remoteHosts": ["a"');
   });
 
-  it('keeps a copy of a file whose list is not a list', async () => {
-    fs.writeFileSync(state.file, '{"remoteHosts": "a"}');
+  it.each([
+    ['the list of hosts', '{"remoteHosts": "a"}'],
+    ['the offered hosts', '{"offered": "a"}'],
+    ['the rootless sockets', '{"hosts": {"a": {"rootlessSocket": "/run/user/1000/docker.sock"}}}'],
+  ])('keeps a copy of a file whose field of %s is not a list', async (_name, text) => {
+    fs.writeFileSync(state.file, text);
     await state.setDockerHost('b');
     expect(await state.read()).toEqual({ dockerHost: 'b', remoteHosts: ['b'] });
     expect(fs.readdirSync(dir).filter((name) => name.startsWith('remote-docker.json.backup-'))).toHaveLength(1);
@@ -113,10 +117,15 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
   });
 
   it('drops the fields that it does not know, and puts a Docker host that is not listed into the list', async () => {
-    fs.writeFileSync(state.file, JSON.stringify({ other: 'x', dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: 'x' }));
-    expect(await state.read()).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'] });
+    fs.writeFileSync(
+      state.file,
+      JSON.stringify({ other: 'x', dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: [1], hosts: [{ host: 'a', rootlessSocket: '/s1' }, { host: 'a', rootlessSocket: '/s2' }, 'b'] }),
+    );
+    expect(await state.read()).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'], hosts: [{ host: 'a', rootlessSocket: '/s1' }] });
     await state.claimOffer('x');
-    expect(JSON.parse(fs.readFileSync(state.file, 'utf8'))).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'], offered: ['x'] });
+    expect(JSON.parse(fs.readFileSync(state.file, 'utf8'))).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'], offered: ['x'], hosts: [{ host: 'a', rootlessSocket: '/s1' }] });
+    // The fields are lists, so no copy is kept.
+    expect(fs.readdirSync(dir).filter((name) => name.startsWith('remote-docker.json.backup-'))).toHaveLength(0);
   });
 });
 
