@@ -9,7 +9,7 @@
 // connection is open once the HELLO of the relay came. The error output of the transport (the messages of `ssh`, the
 // relay, and the worker) is kept as the reason of a failure, as the error output of the Docker CLI before. A stream to
 // the target `worker` is the program of a helper channel (openWorker). No `vscode`.
-import { encodeBundle, readableStderr } from '../loader/pipeLoader';
+import { readableStderr } from '../loader/pipeLoader';
 import { decodedOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
 import { Mux } from './mux';
 
@@ -43,8 +43,8 @@ export interface RelayConnectionOptions {
   marker: string;
   /** The start script for `sh -s` (relayStartScript with `marker`). */
   startScript: string;
-  /** The bundle (dist/helperChannel.js): the first line of the pipe loader of the relay. */
-  bundle: string;
+  /** The first line of the pipe loader of the relay: the bundle (dist/helperChannel.js) as bundleLine encodes it. */
+  bundleLine: string;
   openTimeoutMs?: number;
   closeKillMs?: number;
   /** Only for the tests. */
@@ -67,8 +67,8 @@ export class RelayConnection {
 
   /**
    * Starts the connection on `process` and resolves once the relay said HELLO. Rejects with RelayConnectionError, and
-   * stops the process, when the transport ends before, when the login prints more than MAX_OUTPUT_BEFORE_MARKER before
-   * the marker, when the relay breaks the rules, and after `openTimeoutMs`.
+   * stops the process, when the transport or its output ends before, when the login prints more than
+   * MAX_OUTPUT_BEFORE_MARKER before the marker, when the relay breaks the rules, and after `openTimeoutMs`.
    */
   static open(process: StartedByteProcess, options: RelayConnectionOptions): Promise<RelayConnection> {
     return new RelayConnection(process, options).start();
@@ -128,8 +128,8 @@ export class RelayConnection {
         settle({ exitCode: null });
       },
       killNow: () => {
-        this.killNow();
         settle({ exitCode: null });
+        this.killNow();
       },
       onStdout: stdout.listen,
       onStderr: (listener) => {
@@ -147,10 +147,16 @@ export class RelayConnection {
     this.shutdown(reason);
   }
 
-  /** Stops the transport at once (the end of the extension host). */
+  /** Ends the connection and stops the transport at once (the end of the extension host). */
   killNow(): void {
+    this.shutdown('stopped by the extension');
     if (this.process.killNow) this.process.killNow();
     else this.process.kill();
+  }
+
+  /** The readable end of the error output of the transport (readableStderr), or empty. */
+  private stderrReason(): string {
+    return readableStderr(this.stderrTail, STDERR_TAIL_LENGTH);
   }
 
   private start(): Promise<RelayConnection> {
@@ -195,7 +201,7 @@ export class RelayConnection {
           const rest = before.subarray(at + marker.length);
           before = undefined;
           // The first line of the pipe loader, then the frames (the extension sends none before the HELLO of the relay).
-          process.write(Buffer.from(encodeBundle(options.bundle), 'utf8'));
+          process.write(Buffer.from(options.bundleLine, 'utf8'));
           this.mux = new Mux({
             side: 'extension',
             link: {
@@ -219,19 +225,20 @@ export class RelayConnection {
           });
           if (rest.length > 0) this.mux.input(rest);
         },
-        // The end of the transport says why (its error output): before the HELLO, the open fails with it; after, the
-        // connection ends with it when the transport ends within EXIT_REASON_WAIT_MS.
+        // The end of the transport says why (its error output): the open fails, or the connection ends, with it when
+        // the transport ends within EXIT_REASON_WAIT_MS. A transport that keeps running after the end of its output (for
+        // example `ssh` that waits for a program of the session) ends the open or the connection then, without it.
         () => {
-          if (!settled) return;
           let wait: ReturnType<typeof setTimeout> | undefined;
           void Promise.race([process.exited, new Promise((resolve) => (wait = setTimeout(resolve, EXIT_REASON_WAIT_MS)))]).then(() => {
             clearTimeout(wait);
-            this.mux?.inputEnded();
+            if (this.mux) this.mux.inputEnded();
+            else fail(`its output ended (${this.stderrReason() || 'no error output'})`);
           });
         },
       );
       void process.exited.then(({ exitCode, error }) => {
-        const why = error ? error.message : readableStderr(this.stderrTail, STDERR_TAIL_LENGTH) || `exit code ${exitCode}`;
+        const why = error ? error.message : this.stderrReason() || `exit code ${exitCode}`;
         if (!settled) fail(`it ended (${why})`);
         else this.shutdown(`the connection ended (${why})`);
       });
