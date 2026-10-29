@@ -252,6 +252,8 @@ async function activateExtension(
   // ghcr.io login it could use (the GitHub sign-in is the ghcr.io login of the operations in the worker only).
   const registryClient = new RegistryClient(nodeHttpsTransport, credentials.provider(), logger);
   const helperDockerfile = context.asAbsolutePath(path.join('resources', 'helper', 'Dockerfile'));
+  // The connections of the relay of this window, one per remote host: its worker channel and its Docker pipe share it.
+  const relayConnections = new RelayConnections({ logger });
   // The helper image of the bootstrap, apart from the steps of the workspace helper (the worker's).
   const helper = new HelperImages({
     docker,
@@ -274,8 +276,12 @@ async function activateExtension(
       heartbeats.imageBuilt();
       // A build (a Start, for example) also ends the wait after a failed background build.
       missingHelperBuild?.clearFailures();
-      // A Stop or a Delete of a devspace that the user kept on an engine with the removal mark builds it there again.
       const built = operationDockerTarget();
+      // The next worker on the engine starts in a new container of the relay, from the new image (the open connection
+      // keeps its streams); every remote engine when the engine of the build is not known.
+      if (built === undefined) relayConnections.retireAll();
+      else if (built.kind === 'remote') relayConnections.retireAll(built.host);
+      // A Stop or a Delete of a devspace that the user kept on an engine with the removal mark builds it there again.
       if (built !== undefined) void engineRemoved(built).then((removed) => (removed ? logger.info(removedEngineImageNote(describeDockerHost(built.host))) : undefined));
     },
   });
@@ -356,8 +362,6 @@ async function activateExtension(
   context.subscriptions.push(closingWork.deferred({ dispose: () => helperBuilds.dispose() }));
   // The window of an attached container, also in the names of its workers (ConnectionAdapter.windowName).
   const connection = new ConnectionAdapter(logger);
-  // The connections of the relay of this window, one per remote host: its worker channel and its Docker pipe share it.
-  const relayConnections = new RelayConnections({ logger });
   const channels = new HelperChannels({
     logger,
     // The refresh found no helper image (see helperBuilds above); never on an engine that Devspaces was removed from.
@@ -978,7 +982,7 @@ async function activateExtension(
 
   // The Docker pipe in the authority of this window (docs/architecture.md "The Docker pipe"): served before activate()
   // returns, because the Dev Containers extension reaches the engine of the devspace through it once VS Code resolves
-  // the authority. It ends after the release of the window (closingWork), like the connection of the relay.
+  // the authority.
   const pipeHost = connection.currentDockerHost();
   if (pipeHost !== undefined && containerName) {
     const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
@@ -1006,7 +1010,9 @@ async function activateExtension(
         return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
       },
     });
-    if (served.kind === 'served') context.subscriptions.push(closingWork.deferred({ dispose: () => served.pipe.close() }));
+    // Closed at once when the window closes (the release of deactivate() does not use it), so that the extension host of
+    // the window after a reload can serve the address.
+    if (served.kind === 'served') context.subscriptions.push({ dispose: () => served.pipe.close() });
     // Without its pipe, the window must not connect. The window of a container whose owner cannot be read leaves below,
     // after the token left the container.
     if (served.kind === 'refused' && labeled.kind !== 'unreadable') {

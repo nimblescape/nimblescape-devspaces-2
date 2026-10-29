@@ -27,13 +27,17 @@ export interface RelayConnectionsOptions {
  * worker channel and the Docker pipe of the window share, or a new one.
  */
 export interface RelayAccess {
-  /** The open connection to the engine; undefined when none is open. */
+  /** The open connection to the engine on which a worker may start; undefined when none is open (see retire). */
   current(): RelayConnection | undefined;
   /**
    * Opens a new connection: starts `command` (`docker run …`) on the computer of the engine and writes `bundle` as the
-   * first line of its pipe loader. It is `current` from then on.
+   * first line of its pipe loader. It becomes the current one only with `use`, after its worker passed its checks.
    */
   connect(command: readonly string[], bundle: string): Promise<RelayConnection>;
+  /** `connection` (from connect) is the current connection to the engine from now on. */
+  use(connection: RelayConnection): void;
+  /** No new worker starts on `connection` (a worker could not be opened on it); the next worker opens a new one. */
+  retire(connection: RelayConnection): void;
 }
 
 /** The RelayAccess of the engine on `host`: the connection of `connections`, or a new one with `connect` that it keeps. */
@@ -43,12 +47,16 @@ export function relayAccess(
   connect: (command: readonly string[], bundle: string) => Promise<RelayConnection>,
 ): RelayAccess {
   return {
-    current: () => connections.get(host),
+    current: () => connections.forWorker(host),
     connect: async (command, bundle) => {
       const connection = await connect(command, bundle);
       connections.add(host, connection);
+      // The window closed meanwhile: `add` stopped it.
+      if (!connection.isOpen) throw new Error('The window closes.');
       return connection;
     },
+    use: (connection) => connections.use(host, connection),
+    retire: (connection) => connections.retire(connection),
   };
 }
 
@@ -56,10 +64,10 @@ export function relayAccess(
 export class RelayConnections {
   private readonly current = new Map<string, RelayConnection>();
   /**
-   * Every connection that is not closed yet, with the time since when it has no stream and the number of streams that
-   * were opened on it at the last sweep.
+   * Every connection that is not closed yet: its host, the time since when it has no stream, the number of streams that
+   * were opened on it at the last sweep, and whether new workers may start on it.
    */
-  private readonly all = new Map<RelayConnection, { host: string; idleSince?: number; opened: number }>();
+  private readonly all = new Map<RelayConnection, { host: string; idleSince?: number; opened: number; retired: boolean }>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private disposed = false;
 
@@ -68,28 +76,54 @@ export class RelayConnections {
     this.sweepTimer.unref?.();
   }
 
-  /** The open connection to `host`, or undefined. */
+  /** The open connection to `host` for a Docker stream, or undefined. */
   get(host: string): RelayConnection | undefined {
     const connection = this.current.get(host);
     return connection?.isOpen ? connection : undefined;
   }
 
+  /** The open connection to `host` on which a new worker may start (not retired), or undefined. */
+  forWorker(host: string): RelayConnection | undefined {
+    const connection = this.get(host);
+    return connection !== undefined && this.all.get(connection)?.retired === false ? connection : undefined;
+  }
+
   /**
-   * Keeps `connection` as the connection to `host` (a new one that the worker channel opened). An older connection to
-   * the host stays until its streams ended and it was idle, so a stream on it is not lost. After `dispose`, it is
-   * stopped at once.
+   * Keeps `connection` to `host` (a new one that the worker channel opened) until it ends, for `close`, the sweeps and
+   * `dispose`; it is not the current one before `use`. After `dispose`, it is stopped at once.
    */
   add(host: string, connection: RelayConnection): void {
     if (this.disposed) {
       connection.killNow();
       return;
     }
-    this.current.set(host, connection);
-    this.all.set(connection, { host, opened: connection.streamsOpened });
+    this.all.set(connection, { host, opened: connection.streamsOpened, retired: false });
     connection.onClose(() => {
       this.all.delete(connection);
       if (this.current.get(host) === connection) this.current.delete(host);
     });
+  }
+
+  /**
+   * `connection` (added, its worker passed its checks) is the connection to `host` from now on. An older connection to
+   * the host stays until its streams ended and it was idle, so a stream on it is not lost.
+   */
+  use(host: string, connection: RelayConnection): void {
+    if (this.all.get(connection)?.host === host && connection.isOpen) this.current.set(host, connection);
+  }
+
+  /** No new worker starts on `connection`; it still carries its streams and the Docker streams until a new one is used. */
+  retire(connection: RelayConnection): void {
+    const entry = this.all.get(connection);
+    if (entry !== undefined) entry.retired = true;
+  }
+
+  /**
+   * No new worker starts on the connections to `host` (every host when undefined): the helper image was built again, and
+   * the containers of these connections run the image from before.
+   */
+  retireAll(host?: string): void {
+    for (const entry of this.all.values()) if (host === undefined || entry.host === host) entry.retired = true;
   }
 
   /** Closes every connection to `host` ("Remove Devspaces from This Docker Engine…"); its streams are lost. */

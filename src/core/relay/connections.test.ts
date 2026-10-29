@@ -50,13 +50,24 @@ function registry(now: () => number = () => 0): RelayConnections {
 
 const asConnection = (fake: FakeConnection) => fake as unknown as RelayConnection;
 
+/** Adds `fake` and uses it as the connection to `host` (its worker passed the checks). */
+function addUsed(connections: RelayConnections, host: string, fake: FakeConnection): void {
+  connections.add(host, asConnection(fake));
+  connections.use(host, asConnection(fake));
+}
+
 describe('RelayConnections', () => {
-  it('keeps the connection of each host, and forgets it when it ends', () => {
+  it('keeps the connection of each host once it is used, and forgets it when it ends', () => {
     const connections = registry();
     const box = new FakeConnection();
     const other = new FakeConnection();
     connections.add('build-box', asConnection(box));
-    connections.add('me@other:2222', asConnection(other));
+    // Not before its worker passed the checks.
+    expect(connections.get('build-box')).toBeUndefined();
+    connections.use('build-box', asConnection(box));
+    addUsed(connections, 'me@other:2222', other);
+    // Never as the connection of another host.
+    connections.use('third', asConnection(box));
     expect(connections.get('build-box')).toBe(box);
     expect(connections.get('me@other:2222')).toBe(other);
     expect(connections.get('third')).toBeUndefined();
@@ -69,7 +80,7 @@ describe('RelayConnections', () => {
     let now = 0;
     const connections = registry(() => now);
     const connection = new FakeConnection();
-    connections.add('build-box', asConnection(connection));
+    addUsed(connections, 'build-box', connection);
     connection.streamCount = 1;
     connections.sweep();
     now = RELAY_IDLE_CLOSE_MS * 2;
@@ -109,8 +120,8 @@ describe('RelayConnections', () => {
     const older = new FakeConnection();
     const newer = new FakeConnection();
     older.streamCount = 1;
-    connections.add('build-box', asConnection(older));
-    connections.add('build-box', asConnection(newer));
+    addUsed(connections, 'build-box', older);
+    addUsed(connections, 'build-box', newer);
     expect(connections.get('build-box')).toBe(newer);
     older.close('the worker ended');
     expect(connections.get('build-box')).toBe(newer);
@@ -139,7 +150,7 @@ describe('RelayConnections', () => {
     expect(connections.get('build-box')).toBeUndefined();
   });
 
-  it('relayAccess: the open connection of the host, or a new one that the registry keeps', async () => {
+  it('relayAccess: the open connection of the host for a worker, or a new one that the registry keeps and that the host uses after `use`', async () => {
     const connections = registry();
     const created = new FakeConnection();
     const connect = vi.fn(async () => asConnection(created));
@@ -147,7 +158,31 @@ describe('RelayConnections', () => {
     expect(access.current()).toBeUndefined();
     await expect(access.connect(['docker', 'run'], 'bundle')).resolves.toBe(created);
     expect(connect).toHaveBeenCalledWith(['docker', 'run'], 'bundle');
+    expect([access.current(), connections.get('build-box')]).toEqual([undefined, undefined]);
+    access.use(asConnection(created));
     expect(access.current()).toBe(created);
     expect(connections.get('build-box')).toBe(created);
+    // Retired: it still carries the Docker streams, but the next worker opens a new connection.
+    access.retire(asConnection(created));
+    expect(access.current()).toBeUndefined();
+    expect(connections.get('build-box')).toBe(created);
+    // A connection that comes after the window closed is stopped, and the open fails.
+    connections.dispose();
+    const late = new FakeConnection();
+    await expect(relayAccess(connections, 'build-box', async () => asConnection(late)).connect(['docker', 'run'], 'bundle')).rejects.toThrow('The window closes.');
+    expect(late.ends).toEqual(['killNow']);
+  });
+
+  it('retires the connections of a host, or of every host, for new workers after a build of the helper image', () => {
+    const connections = registry();
+    const box = new FakeConnection();
+    const other = new FakeConnection();
+    addUsed(connections, 'build-box', box);
+    addUsed(connections, 'other', other);
+    connections.retireAll('build-box');
+    expect([connections.forWorker('build-box'), connections.forWorker('other')]).toEqual([undefined, other]);
+    connections.retireAll();
+    expect(connections.forWorker('other')).toBeUndefined();
+    expect([connections.get('build-box'), connections.get('other')]).toEqual([box, other]);
   });
 });

@@ -58,9 +58,9 @@ function fakeConnection(worker: StartedProcess) {
   return connection;
 }
 
-/** A RelayAccess without an open connection, whose new connections come from `connect`. */
-function access(connect: RelayAccess['connect']): RelayAccess {
-  return { current: () => undefined, connect };
+/** A RelayAccess with the open connection `current` (none by default), whose new connections come from `connect`. */
+function access(connect: RelayAccess['connect'], current?: unknown) {
+  return { current: () => current as RelayConnection | undefined, connect, use: vi.fn<RelayAccess['use']>(), retire: vi.fn<RelayAccess['retire']>() };
 }
 
 function deps(overrides: Partial<ChannelOpenDeps>): ChannelOpenDeps {
@@ -85,15 +85,16 @@ describe('openHelperChannel with the connection of the relay', () => {
     const worker = fakeWorker();
     const connection = fakeConnection(worker);
     const connects: { command: readonly string[]; bundle: string }[] = [];
-    const relay = vi.fn(() =>
-      access(async (command, bundle) => {
-        connects.push({ command, bundle });
-        return connection as unknown as RelayConnection;
-      }),
-    );
+    const relayAccess = access(async (command, bundle) => {
+      connects.push({ command, bundle });
+      return connection as unknown as RelayConnection;
+    });
+    const relay = vi.fn(() => relayAccess);
     const channel = await openHelperChannel(deps({ relay }), REMOTE);
     expect(relay).toHaveBeenCalledWith(REMOTE);
     expect(connects).toHaveLength(1);
+    // The engine uses the new connection only after the checks of the worker.
+    expect(relayAccess.use).toHaveBeenCalledWith(connection);
     const [{ command, bundle }] = connects;
     // `docker run` of the worker container, with the relay as its first program.
     expect(command.slice(0, 3)).toEqual(['docker', 'run', '--rm']);
@@ -117,7 +118,7 @@ describe('openHelperChannel with the connection of the relay', () => {
     const connect = vi.fn<RelayAccess['connect']>();
     const socketPath = vi.fn(async () => '/var/run/docker.sock');
     const runDirect = vi.fn<ChannelOpenDeps['runDirect']>(async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false }));
-    const relay = () => ({ current: () => connection as unknown as RelayConnection, connect });
+    const relay = () => access(connect, connection);
     const channel = await openHelperChannel(deps({ relay, socketPath, runDirect }), REMOTE);
     expect(connect).not.toHaveBeenCalled();
     expect(connection.openWorker).toHaveBeenCalledTimes(1);
@@ -128,18 +129,22 @@ describe('openHelperChannel with the connection of the relay', () => {
     channel.close();
   });
 
-  it('closes a new connection when the worker on it reaches another engine, and never the open connection of the engine', async () => {
+  it('closes a new connection when the worker on it reaches another engine, and only retires the open connection of the engine', async () => {
     const otherEngine = async () => ({ exitCode: 0, stdout: '"another-engine" "/var/lib/docker"\n', stderr: '', timedOut: false });
     const fresh = fakeConnection(fakeWorker());
-    await expect(openHelperChannel(deps({ relay: () => access(async () => fresh as unknown as RelayConnection), runDirect: otherEngine }), REMOTE)).rejects.toMatchObject({
+    const freshAccess = access(async () => fresh as unknown as RelayConnection);
+    await expect(openHelperChannel(deps({ relay: () => freshAccess, runDirect: otherEngine }), REMOTE)).rejects.toMatchObject({
       code: 'open',
       message: expect.stringContaining('it reaches another Docker engine'),
     });
     expect(fresh.closes).toEqual(['the worker could not be opened']);
+    expect(freshAccess.use).not.toHaveBeenCalled();
+    // The open connection keeps its streams (the Docker pipe of the window); the next worker opens a new one.
     const shared = fakeConnection(fakeWorker());
-    const relay = () => ({ current: () => shared as unknown as RelayConnection, connect: vi.fn<RelayAccess['connect']>() });
-    await expect(openHelperChannel(deps({ relay, runDirect: otherEngine }), REMOTE)).rejects.toMatchObject({ code: 'open' });
+    const sharedAccess = access(vi.fn<RelayAccess['connect']>(), shared);
+    await expect(openHelperChannel(deps({ relay: () => sharedAccess, runDirect: otherEngine }), REMOTE)).rejects.toMatchObject({ code: 'open' });
     expect(shared.closes).toEqual([]);
+    expect(sharedAccess.retire).toHaveBeenCalledWith(shared);
   });
 
   it('takes the next name when `docker run` refused the name in use, and starts without network on a daemon without bridge', async () => {

@@ -192,6 +192,33 @@ describe('serveWindowPipe', () => {
     expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: ssh was not found, or marked-box is no SSH host`);
   });
 
+  it('waits for one open of the connection of the relay at most a while, and goes without it for one connection that it cannot carry', async () => {
+    const runner = new NodeProcessRunner();
+    const dialStdio = vi.fn<WindowPipeDeps['dialStdio']>(() => runner.startBytes('cat', []));
+    const log = logger();
+    const address = dockerPipeAddress(dockerPipeId(COMPUTER, 'build-box', CONTAINER), 'linux', base());
+    let open: (connection: RelayConnection) => void = () => {};
+    const relayConnection = vi.fn<WindowPipeDeps['relayConnection']>(() => new Promise((resolve) => (open = resolve)));
+    await serve(address.dockerHost, devspace('build-box'), deps({ logger: log, relayConnection, dialStdio, relayWaitMs: 50 }));
+    // Two connections while the worker opens the connection: one open, and each logs in itself after the wait.
+    await expect(Promise.all([roundTrip(address.path, 'first'), roundTrip(address.path, 'second')])).resolves.toEqual(['first', 'second']);
+    expect(relayConnection).toHaveBeenCalledTimes(1);
+    expect(log.lines.filter((line) => line.includes('is not open'))).toEqual([
+      `info The connection of the relay to build-box is not open after 0.05 s. Until it is, each Docker connection of ${CONTAINER} logs in itself.`,
+    ]);
+    // The open goes on; the next connections go through the connection that it opened (as relayConnections.get).
+    const opened = echoRelay();
+    open(opened);
+    relayConnection.mockResolvedValue(opened);
+    await expect(roundTrip(address.path, 'third')).resolves.toBe('relay: third');
+    // A connection that the relay cannot carry (it has no stream left) logs in itself; the next one tries the relay again.
+    const full = { openDocker: () => { throw new Error('The connection to build-box has no stream left.'); } } as unknown as RelayConnection;
+    relayConnection.mockResolvedValueOnce(full).mockResolvedValue(echoRelay());
+    await expect(roundTrip(address.path, 'fourth')).resolves.toBe('fourth');
+    expect(log.lines.filter((line) => line.startsWith('warn'))).toEqual([`warn A Docker connection of ${CONTAINER} goes without the connection of the relay: The connection to build-box has no stream left.`]);
+    await expect(roundTrip(address.path, 'fifth')).resolves.toBe('relay: fifth');
+  });
+
   it('goes without the connection of the relay while it cannot be had, and tries it again after a while', async () => {
     const runner = new NodeProcessRunner();
     const dialStdio = vi.fn<WindowPipeDeps['dialStdio']>(() => runner.startBytes('cat', []));

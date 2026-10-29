@@ -245,7 +245,7 @@ async function openBehindRelay(
 /**
  * Opens a channel to the engine of `target`: starts the container with the Docker context of `target` (a remote engine
  * with a transport: behind the relay, ChannelOpenDeps.relay; on the open connection of the engine when it has one, else
- * on a new one, which ends again when the open fails), then checks with
+ * on a new one, which ends again when the open fails, and which the engine uses only after the checks), then checks with
  * the operation `probe` that the worker reaches its engine, and that it is the engine of `target`: the engine identity
  * of the probe must be the one that ENGINE_IDENTITY_ARGS reads without the worker (a socket mount of another engine,
  * for example with DOCKER_HOST set to a TCP endpoint of this computer, is refused). The worker reads its identity over
@@ -256,17 +256,21 @@ async function openBehindRelay(
 export async function openHelperChannel(deps: ChannelOpenDeps, target: DockerTarget): Promise<HelperChannel> {
   const name = engineName(target);
   const relay = target.kind === 'remote' ? deps.relay?.(target) : undefined;
-  // The new connection of the relay that this open made.
+  // The open connection of the engine (an earlier worker opened it, and the Docker pipe of the window keeps it): the
+  // worker starts in its container, without a new login, and keeps the name of that container.
+  const shared = relay?.current();
+  // The new connection of the relay that this open made: the current one of the engine only after the checks, so that
+  // no Docker stream of the window goes to an engine that the checks refuse.
   let opened: RelayConnection | undefined;
   try {
-    // The open connection of the engine (the Docker pipe of the window, or an earlier worker, opened it): the worker
-    // starts in its container, without a new login, and keeps the name of that container.
-    const shared = relay?.current();
     const channel = shared !== undefined ? await openWorkerOn(shared, deps.logger, name) : await startChannel(deps, target, name, relay, (connection) => (opened = connection));
     await checkChannelEngine(deps, target, name, channel);
+    if (opened !== undefined) relay?.use(opened);
     return channel;
   } catch (error) {
     opened?.close('the worker could not be opened');
+    // Its streams stay; the next worker opens a new connection instead of failing on this one again.
+    if (shared !== undefined) relay?.retire(shared);
     throw error;
   }
 }
