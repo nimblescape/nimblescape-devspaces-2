@@ -29,6 +29,12 @@ export interface Seed {
   /** The run `remote` only: the Docker context of the other computer (in the folder URI) and its host of the SSH config. */
   dockerContext?: string;
   remoteHost?: string;
+  /**
+   * The run `remote` only: the container of the other computer on the Docker engine of the runner, and the time (ISO
+   * 8601) after the last SSH login of the preparation, from which remote.test.ts counts the logins of the open.
+   */
+  remoteHostContainer?: string;
+  preparedAt?: string;
   /** A devspace only: its ID (the label nimblescape.devspaces.id of its volume). */
   devspaceId?: string;
   /**
