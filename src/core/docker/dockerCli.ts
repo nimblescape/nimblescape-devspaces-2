@@ -207,6 +207,18 @@ export function addDockerFolderToPath(env: NodeJS.ProcessEnv, platform: NodeJS.P
   return true;
 }
 
+/**
+ * Puts `folder` first in PATH of `env` (under the spelling of the key that `env` has on Windows, for example `Path`),
+ * and removes its other entries, so that a program started with `env` finds the `docker` in it first. Changes `env`.
+ */
+export function putFolderFirstInPath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, folder: string): void {
+  const key = platform === 'win32' ? (Object.keys(env).find((name) => name.toLowerCase() === 'path' && env[name] !== undefined) ?? 'Path') : 'PATH';
+  const delimiter = pathDelimiter(platform);
+  const folderId = folderKey(folder, platform);
+  const others = (env[key] ?? '').split(delimiter).filter((entry) => entry.trim() !== '' && folderKey(entry, platform) !== folderId);
+  env[key] = [folder, ...others].join(delimiter);
+}
+
 // The words of a Docker command and the calls that only read, for the Docker CLI of the bootstrap.
 
 /** Options of the Docker CLI before the command that take a value (`docker -H ssh://box info`). */

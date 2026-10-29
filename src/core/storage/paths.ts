@@ -76,6 +76,8 @@ export class StoragePaths {
    * that a later loss of registry.json still counts as a use of Devspaces.
    */
   readonly usedMarker: string;
+  /** The Docker CLI of Devspaces, `docker-cli/<version>/docker[.exe]` (ownDockerCli.ts). */
+  readonly dockerCliDir: string;
 
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
@@ -91,6 +93,7 @@ export class StoragePaths {
     this.computerId = path.join(root, 'computer.id');
     this.configChecksDir = path.join(root, 'checks');
     this.usedMarker = path.join(root, 'used');
+    this.dockerCliDir = path.join(root, 'docker-cli');
   }
 
   /**

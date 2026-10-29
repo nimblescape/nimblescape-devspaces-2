@@ -14,12 +14,16 @@
 // before it attaches (controller.ts, onWindowHost).
 // The first test counts the SSH logins of the open on the other computer, writes them to the log of the test and to the
 // summary of the CI job, and allows one: the checks before the relay run on the shell whose login the relay takes over.
+// The window attaches with the Docker CLI of Devspaces (src/core/docker/ownDockerCli.ts), which it downloads before the
+// Dev Containers extension resolves it, because VS Code starts directly in that window.
 import * as assert from 'assert';
 import * as childProcess from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { DEFAULT_CONTEXT_NAME } from '../../../src/core/docker/dockerHost';
+import { OWN_DOCKER_CLI_VERSION } from '../../../src/core/docker/ownDockerCli';
 import { LABEL_DEVSPACE_ID, LABEL_HELPER } from '../../../src/core/names';
 import { LABEL_MONITOR } from '../../../src/core/remoteMonitor/protocol';
 import { decodeAuthorityParts } from '../../../src/vscode/connection/authority';
@@ -194,6 +198,28 @@ describe('the window of a devspace on a Docker engine over SSH', () => {
     assert.strictEqual(docker(['--context', dockerContext, 'inspect', '-f', '{{.State.Status}}', containerName]).trim(), 'running');
     const entries = (await vscode.workspace.fs.readDirectory(folder)).map(([name]) => name);
     assert.ok(entries.includes('.devcontainer'), entries.join(', '));
+  });
+
+  it('attaches with the Docker CLI of Devspaces', () => {
+    const log = channelLog('Devspaces');
+    const first = new RegExp(`The Docker CLI ${OWN_DOCKER_CLI_VERSION.replaceAll('.', '\\.')} of Devspaces is first in PATH of this window: (.+)$`, 'm').exec(log);
+    assert.ok(first, 'The window did not put the Docker CLI of Devspaces first in PATH');
+    const cli = first[1].trim();
+    console.log(`    ${log.split('\n').find((line) => line.includes(' of Devspaces is installed: ')) ?? `the Docker CLI of Devspaces was installed before: ${cli}`}`);
+    assert.strictEqual(process.env.PATH?.split(path.delimiter)[0], path.dirname(cli));
+    assert.match(childProcess.execFileSync(cli, ['--version'], { encoding: 'utf8' }), new RegExp(`^Docker version ${OWN_DOCKER_CLI_VERSION.replaceAll('.', '\\.')},`));
+    // The Dev Containers extension of this extension host keeps a `docker exec` open for the connection of the window
+    // to the VS Code server in the container: it runs the program of Devspaces (Linux: the program of each process).
+    const program = fs.realpathSync(cli);
+    const pids = fs.readdirSync('/proc').filter((name) => /^\d+$/.test(name));
+    const running = pids.filter((pid) => {
+      try {
+        return fs.readlinkSync(`/proc/${pid}/exe`) === program;
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(running.length > 0, `No process runs ${cli}`);
   });
 
   it('works in the container on that engine, not in the container of the same name on the local Docker', async () => {

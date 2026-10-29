@@ -169,6 +169,8 @@ export interface ControllerDeps {
    * Default: none.
    */
   windowDockerHost?: (devspace: Devspace, containerName: string) => string | undefined;
+  /** Before a window with a Docker pipe (windowDockerHost) opens: installs the Docker CLI of Devspaces. Never rejects. */
+  prepareDockerPipeWindow?: () => Promise<void>;
   /** "Use a Remote Docker Host…", "Use the Local Docker", and the switch back of a restored window. */
   remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost' | 'askAgain' | 'offerSwitchBack'>;
   /**
@@ -4052,6 +4054,7 @@ export class Controller implements vscode.Disposable {
     } catch (error) {
       this.logger.warn(`The Docker context of ${host} could not be made (${errorMessage(error)}). The window connects through its Docker pipe.`);
     }
+    await this.deps.prepareDockerPipeWindow?.();
     return [containerName, folder, { host: pipe }];
   }
 

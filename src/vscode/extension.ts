@@ -11,7 +11,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
-import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable } from '../core/docker/dockerCli';
+import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
+import { installOwnDockerCli, ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
 import { classifyDockerEndpoint, describeDockerHost, dockerHostOf, isOnDockerHost, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
@@ -68,6 +69,7 @@ import type { Devspace, ExtensionSettings } from '../core/types';
 import { AccountOffers } from './accountOffers';
 import { VsCodeGitHubAuth, watchGitHubEnterpriseSettings } from './auth';
 import { ConnectionAdapter } from './connectionAdapter';
+import { installOwnDockerCliWithProgress } from './ownDockerCliWindow';
 import { Controller } from './controller';
 import { DisconnectRequests } from './disconnectRequests';
 import { dockerAdapterOptions } from './dockerAdapterOptions';
@@ -174,8 +176,26 @@ async function activateExtension(
   warnInvalidCacheUpdateSchedule(logger, cacheScheduleWarnings);
 
   const runner = new NodeProcessRunner();
-  const dockerPath = findDockerCli(env, platform);
-  logger.info(dockerPath ? `Docker CLI: ${dockerPath}` : 'The Docker CLI was not found.');
+  // The window of an attached container, also in the names of its workers (ConnectionAdapter.windowName).
+  const connection = new ConnectionAdapter(logger);
+  const installedCli = findDockerCli(env, platform);
+  logger.info(installedCli ? `Docker CLI: ${installedCli}` : 'The Docker CLI was not found.');
+  // The window of a devspace on another computer (its authority names a Docker pipe) runs the Dev Containers extension
+  // with the Docker CLI of Devspaces, one tested version (docs/architecture.md "The Docker CLI of Devspaces"): its folder
+  // goes first in PATH of this extension host, before the Dev Containers extension resolves the window. Devspaces itself
+  // keeps the Docker CLI of this computer when it has one. A CLI that is not installed yet is downloaded below, before
+  // activate() returns.
+  const pipeWindow = connection.currentDockerHost() !== undefined;
+  const useOwnDockerCli = (cli: string): void => {
+    putFolderFirstInPath(process.env, platform, path.dirname(cli));
+    logger.info(`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces is first in PATH of this window: ${cli}`);
+  };
+  const ownCli = pipeWindow ? presentOwnDockerCli(paths.dockerCliDir, platform, process.arch) : undefined;
+  if (ownCli !== undefined) useOwnDockerCli(ownCli);
+  if (pipeWindow && ownDockerCliDownload(platform, process.arch) === undefined) {
+    logger.info(`Docker publishes no Docker CLI for ${platform} on ${process.arch}, so this window uses the Docker CLI of this computer.`);
+  }
+  const dockerPath = installedCli ?? ownCli;
   // Windows: the Dev Containers extension, which connects the windows to the containers, runs in this extension host and
   // looks up `docker` in its PATH and in C:\Program Files\Docker\Docker\resources\bin only. A CLI that Devspaces found
   // elsewhere, for example of a per-user Docker Desktop installed after VS Code (or the browser that opened a link of
@@ -413,8 +433,6 @@ async function activateExtension(
   // Cancelled when the window closes, after the release of deactivate() (which may join its build), as the preparations
   // of the heartbeats.
   context.subscriptions.push(closingWork.deferred({ dispose: () => helperBuilds.dispose() }));
-  // The window of an attached container, also in the names of its workers (ConnectionAdapter.windowName).
-  const connection = new ConnectionAdapter(logger);
   const channels = new HelperChannels({
     logger,
     // The refresh found no helper image (see helperBuilds above); never on an engine that Devspaces was removed from.
@@ -792,6 +810,16 @@ async function activateExtension(
     revealRow: (rowId) => revealRow(view, tree, rowId),
     development: context.extensionMode === vscode.ExtensionMode.Development,
     dockerTargets: targets,
+    // Before a window with a Docker pipe opens: the Docker CLI of Devspaces for its Dev Containers extension, so that
+    // the new window finds it installed. A failure is logged; that window tries again.
+    prepareDockerPipeWindow: async () => {
+      if (ownDockerCliDownload(platform, process.arch) === undefined) return;
+      try {
+        await installOwnDockerCli({ folder: paths.dockerCliDir, platform, arch: process.arch, logger });
+      } catch (error) {
+        logger.warn(`The Docker CLI ${OWN_DOCKER_CLI_VERSION} of Devspaces could not be installed before the window opens: ${errorMessage(error)}`);
+      }
+    },
     // The Docker pipe of the window of a devspace on an SSH host (docs/architecture.md "The Docker pipe").
     windowDockerHost: (devspace, shownContainer) =>
       windowDockerHost(devspace, shownContainer, {
@@ -912,6 +940,10 @@ async function activateExtension(
   // devspace in its status file.
   let pipeRefused: string | undefined;
   const pipeHost = connection.currentDockerHost();
+  if (pipeWindow && ownCli === undefined && ownDockerCliDownload(platform, process.arch) !== undefined) {
+    const cli = await installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: installedCli });
+    if (cli !== undefined) useOwnDockerCli(cli);
+  }
   if (pipeHost !== undefined && containerName) {
     const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
       logger,

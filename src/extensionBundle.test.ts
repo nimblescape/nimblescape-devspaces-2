@@ -33,9 +33,12 @@ const PIPELINE_MODULES = [
  */
 const ALLOWED_MODULES: Record<string, readonly string[]> = {
   'src/core/docker': [
+    // The Docker CLI of Devspaces for the window of a devspace on another computer: its download and its pin.
+    'archive.ts',
     'attachDiagnostics.ts',
     'bootstrapDocker.ts',
     'dockerCli.ts',
+    'dockerCliPin.json',
     'dockerDownload.ts',
     'dockerHost.ts',
     'dockerObjects.ts',
@@ -47,6 +50,7 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
     // "Remove Devspaces from This Docker Engine…": the removal of the Monitor, the helper containers and images and the
     // shared volumes with the Docker CLI of the bootstrap, after the worker was ended.
     'engineRemoval.ts',
+    'ownDockerCli.ts',
     'remoteDocker.ts',
   ],
   // missingHelperBuild.ts: the background build of a helper image that the refresh found missing.

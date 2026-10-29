@@ -286,6 +286,8 @@ function createHarness(
     remoteDocker?: ControllerDeps['remoteDocker'];
     /** The Docker pipe of the window of a devspace. Default: none. */
     windowDockerHost?: ControllerDeps['windowDockerHost'];
+    /** Before a window with a Docker pipe opens (the Docker CLI of Devspaces). Default: none. */
+    prepareDockerPipeWindow?: ControllerDeps['prepareDockerPipeWindow'];
     /** The heartbeat of Close and Keep Running (on every engine). */
     sessionMonitor?: ControllerDeps['sessionMonitor'];
     /** The pause between the checks of the container (default 0). */
@@ -484,6 +486,7 @@ function createHarness(
     dockerTargets: options.dockerTargets,
     remoteDocker: options.remoteDocker,
     windowDockerHost: options.windowDockerHost,
+    prepareDockerPipeWindow: options.prepareDockerPipeWindow,
     sessionMonitor: options.sessionMonitor,
     monitorQuestion,
     engineRecords,
@@ -6229,6 +6232,7 @@ describe('the Docker host of the current Docker context', () => {
   let resolves: number;
   let depth = 0;
   let windowDockerHost: Mock<NonNullable<ControllerDeps['windowDockerHost']>>;
+  let prepareDockerPipeWindow: Mock<NonNullable<ControllerDeps['prepareDockerPipeWindow']>>;
   let remote: {
     useRemoteHost: Mock<RemoteDockerCommands['useRemoteHost']>;
     useLocalDocker: Mock<RemoteDockerCommands['useLocalDocker']>;
@@ -6273,7 +6277,8 @@ describe('the Docker host of the current Docker context', () => {
       }),
     };
     windowDockerHost = vi.fn(() => undefined);
-    h = createHarness({ dockerTargets: dockerTargets as unknown as ControllerDeps['dockerTargets'], remoteDocker: remote, windowDockerHost });
+    prepareDockerPipeWindow = vi.fn(async () => undefined);
+    h = createHarness({ dockerTargets: dockerTargets as unknown as ControllerDeps['dockerTargets'], remoteDocker: remote, windowDockerHost, prepareDockerPipeWindow });
   });
 
   function remoteDevspace(overrides: Partial<Devspace> = {}): Devspace {
@@ -6720,13 +6725,18 @@ describe('the Docker host of the current Docker context', () => {
     await run('start', row('acme/api', remoteDevspace()));
     expect(h.connection.open.mock.calls[0]).toEqual(['devspaces-acme-api-a1b2c3d4', '/workspaces/api', { host: pipe }]);
     expect(windowDockerHost).toHaveBeenCalledWith(expect.objectContaining({ id: REMOTE_ENV_ID }), 'devspaces-acme-api-a1b2c3d4');
+    // The Docker CLI of Devspaces is installed before the window opens.
+    expect(prepareDockerPipeWindow).toHaveBeenCalledTimes(1);
+    expect(prepareDockerPipeWindow.mock.invocationCallOrder[0]).toBeLessThan(h.connection.open.mock.invocationCallOrder[0]);
     // The window of a local devspace never asks for one.
     windowDockerHost.mockClear();
+    prepareDockerPipeWindow.mockClear();
     current = dockerTargetOf('unix:///var/run/docker.sock', 'default');
     await h.registry.add(devspace());
     await run('start', row('acme/api', devspace()));
     expect(h.connection.open.mock.calls[1]).toEqual([CONTAINER, '/workspaces/api']);
     expect(windowDockerHost).not.toHaveBeenCalled();
+    expect(prepareDockerPipeWindow).not.toHaveBeenCalled();
   });
 
   it('shows the other window of a remote devspace with the Docker pipe that its status file names', async () => {

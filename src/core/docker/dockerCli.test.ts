@@ -14,6 +14,7 @@ import {
   findDockerCli,
   findExecutable,
   isExecutableFile,
+  putFolderFirstInPath,
   windowsDockerDesktopFolders,
 } from './dockerCli';
 
@@ -211,6 +212,26 @@ describe('dockerProcessEnv', () => {
   it('compares folders case-insensitively on Windows', () => {
     const value = 'C:\\Windows;c:\\program files\\docker\\docker\\resources\\bin\\';
     expect(dockerProcessEnv({ Path: value }, 'win32').Path).toBe(value);
+  });
+});
+
+describe('putFolderFirstInPath', () => {
+  it('puts the folder first and removes its other entries, on Windows under the spelling of the key', () => {
+    const env: NodeJS.ProcessEnv = { Path: 'C:\\Windows;c:\\users\\me\\cli\\;C:\\Tools;' };
+    putFolderFirstInPath(env, 'win32', 'C:\\Users\\me\\cli');
+    expect(env).toEqual({ Path: 'C:\\Users\\me\\cli;C:\\Windows;C:\\Tools' });
+    const unix: NodeJS.ProcessEnv = { PATH: '/usr/bin:/home/me/cli/:/bin' };
+    putFolderFirstInPath(unix, 'linux', '/home/me/cli');
+    expect(unix).toEqual({ PATH: '/home/me/cli:/usr/bin:/bin' });
+  });
+
+  it('sets PATH when there is none', () => {
+    const env: NodeJS.ProcessEnv = {};
+    putFolderFirstInPath(env, 'darwin', '/s/docker-cli/1.2.3');
+    expect(env).toEqual({ PATH: '/s/docker-cli/1.2.3' });
+    const windows: NodeJS.ProcessEnv = {};
+    putFolderFirstInPath(windows, 'win32', 'C:\\s');
+    expect(windows).toEqual({ Path: 'C:\\s' });
   });
 });
 
