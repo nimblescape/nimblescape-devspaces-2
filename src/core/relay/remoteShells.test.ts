@@ -9,7 +9,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { silentLogger, type Logger, type StartedByteProcess } from '../ports';
 import { NodeProcessRunner } from '../process';
-import { sshPromptsAllowed, withSshPrompts } from '../sshAskpass';
+import { sshPromptSignal, sshPromptsAllowed, withSshPrompts } from '../sshAskpass';
 import { RemoteShells } from './remoteShells';
 
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
@@ -101,6 +101,43 @@ describeUnix('RemoteShells', () => {
     await expect(flow).resolves.toEqual({ ok: true });
     expect(logins).toEqual(['quiet', 'asks']);
     registry.dispose();
+  });
+
+  // Two flows of the user: the Cancel of the first ends the questions of its login, and the second asks itself.
+  it('logs in anew for a flow of the user after the login of another flow was cancelled, but not after a time limit', async () => {
+    const logins: string[] = [];
+    const prompts = { onPrompt: () => () => undefined };
+    let script = '';
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 300,
+      start: () => {
+        const signal = sshPromptSignal();
+        logins.push(sshPromptsAllowed() ? 'flow' : 'background');
+        const process = runner.startBytes('sh', ['-c', script]);
+        // The Cancel of the flow ends its questions, and `ssh` then fails.
+        signal?.addEventListener('abort', () => process.kill());
+        return { process, prompts };
+      },
+    });
+    script = 'sleep 0.2; exec sh -s';
+    const first = new AbortController();
+    const cancelled = withSshPrompts(() => registry.login('box'), first.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = withSshPrompts(() => registry.login('box'));
+    first.abort();
+    await expect(cancelled).resolves.toMatchObject({ ok: false });
+    await expect(second).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['flow', 'flow']);
+    registry.dispose();
+    // A host that did not answer in time: the second flow takes that result.
+    logins.length = 0;
+    script = 'sleep 30';
+    const late = new RemoteShells({ logger: silentLogger, loginTimeoutMs: 300, start: () => (logins.push('login'), { process: runner.startBytes('sh', ['-c', script]), prompts }) });
+    const both = await Promise.all([withSshPrompts(() => late.login('box')), new Promise((resolve) => setTimeout(resolve, 50)).then(() => withSshPrompts(() => late.login('box')))]);
+    expect(both).toEqual([expect.objectContaining({ ok: false, timedOut: true }), expect.objectContaining({ ok: false, timedOut: true })]);
+    expect(logins).toEqual(['login']);
+    late.dispose();
   });
 
   it('gives the relay the login of the shell after the calls before it, and a new login to the calls after it', async () => {

@@ -177,9 +177,12 @@ export function hostKeyFingerprint(prompt: string): string | undefined {
   return /key fingerprint is ([A-Za-z0-9]+:[A-Za-z0-9+/=:]+)/.exec(prompt)?.[1];
 }
 
-/** The questions of one login that may ask: while one is open, the login does not time out (RemoteShell). */
+/** The questions of one login that may ask: while one is open, the login does not time out (RemoteShell, RelayConnection). */
 export interface SshLoginPrompts {
-  /** Calls `listener` with true when a question of this login opens, and with false when it closes. Returns its end. */
+  /**
+   * Calls `listener` with true when the first open question of this login opens, and with false when the last one
+   * closes. Returns its end.
+   */
   onPrompt(listener: (open: boolean) => void): () => void;
 }
 
@@ -210,7 +213,13 @@ export async function withSshPrompts<T>(fn: () => Promise<T>, signal?: AbortSign
 
 /** True within withSshPrompts: an SSH login that starts now may ask. */
 export function sshPromptsAllowed(): boolean {
-  return promptScopes.getStore()?.active === true;
+  return currentSshPromptFlow() !== undefined;
+}
+
+/** The flow of the user that runs now (withSshPrompts), as an object that only it has; undefined outside of one. */
+export function currentSshPromptFlow(): object | undefined {
+  const scope = promptScopes.getStore();
+  return scope?.active === true ? scope : undefined;
 }
 
 /** The signal of the flow of the user that runs now (withSshPrompts): when it aborts, its logins ask nothing more. */

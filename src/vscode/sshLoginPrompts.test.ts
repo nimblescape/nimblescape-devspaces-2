@@ -152,6 +152,7 @@ describeUnix('SshAskpassServer', () => {
     expect(await first).toMatchObject({ code: 1 });
     expect(closed).toBe(true);
     expect(open).toEqual([true, false]);
+    expect(lines).toContain('The question of the SSH login to build-box closed without an answer: the login ended, or its flow was cancelled.');
     expect(await runAskpass(env, "me@build-box's password: ")).toMatchObject({ code: 1 });
     expect(asked).toHaveLength(1);
     // A login of a flow that was cancelled before asks nothing.

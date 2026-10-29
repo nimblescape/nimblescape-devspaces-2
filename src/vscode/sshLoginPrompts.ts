@@ -354,7 +354,10 @@ export class SshAskpassServer implements vscode.Disposable {
       });
       this.dialogQueue = run.catch(() => undefined);
       const value = await run;
-      if (value === undefined || (kind === 'hostKey' && value === 'no')) {
+      if (value === undefined && cancel.isCancellationRequested) {
+        state.cancelled = true;
+        logger.info(`The question of the SSH login to ${host} closed without an answer: the login ended, or its flow was cancelled.`);
+      } else if (value === undefined || (kind === 'hostKey' && value === 'no')) {
         state.cancelled = true;
         logger.info(kind === 'hostKey' ? `The host key of ${host} was not accepted.` : `The question of the SSH login to ${host} was cancelled.`);
       } else if (kind === 'hostKey') {
@@ -367,8 +370,10 @@ export class SshAskpassServer implements vscode.Disposable {
     }
   }
 
+  /** Counts the open questions of a login, and tells its listeners when the first opens and when the last closes. */
   private setOpen(state: LoginState, open: boolean): void {
     state.open += open ? 1 : -1;
+    if (state.open !== (open ? 1 : 0)) return;
     for (const listener of [...state.listeners]) listener(open);
   }
 }
