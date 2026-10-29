@@ -49,10 +49,10 @@ export async function openRelayConnection(
   options: { logger: Logger; name: string },
 ): Promise<RelayConnection> {
   // The loader limits the escaped line (the memory guard of the pipe loader), so the same is checked here.
-  const { length, tooLong } = bundleLine(bundle);
+  const { line, length, tooLong } = bundleLine(bundle);
   if (tooLong) throw new RelayConnectionError(`The connection to ${options.name} could not be opened: the bundle is too long (${length} characters as JSON).`);
   const marker = startMarker();
   const startScript = relayStartScript(marker, command);
   const process = runner.startBytes(transport.file, transport.args, { env: transport.env });
-  return RelayConnection.open(process, { ...options, marker, startScript, bundle });
+  return RelayConnection.open(process, { ...options, marker, startScript, bundleLine: line });
 }

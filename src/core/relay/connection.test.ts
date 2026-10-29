@@ -89,6 +89,11 @@ class FakeTransport implements StartedByteProcess {
     this.stderrListener!(text);
   }
 
+  /** The output ends, and the transport keeps running. */
+  endOutput(): void {
+    this.stdoutEnd!();
+  }
+
   /** The relay of the test starts: its mux on the input from now on, and its output on the output of the transport. */
   startRelay(accept: (stream: MuxStream) => void): Mux {
     this.relay = new Mux({
@@ -135,7 +140,7 @@ function open(transport: FakeTransport, options: Partial<RelayConnectionOptions>
     name: 'build-box',
     marker,
     startScript: relayStartScript(marker, ['docker', 'run', '--rm', '-i', 'image']),
-    bundle: BUNDLE,
+    bundleLine: encodeBundle(BUNDLE),
     ...options,
   }).then((connection) => {
     connections.push(connection);
@@ -204,6 +209,21 @@ describe('RelayConnection.open', () => {
     transport.exit(255);
     await expect(opening).rejects.toThrow(new RelayConnectionError('The connection to build-box could not be opened: it ended (ssh: connect to host build-box port 22: Connection refused)'));
     expect(transport.inputEnded).toBe(true);
+  });
+
+  it('rejects when the output ends and the transport keeps running, before and after the marker', async () => {
+    const before = new FakeTransport();
+    const beforeOpening = open(before);
+    before.printError('Welcome\n');
+    before.endOutput();
+    await expect(beforeOpening).rejects.toThrow(new RelayConnectionError('The connection to build-box could not be opened: its output ended (Welcome)'));
+    expect(before.inputEnded).toBe(true);
+
+    const after = new FakeTransport();
+    const afterOpening = open(after);
+    after.print(`${after.marker()}\n`);
+    after.endOutput();
+    await expect(afterOpening).rejects.toThrow('could not be opened: the connection ended before the hello of the relay');
   });
 
   it('rejects with the refusal of `docker run` after the marker, and with the exit code without error output', async () => {
@@ -337,7 +357,11 @@ describe('RelayConnection', () => {
   it('stops the transport at once at killNow', async () => {
     const { transport, connection } = await opened();
     const worker = connection.openWorker();
+    const reasons: string[] = [];
+    connection.onClose((reason) => reasons.push(reason));
     worker.killNow!();
+    expect(connection.isOpen).toBe(false);
+    expect(reasons).toEqual(['stopped by the extension']);
     await expect(worker.exited).resolves.toEqual({ exitCode: null });
     expect(transport.killsNow).toBe(1);
     await transport.exited;
