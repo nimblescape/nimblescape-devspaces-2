@@ -13,7 +13,7 @@
 import { randomUUID } from 'crypto';
 import { errorMessage } from '../errors';
 import { VERSION_ENV, userAgentVersion } from '../http';
-import { LOADER_EXIT_CODE, MAX_BUNDLE_LINE_LENGTH, bundleHash, encodeBundle, loaderCommand } from '../loader/pipeLoader';
+import { LOADER_EXIT_CODE, bundleHash, bundleLine, loaderCommand } from '../loader/pipeLoader';
 import { abortError, isAbortError, sleep, type Logger } from '../ports';
 import { VSCODE_STORE_DIR } from '../names';
 import { monitorRestartPolicy } from './cacheSettings';
@@ -227,10 +227,8 @@ export class RemoteSessionMonitor {
     const { logger } = this.options;
     const script = await this.options.script();
     // The memory guard of the loader, before an old monitor is removed.
-    const scriptLine = encodeBundle(script);
-    if (scriptLine.length - 1 > MAX_BUNDLE_LINE_LENGTH) {
-      throw new Error(`The script of the Monitor is too long (${scriptLine.length - 1} characters as JSON).`);
-    }
+    const { line: scriptLine, length, tooLong } = bundleLine(script);
+    if (tooLong) throw new Error(`The script of the Monitor is too long (${length} characters as JSON).`);
     const images = this.options.imageMaintenance?.();
     // The schedule and the time zone come with `settings -` (monitorSettings), so computers with other settings or
     // another time zone on the same engine do not replace it at each open. The label holds the mode (permanent or not:

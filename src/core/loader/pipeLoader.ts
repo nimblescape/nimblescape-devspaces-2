@@ -122,6 +122,17 @@ export function encodeBundle(bundle: string): string {
   return `${JSON.stringify(bundle)}\n`;
 }
 
+/**
+ * The first line of the input for `bundle` (encodeBundle) and whether the pipe loader takes it: the loader refuses a line
+ * longer than MAX_BUNDLE_LINE_LENGTH without its line feed (its memory guard), so a caller checks `tooLong` before it
+ * starts anything. `length` is that length, for the message.
+ */
+export function bundleLine(bundle: string): { line: string; length: number; tooLong: boolean } {
+  const line = encodeBundle(bundle);
+  const length = line.length - 1;
+  return { line, length, tooLong: length > MAX_BUNDLE_LINE_LENGTH };
+}
+
 /** Where the bundle is stored, its hash (bundleHash), and the exported function that starts it (letters only). */
 export interface LoaderTarget {
   path: string;

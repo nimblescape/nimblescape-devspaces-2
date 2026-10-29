@@ -5,7 +5,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import * as path from 'path';
 import { MAX_CAPTURED_OUTPUT_BYTES, MAX_CAPTURED_STDERR_CHARACTERS } from './helper/analysisLimits';
-import { abortError, heldOutput, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedByteProcess, type StartedProcess } from './ports';
+import { abortError, decodedOutput, heldOutput, type ProcessRunner, type RunOptions, type RunResult, type StartOptions, type StartedByteProcess, type StartedProcess } from './ports';
 
 /**
  * A program printed more than MAX_CAPTURED_OUTPUT_BYTES on its standard output. It was stopped,
@@ -198,21 +198,16 @@ export class NodeProcessRunner implements ProcessRunner {
    * after a time limit (on Windows the process tree: docker.exe starts ssh.exe).
    */
   start(file: string, args: readonly string[], options: StartOptions = {}): StartedProcess {
-    const stdoutDecoder = new TextDecoder('utf-8');
-    const stderrDecoder = new TextDecoder('utf-8');
-    const stdout = heldOutput<string>();
-    const stderr = heldOutput<string>();
-    const deliver = (output: ReturnType<typeof heldOutput<string>>, text: string) => {
-      if (text !== '') output.deliver(text);
-    };
+    const stdout = decodedOutput();
+    const stderr = decodedOutput();
     const started = this.spawnStarted(file, args, options, () => {
       // The rest of an incomplete character at the end of the output.
-      deliver(stdout, stdoutDecoder.decode());
-      deliver(stderr, stderrDecoder.decode());
+      stdout.end();
+      stderr.end();
     });
     const { child } = started;
-    child.stdout.on('data', (chunk: Buffer) => deliver(stdout, stdoutDecoder.decode(chunk, { stream: true })));
-    child.stderr.on('data', (chunk: Buffer) => deliver(stderr, stderrDecoder.decode(chunk, { stream: true })));
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
     return {
       killNow: started.killNow,
       write: (text) => {
@@ -236,18 +231,14 @@ export class NodeProcessRunner implements ProcessRunner {
    * Stopped as `start` does.
    */
   startBytes(file: string, args: readonly string[], options: StartOptions = {}): StartedByteProcess {
-    const stderrDecoder = new TextDecoder('utf-8');
     // `null`: the end of the output.
     const stdout = heldOutput<Buffer | null>();
-    const stderr = heldOutput<string>();
-    const deliverStderr = (text: string) => {
-      if (text !== '') stderr.deliver(text);
-    };
-    const started = this.spawnStarted(file, args, options, () => deliverStderr(stderrDecoder.decode()));
+    const stderr = decodedOutput();
+    const started = this.spawnStarted(file, args, options, () => stderr.end());
     const { child } = started;
     child.stdout.on('data', (chunk: Buffer) => stdout.deliver(chunk));
     child.stdout.on('end', () => stdout.deliver(null));
-    child.stderr.on('data', (chunk: Buffer) => deliverStderr(stderrDecoder.decode(chunk, { stream: true })));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
     return {
       killNow: started.killNow,
       write: (chunk) => {
