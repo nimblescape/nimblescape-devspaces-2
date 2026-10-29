@@ -360,18 +360,26 @@ export function processDockerDial(start: () => StartedByteProcess, logger: Logge
   };
 }
 
-/** Makes `folder` (whose parent exists) a folder of this user that nobody else may use. Throws when it cannot. */
+/**
+ * Makes `folder` (whose parent exists) a folder of this user that nobody else may use. Throws when it cannot; a
+ * PipeInUseError when the folder went away after the mkdir (the extension host before a reload closed its pipe).
+ */
 async function preparePrivateFolder(folder: string): Promise<void> {
   try {
     await fs.promises.mkdir(folder, { mode: 0o700 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
-  const stat = await fs.promises.lstat(folder);
-  if (!stat.isDirectory()) throw new Error(`${folder} is not a folder.`);
-  const uid = process.getuid?.();
-  if (uid !== undefined && stat.uid !== uid) throw new Error(`${folder} belongs to another user.`);
-  if ((stat.mode & 0o077) !== 0) await fs.promises.chmod(folder, 0o700);
+  try {
+    const stat = await fs.promises.lstat(folder);
+    if (!stat.isDirectory()) throw new Error(`${folder} is not a folder.`);
+    const uid = process.getuid?.();
+    if (uid !== undefined && stat.uid !== uid) throw new Error(`${folder} belongs to another user.`);
+    if ((stat.mode & 0o077) !== 0) await fs.promises.chmod(folder, 0o700);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new PipeInUseError(folder);
+    throw error;
+  }
 }
 
 /**
@@ -393,5 +401,10 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
     probe.once('error', (error: NodeJS.ErrnoException) => resolve(!STALE_SOCKET_CODES.has(error.code ?? '')));
   });
   if (served) throw new PipeInUseError(socketPath);
-  await fs.promises.unlink(socketPath);
+  try {
+    await fs.promises.unlink(socketPath);
+  } catch (error) {
+    // Its extension host removed it meanwhile.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 }

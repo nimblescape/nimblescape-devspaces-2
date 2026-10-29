@@ -849,7 +849,7 @@ async function activateExtension(
   // the authority; and before the session starts, so that a window whose pipe is refused is never the window of its
   // devspace in its status file.
   let pipeRefused: string | undefined;
-  let pipeSsh: { path: string | undefined } | undefined;
+  let pipeSsh: string | undefined;
   const pipeHost = connection.currentDockerHost();
   if (pipeHost !== undefined && containerName) {
     const served = await serveWindowPipe(pipeHost, containerName, windowDevspace, {
@@ -872,8 +872,8 @@ async function activateExtension(
       },
       dialStdio: (host) => {
         // Found once: a window that works without the relay makes many short Docker connections.
-        pipeSsh ??= { path: sshPath() };
-        const ssh = pipeSsh.path;
+        pipeSsh ??= sshPath();
+        const ssh = pipeSsh;
         const address = sshTargetOf(host);
         if (ssh === undefined || address === undefined) return undefined;
         return runner.startBytes(ssh, sshCommandArgs(address, 'docker system dial-stdio'), { env: noPromptEnv(env) });
@@ -1005,7 +1005,8 @@ async function activateExtension(
 
   if (currentDevspace && containerName && docker.isInstalled() && !onRemovedEngine && connection.currentDockerHost() === undefined) {
     // Which Docker the Dev Containers extension asks when it resolves this window. Only for a devspace of this
-    // extension, and not for a window with a Docker pipe, which logs each Docker call that comes through it. Its
+    // extension, and not for a window whose authority names a Docker host: its Docker pipe logs the Docker calls that
+    // come through it, and serveWindowPipe logged any other address. Its
     // context: the one in the authority of this window, through which the Dev Containers extension attaches; for a
     // window without one, the current context when that is on the host of the devspace, else none for the local
     // Docker.
