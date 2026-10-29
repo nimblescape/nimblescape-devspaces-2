@@ -31,7 +31,13 @@ const SLOW_TEST_MS = 30_000;
 
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
 
-/** The Engine API of the probe of the worker, and `POST /echo`, which answers with the bytes of its body. */
+/** More than the credit of a stream. */
+const BIG_ANSWER = Buffer.alloc(1024 * 1024, 7);
+
+/**
+ * The Engine API of the probe of the worker, `POST /echo`, which answers with the bytes of its body, and `GET /big`,
+ * which answers with BIG_ANSWER.
+ */
 function fakeEngine(socketPath: string) {
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -42,6 +48,7 @@ function fakeEngine(socketPath: string) {
       if (request === 'GET /version') return json({ Version: '27.1.0', ApiVersion: '1.47' });
       if (request === 'GET /info') return json({ ID: ENGINE_ID, DockerRootDir: '/var/lib/docker', Containers: 0 });
       const body = Buffer.concat(chunks);
+      if (request === 'GET /big') return res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': BIG_ANSWER.length }).end(BIG_ANSWER);
       if (request === 'POST /echo') return res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': body.length }).end(body);
       res.writeHead(404).end();
     });
@@ -112,8 +119,10 @@ describeUnix('the relay in a Node.js process', () => {
     child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
     child.stdin.on('error', () => {});
     const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+    const closes: { reason: string; failed: boolean }[] = [];
     const mux = new Mux({
       side: 'extension',
+      onClose: (reason, failed) => closes.push({ reason, failed }),
       link: {
         write: (chunk) => child.stdin.write(chunk),
         onDrain: (listener) => child.stdin.once('drain', listener),
@@ -123,7 +132,7 @@ describeUnix('the relay in a Node.js process', () => {
     child.stdout.on('data', (chunk: Buffer) => mux.input(chunk));
     child.stdout.on('end', () => mux.inputEnded());
     child.stdin.write(first);
-    return { child, mux, exited, stderr: () => stderr };
+    return { child, mux, exited, closes, stderr: () => stderr };
   }
 
   it('passes every byte value through a Docker stream to the engine and back', { timeout: SLOW_TEST_MS }, async () => {
@@ -175,6 +184,28 @@ describeUnix('the relay in a Node.js process', () => {
     expect(await exited).toEqual({ code: 0, signal: null });
     expect(() => process.kill(workers[0], 0)).toThrow();
     expect(stderr()).toBe('');
+  });
+
+  it('at SIGTERM, exits after the frames that wait in its output went', { timeout: SLOW_TEST_MS }, async () => {
+    const { child, mux, exited, closes, stderr } = start();
+    // The credit of 8 streams is more than the buffers of the pipe (a socket pair of the kernel) and of the reader.
+    const answers = Array.from({ length: 8 }, () => {
+      const stream = mux.open('docker');
+      stream.write(Buffer.from('GET /big HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n', 'latin1'));
+      return collect(stream);
+    });
+    await waitUntil(() => answers.every((answer) => answer.data().length > 0), 'the start of the answers');
+    // The extension reads nothing more: the pipe fills, and frames wait in the output of the relay.
+    child.stdout.pause();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    child.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    child.stdout.resume();
+    expect(await exited).toEqual({ code: 0, signal: null });
+    await waitUntil(() => closes.length > 0, 'the end of the connection');
+    // Whole frames up to the end: no frame was cut.
+    expect(closes).toEqual([{ reason: 'the connection ended', failed: false }]);
+    expect(stderr()).toBe('devspace relay: stopped by SIGTERM\n');
   });
 
   // The loader passes what it read together with the bundle line, and the relay refuses it; a later read is read as

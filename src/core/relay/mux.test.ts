@@ -301,7 +301,7 @@ describe('a connection of the relay that breaks the rules', () => {
 
 describe('the pings of a connection of the relay', () => {
   it('wait while the link holds frames', async () => {
-    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
     const down = new Pipe();
     down.highWater = 1;
     down.held = true;
@@ -316,7 +316,7 @@ describe('the pings of a connection of the relay', () => {
   });
 
   it('do not limit the wait of the extension for the HELLO (its caller does)', () => {
-    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
     const up = new Pipe();
     const closes: string[] = [];
     const extension = new Mux({ side: 'extension', link: up.link, onClose: (reason) => closes.push(reason), pingIntervalMs: 1_000, silenceMs: 4_000 });
@@ -330,7 +330,7 @@ describe('the pings of a connection of the relay', () => {
   });
 
   it('go when a side sent nothing else, and the silence of the other side ends the connection', async () => {
-    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
     const { up, down, closes } = pair(() => {}, { pingIntervalMs: 1_000, silenceMs: 4_000 });
     await settle();
     vi.advanceTimersByTime(1_400);

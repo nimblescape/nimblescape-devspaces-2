@@ -196,6 +196,19 @@ export function spawnLoaderWorker(file: string, hash: string): RelayWorker {
 }
 
 /**
+ * Exits with `code` once the frames that wait in the standard output went, within RELAY_EXIT_MARGIN_MS: process.exit
+ * drops what waits in a pipe.
+ */
+function exitAfterOutput(code: number): void {
+  const exit = () => process.exit(code);
+  if (process.stdout.writableFinished || process.stdout.destroyed) return exit();
+  setTimeout(exit, RELAY_EXIT_MARGIN_MS);
+  process.stdout.once('finish', exit);
+  process.stdout.once('close', exit);
+  process.stdout.end();
+}
+
+/**
  * The entry of the relay (RELAY_ENTRY) for the pipe loader: `initial` is the input that the loader read together with
  * the bundle line, decoded as UTF-8, which must be empty (the extension writes nothing more before the HELLO of the
  * relay). The relay reads its input as bytes: the loader set it to UTF-8, which `latin1` replaces here, before any
@@ -222,7 +235,7 @@ export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER
     connectDocker: () => net.createConnection({ path: dockerSocket, allowHalfOpen: true }),
     spawnWorker: () => spawnLoaderWorker(file, hash),
     log: (line) => process.stderr.write(`${line}\n`),
-    exit: (code) => process.exit(code),
+    exit: exitAfterOutput,
   });
   process.stdout.on('error', (error) => relay.shutdown(`the output cannot be written (${error.message})`, true));
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(signal, () => relay.shutdown(`stopped by ${signal}`));
