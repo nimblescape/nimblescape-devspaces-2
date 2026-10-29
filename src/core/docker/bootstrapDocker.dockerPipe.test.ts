@@ -94,6 +94,9 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     // Outside an operation, the Docker CLI uses the current Docker context, the one of the last read.
     last = REMOTE;
     await docker.run(['info']);
+    // The commands of the Docker contexts and the version of the CLI log in nowhere.
+    await docker.run(['context', 'inspect', '--format', '{{json .}}']);
+    await docker.run(['--version']);
     expect(lines).toEqual([
       'docker image inspect x logs in to build-box with the Docker context.',
       'docker info --format {{json .ID}} logs in to build-box with the Docker context.',

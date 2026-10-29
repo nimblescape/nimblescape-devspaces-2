@@ -645,7 +645,9 @@ async function activateExtension(
       }
     },
     // Whether the Docker engine of the current target answers (Stop and the refresh do nothing without it).
-    dockerRunning: () => docker.isRunning(),
+    // As an operation on the current target: on an SSH host, the call goes through the connection of the relay when
+    // one is open (BootstrapDocker), not with an SSH login of its own.
+    dockerRunning: () => targets.withOperation(() => docker.isRunning()),
     // The refresh of the states asks nothing on an engine with the removal mark, also no `docker info`.
     engineRemoved: (host) => engineRemoved({ host }),
     ui,

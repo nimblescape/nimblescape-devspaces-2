@@ -211,6 +211,12 @@ function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): 
   });
 }
 
+/** False for a Docker call that does not reach the engine: a command of the Docker contexts, or only global options. */
+function reachesEngine(args: readonly string[]): boolean {
+  const [command] = dockerCommandWords(args);
+  return command !== undefined && command !== 'context';
+}
+
 /**
  * The variables of the Docker CLI that a call through the Docker pipe of the extension goes without: the pipe is its
  * endpoint (DOCKER_HOST), and the TLS settings of an endpoint of the user do not apply to it.
@@ -336,7 +342,8 @@ export class BootstrapDocker {
       // The environment after the lookup: a CLI that was found again has its own (dockerProcessEnv).
       const call = options.env === undefined ? this.callEnv(viaPipe) : { env: options.env };
       // Each such call is one SSH login of the Docker CLI (`ssh … docker system dial-stdio`), which SSH servers limit.
-      if (call.login !== undefined) this.logger.info(`${commandText(args)} logs in to ${call.login} with the Docker context${call.outside ? ' (outside an operation)' : ''}.`);
+      // The commands of the Docker contexts and `docker --version` do not reach the engine.
+      if (call.login !== undefined && reachesEngine(args)) this.logger.info(`${commandText(args)} logs in to ${call.login} with the Docker context${call.outside ? ' (outside an operation)' : ''}.`);
       return await this.runner.run(dockerPath, args, { ...options, env: call.env });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
