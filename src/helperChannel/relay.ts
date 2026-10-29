@@ -112,16 +112,20 @@ export class Relay {
     }
     this.worker = worker;
     // Its end is EXIT, after all its output. A closed stream ends its input and stops it, with SIGKILL after
-    // RELAY_WORKER_STOP_MS, so that a worker that does not end refuses the next worker stream only that long.
+    // RELAY_WORKER_STOP_MS, so that a worker that does not end refuses the next worker stream only that long. A worker
+    // that ended already (its EXIT waits behind its output) gets no signal.
+    let ended = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     bridgeStream(stream, worker.stdout, worker.stdin, {
       pipeEndsStream: false,
       onClosed: () => {
+        if (ended) return;
         worker.kill('SIGTERM');
         killTimer = setTimeout(() => worker.kill('SIGKILL'), this.deps.workerStopMs ?? RELAY_WORKER_STOP_MS);
       },
     });
     worker.onClosed((exit, error) => {
+      ended = true;
       clearTimeout(killTimer);
       if (this.worker === worker) this.worker = undefined;
       if (error) stream.close(`the worker cannot be started: ${error.message}`);
@@ -220,12 +224,12 @@ export function startRelay(initial: string, dockerSocket: string = HELPER_DOCKER
     log: (line) => process.stderr.write(`${line}\n`),
     exit: (code) => process.exit(code),
   });
-  process.stdout.on('error', (error) => relay.shutdown(`the output cannot be written (${error.message})`));
+  process.stdout.on('error', (error) => relay.shutdown(`the output cannot be written (${error.message})`, true));
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(signal, () => relay.shutdown(`stopped by ${signal}`));
   // A defect of the relay never leaves the container running: a timer ends it in any case, and at once when the
   // shutdown itself fails (as fatalHandler of main.ts).
   const fatal = (error: unknown) => {
-    setTimeout(() => process.exit(RELAY_FAILURE_EXIT_CODE), RELAY_WORKER_STOP_MS + 5_000);
+    setTimeout(() => process.exit(RELAY_FAILURE_EXIT_CODE), RELAY_WORKER_STOP_MS + RELAY_EXIT_MARGIN_MS);
     try {
       relay.shutdown(`an error of the relay: ${error instanceof Error ? error.message : String(error)}`, true);
     } catch {

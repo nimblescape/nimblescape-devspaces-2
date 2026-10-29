@@ -258,6 +258,20 @@ describeUnix('the relay', () => {
     await until(() => workers.length === 2, 'the next worker');
   });
 
+  it('sends no signal to a worker that ended while its EXIT waited behind its output, when the extension closes the stream', async () => {
+    const { extension, workers } = start({ workerStopMs: 50 });
+    // Nobody takes the data of the stream, so its credit runs out and the EXIT waits.
+    const stream = extension.open('worker');
+    await until(() => workers.length === 1, 'the worker');
+    workers[0].stdout.write(Buffer.alloc(300 * 1024, 1));
+    await settle();
+    workers[0].end({ code: 0, signal: null });
+    stream.close('the channel was closed');
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(workers[0].signals).toEqual([]);
+  });
+
   it('exits at once without a worker; after a frame that breaks the rules with a line and RELAY_FAILURE_EXIT_CODE', () => {
     const { relay, exits, lines } = start();
     relay.input(encodeFrame('data', 7, Buffer.from('x')));
