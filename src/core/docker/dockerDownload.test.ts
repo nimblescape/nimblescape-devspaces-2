@@ -2,6 +2,7 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -145,5 +146,43 @@ describe('downloadFile', () => {
     const error = await downloadFile({ url: URL_DMG, target, get, signal: controller.signal }).catch((e: unknown) => e);
     expect(isAbortError(error)).toBe(true);
     expect(urls).toEqual([]);
+  });
+});
+
+describe('downloadFile with another host and a pinned file', () => {
+  const URL_CLI = 'https://download.docker.com/mac/static/stable/aarch64/docker-1.2.3.tgz';
+  const body = 'archive';
+  const sha256 = '0b80c1d2de1ad1dd0b5b0d1ccd6cbfd1d8e6a6e9a41e1fde21f1ef01ee4b4d5c';
+  const realSha256 = crypto.createHash('sha256').update(body).digest('hex');
+
+  it('takes the file of that host when it has the pinned size and SHA-256', async () => {
+    const { get } = fakeGet({ [URL_CLI]: () => respond(200, body, { 'content-length': '7' }) });
+    await downloadFile({ url: URL_CLI, target, get, host: 'download.docker.com', expected: { size: 7, sha256: realSha256 } });
+    expect(fs.readFileSync(target, 'utf8')).toBe(body);
+  });
+
+  it('keeps nothing of a file with another SHA-256 or size', async () => {
+    const { get } = fakeGet({ [URL_CLI]: () => respond(200, body) });
+    await expect(downloadFile({ url: URL_CLI, target, get, host: 'download.docker.com', expected: { size: 7, sha256 } })).rejects.toThrow('is not the file of its pin');
+    const sized = fakeGet({ [URL_CLI]: () => respond(200, body, { 'content-length': '7' }) });
+    await expect(downloadFile({ url: URL_CLI, target, get: sized.get, host: 'download.docker.com', expected: { size: 8, sha256: realSha256 } })).rejects.toThrow('not the 8 bytes of its pin');
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('refuses another host, also as the target of a redirect, and the default host for another host', async () => {
+    await expect(downloadFile({ url: URL_DMG, target, host: 'download.docker.com', get: fakeGet({}).get })).rejects.toThrow('Downloads come only from https://download.docker.com');
+    await expect(downloadFile({ url: URL_CLI, target, get: fakeGet({}).get })).rejects.toThrow('Downloads come only from https://desktop.docker.com');
+    const { get } = fakeGet({ [URL_CLI]: () => respond(302, '', { location: 'https://download.docker.com.example/x.tgz' }) });
+    await expect(downloadFile({ url: URL_CLI, target, get, host: 'download.docker.com' })).rejects.toThrow('which is not HTTPS on download.docker.com');
+    await expect(downloadFile({ url: 'https://download.docker.com:8443/x.tgz', target, host: 'download.docker.com', get: fakeGet({}).get })).rejects.toThrow('Downloads come only');
+  });
+
+  it('refuses every redirect with maxRedirects 0, also one on the same host', async () => {
+    const { get, urls } = fakeGet({ [URL_CLI]: () => respond(302, '', { location: '/mac/static/stable/aarch64/docker-9.9.9.tgz' }) });
+    await expect(downloadFile({ url: URL_CLI, target, get, host: 'download.docker.com', maxRedirects: 0 })).rejects.toThrow(
+      `The download of ${URL_CLI} was redirected to https://download.docker.com/mac/static/stable/aarch64/docker-9.9.9.tgz; it takes no redirect.`,
+    );
+    expect(urls).toEqual([URL_CLI]);
+    expect(fs.readdirSync(dir)).toEqual([]);
   });
 });

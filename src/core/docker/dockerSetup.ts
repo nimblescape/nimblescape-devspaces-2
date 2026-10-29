@@ -177,11 +177,14 @@ export function dockerDesktopDownloadUrl(platform: NodeJS.Platform, arch: string
   return undefined;
 }
 
-/** True for an HTTPS URL of the Docker download host (also the target of a redirect is checked with it). */
-export function isOfficialDownloadUrl(url: string): boolean {
+/**
+ * True for an HTTPS URL of `host` without another port: the downloads of Docker (dockerDownload.ts) come only from such
+ * URLs, also the target of a redirect.
+ */
+export function isHttpsUrlOf(url: string, host: string): boolean {
   try {
     const parsed = new URL(url);
-    return parsed.protocol === 'https:' && parsed.hostname === DOCKER_DOWNLOAD_HOST;
+    return parsed.protocol === 'https:' && parsed.hostname === host && parsed.port === '';
   } catch {
     return false;
   }
