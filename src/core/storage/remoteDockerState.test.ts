@@ -82,6 +82,20 @@ describe('RemoteDockerState: the list of hosts and the Docker host of Devspaces'
     fs.rmdirSync(state.lockDir);
   });
 
+  // A change never writes over a list that it could not read; a file that is not valid JSON is kept as a copy first.
+  it('writes nothing when the file cannot be read, and keeps a copy of a file that is not valid', async () => {
+    fs.mkdirSync(state.file);
+    await expect(state.setDockerHost('a')).rejects.toThrow();
+    expect(fs.statSync(state.file).isDirectory()).toBe(true);
+    fs.rmdirSync(state.file);
+    fs.writeFileSync(state.file, '{"remoteHosts": ["a"');
+    await state.setDockerHost('b');
+    expect(await state.read()).toEqual({ dockerHost: 'b', remoteHosts: ['b'] });
+    const copies = fs.readdirSync(dir).filter((name) => name.startsWith('remote-docker.json.backup-'));
+    expect(copies).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, copies[0]), 'utf8')).toBe('{"remoteHosts": ["a"');
+  });
+
   it('drops the fields that it does not know, and puts a Docker host that is not listed into the list', async () => {
     fs.writeFileSync(state.file, JSON.stringify({ other: 'x', dockerHost: 'c', remoteHosts: ['a', 'a', '', 3], offered: 'x' }));
     expect(await state.read()).toEqual({ dockerHost: 'c', remoteHosts: ['a', 'c'] });

@@ -6376,6 +6376,25 @@ describe('the Docker host of Devspaces', () => {
     expect(operations).toEqual([]);
   });
 
+  // Try again runs after the operation ended: on the host of the devspace again, not on the host that Devspaces uses then.
+  it('runs Try again of a Stop on the host of its devspace', async () => {
+    await h.registry.add(devspace());
+    const seen: Array<string | undefined> = [];
+    h.service.stop.mockImplementationOnce(async () => {
+      seen.push(operationDockerTarget()?.host);
+      // Devspaces uses another host when the user clicks Try again.
+      current = remoteDockerTarget('build-box');
+      throw new UserFacingError('dockerStartFailed', Messages.dockerStartFailed, 'log');
+    });
+    h.service.stop.mockImplementationOnce(async () => {
+      seen.push(operationDockerTarget()?.host);
+    });
+    fakeVscode.window.showErrorMessage.mockResolvedValueOnce(Actions.tryAgain);
+    await run('stop', row('acme/api', devspace()));
+    await settle(() => h.service.stop.mock.calls.length === 2, 'the Try again');
+    expect(seen).toEqual(['', '']);
+  });
+
   it('runs every other command as one operation on the host that is current when it starts', async () => {
     current = remoteDockerTarget('build-box');
     await run('updateImagesNow');

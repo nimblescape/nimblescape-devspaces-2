@@ -12,7 +12,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, sshTargetOf, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
 import { dockerEndpointUnsupported } from '../core/docker/remoteDocker';
 import { engineInventory, inventoryIsEmpty, removalEndedNote, removeEngineInfrastructure, type EngineInventory, type RemovalResult } from '../core/docker/engineRemoval';
-import { operationDockerTarget, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
+import { operationDockerTarget, outsideOperation, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
 import type { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import type { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApiError } from '../core/discovery/githubApi';
@@ -730,7 +730,7 @@ export class Controller implements vscode.Disposable {
               await this.deps.service.openDevspaceInWorker(devspace.id, { progress, signal, source: sourceOf(devspace, this.deps.settings()) });
             },
           }),
-        { retry: () => this.withHostOf(devspace, () => this.start({ kind: 'devspace', devspaceId: devspace.id })) },
+        { retry: this.retryOn(devspace, () => this.start({ kind: 'devspace', devspaceId: devspace.id })) },
       );
       if (!succeeded) {
         // "Delete devspace" for missing files removed the devspace of this window.
@@ -806,6 +806,8 @@ export class Controller implements vscode.Disposable {
     }
     const accounts = await this.readAccounts();
     const dockerHost = await this.currentDockerHost();
+    // The target of each Docker host, read once for all its operations.
+    const engines = new Map<string, Promise<DockerTarget | undefined>>();
     for (const operation of runnable) {
       if (this.disposed) return;
       // An operation of a devspace of an account that Devspaces does not use is not run by this window; it expires.
@@ -818,7 +820,8 @@ export class Controller implements vscode.Disposable {
       }
       // It runs on the Docker host of its devspace, whatever host Devspaces uses now; not when that host is not supported
       // now (the local Docker set to an endpoint that Devspaces does not use), and it expires.
-      const engine = target ? await this.hostTargetOf(target) : undefined;
+      if (target && !engines.has(dockerHostOf(target))) engines.set(dockerHostOf(target), this.hostTargetOf(target));
+      const engine = target ? await engines.get(dockerHostOf(target)) : undefined;
       if (target && engine && !isOnDockerHost(target, engine.host)) {
         this.logger.info(`The pending ${operation.operation} of ${operation.devspaceId} is for ${describeDockerHost(dockerHostOf(target))}, which is not supported now. It is not run.`);
         continue;
@@ -1217,7 +1220,7 @@ export class Controller implements vscode.Disposable {
         }
         await this.deleteWithProgress(repository, current, additionalVolumesToRemove);
       },
-      { retry: () => this.delete({ kind: 'devspace', devspaceId: devspace.id }) },
+      { retry: this.retryOn(devspace, () => this.delete({ kind: 'devspace', devspaceId: devspace.id })) },
     );
     if (openInstead) {
       const fresh = await this.deps.registry.get(devspace.id);
@@ -2616,7 +2619,7 @@ export class Controller implements vscode.Disposable {
       this.operationKey(target),
       'Stop',
       () => runWithProgress({ title: ControllerTexts.stopping(repository), task: () => this.deps.service.stop(devspace.id) }),
-      { retry: () => this.stopNow(target, devspace) },
+      { retry: this.retryOn(devspace, () => this.stopNow(target, devspace)) },
     );
     if (stopped) this.inform(ControllerTexts.stopped(repository));
   }
@@ -2698,7 +2701,7 @@ export class Controller implements vscode.Disposable {
             await this.deps.service.openDevspaceInWorker(devspace.id, { progress, signal, forceRebuild: true, source: sourceOf(devspace, this.deps.settings()) });
           },
         }),
-      { retry: () => this.rebuildDevspace(target, devspace, request) },
+      { retry: this.retryOn(devspace, () => this.rebuildDevspace(target, devspace, request)) },
     );
   }
 
@@ -2977,7 +2980,7 @@ export class Controller implements vscode.Disposable {
             this.operationKey(target),
             'Delete',
             () => this.deleteWithProgress(this.shownName(target), devspace, operation.additionalVolumesToRemove ?? []),
-            { retry: () => this.delete({ kind: 'devspace', devspaceId: devspace.id }) },
+            { retry: this.retryOn(devspace, () => this.delete({ kind: 'devspace', devspaceId: devspace.id })) },
           );
           return;
         case 'stop':
@@ -3010,7 +3013,7 @@ export class Controller implements vscode.Disposable {
               await this.connect(result, progress, connectRequest, signal);
             }),
         }),
-      { retry: () => this.rebuildAndConnect(target, devspace, beforeConnect) },
+      { retry: this.retryOn(devspace, () => this.rebuildAndConnect(target, devspace, beforeConnect)) },
     );
   }
 
@@ -3924,6 +3927,15 @@ export class Controller implements vscode.Disposable {
     return runWithDockerTarget(target, fn);
   }
 
+  /**
+   * The Try again of an operation on `devspace`: an operation of its own on the host of that devspace (withHostOf), not on
+   * the host that Devspaces uses then. Its callback keeps the context of the failed operation, whose scope ends when that
+   * operation ends, so it starts outside of it.
+   */
+  private retryOn(devspace: Devspace, fn: () => Promise<void>): () => Promise<void> {
+    return () => outsideOperation(() => this.withHostOf(devspace, fn));
+  }
+
   /** The target of the Docker host of `devspace` (DockerTargets.ofHost); undefined without Docker targets. */
   private async hostTargetOf(devspace: Devspace): Promise<DockerTarget | undefined> {
     return this.deps.dockerTargets?.ofHost(dockerHostOf(devspace));
@@ -4108,7 +4120,7 @@ export class Controller implements vscode.Disposable {
       return noWindowPipe(host);
     }
     const targets = this.deps.dockerTargets;
-    if (targets && dockerHostOf(devspace) === '') {
+    if (targets && host === '') {
       // The current context itself, not the one this operation is pinned to (DOCKER_CONTEXT; ofHost reads it outside).
       const current = await targets.ofHost('');
       if (current.kind !== 'local') {

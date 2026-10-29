@@ -8,11 +8,12 @@
 // mount on that computer). Devspaces creates and changes no Docker context (docs/architecture.md "Remote Docker
 // hosts"). Every window of this computer changes the file: each change reads and writes it under the lock folder
 // `remote-docker.lock` (lockFolder.ts), so that a change of another window between the read and the write is not lost.
+import * as fs from 'fs';
 import * as path from 'path';
 import { silentLogger, type Logger } from '../ports';
 import { readJson, writeJsonAtomic } from './atomicJson';
 import { DEFAULT_LOCK_STALE_MS, DEFAULT_LOCK_TIMEOUT_MS, LockLostError, withLockFolder, type LockTimings } from './lockFolder';
-import { retryTransient } from './paths';
+import { parseJson, readTextFile, retryTransient } from './paths';
 
 export interface RemoteDockerHostRecord {
   host: string;
@@ -139,7 +140,8 @@ export class RemoteDockerState {
    * engine at each Docker start); only then the read and the write run under the lock folder `lockDir`. If another
    * process took over the lock meanwhile (this process stalled longer than the stale time, see withLockFolder), nothing
    * is written and the whole change runs once more on the current file, as for registry.json. So `update` runs up to
-   * three times, and its last run counts. Throws, and writes nothing, when the lock is not free within the wait.
+   * three times, and its last run counts. Throws, and writes nothing, when the lock is not free within the wait or the
+   * file cannot be read (readForChange).
    */
   private async change(update: (state: RemoteDockerStateFile) => boolean): Promise<void> {
     if (!update(await this.read())) return;
@@ -147,12 +149,13 @@ export class RemoteDockerState {
       withLockFolder(
         this.lockDir,
         async (held) => {
-          const state = await this.read();
+          const { state, invalid } = await this.readForChange();
           if (!update(state)) return;
           const checkHeld = async (): Promise<void> => {
             if (!(await held())) throw new LockLostError(this.lockDir);
           };
           await checkHeld();
+          if (invalid) await this.keepCopy();
           await retryTransient(() => writeJsonAtomic(this.file, state, { beforeRename: checkHeld }));
         },
         this.lockTimings,
@@ -164,6 +167,25 @@ export class RemoteDockerState {
       this.logger.warn(`${error.message} The change of the remote Docker hosts runs again on the current file.`);
       await run();
     }
+  }
+
+  /**
+   * The file for a change: a transient error of Windows is tried again, and any other error of the read is thrown
+   * (readTextFile), so that a change never writes over a list that it could not read. A file that is not valid JSON
+   * knows nothing (`invalid`: a copy is kept before the write).
+   */
+  private async readForChange(): Promise<{ state: RemoteDockerStateFile; invalid: boolean }> {
+    const text = await readTextFile(this.file);
+    if (text === undefined) return { state: {}, invalid: false };
+    const value = parseJson(text);
+    return { state: normalize(value), invalid: value === undefined };
+  }
+
+  /** Keeps a copy of a file that is not valid before a change writes over it: `<file>.backup-<time>`. */
+  private async keepCopy(): Promise<void> {
+    const copy = `${this.file}.backup-${Date.now()}`;
+    await retryTransient(() => fs.promises.copyFile(this.file, copy));
+    this.logger.warn(`The list of the remote Docker hosts was not valid, so it counts as empty. A copy was saved as ${copy}.`);
   }
 }
 
