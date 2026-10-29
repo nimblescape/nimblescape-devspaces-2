@@ -3,9 +3,9 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // The worker's bundle (dist/helperChannel.js, built here with workerBundleOptions of scripts/bundleOptions.mjs) is the
-// program of four uses, each with its own entry: the worker (startChannel), the batch helper (startBatchHelper), the
-// Monitor (startMonitor, and `node monitor.js <subcommand>`, where the file is the main module) and the thread of the
-// host access analysis (a thread of the file with ANALYSIS_THREAD_DATA). Loading the file starts none of them: a
+// program of five uses, each with its own entry: the worker (startChannel), the relay (startRelay), the batch helper
+// (startBatchHelper), the Monitor (startMonitor, and `node monitor.js <subcommand>`, where the file is the main module)
+// and the thread of the host access analysis (a thread of the file with ANALYSIS_THREAD_DATA). Loading the file starts none of them: a
 // `require` and a thread without that data do nothing, and no module of the bundle does I/O when it is loaded.
 import { execFile } from 'child_process';
 import * as fs from 'fs';
@@ -21,6 +21,7 @@ import { fileHash } from '../core/helper/configurationAnalysisRunner.testkit';
 import { ANALYSIS_THREAD_DATA, type AnalysisWorkerMessage } from '../core/helper/configurationAnalysisWorker';
 import { BATCH_ENTRY } from '../core/helperChannel/batch';
 import { CHANNEL_ENTRY } from '../core/helperChannel/protocol';
+import { RELAY_ENTRY } from '../core/relay/frames';
 import { REMOTE_MONITOR_ENTRY } from '../core/remoteMonitor/protocol';
 
 /**
@@ -118,7 +119,7 @@ function thread(options: { workerData?: unknown; job?: AnalysisJob }): Promise<{
 }
 
 describe("the entries of the worker's bundle", () => {
-  it('exports the entries of the worker, the batch helper and the Monitor; a require starts nothing and does no I/O', async () => {
+  it('exports the entries of the worker, the relay, the batch helper and the Monitor; a require starts nothing and does no I/O', async () => {
     const { code, stdout, stderr } = await node(['-e', LOAD_PROBE, bundle]);
     expect(stderr).toBe('');
     expect(code).toBe(0);
@@ -126,8 +127,8 @@ describe("the entries of the worker's bundle", () => {
     expect(loaded.calls).toEqual([]);
     // No listener of a signal, of an error or of the standard input.
     expect(loaded.listeners.after).toEqual(loaded.listeners.before);
-    expect(loaded.functions).toEqual(expect.arrayContaining([CHANNEL_ENTRY, BATCH_ENTRY, REMOTE_MONITOR_ENTRY]));
-    expect([CHANNEL_ENTRY, BATCH_ENTRY, REMOTE_MONITOR_ENTRY]).toEqual(['startChannel', 'startBatchHelper', 'startMonitor']);
+    expect(loaded.functions).toEqual(expect.arrayContaining([CHANNEL_ENTRY, RELAY_ENTRY, BATCH_ENTRY, REMOTE_MONITOR_ENTRY]));
+    expect([CHANNEL_ENTRY, RELAY_ENTRY, BATCH_ENTRY, REMOTE_MONITOR_ENTRY]).toEqual(['startChannel', 'startRelay', 'startBatchHelper', 'startMonitor']);
   });
 
   // `docker exec … node /opt/devspace/monitor.js heartbeat <json>`: the stored bundle as the main module.

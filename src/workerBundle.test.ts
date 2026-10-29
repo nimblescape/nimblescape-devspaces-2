@@ -4,8 +4,8 @@
 
 // The worker's bundle (dist/helperChannel.js), built with the options of esbuild.mjs (workerBundleOptions of
 // scripts/bundleOptions.mjs), checked on the modules that esbuild bundles into it (its metafile) and on its text. It is
-// the one program of the worker, the batch helpers, the Monitor and the threads of the host access analysis, which are
-// modules of it, not text in it. Nothing in it runs with `eval`; it holds fixed scripts as text (the pipe loader, and
+// the one program of the worker, the relay, the batch helpers, the Monitor and the threads of the host access analysis,
+// which are modules of it, not text in it. Nothing in it runs with `eval`; it holds fixed scripts as text (the pipe loader, and
 // the scripts that run in containers with `node -e` or `sh -c`). It holds no code of the helper image of the extension:
 // the worker runs from its own image, so its WorkspaceHelper builds, checks, maintains and records no helper image;
 // HelperImages and what it runs (helperImage.ts) are the extension's.
