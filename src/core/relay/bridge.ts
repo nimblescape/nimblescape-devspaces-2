@@ -52,11 +52,11 @@ export function bridgeStream(stream: MuxStream, readable: Readable, writable: Wr
   });
   readable.on('error', (error: Error) => fail(error.message));
   if (!oneObject) writable.on('error', (error: Error) => fail(error.message));
+  // A chunk that the pipe can no longer take is dropped and counts as taken, so that the writer of the other side does
+  // not wait for credit that never comes.
   stream.onData((chunk) => {
-    if (writable.destroyed || writable.writableEnded) return;
-    writable.write(chunk, (error) => {
-      if (!error) stream.consumed(chunk.length);
-    });
+    if (writable.destroyed || writable.writableEnded) return stream.consumed(chunk.length);
+    writable.write(chunk, () => stream.consumed(chunk.length));
   });
   stream.onEnd(() => {
     if (!writable.destroyed && !writable.writableEnded) writable.end();

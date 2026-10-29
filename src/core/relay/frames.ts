@@ -76,12 +76,18 @@ export interface Frame {
 
 /** A frame: its header and `payload`, which must not be longer than MAX_FRAME_PAYLOAD. */
 export function encodeFrame(kind: FrameKind, stream: number, payload: Buffer = Buffer.alloc(0)): Buffer {
-  if (payload.length > MAX_FRAME_PAYLOAD) throw new RangeError(`A frame holds at most ${MAX_FRAME_PAYLOAD} bytes, not ${payload.length}.`);
-  const frame = Buffer.allocUnsafe(FRAME_HEADER_LENGTH + payload.length);
+  const frame = frameWithHeader(kind, stream, payload.length);
+  payload.copy(frame, FRAME_HEADER_LENGTH);
+  return frame;
+}
+
+/** A frame with its header and room for a payload of `length` bytes (at most MAX_FRAME_PAYLOAD), not filled yet. */
+export function frameWithHeader(kind: FrameKind, stream: number, length: number): Buffer {
+  if (length > MAX_FRAME_PAYLOAD) throw new RangeError(`A frame holds at most ${MAX_FRAME_PAYLOAD} bytes, not ${length}.`);
+  const frame = Buffer.allocUnsafe(FRAME_HEADER_LENGTH + length);
   frame.writeUInt8(FRAME[kind], 0);
   frame.writeUInt32BE(stream, 1);
-  frame.writeUInt32BE(payload.length, 5);
-  payload.copy(frame, FRAME_HEADER_LENGTH);
+  frame.writeUInt32BE(length, 5);
   return frame;
 }
 
