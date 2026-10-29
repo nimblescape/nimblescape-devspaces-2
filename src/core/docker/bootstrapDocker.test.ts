@@ -880,11 +880,15 @@ describe('BootstrapDocker: every call runs directly', () => {
       'constructor',
       'dockerPath',
       'isInstalled',
-      // `run` is the one method of a call; runRepeated and runOnce run it.
+      // `run` is the one method of a call; runVia, runRepeated and runOnce run it, and runWithContext passes it through.
+      'runVia',
       'runRepeated',
+      'runWithContext',
       'runOnce',
       'start',
       'operationEnv',
+      // The lookup of the Docker pipe of the extension (dockerPipe), no Docker call.
+      'pipeOf',
       'processEnv',
       'lookUpCliNow',
       'reportCliLost',

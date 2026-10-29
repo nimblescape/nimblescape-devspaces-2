@@ -123,8 +123,8 @@ describe('openHelperChannel with the connection of the relay', () => {
     expect(connect).not.toHaveBeenCalled();
     expect(connection.openWorker).toHaveBeenCalledTimes(1);
     expect(socketPath).not.toHaveBeenCalled();
-    // No list of the names; only the engine identity.
-    expect(runDirect.mock.calls.map(([args]) => args[0])).toEqual(['info']);
+    // No list of the names; only the engine identity, through the Docker pipe of the extension (the open connection).
+    expect(runDirect.mock.calls.map(([args, , withContext]) => [args[0], withContext === true])).toEqual([['info', false]]);
     expect(channel.isOpen).toBe(true);
     channel.close();
   });
@@ -161,10 +161,14 @@ describe('openHelperChannel with the connection of the relay', () => {
     const next = fakeConnection(fakeWorker());
     const relayAccess = access(async () => next as unknown as RelayConnection, shared);
     const log: string[] = [];
-    const channel = await openHelperChannel(deps({ relay: () => relayAccess, logger: { ...silentLogger, warn: (message) => log.push(message) } }), REMOTE);
+    const runDirect = vi.fn<ChannelOpenDeps['runDirect']>(async () => ({ exitCode: 0, stdout: `${ENGINE}\n`, stderr: '', timedOut: false }));
+    const channel = await openHelperChannel(deps({ relay: () => relayAccess, runDirect, logger: { ...silentLogger, warn: (message) => log.push(message) } }), REMOTE);
     expect(channel.isOpen).toBe(true);
     expect(relayAccess.retire).toHaveBeenCalledWith(shared);
     expect(relayAccess.use).toHaveBeenCalledWith(next);
+    // The identity of the engine of the new connection is read with the Docker context, not through the Docker pipe
+    // of the extension, which still uses the open connection that failed.
+    expect(runDirect.mock.calls.map(([args, , withContext]) => [args[0], withContext])).toEqual([['info', true]]);
     expect(log).toEqual([
       'The worker on build-box could not be opened on the open connection of the relay, so it opens a new connection: The connection to build-box is closed (the transport ended).',
     ]);
@@ -185,7 +189,13 @@ describe('openHelperChannel with the connection of the relay', () => {
         if (failure !== undefined) throw new RelayConnectionError(failure);
         return fakeConnection(worker) as unknown as RelayConnection;
       });
-    const channel = await openHelperChannel(deps({ relay }), REMOTE);
+    const runDirect = vi.fn(deps({}).runDirect);
+    const channel = await openHelperChannel(deps({ relay, runDirect }), REMOTE);
+    // The list of the names after the refusal, and the identity: with the Docker context.
+    expect(runDirect.mock.calls.map(([args, , withContext]) => [args[0], withContext])).toEqual([
+      ['ps', true],
+      ['info', true],
+    ]);
     expect(commands.map((command) => [command[command.indexOf('--name') + 1], command[command.indexOf('--network') + 1]])).toEqual([
       ['devspaces-api-worker1', 'bridge'],
       ['devspaces-api-worker2', 'bridge'],

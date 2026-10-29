@@ -4,10 +4,11 @@
 
 // The Docker pipe of a devspace window (docs/architecture.md "The Docker pipe"): a named pipe or a Unix socket on this
 // computer (pipeAddress.ts) that the Docker calls of the Dev Containers extension reach through `settings.host` in the
-// authority of the window. Each connection of the pipe becomes one Docker stream of the connection of the relay to the
-// host of the devspace (relayDockerDial), which the worker channel of the window shares, so the window logs in to the
-// host once. A window of a devspace on an engine with the removal mark gets one `docker system dial-stdio` over SSH per
-// connection instead (processDockerDial): the relay would set Devspaces up there again. No `vscode`.
+// authority of the window (windowPipe.ts), and the Docker calls of the extension itself through DOCKER_HOST
+// (hostPipes.ts). Each connection of the pipe becomes one Docker stream of the connection of the relay to the host
+// (relayDockerDial), which the worker channel of the window shares, so the window logs in to the host once. A window
+// of a devspace on an engine with the removal mark gets one `docker system dial-stdio` over SSH per connection instead
+// (processDockerDial): the relay would set Devspaces up there again. No `vscode`.
 import * as fs from 'fs';
 import * as net from 'net';
 import { errorMessage } from '../errors';
@@ -108,6 +109,28 @@ export class DockerPipe {
     pipe.refreshTimer.unref?.();
     logger.info(`The Docker pipe of ${name} listens on ${address.dockerHost}.`);
     return pipe;
+  }
+
+  /** The address that the pipe listens on. */
+  get address(): DockerPipeAddress {
+    return this.options.address;
+  }
+
+  /**
+   * True while a connection to the address reaches this pipe: it is not closed, and a Unix socket is still its own file
+   * (not removed by a cleanup of temporary folders, not replaced by another file; refresh repairs only the first). One
+   * lstat of the socket; never throws.
+   */
+  isServing(): boolean {
+    if (this.closed || this.server === undefined) return false;
+    const { address } = this.options;
+    if (address.folder === undefined) return true;
+    try {
+      const stat = fs.lstatSync(address.path);
+      return stat.dev === this.socketFile?.dev && stat.ino === this.socketFile.ino;
+    } catch {
+      return false;
+    }
   }
 
   /** The connections that are open now (for the tests). */

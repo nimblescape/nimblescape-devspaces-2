@@ -57,6 +57,36 @@ function addUsed(connections: RelayConnections, host: string, fake: FakeConnecti
 }
 
 describe('RelayConnections', () => {
+  it('reports each connection that becomes the current one of its host (onUse), and logs a report that fails', () => {
+    const used: string[] = [];
+    const warnings: string[] = [];
+    const connections = new RelayConnections({
+      logger: { ...silentLogger, warn: (message) => warnings.push(message) },
+      onUse: (host) => {
+        used.push(host);
+        if (host === 'broken-box') throw new Error('no pipe');
+      },
+    });
+    registries.push(connections);
+    const first = new FakeConnection();
+    connections.add('build-box', asConnection(first));
+    expect(used).toEqual([]);
+    connections.use('build-box', asConnection(first));
+    // Not for another host than the one of the connection, and not for a connection that ended.
+    connections.use('other-box', asConnection(first));
+    const ended = new FakeConnection();
+    connections.add('build-box', asConnection(ended));
+    ended.close();
+    connections.use('build-box', asConnection(ended));
+    expect(used).toEqual(['build-box']);
+    expect(connections.get('build-box')).toBe(asConnection(first));
+    // A report that fails keeps the connection the current one.
+    const broken = new FakeConnection();
+    addUsed(connections, 'broken-box', broken);
+    expect(connections.get('broken-box')).toBe(asConnection(broken));
+    expect(warnings).toEqual(['The use of the connection to broken-box could not be reported: no pipe']);
+  });
+
   it('keeps the connection of each host once it is used, and forgets it when it ends', () => {
     const connections = registry();
     const box = new FakeConnection();

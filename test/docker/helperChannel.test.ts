@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // The Docker CLI of the extension (BootstrapDocker).
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
 import { dockerTargetOf } from '../../src/core/docker/dockerHost';
+import { runWithDockerTarget } from '../../src/core/docker/dockerTargets';
 import { HelperChannel } from '../../src/core/helperChannel/helperChannel';
 import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
 import {
@@ -42,6 +43,7 @@ import { NodeProcessRunner } from '../../src/core/process';
 import type { RelayConnection } from '../../src/core/relay/connection';
 import { RelayConnections, relayAccess } from '../../src/core/relay/connections';
 import { DockerPipe, relayDockerDial } from '../../src/core/relay/dockerPipe';
+import { HostPipes } from '../../src/core/relay/hostPipes';
 import { dockerPipeAddress } from '../../src/core/relay/pipeAddress';
 import { openRelayConnection } from '../../src/core/relay/transport';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
@@ -176,6 +178,16 @@ describe('the helper channel with the real Docker engine', () => {
     return { channel, process: started!, name, transport };
   }
 
+  /**
+   * Closes the connection of the relay and waits until `--rm` removed its container `name`, so that no later check of
+   * the leftovers (afterAll) sees it, also when the test runs alone.
+   */
+  async function endRelay(connections: RelayConnections, transport: StartedByteProcess | undefined, name: string): Promise<void> {
+    connections.close('runner-engine', 'the test closed it');
+    await transport?.exited;
+    await waitUntil(() => cli.container(name) === undefined, 'the removal of the container');
+  }
+
   beforeAll(async () => {
     script = await timings.measure('bundle the script', bundleScript);
     // The helper image through the harness.
@@ -304,7 +316,7 @@ describe('the helper channel with the real Docker engine', () => {
     let pipe: DockerPipe | undefined;
     const sleeper = `devspaces-pipe-test-${run.runId}`;
     try {
-      const { channel } = await open([], { relay: connections });
+      const { channel, name, transport } = await open([], { relay: connections });
       const address = dockerPipeAddress('0123456789abcdef', process.platform, folder);
       pipe = await DockerPipe.listen({ address, connect: async (socket) => relayDockerDial(connections.get('runner-engine')!, socket), logger: log, name: 'the test' });
       const viaPipe = (args: string[], input?: string) => byteRunner.run(run.dockerPath, ['-H', address.dockerHost, ...args], { env, input, timeoutMs: 120_000 });
@@ -324,11 +336,49 @@ describe('the helper channel with the real Docker engine', () => {
       // The worker stream and at least one Docker stream for each of the four calls.
       expect(connections.get('runner-engine')?.streamsOpened).toBeGreaterThanOrEqual(5);
       channel.close();
+      await endRelay(connections, transport, name);
     } finally {
       cli.run(['rm', '-f', sleeper]);
       pipe?.close();
       connections.dispose();
       fs.rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  // The Docker pipe of the extension (docs/architecture.md "The Docker pipe"): the Docker CLI of the extension
+  // (BootstrapDocker) in an operation on the host, through the connection of the relay that the worker opened, once that
+  // connection passed its checks; a build too (the context and the session of BuildKit on Docker streams).
+  it('carries the Docker calls of the extension through its Docker pipe and the relay: a query and a build', async () => {
+    let hostPipes: HostPipes | undefined;
+    const connections = new RelayConnections({ logger: log, onUse: (host) => void hostPipes?.serve(host) });
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'host-pipe-'));
+    hostPipes = new HostPipes({ logger: log, platform: process.platform, base: () => folder, relayConnection: (host) => connections.get(host), dialStdio: () => undefined });
+    const pipes = hostPipes;
+    const viaPipe = new BootstrapDocker(byteRunner, run.dockerPath, env, log, process.platform, { dockerPipe: (pipeTarget) => pipes.dockerHost(pipeTarget.host) });
+    const context = fs.mkdtempSync(path.join(os.tmpdir(), 'host-pipe-build-'));
+    const tag = `devspaces-pipe-build-test:${run.runId}`;
+    try {
+      const { channel, name, transport } = await open([], { relay: connections });
+      await waitUntil(() => pipes.dockerHost('runner-engine') !== undefined, 'the Docker pipe of the extension');
+      const connection = connections.get('runner-engine')!;
+      const opened = connection.streamsOpened;
+      fs.writeFileSync(path.join(context, 'Dockerfile'), `FROM ${helperTag}\nLABEL ${TEST_RUN_LABEL}=${run.runId}\n`);
+      const built = await runWithDockerTarget(target, async () => {
+        expect(await viaPipe.imageExists(helperTag)).toBe(true);
+        return timings.measure('docker build through the Docker pipe of the extension', () =>
+          viaPipe.buildImage({ tag, dockerfile: path.join(context, 'Dockerfile'), context, labels: { [TEST_RUN_LABEL]: run.runId } }),
+        );
+      });
+      expect(built).toBe(cli.ok(['image', 'inspect', '--format', '{{.Id}}', tag]));
+      // The inspect, the build, and the list of the image by its build label went over Docker streams of the connection.
+      expect(connection.streamsOpened - opened).toBeGreaterThanOrEqual(3);
+      channel.close();
+      await endRelay(connections, transport, name);
+    } finally {
+      hostPipes.dispose();
+      connections.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+      fs.rmSync(context, { recursive: true, force: true });
     }
   });
 
