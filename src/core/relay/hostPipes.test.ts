@@ -168,6 +168,26 @@ describe('HostPipes', () => {
     expect(log.lines.at(-1)).toBe('warn The Docker pipe of the extension on build-box could not reach the Docker engine: ssh was not found');
   });
 
+  it('replaces a pipe whose socket another file replaced at the next serve, at a new address', async () => {
+    const folder = base();
+    const ids = ['0123456789abcdef', 'fedcba9876543210'];
+    const log = logger();
+    const hostPipes = pipes({ base: () => folder, logger: log, relayConnection: () => echoRelay(), randomId: () => ids.shift() ?? 'ffffffffffffffff' });
+    await hostPipes.serve('build-box');
+    const first = dockerPipeAddress('0123456789abcdef', 'linux', folder);
+    fs.rmSync(first.path);
+    fs.writeFileSync(first.path, '');
+    expect(hostPipes.dockerHost('build-box')).toBeUndefined();
+    await hostPipes.serve('build-box');
+    const second = dockerPipeAddress('fedcba9876543210', 'linux', folder);
+    expect(hostPipes.dockerHost('build-box')).toBe(second.dockerHost);
+    expect(log.lines).toContain(`info The Docker pipe of the extension on build-box does not serve ${first.dockerHost} anymore, so a new pipe takes its place.`);
+    // A pipe that serves stays.
+    await hostPipes.serve('build-box');
+    expect(hostPipes.dockerHost('build-box')).toBe(second.dockerHost);
+    await expect(roundTrip(second.path, 'z')).resolves.toBe('relay: z');
+  });
+
   it('logs a pipe that cannot listen, and tries again at the next serve', async () => {
     const folder = base();
     // A file where the folder of the socket would be.

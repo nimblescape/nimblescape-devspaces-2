@@ -52,15 +52,24 @@ export class HostPipes {
 
   /**
    * Serves the pipe of `host` (an SSH host) when it does not listen yet: a connection of the relay to it passed its
-   * checks. A pipe that cannot listen is logged; the next connection that passes its checks tries again. Resolves when
-   * the pipe listens or could not; never rejects.
+   * checks. A pipe that does not serve its address anymore (DockerPipe.isServing) is closed, and a new one at a new
+   * address takes its place. A pipe that cannot listen is logged; the next connection that passes its checks tries
+   * again. Resolves when the pipe listens or could not; never rejects.
    */
   async serve(host: string): Promise<void> {
-    if (this.disposed || this.pipes.has(host) || sshTargetOf(host) === undefined) return;
+    if (this.disposed || sshTargetOf(host) === undefined) return;
     const { logger, platform } = this.deps;
+    const name = `the extension on ${host}`;
+    const served = this.pipes.get(host);
+    if (served !== undefined) {
+      // Listens, or starts to listen.
+      if (served.pipe === undefined || served.pipe.isServing()) return;
+      logger.info(`The Docker pipe of ${name} does not serve ${served.pipe.address.dockerHost} anymore, so a new pipe takes its place.`);
+      served.pipe.close();
+      this.pipes.delete(host);
+    }
     const entry: { pipe?: DockerPipe } = {};
     this.pipes.set(host, entry);
-    const name = `the extension on ${host}`;
     const direct = processDockerDial(
       () => {
         const process = this.deps.dialStdio(host);

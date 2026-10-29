@@ -880,7 +880,8 @@ describe('BootstrapDocker: every call runs directly', () => {
       'constructor',
       'dockerPath',
       'isInstalled',
-      // `run` is the one method of a call; runRepeated and runOnce run it, and runWithContext passes it through.
+      // `run` is the one method of a call; runVia, runRepeated and runOnce run it, and runWithContext passes it through.
+      'runVia',
       'runRepeated',
       'runWithContext',
       'runOnce',

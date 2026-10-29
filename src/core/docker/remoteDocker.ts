@@ -241,8 +241,7 @@ export type SshLoginCheck =
  * The SSH check before a Docker call to `host` (see the module comment): `ssh -o BatchMode=yes -o ConnectTimeout=15 -T
  * [-p port] [-l user] -- <host> true`, without questions. `useCache`: a success of the last SSH_CHECK_CACHE_MS counts,
  * and so do Docker calls that go through the Docker pipe of the extension (the test before a switch always connects). A
- * host that is no usable
- * alias or address (for example of a context of the user with a path) is left to the Docker CLI.
+ * host that is no usable alias or address (for example of a context of the user with a path) is left to the Docker CLI.
  */
 export async function checkSshLogin(
   host: string,

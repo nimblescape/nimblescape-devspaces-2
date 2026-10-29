@@ -280,13 +280,26 @@ export class BootstrapDocker {
    * host closed the connection before the login (sshDroppedReadCall). A call that does not only read is logged with its
    * command (directCommandName; never its arguments or its input), its exit code, and its time.
    */
-  async run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    if (isReadOnlyDockerCall(args)) return this.runRepeated(args, options);
+  run(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    return this.runVia(args, options, true);
+  }
+
+  /**
+   * run, with the Docker context of the operation also while its host has the Docker pipe of the extension (dockerPipe):
+   * for the checks of a new connection of the relay, which must not depend on another connection to the host.
+   */
+  runWithContext(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
+    return this.runVia(args, options, false);
+  }
+
+  /** run, through the Docker pipe of the extension when `viaPipe` and the host has one (operationEnv). */
+  private async runVia(args: readonly string[], options: RunOptions, viaPipe: boolean): Promise<RunResult> {
+    if (isReadOnlyDockerCall(args)) return this.runRepeated(args, options, viaPipe);
     const startedAt = this.clock.now();
     const command = directCommandName(args);
     const seconds = (): string => (Math.max(0, this.clock.now() - startedAt) / 1000).toFixed(1);
     try {
-      const result = await this.runRepeated(args, options);
+      const result = await this.runRepeated(args, options, viaPipe);
       const end = result.timedOut ? 'timed out' : `exit code ${result.exitCode}`;
       this.logger.info(`docker ${command}: ${end} after ${seconds()} s.`);
       return result;
@@ -296,32 +309,25 @@ export class BootstrapDocker {
     }
   }
 
-  /**
-   * run, with the Docker context of the operation also while its host has the Docker pipe of the extension (dockerPipe):
-   * for the checks of a new connection of the relay, which must not depend on another connection to the host.
-   */
-  runWithContext(args: readonly string[], options: RunOptions = {}): Promise<RunResult> {
-    return this.run(args, { ...options, env: options.env ?? this.operationEnv(false) });
-  }
-
   /** runOnce, repeated once after an SSH drop of a call that only reads (sshDroppedReadCall). */
-  private async runRepeated(args: readonly string[], options: RunOptions): Promise<RunResult> {
-    const result = await this.runOnce(args, options);
+  private async runRepeated(args: readonly string[], options: RunOptions, viaPipe: boolean): Promise<RunResult> {
+    const result = await this.runOnce(args, options, viaPipe);
     if (!sshDroppedReadCall(args, result) || options.signal?.aborted) return result;
     const command = dockerCommandWords(args).join(' ');
     this.logger.warn(
       `docker ${command}: the SSH server of the Docker host closed the connection before the login. Trying once more in ${this.sshDropRetryDelayMs / 1000} s.`,
     );
     await sleep(this.sshDropRetryDelayMs, options.signal);
-    return this.runOnce(args, options);
+    return this.runOnce(args, options, viaPipe);
   }
 
-  private async runOnce(args: readonly string[], options: RunOptions): Promise<RunResult> {
+  private async runOnce(args: readonly string[], options: RunOptions, viaPipe: boolean): Promise<RunResult> {
     this.lookUpCliIfMissing();
     const dockerPath = this.path;
     if (dockerPath === undefined) throw new UserFacingError('dockerNotInstalled', Messages.dockerNotInstalled);
     try {
-      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.operationEnv() });
+      // The environment after the lookup: a CLI that was found again has its own (dockerProcessEnv).
+      return await this.runner.run(dockerPath, args, { ...options, env: options.env ?? this.operationEnv(viaPipe) });
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
         if (this.findDocker && this.path === dockerPath) {
@@ -357,7 +363,7 @@ export class BootstrapDocker {
    * Otherwise DOCKER_HOST is never set here; when it is set for VS Code, it decides the endpoint and the operation has no
    * context name.
    */
-  private operationEnv(viaPipe = true): NodeJS.ProcessEnv {
+  private operationEnv(viaPipe: boolean): NodeJS.ProcessEnv {
     const target = operationDockerTarget();
     if (target === undefined) return this.env;
     const pipe = viaPipe && target.kind === 'remote' ? this.pipeOf(target) : undefined;

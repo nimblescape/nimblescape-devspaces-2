@@ -124,7 +124,7 @@ describe('openHelperChannel with the connection of the relay', () => {
     expect(connection.openWorker).toHaveBeenCalledTimes(1);
     expect(socketPath).not.toHaveBeenCalled();
     // No list of the names; only the engine identity, through the Docker pipe of the extension (the open connection).
-    expect(runDirect.mock.calls.map(([args, , withContext]) => [args[0], withContext])).toEqual([['info', false]]);
+    expect(runDirect.mock.calls.map(([args, , withContext]) => [args[0], withContext === true])).toEqual([['info', false]]);
     expect(channel.isOpen).toBe(true);
     channel.close();
   });
