@@ -4101,8 +4101,9 @@ export class Controller implements vscode.Disposable {
    * Logs which Docker the Dev Containers extension will ask when the window switches to `containerName`
    * (attachDiagnostics.ts), with the context of the running operation. A window of `devspace` with a Docker pipe
    * (windowDockerHost) gets one line instead: the Dev Containers extension asks no Docker context there, and its pipe
-   * logs the Docker calls that come through it, so no inspect logs in to the host for this. Only log lines; never
-   * rejects.
+   * logs the Docker calls that come through it, so no inspect logs in to the host for this. A window of a devspace on
+   * an SSH host without its pipe gets none: it does not connect (readyForWindow), and the inspects would describe the
+   * Docker of this computer. Only log lines; never rejects.
    */
   private async logAttachDiagnostics(devspace: Devspace, containerName: string): Promise<void> {
     try {
@@ -4112,7 +4113,7 @@ export class Controller implements vscode.Disposable {
         this.logger.info(`Before the window connects: the Dev Containers extension reaches ${host} through the Docker pipe ${pipe} of the window.`);
         return;
       }
-      if (!this.deps.docker.isInstalled()) return;
+      if (host !== '' || !this.deps.docker.canRunOn(LOCAL_DOCKER_TARGET)) return;
       const context = operationDockerTarget()?.context;
       const lines = await attachDiagnostics(this.deps.docker, this.deps.docker.processEnv(), containerName, context);
       for (const line of lines) this.logger.info(`Before the window connects: ${line}`);

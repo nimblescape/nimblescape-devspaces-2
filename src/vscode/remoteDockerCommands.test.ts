@@ -327,6 +327,30 @@ describe('Use a Remote Docker Host…', () => {
     expect(await state.dockerHost()).toBeUndefined();
   });
 
+  // The host of the list that no Docker CLI reaches (its Docker CLI of Devspaces was removed): DockerTargets.resolve
+  // gave the local Docker, so the setup shows; the choice of that host downloads and tests as a new choice.
+  it('downloads the Docker CLI of Devspaces for the host that Devspaces uses already when no Docker CLI reaches it', async () => {
+    await listed(['build-box'], 'build-box');
+    let own: string | undefined;
+    cli.isInstalled = () => false;
+    cli.canRunRemote = () => own !== undefined;
+    const installOwnCli = vi.fn(async () => (own = '/storage/docker-cli/29.9.2/docker'));
+    commands = create({ installOwnCli });
+    cli.hosts.set('build-box', engineInfo());
+    pick('$(check) build-box');
+    await commands.useRemoteHost();
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(window.showInformationMessage).not.toHaveBeenCalledWith(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(cli.calls.map((call) => call.args.slice(0, 3))).toEqual([['-H', 'ssh://build-box', 'info']]);
+    expect(targets.last).toEqual(remoteDockerTarget('build-box'));
+    // Then it is the host that Devspaces uses: said so, nothing tested.
+    pick('$(check) build-box');
+    await commands.useRemoteHost();
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.alreadyHost('build-box'));
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(cli.calls).toHaveLength(1);
+  });
+
   // The Docker CLI of Devspaces that another window downloaded, or the Docker CLI of this computer: no download.
   it('downloads nothing while a Docker CLI runs the calls on a remote engine', async () => {
     cli.isInstalled = () => false;
