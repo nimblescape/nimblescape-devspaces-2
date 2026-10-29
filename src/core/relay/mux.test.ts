@@ -258,15 +258,27 @@ describe('the streams of a connection of the relay', () => {
     expect(closes).toContainEqual({ side: 'early', reason: 'the connection ended before the hello of the relay', failed: true });
   });
 
-  it('refuse a stream beyond MAX_STREAMS at once and keep the others', async () => {
-    const { extension, relay } = pair(() => {});
-    const streams = Array.from({ length: MAX_STREAMS + 1 }, () => extension.open('docker'));
-    const reasons: string[] = [];
-    streams.at(-1)?.onClose((reason) => reasons.push(reason));
+  it('let the extension open at most MAX_STREAMS streams at a time', async () => {
+    const { extension, relay, closes } = pair(() => {});
+    const streams = Array.from({ length: MAX_STREAMS }, () => extension.open('docker'));
+    expect(() => extension.open('docker')).toThrow(`The connection of the relay has ${MAX_STREAMS} streams open.`);
+    streams[0].close('done');
+    extension.open('docker');
     await settle();
-    expect(reasons).toEqual([`the relay has ${MAX_STREAMS} streams open`]);
     expect(relay.streamCount).toBe(MAX_STREAMS);
     expect(extension.streamCount).toBe(MAX_STREAMS);
+    expect(closes).toEqual([]);
+  });
+
+  it('end when a listener fails, since the rest of the chunk is lost', async () => {
+    const { extension, closes } = pair((stream) =>
+      stream.onData(() => {
+        throw new Error('boom');
+      }),
+    );
+    extension.open('docker').write(Buffer.from('x'));
+    await settle();
+    expect(closes).toContainEqual({ side: 'relay', reason: 'an error while a frame was handled: boom', failed: true });
   });
 });
 
@@ -289,6 +301,13 @@ describe('a connection of the relay that breaks the rules', () => {
     for (const frame of frames) relay.input(frame);
     expect(closes).toEqual([{ reason, failed: true }]);
     expect(down.ended).toBe(true);
+  });
+
+  it('ends at an open beyond MAX_STREAMS', () => {
+    const { relay, closes } = relayOnly();
+    for (let stream = 1; stream <= MAX_STREAMS + 1; stream++) relay.input(open(stream));
+    expect(closes).toEqual([{ reason: `the other side opened more than ${MAX_STREAMS} streams`, failed: true }]);
+    expect(relay.streamCount).toBe(0);
   });
 
   it('ends at data beyond the credit of the stream', () => {
