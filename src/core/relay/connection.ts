@@ -12,6 +12,7 @@
 // connection of the Docker pipe of the window (openDocker, dockerPipe.ts). No `vscode`.
 import { readableStderr } from '../loader/pipeLoader';
 import { decodedOutput, type Logger, type StartedByteProcess, type StartedProcess } from '../ports';
+import type { SshLoginPrompts } from '../sshAskpass';
 import { Mux, type MuxStream } from './mux';
 
 /** The longest time from the start of the transport to the HELLO of the relay: the login, the start, the bundle. */
@@ -47,6 +48,11 @@ export interface RelayConnectionOptions {
   /** The first line of the pipe loader of the relay: the bundle (dist/helperChannel.js) as bundleLine encodes it. */
   bundleLine: string;
   openTimeoutMs?: number;
+  /**
+   * The questions of a login that may ask in VS Code (sshAskpass.ts): while one is open, the time limit of the open
+   * stops, and it starts anew when the question closes (as RemoteShell).
+   */
+  prompts?: SshLoginPrompts;
   closeKillMs?: number;
   /** Only for the tests. */
   pingIntervalMs?: number;
@@ -193,14 +199,31 @@ export class RelayConnection {
     const timeoutMs = options.openTimeoutMs ?? RELAY_OPEN_TIMEOUT_MS;
     return new Promise<RelayConnection>((resolve, reject) => {
       let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let stopPrompts: (() => void) | undefined;
       const fail = (reason: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        stopPrompts?.();
         this.shutdown(reason);
         reject(new RelayConnectionError(`The connection to ${name} could not be opened: ${reason}`));
       };
-      const timer = setTimeout(() => fail(`no answer within ${timeoutMs / 1000} seconds`), timeoutMs);
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fail(`no answer within ${timeoutMs / 1000} seconds`), timeoutMs);
+      };
+      arm();
+      // A question in VS Code waits for the user: no time limit while it is open, the full one again after it.
+      stopPrompts = options.prompts?.onPrompt((open) => {
+        if (settled) return;
+        if (open) {
+          clearTimeout(timer);
+          timer = undefined;
+        } else {
+          arm();
+        }
+      });
       process.onStderr((text) => {
         this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_LENGTH);
         for (const listener of this.stderrListeners) listener(text);
@@ -241,6 +264,7 @@ export class RelayConnection {
               if (settled) return;
               settled = true;
               clearTimeout(timer);
+              stopPrompts?.();
               logger.info(`The connection to ${name} is open.`);
               resolve(this);
             },

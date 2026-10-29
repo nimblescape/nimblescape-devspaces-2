@@ -9,6 +9,7 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import { silentLogger, type Logger, type StartedByteProcess } from '../ports';
 import { NodeProcessRunner } from '../process';
+import { sshPromptSignal, sshPromptsAllowed, withSshPrompts } from '../sshAskpass';
 import { RemoteShells } from './remoteShells';
 
 const describeUnix = process.platform === 'win32' ? describe.skip : describe;
@@ -25,7 +26,7 @@ function shells(options: { script?: string; noTransport?: string[]; logger?: Log
       logins.push(host);
       const process = runner.startBytes('sh', ['-c', options.script ?? 'exec sh -s']);
       processes.push(process);
-      return process;
+      return { process };
     },
     idleCloseMs: options.idleCloseMs,
     loginTimeoutMs: 5_000,
@@ -76,6 +77,98 @@ describeUnix('RemoteShells', () => {
     await expect(registry.login('box')).resolves.toEqual({ ok: false, detail: 'ssh: connect to host box port 22: Connection refused', timedOut: false });
     await expect(registry.run('box', 'true')).resolves.toEqual({ exitCode: 255, stdout: '', stderr: 'ssh: connect to host box port 22: Connection refused', timedOut: false });
     expect(logins).toEqual(['box', 'box']);
+  });
+
+  // A login of the background runs with BatchMode and fails for a host that needs a password or an unknown host key.
+  it('logs in anew for a flow of the user after a login of the background in progress failed', async () => {
+    const logins: string[] = [];
+    const prompts = { onPrompt: () => () => undefined };
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 5_000,
+      start: () => {
+        const asks = sshPromptsAllowed();
+        logins.push(asks ? 'asks' : 'quiet');
+        const script = asks ? 'exec sh -s' : 'sleep 0.3; echo "me@box: Permission denied (password)." >&2; exit 255';
+        const process = runner.startBytes('sh', ['-c', script]);
+        return asks ? { process, prompts } : { process };
+      },
+    });
+    const background = registry.login('box');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const flow = withSshPrompts(() => registry.login('box'));
+    await expect(background).resolves.toMatchObject({ ok: false, detail: 'me@box: Permission denied (password).' });
+    await expect(flow).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['quiet', 'asks']);
+    registry.dispose();
+  });
+
+  // The test of a host sees the SSH configuration and the host of now.
+  it('logs in anew with fresh, and ends the open shell at once', async () => {
+    const { registry, logins, processes } = shells();
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    await expect(registry.login('box', undefined, { fresh: true })).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['box', 'box']);
+    await processes[0].exited;
+    // The calls after it use the new login, and so does a login without fresh.
+    await expect(registry.run('box', 'printf two')).resolves.toMatchObject({ stdout: 'two' });
+    await expect(registry.login('box')).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['box', 'box']);
+    registry.dispose();
+  });
+
+  it('shares the login of a flow with the other calls of the same flow, also after a failure', async () => {
+    const logins: string[] = [];
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 5_000,
+      start: () => {
+        logins.push('login');
+        // A login that cannot ask (the pipe of the questions is not ready yet) and is refused.
+        return { process: runner.startBytes('sh', ['-c', 'sleep 0.2; echo "me@box: Permission denied (password)." >&2; exit 255']) };
+      },
+    });
+    const results = await withSshPrompts(() => Promise.all([registry.login('box'), registry.login('box')]));
+    expect(results).toEqual([expect.objectContaining({ ok: false }), expect.objectContaining({ ok: false })]);
+    expect(logins).toEqual(['login']);
+    registry.dispose();
+  });
+
+  // Two flows of the user: the Cancel of the first ends the questions of its login, and the second asks itself.
+  it('logs in anew for a flow of the user after the login of another flow was cancelled, but not after a time limit', async () => {
+    const logins: string[] = [];
+    const prompts = { onPrompt: () => () => undefined };
+    let script = '';
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 5_000,
+      start: () => {
+        const signal = sshPromptSignal();
+        logins.push(sshPromptsAllowed() ? 'flow' : 'background');
+        const process = runner.startBytes('sh', ['-c', script]);
+        // The Cancel of the flow ends its questions, and `ssh` then fails.
+        signal?.addEventListener('abort', () => process.kill());
+        return { process, prompts };
+      },
+    });
+    script = 'sleep 0.2; exec sh -s';
+    const first = new AbortController();
+    const cancelled = withSshPrompts(() => registry.login('box'), first.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = withSshPrompts(() => registry.login('box'));
+    first.abort();
+    await expect(cancelled).resolves.toMatchObject({ ok: false });
+    await expect(second).resolves.toEqual({ ok: true });
+    expect(logins).toEqual(['flow', 'flow']);
+    registry.dispose();
+    // A host that did not answer in time: the second flow takes that result.
+    logins.length = 0;
+    script = 'sleep 30';
+    const late = new RemoteShells({ logger: silentLogger, loginTimeoutMs: 300, start: () => (logins.push('login'), { process: runner.startBytes('sh', ['-c', script]), prompts }) });
+    const both = await Promise.all([withSshPrompts(() => late.login('box')), new Promise((resolve) => setTimeout(resolve, 50)).then(() => withSshPrompts(() => late.login('box')))]);
+    expect(both).toEqual([expect.objectContaining({ ok: false, timedOut: true }), expect.objectContaining({ ok: false, timedOut: true })]);
+    expect(logins).toEqual(['login']);
+    late.dispose();
   });
 
   it('gives the relay the login of the shell after the calls before it, and a new login to the calls after it', async () => {

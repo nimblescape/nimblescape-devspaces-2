@@ -6,12 +6,19 @@
 // host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
 // it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
+import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
 import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } from './remoteShell';
+
+/** A login that started: its process, and the questions it may ask in VS Code (a login of a flow of the user). */
+export interface RemoteShellStart {
+  process: StartedByteProcess;
+  prompts?: SshLoginPrompts;
+}
 
 export interface RemoteShellsOptions {
   logger: Logger;
   /** Starts the login `ssh … sh -s` to `host` (sshRelayTransport); undefined when the host has no transport. */
-  start(host: string): StartedByteProcess | undefined;
+  start(host: string): RemoteShellStart | undefined;
   /** Only for the tests. */
   loginTimeoutMs?: number;
   idleCloseMs?: number;
@@ -20,6 +27,8 @@ export interface RemoteShellsOptions {
 /** A shell of `RemoteShells`: open, or still logging in on `process`. */
 interface Entry {
   process: StartedByteProcess;
+  /** The flow of the user that started this login (currentSshPromptFlow), or none (the background). */
+  flow?: object;
   shell?: RemoteShell;
   opening?: Promise<RemoteShell>;
 }
@@ -45,21 +54,42 @@ export class RemoteShells {
   /**
    * The open shell to `host`, or a new one (one SSH login, RemoteShell.open), which callers at the same time share.
    * Undefined when the host has no transport, and after `dispose`. Rejects with RemoteShellError when the login failed,
-   * and with an AbortError when `signal` aborts (the login goes on for the others).
+   * and with an AbortError when `signal` aborts (the login goes on for the others). A flow of the user whose login may
+   * ask (currentSshPromptFlow) that finds a login of the background or of another flow in progress waits for it, and
+   * logs in anew when it failed: a login without questions fails for a host that needs a password or an unknown host
+   * key, and the Cancel of the other flow ends the questions of its login. After the time limit of that login it does
+   * not: a login without questions fails at once instead of waiting, so the host did not answer in time. `fresh` (the
+   * test of a host): the open shell to the host ends at once (a command on it ends with it), and a new login starts; a
+   * login in progress counts as new.
    */
-  open(host: string, signal?: AbortSignal): Promise<RemoteShell | undefined> {
+  open(host: string, signal?: AbortSignal, options: { fresh?: boolean } = {}): Promise<RemoteShell | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
     const current = this.entries.get(host);
-    if (current?.shell?.isOpen) return Promise.resolve(current.shell);
-    if (current?.opening) return untilAborted(current.opening, signal);
-    const process = this.options.start(host);
-    if (process === undefined) return Promise.resolve(undefined);
-    const entry: Entry = { process };
+    if (current?.shell?.isOpen) {
+      if (options.fresh !== true) return Promise.resolve(current.shell);
+      // Its end forgets its entry (onEnd).
+      current.shell.close();
+    }
+    if (current?.opening) {
+      const flow = currentSshPromptFlow();
+      if (flow === undefined || current.flow === flow) return untilAborted(current.opening, signal);
+      return untilAborted(
+        current.opening.catch((error: unknown) => {
+          if (!(error instanceof RemoteShellError) || error.timedOut || signal?.aborted) throw error;
+          return this.open(host, signal);
+        }),
+        signal,
+      );
+    }
+    const started = this.options.start(host);
+    if (started === undefined) return Promise.resolve(undefined);
+    const { process, prompts } = started;
+    const entry: Entry = { process, flow: currentSshPromptFlow() };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
-    entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget }).then(
+    entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
       (shell) => {
         entry.shell = shell;
         entry.opening = undefined;
@@ -77,12 +107,16 @@ export class RemoteShells {
   }
 
   /**
-   * The login of the shell to `host` (`open`), for the SSH check (RemoteShellAccess.login): undefined when the host has
-   * no transport; a failure with the error output of `ssh`. Rejects only with an AbortError.
+   * The login of the shell to `host` (`open`, also with `fresh`), for the SSH check (RemoteShellAccess.login): undefined
+   * when the host has no transport; a failure with the error output of `ssh`. Rejects only with an AbortError.
    */
-  async login(host: string, signal?: AbortSignal): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined> {
+  async login(
+    host: string,
+    signal?: AbortSignal,
+    options: { fresh?: boolean } = {},
+  ): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined> {
     try {
-      return (await this.open(host, signal)) === undefined ? undefined : { ok: true };
+      return (await this.open(host, signal, options)) === undefined ? undefined : { ok: true };
     } catch (error) {
       if (error instanceof RemoteShellError) return { ok: false, detail: error.detail, timedOut: error.timedOut };
       throw error;

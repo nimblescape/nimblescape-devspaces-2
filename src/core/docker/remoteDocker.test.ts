@@ -129,6 +129,41 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     });
   });
 
+  // One login, which may ask for a password or a host key in a flow of the user: docker info of the host on its shell.
+  it('logs in once with the shell of the host and runs docker info on it, when the window has shells', async () => {
+    const docker = fakeDocker(() => info());
+    const commands: string[] = [];
+    const shells = {
+      login: vi.fn(async () => ({ ok: true as const })),
+      run: vi.fn(async (_host: string, command: string) => {
+        commands.push(command);
+        return info(true);
+      }),
+    };
+    const sshLogins = new SshLoginCache();
+    await expect(testRemoteDockerHost(docker, 'me@box:2222', { ...sshDeps(), shells, sshLogins })).resolves.toEqual({ ok: true, version: '28.1.0', rootless: true });
+    // Always a new login, also when a shell to the host is open.
+    expect(shells.login).toHaveBeenCalledWith('me@box:2222', undefined, { fresh: true });
+    expect(commands).toEqual([`'docker' 'info' '--format' '${ENGINE_INFO_FORMAT}'`]);
+    expect(docker.calls).toEqual([]);
+    expect(sshLogins.isFresh('me@box:2222')).toBe(true);
+    // A failed login names its reason, and the earlier success no longer counts; docker info does not run.
+    shells.login.mockResolvedValueOnce({ ok: false, detail: 'Permission denied (publickey,password).', timedOut: false } as never);
+    await expect(testRemoteDockerHost(docker, 'me@box:2222', { ...sshDeps(), shells, sshLogins })).resolves.toEqual({
+      ok: false,
+      problem: 'login',
+      detail: 'Permission denied (publickey,password).',
+    });
+    expect(sshLogins.isFresh('me@box:2222')).toBe(false);
+    shells.login.mockResolvedValueOnce({ ok: false, detail: 'ssh did not answer within 30 seconds.', timedOut: true } as never);
+    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: false, problem: 'unreachable' });
+    expect(commands).toHaveLength(1);
+    // A host without a transport (no alias or address) takes the way without the shell.
+    shells.login.mockResolvedValueOnce(undefined as never);
+    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
+    expect(docker.calls).toHaveLength(1);
+  });
+
   it('noPromptEnv replaces every spelling of SSH_ASKPASS_REQUIRE', () => {
     expect(noPromptEnv({ ssh_askpass_require: 'force', A: '1' })).toEqual({ A: '1', SSH_ASKPASS_REQUIRE: 'never' });
   });

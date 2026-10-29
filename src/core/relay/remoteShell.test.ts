@@ -123,6 +123,34 @@ describeUnix('RemoteShell', () => {
     await expect(silent).rejects.toMatchObject({ detail: 'ssh did not answer within 0.3 seconds.', timedOut: true });
   });
 
+  // A question of the login in VS Code (a password, a host key) waits for the user, longer than the time limit.
+  it('stops the time limit of the login while a question is open, and starts it anew after it', async () => {
+    const listeners = new Set<(open: boolean) => void>();
+    const prompts = {
+      onPrompt: (listener: (open: boolean) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    const ask = (open: boolean) => listeners.forEach((listener) => listener(open));
+    // Answers after 600 ms, twice the time limit: the question is open from 50 ms to 450 ms.
+    const opening = RemoteShell.open(login('sleep 0.6; exec sh -s'), { logger: silentLogger, name: 'box', loginTimeoutMs: 300, prompts });
+    setTimeout(() => ask(true), 50);
+    setTimeout(() => ask(false), 450);
+    const shell = await opening;
+    expect(shell.isOpen).toBe(true);
+    expect(listeners.size).toBe(0);
+    shell.killNow();
+    // After the question, the full time limit again.
+    const late = RemoteShell.open(login('sleep 30'), { logger: silentLogger, name: 'box', loginTimeoutMs: 300, prompts });
+    const started = Date.now();
+    setTimeout(() => ask(true), 50);
+    setTimeout(() => ask(false), 250);
+    await expect(late).rejects.toMatchObject({ timedOut: true });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(500);
+    expect(listeners.size).toBe(0);
+  });
+
   it('closes a shell that no command used for a while', async () => {
     const { logger, lines } = logged();
     let ended = 0;

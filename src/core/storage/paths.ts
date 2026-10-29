@@ -78,6 +78,8 @@ export class StoragePaths {
   readonly usedMarker: string;
   /** The Docker CLI of Devspaces, `docker-cli/<version>/docker[.exe]` (ownDockerCli.ts). */
   readonly dockerCliDir: string;
+  /** The helper that asks the questions of SSH logins in VS Code and its launcher (sshAskpass.ts). */
+  readonly askpassDir: string;
 
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
@@ -94,6 +96,7 @@ export class StoragePaths {
     this.configChecksDir = path.join(root, 'checks');
     this.usedMarker = path.join(root, 'used');
     this.dockerCliDir = path.join(root, 'docker-cli');
+    this.askpassDir = path.join(root, 'askpass');
   }
 
   /**

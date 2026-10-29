@@ -18,12 +18,14 @@ import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '.
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
+import { RelayConnectionError } from '../core/relay/connection';
 import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { HostPipes } from '../core/relay/hostPipes';
-import { RemoteShells } from '../core/relay/remoteShells';
+import { RemoteShells, type RemoteShellStart } from '../core/relay/remoteShells';
 import { dockerPipeBase } from '../core/relay/pipeAddress';
+import { sshPromptSignal, sshPromptsAllowed } from '../core/sshAskpass';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
 import { sameScope } from '../core/discovery/scope';
@@ -83,6 +85,7 @@ import { isProcessAlive } from '../core/session/sessionRules';
 import { extensionFlow, extensionHostSide, type HostSideDeps } from './hostSide';
 import { VsCodePipelineUi } from './pipelineUi';
 import { onDidChangeBusy } from './progress';
+import { SshAskpassServer, vscodeSshLoginDialogs, type SshLogin } from './sshLoginPrompts';
 import { GroupMatchWorkerRunner } from './groupMatcher';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
@@ -288,16 +291,39 @@ async function activateExtension(
     relayConnection: (host) => relayConnections.get(host),
     dialStdio,
   });
+  // The questions of the SSH logins of the flows of the user in VS Code (a password, a host key): the helper of
+  // SSH_ASKPASS and the pipe that it asks, prepared in the background. Every other login asks nothing (BatchMode).
+  const askpass = new SshAskpassServer({
+    folder: paths.askpassDir,
+    platform,
+    nodePath: process.execPath,
+    base: () => dockerPipeBase(env, os.tmpdir()),
+    dialogs: vscodeSshLoginDialogs(),
+    logger,
+  });
+  context.subscriptions.push(askpass);
+  void askpass.prepare();
+  /**
+   * A new login `ssh … sh -s` to `host` (sshHostTransport), for a shell before the relay or a connection of the relay.
+   * Within a flow of the user (withSshPrompts), it may ask in VS Code until the Cancel of the flow; its questions end
+   * with its process. Undefined without `ssh` and for a host that is no SSH alias or address.
+   */
+  const startLogin = (host: string): RemoteShellStart | undefined => {
+    const ssh = sshPath();
+    if (ssh === undefined) return undefined;
+    const login: SshLogin | undefined = sshPromptsAllowed() ? askpass.login(host, sshPromptSignal()) : undefined;
+    const transport = sshHostTransport(host, ssh, env, login);
+    if (transport === undefined) {
+      login?.dispose();
+      return undefined;
+    }
+    const process = runner.startBytes(transport.file, transport.args, { env: transport.env });
+    if (login !== undefined) void process.exited.then(() => login.dispose());
+    return { process, prompts: login };
+  };
   // The shells before the relay, one per SSH host: the checks before a connection of the relay run on one login, which
   // the connection then takes over (`ssh … sh -s`, as its transport).
-  remoteShells = new RemoteShells({
-    logger,
-    start: (host) => {
-      const ssh = sshPath();
-      const transport = ssh === undefined ? undefined : sshHostTransport(host, ssh, env);
-      return transport === undefined ? undefined : runner.startBytes(transport.file, transport.args, { env: transport.env });
-    },
-  });
+  remoteShells = new RemoteShells({ logger, start: startLogin });
   const shells = remoteShells;
   // The SSH check before the Docker calls to a remote host: the login of its shell before the relay. A success counts
   // for a minute per host, and the Docker pipe of the extension for the host makes it needless while the calls go
@@ -468,11 +494,16 @@ async function activateExtension(
           // (`ssh … sh -s`).
           relay: (target) => {
             const ssh = sshPath();
-            const transport = ssh === undefined ? undefined : sshRelayTransport(target, ssh, env);
-            if (transport === undefined) return undefined;
-            // The login of the shell before the relay, when its checks left one open; else a new one.
+            if (ssh === undefined || sshRelayTransport(target, ssh, env) === undefined) return undefined;
+            // The login of the shell before the relay, when its checks left one open; else a new one, which may ask
+            // within a flow of the user.
+            const start = () => {
+              const started = startLogin(target.host);
+              if (started === undefined) throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ssh was not found, or it is no SSH alias or address.`);
+              return started;
+            };
             return relayAccess(relayConnections, target.host, (command, bundle) =>
-              openRelayConnection(runner, transport, command, bundle, { logger, name: target.host, takeOver: () => shells.takeOver(target.host) }),
+              openRelayConnection(start, command, bundle, { logger, name: target.host, takeOver: () => shells.takeOver(target.host) }),
             );
           },
           runDirect: (args, options, withoutPipe) => (withoutPipe === true ? docker.runWithoutPipe(args, options) : docker.run(args, options)),
@@ -802,6 +833,7 @@ async function activateExtension(
     sshPath,
     env,
     sshLogins,
+    shells,
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();

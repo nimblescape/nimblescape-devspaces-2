@@ -4,8 +4,8 @@
 
 // "Devspaces: Use a Remote Docker Host…", "Devspaces: Use the Local Docker", and the choice of the first row of the view.
 // Devspaces keeps its own list of SSH hosts (RemoteDockerState, docs/architecture.md "Remote Docker hosts"): "Use a
-// Remote Docker Host…" tests a host over SSH without questions and makes it the Docker host of Devspaces (it joins the
-// list); "Use the Local Docker" goes back to the Docker of this computer, which the current Docker context names. Nothing
+// Remote Docker Host…" tests a host with one SSH login, which may ask for a password or an unknown host key in VS Code
+// (sshLoginPrompts.ts), and makes it the Docker host of Devspaces (it joins the list); "Use the Local Docker" goes back to the Docker of this computer, which the current Docker context names. Nothing
 // else is written: no Docker context, no setting, no DOCKER_HOST, no setting of the Dev Containers extension, so the
 // docker command in the terminals of the user keeps its target. One Docker host at a time, for every window of
 // Devspaces on this computer. A Docker context or DOCKER_HOST of the user that reaches a host over SSH is offered once
@@ -27,6 +27,7 @@ import {
   testRemoteDockerHost,
   unsupportedTargetMessage,
   type RemoteDockerCli,
+  type RemoteShellAccess,
   type SshLoginCache,
 } from '../core/docker/remoteDocker';
 import { errorMessage, isUserFacingError } from '../core/errors';
@@ -117,6 +118,11 @@ export interface RemoteDockerDeps {
   env: NodeJS.ProcessEnv;
   /** The successes of the SSH check, shared with the operations. */
   sshLogins?: SshLoginCache;
+  /**
+   * The shells before the relay: the test of a host is one login, which may ask for a password or an unknown host key
+   * in VS Code (sshAskpass.ts), and the read of the socket of a rootless engine runs on it too.
+   */
+  shells?: RemoteShellAccess;
   /** The number of devspaces of this computer on `host` (its registry), for the message of a removed host. */
   devspaceCount?: (host: string) => Promise<number>;
   /** After a change of the Docker host of Devspaces: the sidebar shows the devspaces of the new host. */
@@ -276,7 +282,7 @@ export class RemoteDockerCommands {
           const result = await testRemoteDockerHost(
             this.deps.docker,
             host,
-            { runner: this.deps.runner, sshPath: this.deps.sshPath(), env: this.deps.env, sshLogins: this.deps.sshLogins },
+            { runner: this.deps.runner, sshPath: this.deps.sshPath(), env: this.deps.env, sshLogins: this.deps.sshLogins, shells: this.deps.shells },
             { signal: controller.signal },
           );
           // A rootless engine: its socket is read once (ssh, without questions) and recorded with the host.
@@ -287,6 +293,7 @@ export class RemoteDockerCommands {
               logger: this.deps.logger,
               sshPath: this.deps.sshPath(),
               env: this.deps.env,
+              shells: this.deps.shells,
             }, controller.signal);
           }
           return result;

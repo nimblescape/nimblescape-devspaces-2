@@ -38,7 +38,7 @@ import {
 import { PIPE_LOADER, bundleHash, encodeBundle } from '../../src/core/loader/pipeLoader';
 import { LABEL_HELPER_CHANNEL, LABEL_HELPER_RUN } from '../../src/core/names';
 import { helperDockerSocket } from '../../src/core/helper/helperImages';
-import type { StartOptions, StartedByteProcess, StartedProcess } from '../../src/core/ports';
+import type { StartedByteProcess, StartedProcess } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
 import type { RelayConnection } from '../../src/core/relay/connection';
 import { RelayConnections, relayAccess } from '../../src/core/relay/connections';
@@ -155,12 +155,10 @@ describe('the helper channel with the real Docker engine', () => {
         },
         relay: () => {
           if (!options.relay) return undefined;
-          const runner = {
-            startBytes: (file: string, args: readonly string[], startOptions?: StartOptions) => (transport = byteRunner.startBytes(file, args, startOptions)),
-          };
+          const start = () => ({ process: (transport = byteRunner.startBytes('sh', ['-s'], { env })) });
           // The Docker CLI of the run, with the environment of the run.
           return relayAccess(options.relay, 'runner-engine', (command, bundle) =>
-            openRelayConnection(runner, { file: 'sh', args: ['-s'], env }, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: 'runner-engine' }),
+            openRelayConnection(start, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: 'runner-engine' }),
           );
         },
         // The engine identity of the open is compared with one call without the worker.
