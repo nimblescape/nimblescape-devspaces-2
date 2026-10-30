@@ -42,7 +42,7 @@ export const WslSetupTexts = {
   notWindows: 'The WSL distribution of Devspaces exists only on Windows.',
   busy: 'The WSL distribution of Devspaces is being set up or removed in this window. Try again after that.',
   confirmSetUp: 'Set up Docker for Devspaces?',
-  confirmSetUpDetail: (image: WslImage & { size?: number }, folder: string) =>
+  confirmSetUpDetail: (image: WslImage, folder: string) =>
     [
       `Devspaces creates its own WSL distribution "${WSL_DISTRIBUTION}" with Docker Engine, and then uses Docker there. Your other WSL distributions and Docker Desktop stay as they are. This needs no administrator permission.`,
       `Downloads:\n- ${image.name} for WSL${image.size === undefined ? '' : ` (${Math.ceil(image.size / 1_048_576)} MB)`} from ${image.url}, checked against its SHA-256 in the list of WSL distributions of Microsoft (${WSL_DISTRIBUTION_LIST_URL})\n- Docker Engine from download.docker.com, and the packages that it needs from Debian: about 120 MB`,
@@ -60,6 +60,8 @@ export const WslSetupTexts = {
     ].join('\n\n'),
   remove: 'Remove',
   removed: (wasCurrent: boolean) => `The WSL distribution of Devspaces was removed.${wasCurrent ? ' Devspaces now uses the local Docker.' : ''}`,
+  removedStillListed: `The WSL distribution of Devspaces was removed, but Devspaces could not take "${WSL_HOST}" out of its list of Docker hosts. Take it out with "Remove a Host from the List…".`,
+  readyNotUsed: `Docker Engine runs in the WSL distribution of Devspaces, but Devspaces does not use it yet. When the problem of the other message is solved, choose "${WSL_HOST}" in "Use a Remote Docker Host…".`,
   notInstalled: 'The WSL distribution of Devspaces is not installed.',
   foreign: `A WSL distribution with the name "${WSL_DISTRIBUTION}" exists, but Devspaces did not set it up, so Devspaces does not change it. Use it as it is?`,
   foreignRemove: `The WSL distribution "${WSL_DISTRIBUTION}" was not set up by Devspaces, so Devspaces does not remove it. If you do not need it, remove it in a terminal with "wsl --unregister ${WSL_DISTRIBUTION}".`,
@@ -113,7 +115,7 @@ export const WslSetupTexts = {
 
 export interface WslSetupCommandsDeps {
   /** The setup of this computer; undefined where there is none (not Windows, or no LOCALAPPDATA). */
-  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove'> | undefined;
+  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers'> | undefined;
   /** The folder of the distribution (wslSetupFolder), for the questions. */
   folder: string | undefined;
   logger: Logger;
@@ -163,9 +165,10 @@ export class WslSetupCommands {
       if (!confirmed) return;
       this.deps.logger.info(plan.image === undefined ? `The WSL distribution ${WSL_DISTRIBUTION} is set up again.` : `The WSL distribution ${WSL_DISTRIBUTION} is set up in ${folder}.`);
       await this.withProgress(WslSetupTexts.settingUp, (signal, report) => setup.setUp(plan.image, (step) => report(step), signal));
-      await this.deps.useHost(WSL_HOST);
+      // useHost shows its own problem; this message says that the setup itself is done.
+      if (!(await this.deps.useHost(WSL_HOST))) this.inform(WslSetupTexts.readyNotUsed);
     } catch (error) {
-      this.showFailure(error, WslSetupTexts.failed);
+      this.showFailure(error, WslSetupTexts.failed, 'The setup of the WSL distribution of Devspaces was cancelled.');
     } finally {
       this.running = false;
     }
@@ -198,18 +201,29 @@ export class WslSetupCommands {
         return;
       }
       if (registration === 'none') {
-        // Removed by hand: the host leaves the list too.
-        await this.deps.forgetHost(WSL_HOST);
+        // Removed by hand, or a setup that did not end: the host leaves the list, and the files of that setup go.
+        await this.deps.forgetHost(WSL_HOST).catch((error: unknown) => {
+          this.deps.logger.warn(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
+        });
+        await setup.removeLeftovers();
         this.inform(WslSetupTexts.notInstalled);
         return;
       }
       if (!(await this.confirm(WslSetupTexts.confirmRemove, WslSetupTexts.confirmRemoveDetail(folder), WslSetupTexts.remove))) return;
       // `wsl --unregister` is not cancelled: a half removed distribution would help nobody.
       await withNotificationProgress({ title: WslSetupTexts.removing }, () => setup.remove());
-      const wasCurrent = await this.deps.forgetHost(WSL_HOST);
+      let wasCurrent: boolean;
+      try {
+        wasCurrent = await this.deps.forgetHost(WSL_HOST);
+      } catch (error) {
+        // The distribution is gone; only the list of Devspaces still names it.
+        this.deps.logger.error(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
+        this.showError(WslSetupTexts.removedStillListed);
+        return;
+      }
       this.inform(WslSetupTexts.removed(wasCurrent));
     } catch (error) {
-      this.showFailure(error, WslSetupTexts.removeFailedUnknown);
+      this.showFailure(error, WslSetupTexts.removeFailedUnknown, 'The removal of the WSL distribution of Devspaces was cancelled.');
     } finally {
       this.running = false;
     }
@@ -251,9 +265,10 @@ export class WslSetupCommands {
     return (await showWarningMessage(message, { modal: true, detail }, button)) === button;
   }
 
-  private showFailure(error: unknown, unknown: string): void {
+  /** The message of a failure: `unknown` for an error that is not a WslSetupError; a cancel is only logged (`cancelled`). */
+  private showFailure(error: unknown, unknown: string, cancelled: string): void {
     if (isAbortError(error)) {
-      this.deps.logger.info('The setup of the WSL distribution of Devspaces was cancelled.');
+      this.deps.logger.info(cancelled);
       return;
     }
     if (!isWslSetupError(error)) {

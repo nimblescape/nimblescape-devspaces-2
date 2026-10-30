@@ -7,15 +7,17 @@
 // `wsl --install` itself uses), checks it against the SHA-256 of that list, and registers it for the Windows user with
 // `wsl --install --from-file` under the name `devspaces`, with its virtual disk in a folder of Devspaces. Then a script
 // runs as root in the distribution: it turns on systemd and installs Docker Engine from download.docker.com. After a
-// restart of the distribution, systemd starts Docker. The removal is `wsl --unregister devspaces`. No `vscode`.
+// restart of the distribution, systemd starts Docker. The removal is `wsl --unregister devspaces`. Whether Devspaces set
+// up the distribution comes from the registry of the Windows user (the folder of its virtual disk). No `vscode`.
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { errorMessage } from '../errors';
 import type { HttpTransport } from '../http';
-import { abortError, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
+import { abortError, isAbortError, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import { downloadFile, type DownloadOptions } from './dockerDownload';
 import { WSL_DISTRIBUTION, WSL_LIST_ARGS, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
-import { DOCKER_ENGINE_PACKAGES } from './dockerSetup';
+import { DOCKER_ENGINE_PACKAGES, isHttpsUrl } from './dockerSetup';
 
 /** The list of the WSL distributions that `wsl --install` offers, with the URL and the SHA-256 of each file. */
 export const WSL_DISTRIBUTION_LIST_URL = 'https://raw.githubusercontent.com/microsoft/WSL/master/distributions/DistributionInfo.json';
@@ -29,6 +31,10 @@ export const WSL_TERMINATE_ARGS: readonly string[] = ['--terminate', WSL_DISTRIB
 export const WSL_UNREGISTER_ARGS: readonly string[] = ['--unregister', WSL_DISTRIBUTION];
 /** The log of the script in the distribution. */
 export const WSL_SETUP_LOG = '/var/log/devspaces-setup.log';
+/** The line of the policy-rc.d of the script, so that a later run knows the file of a run that was stopped. */
+export const WSL_POLICY_MARK = '# Written by the setup of Devspaces.';
+/** The key of the registry with the WSL distributions of the Windows user: one subkey for each, with its name and folder. */
+export const LXSS_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss';
 
 /** The largest list that is read. */
 const MAX_LIST_BYTES = 1024 * 1024;
@@ -44,6 +50,8 @@ const START_MS = 3 * 60_000;
 const UNREGISTER_MS = 5 * 60_000;
 /** The name of the downloaded file in the folder `download`; it is removed after the registration. */
 const DOWNLOAD_NAME = 'debian.wsl';
+/** The file of `reg.exe export`, in a new folder of the temporary folder that is removed after the read. */
+const REGISTRY_EXPORT_NAME = 'distributions.reg';
 /** The start of the lines of the script that name its next step. */
 const STEP_PREFIX = 'devspaces-step ';
 
@@ -70,6 +78,8 @@ export interface WslImage {
   url: string;
   /** The SHA-256 of the file, hex in lower case. */
   sha256: string;
+  /** The size in bytes, when a HEAD request tells it (WslSetup.image). */
+  size?: number;
 }
 
 const SHA256 = /^(?:0x)?([0-9a-f]{64})$/i;
@@ -91,15 +101,6 @@ export function debianImageOf(list: unknown, arch: string): WslImage | undefined
   return sha256 === undefined ? undefined : { name, url: file.Url, sha256: sha256.toLowerCase() };
 }
 
-function isHttpsUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'https:' && parsed.port === '';
-  } catch {
-    return false;
-  }
-}
-
 /** The version of WSL in the output of `wsl.exe --version` (its first line, also in other languages), or undefined. */
 export function parseWslVersion(output: string): [number, number, number] | undefined {
   const match = /(\d+)\.(\d+)\.(\d+)/.exec(wslText(output));
@@ -114,14 +115,57 @@ export function supportsFromFile(version: readonly [number, number, number]): bo
   return true;
 }
 
+/** The arguments of `reg.exe` that write the key LXSS_KEY to `file` (a `.reg` file in UTF-16). */
+export function regExportArgs(file: string): string[] {
+  return ['export', LXSS_KEY, file, '/y'];
+}
+
+/**
+ * The folders of the WSL distributions (the value BasePath: the folder of the virtual disk) by their name in lower case
+ * (DistributionName), from the file of `reg.exe export` (UTF-16 with a BOM, else UTF-8).
+ */
+export function parseLxssExport(content: Buffer): Map<string, string> {
+  const text = content[0] === 0xff && content[1] === 0xfe ? content.subarray(2).toString('utf16le') : content.toString('utf8');
+  const folders = new Map<string, string>();
+  let values = new Map<string, string>();
+  const close = (): void => {
+    const name = values.get('distributionname');
+    const basePath = values.get('basepath');
+    if (name !== undefined && basePath !== undefined) folders.set(name.toLowerCase(), basePath);
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('[')) {
+      close();
+      values = new Map();
+      continue;
+    }
+    // A string value: "Name"="Value", with \\ and \" inside.
+    const match = /^"((?:[^"\\]|\\.)*)"="((?:[^"\\]|\\.)*)"$/.exec(line.trim());
+    if (match) values.set(unescapeRegistry(match[1]).toLowerCase(), unescapeRegistry(match[2]));
+  }
+  close();
+  return folders;
+}
+
+function unescapeRegistry(text: string): string {
+  return text.replace(/\\(.)/g, '$1');
+}
+
+/** Whether the Windows path `folder` is `parent` or inside it: without case, without `\\?\` and closing separators. */
+function isWithin(folder: string, parent: string): boolean {
+  const plain = (name: string): string => path.win32.normalize(name.replace(/^\\\\\?\\/, '')).replace(/[\\/]+$/, '').toLowerCase();
+  return plain(folder) === plain(parent) || plain(folder).startsWith(`${plain(parent)}\\`);
+}
+
 /** The steps of the script in the distribution (PROVISION_SCRIPT), in this order. */
 export type ProvisionPhase = 'packages' | 'repository' | 'docker';
 const PHASES: readonly ProvisionPhase[] = ['packages', 'repository', 'docker'];
 
 /**
- * The settings of WSL for the distribution: systemd starts Docker; root is the user of `wsl -d devspaces`; the drives of
- * Windows are not mounted, and programs in the distribution cannot start Windows programs, so that a container that
- * breaks out reaches no file and no program of the Windows user through WSL.
+ * The settings of WSL for the distribution: systemd starts Docker; root is the user of `wsl -d devspaces`; WSL mounts no
+ * drive of Windows at the start and turns off the start of Windows programs, so that Docker and the devspaces do not see
+ * the files of the Windows user by default. These are no wall: root in the distribution can mount the drives again
+ * (docs/security.md).
  */
 export const WSL_CONF = [
   '# Written by Devspaces: the settings of the WSL distribution of Devspaces.',
@@ -141,29 +185,38 @@ export const WSL_CONF = [
 
 /**
  * The script that sets up the distribution, as root (`sh -s`, on standard input). It can run again on a distribution
- * that it set up before: each file is written anew, and apt installs or updates. The output of the commands goes to
- * WSL_SETUP_LOG; standard output gets only the step lines (`devspaces-step <phase>`). On a failure, standard error gets
- * the last 40 lines of the log. The body is a function that runs with its standard input from /dev/null, so no command
- * reads the rest of the script. No service starts during the installation (policy-rc.d): systemd starts Docker after
- * the restart of the distribution.
+ * that it set up before, also after a run that was stopped: each file is written anew, dpkg ends an interrupted
+ * installation, and apt installs or updates. Only one run at a time (flock): a second one fails at once. The output of
+ * the commands goes to WSL_SETUP_LOG; standard output gets only the step lines (`devspaces-step <phase>`). On a failure,
+ * standard error gets the last 40 lines of the log. The body is a function that runs with its standard input from
+ * /dev/null, so no command reads the rest of the script. No service starts during the installation (a policy-rc.d with
+ * WSL_POLICY_MARK, removed at the end; one of another program stays): systemd starts Docker after the restart of the
+ * distribution.
  */
 export const PROVISION_SCRIPT = `set -eu
 main() {
 log=${WSL_SETUP_LOG}
+exec 9> /run/devspaces-setup.lock
+if ! flock -n 9; then
+echo "Another setup of Docker runs in the distribution. Try again after it." >&2
+exit 1
+fi
 : > "$log"
 step() { echo "${STEP_PREFIX}$1"; echo "== $1" >> "$log"; }
 fail() { echo "The setup failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
 run() { "$@" >> "$log" 2>&1 || fail; }
 export DEBIAN_FRONTEND=noninteractive
-if [ ! -e /usr/sbin/policy-rc.d ]; then
-printf '#!/bin/sh\\nexit 101\\n' > /usr/sbin/policy-rc.d
+if [ ! -e /usr/sbin/policy-rc.d ] || grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d; then
+printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d
 chmod 755 /usr/sbin/policy-rc.d
 trap 'rm -f /usr/sbin/policy-rc.d' EXIT
+trap 'exit 1' HUP INT TERM
 fi
 step packages
 cat > /etc/wsl.conf <<'WSLCONF'
 ${WSL_CONF}
 WSLCONF
+run dpkg --configure -a
 run apt-get update
 run apt-get install -y ca-certificates curl systemd systemd-sysv
 step repository
@@ -248,9 +301,9 @@ export function isWslSetupError(error: unknown): error is WslSetupError {
 }
 
 /**
- * Whether the distribution `devspaces` is registered: `none`; `own`, set up by Devspaces (its virtual disk is in the
- * folder of Devspaces); or `foreign`, a distribution with that name that the user made, which Devspaces never sets up
- * or removes.
+ * Whether the distribution `devspaces` is registered: `none`; `own`, set up by Devspaces (the registry names the folder
+ * of Devspaces as the folder of its virtual disk); or `foreign`, a distribution with that name that the user made,
+ * which Devspaces never sets up or removes.
  */
 export type WslRegistration = 'none' | 'own' | 'foreign';
 
@@ -292,6 +345,12 @@ export class WslSetup {
     return path.join(this.deps.folder, 'download');
   }
 
+  /** `reg.exe` in System32 of SystemRoot, not from PATH. */
+  private get regPath(): string {
+    const systemRoot = Object.entries(this.deps.env).find(([name]) => name.toUpperCase() === 'SYSTEMROOT')?.[1] ?? 'C:\\Windows';
+    return path.win32.join(systemRoot, 'System32', 'reg.exe');
+  }
+
   /**
    * The version of WSL, when it can register a file (WSL_FROM_FILE_VERSION). Throws WslSetupError `wslMissing` without
    * WSL, `wslTooOld` for an older WSL (an older `wsl.exe` knows no `--version`; `--status` then tells whether WSL is
@@ -319,14 +378,15 @@ export class WslSetup {
     const names = result.exitCode === 0 ? parseWslList(result.stdout) : [];
     // WSL compares the names without case.
     if (!names.some((name) => name.toLowerCase() === WSL_DISTRIBUTION)) return 'none';
-    return (await this.hasOwnDisk()) ? 'own' : 'foreign';
+    const diskFolder = (await this.distributionFolders(signal))?.get(WSL_DISTRIBUTION);
+    return diskFolder !== undefined && isWithin(diskFolder, this.diskFolder) ? 'own' : 'foreign';
   }
 
   /**
    * The Debian file of the list of WSL distributions for this computer, with its size when a HEAD request tells it.
    * Throws WslSetupError `listFailed` or `noImage`.
    */
-  async image(signal?: AbortSignal): Promise<WslImage & { size?: number }> {
+  async image(signal?: AbortSignal): Promise<WslImage> {
     let list: unknown;
     try {
       const response = await this.deps.http.request({ method: 'GET', url: WSL_DISTRIBUTION_LIST_URL, maxBodyBytes: MAX_LIST_BYTES }, signal);
@@ -347,28 +407,36 @@ export class WslSetup {
    * in `diskFolder`, and removes the download; then the script installs Docker Engine (PROVISION_SCRIPT), the
    * distribution restarts, and Docker must answer. Without `image`, only the script, the restart and the check run (a
    * distribution that Devspaces set up before). Returns the version of the engine. Throws WslSetupError, or an
-   * AbortError when the signal aborts: a command in the distribution may then go on (WSL ends it with the distribution).
+   * AbortError when the signal aborts. When the script is cancelled or ends by its time limit, the distribution stops,
+   * because the script would go on there after the end of wsl.exe; its next run goes on from there.
    */
-  async setUp(image: (WslImage & { size?: number }) | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
+  async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
     if (image !== undefined) await this.register(image, onStep, signal);
     let pending = '';
-    const provision = await this.runWsl(wslCommandArgs(WSL_DISTRIBUTION, ['sh', '-s']), {
-      input: PROVISION_SCRIPT,
-      timeoutMs: PROVISION_MS,
-      signal,
-      onStdout: (text) => {
-        pending += wslText(text);
-        const lines = pending.split(/\r?\n/);
-        pending = lines.pop() ?? '';
-        for (const line of lines) {
-          const phase = line.startsWith(STEP_PREFIX) ? (line.slice(STEP_PREFIX.length).trim() as ProvisionPhase) : undefined;
-          if (phase !== undefined && PHASES.includes(phase)) {
-            this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION}: ${phase}.`);
-            onStep({ kind: 'docker', phase });
+    let provision: RunResult;
+    try {
+      provision = await this.runWsl(wslCommandArgs(WSL_DISTRIBUTION, ['sh', '-s']), {
+        input: PROVISION_SCRIPT,
+        timeoutMs: PROVISION_MS,
+        signal,
+        onStdout: (text) => {
+          pending += wslText(text);
+          const lines = pending.split(/\r?\n/);
+          pending = lines.pop() ?? '';
+          for (const line of lines) {
+            const phase = line.startsWith(STEP_PREFIX) ? (line.slice(STEP_PREFIX.length).trim() as ProvisionPhase) : undefined;
+            if (phase !== undefined && PHASES.includes(phase)) {
+              this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION}: ${phase}.`);
+              onStep({ kind: 'docker', phase });
+            }
           }
-        }
-      },
-    });
+        },
+      });
+    } catch (error) {
+      if (isAbortError(error)) await this.stopDistribution('the setup was cancelled');
+      throw error;
+    }
+    if (provision.timedOut) await this.stopDistribution(`the script did not end within ${duration(PROVISION_MS)}`);
     if (provision.exitCode !== 0) {
       throw new WslSetupError('dockerFailed', `Docker Engine could not be installed in the WSL distribution ${WSL_DISTRIBUTION} (${endOf(provision, PROVISION_MS)}): ${outputOf(provision)}`);
     }
@@ -401,8 +469,24 @@ export class WslSetup {
     });
   }
 
-  private async register(image: WslImage & { size?: number }, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<void> {
+  /**
+   * Removes the folder of Devspaces when no WSL distribution has its virtual disk there (the registry): the files of a
+   * setup that did not end. Never throws (logged).
+   */
+  async removeLeftovers(): Promise<void> {
+    const { folder, logger } = this.deps;
+    if (!fs.existsSync(folder)) return;
+    const folders = await this.distributionFolders();
+    if (folders === undefined || [...folders.values()].some((diskFolder) => isWithin(diskFolder, folder))) return;
+    await fs.promises.rm(folder, { recursive: true, force: true }).then(
+      () => logger.info(`The folder ${folder} of an earlier setup was removed.`),
+      (error: unknown) => logger.warn(`The folder ${folder} could not be removed: ${errorMessage(error)}`),
+    );
+  }
+
+  private async register(image: WslImage, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<void> {
     const file = path.join(this.downloadFolder, DOWNLOAD_NAME);
+    await this.clearDiskFolder(signal);
     await fs.promises.mkdir(this.downloadFolder, { recursive: true });
     await fs.promises.mkdir(this.diskFolder, { recursive: true });
     try {
@@ -424,7 +508,7 @@ export class WslSetup {
   }
 
   /** The download, checked against the SHA-256 of the list; it stops when no bytes arrive for a minute. */
-  private async downloadImage(image: WslImage & { size?: number }, file: string, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<void> {
+  private async downloadImage(image: WslImage, file: string, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<void> {
     const stalledAfterMs = this.deps.stalledAfterMs ?? STALLED_AFTER_MS;
     const stall = new AbortController();
     let stallTimer: NodeJS.Timeout | undefined;
@@ -479,11 +563,54 @@ export class WslSetup {
     return undefined;
   }
 
-  private async hasOwnDisk(): Promise<boolean> {
+  /**
+   * Empties `diskFolder` before a registration: a virtual disk of a setup that did not end may be there, and WSL creates
+   * no distribution on it. Throws WslSetupError `registerFailed` when a WSL distribution has its disk there, or when the
+   * registry cannot tell.
+   */
+  private async clearDiskFolder(signal?: AbortSignal): Promise<void> {
+    const names = await fs.promises.readdir(this.diskFolder).catch(() => [] as string[]);
+    if (names.length === 0) return;
+    const folders = await this.distributionFolders(signal);
+    const used = folders === undefined ? undefined : [...folders.entries()].find(([, diskFolder]) => isWithin(diskFolder, this.diskFolder))?.[0];
+    if (folders === undefined || used !== undefined) {
+      const reason = used === undefined ? 'the registry does not tell whether a WSL distribution uses them' : `the WSL distribution ${used} has its virtual disk there`;
+      throw new WslSetupError('registerFailed', `The folder ${this.diskFolder} has files (${names.join(', ')}), and ${reason}; Devspaces creates no distribution there.`);
+    }
+    this.deps.logger.info(`The folder ${this.diskFolder} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
+    await fs.promises.rm(this.diskFolder, { recursive: true, force: true });
+  }
+
+  /**
+   * The folders of the virtual disks of the WSL distributions of the Windows user by name in lower case, from the
+   * registry (`reg.exe export` into a new temporary folder, removed after the read), or undefined when it cannot be
+   * read (logged). Throws an AbortError when the signal aborts.
+   */
+  private async distributionFolders(signal?: AbortSignal): Promise<Map<string, string> | undefined> {
+    let temporary: string | undefined;
     try {
-      return (await fs.promises.readdir(this.diskFolder)).some((name) => name.toLowerCase().endsWith('.vhdx'));
-    } catch {
-      return false;
+      temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'devspaces-registry-'));
+      const file = path.join(temporary, REGISTRY_EXPORT_NAME);
+      const result = await this.deps.runner.run(this.regPath, regExportArgs(file), { timeoutMs: SHORT_CALL_MS, signal });
+      if (result.exitCode !== 0) throw new Error(`reg.exe export ended with ${endOf(result, SHORT_CALL_MS)}: ${outputOf(result)}`);
+      return parseLxssExport(await fs.promises.readFile(file));
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      this.deps.logger.warn(`The WSL distributions could not be read from the registry (${LXSS_KEY}): ${errorMessage(error)}`);
+      return undefined;
+    } finally {
+      if (temporary !== undefined) await fs.promises.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** Stops the distribution, and with it a script that goes on there after the end of wsl.exe. Never throws (logged). */
+  private async stopDistribution(reason: string): Promise<void> {
+    try {
+      const result = await this.runWsl(WSL_TERMINATE_ARGS, { timeoutMs: TERMINATE_MS });
+      if (result.exitCode === 0) this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was stopped: ${reason}.`);
+      else this.deps.logger.warn(`wsl.exe ${WSL_TERMINATE_ARGS.join(' ')} failed (${endOf(result, TERMINATE_MS)}): ${outputOf(result)}`);
+    } catch (error) {
+      this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} could not be stopped (${reason}): ${errorMessage(error)}`);
     }
   }
 

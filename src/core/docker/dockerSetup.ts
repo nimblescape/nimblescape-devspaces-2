@@ -191,6 +191,16 @@ export function isHttpsUrlOf(url: string, host: string): boolean {
   }
 }
 
+/** True for an HTTPS URL on the default port, of any host (a download that a SHA-256 checks). */
+export function isHttpsUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && parsed.port === '';
+  } catch {
+    return false;
+  }
+}
+
 /** File name of a download URL, for example `Docker Desktop Installer.exe`. */
 function fileNameOf(url: string): string {
   return decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '');

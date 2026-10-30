@@ -62,7 +62,7 @@ beforeEach(() => {
   setup = {
     checkWsl: vi.fn(async (_signal?: AbortSignal) => '2.6.1'),
     registration: vi.fn(async (): Promise<WslRegistration> => 'none'),
-    image: vi.fn(async (_signal?: AbortSignal): Promise<WslImage & { size?: number }> => IMAGE),
+    image: vi.fn(async (_signal?: AbortSignal): Promise<WslImage> => IMAGE),
     setUp: vi.fn(async (_image: unknown, onStep: (step: WslSetupStep) => void, _signal?: AbortSignal) => {
       onStep({ kind: 'download', received: 0, total: IMAGE.size });
       onStep({ kind: 'download', received: IMAGE.size / 2, total: IMAGE.size });
@@ -72,6 +72,7 @@ beforeEach(() => {
       return '29.9.2';
     }),
     remove: vi.fn(async (_signal?: AbortSignal) => undefined),
+    removeLeftovers: vi.fn(async () => undefined),
   };
   useHost = vi.fn(async (_host: string) => true);
   forgetHost = vi.fn(async (_host: string) => false);
@@ -107,6 +108,15 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
       `${WslSetupTexts.settingUp} Installing Docker Engine.`,
     ]);
     expect(reports.map((report) => report.increment).filter((increment) => increment !== undefined)).toEqual([50, 50]);
+  });
+
+  it('says that the setup is done when Devspaces cannot use the distribution yet', async () => {
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    useHost.mockResolvedValue(false);
+    await commands().setUp();
+    expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.readyNotUsed);
+    expect(WslSetupTexts.readyNotUsed).toContain(`choose "${WSL_HOST}" in "Use a Remote Docker Host…"`);
+    expect(window.showErrorMessage).not.toHaveBeenCalled();
   });
 
   it('does nothing when the question is closed', async () => {
@@ -217,13 +227,33 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
     expect(forgetHost).not.toHaveBeenCalled();
   });
 
-  it('forgets the host of a distribution that is gone, also without WSL', async () => {
+  it('forgets the host of a distribution that is gone and removes the files of a setup that did not end, also without WSL', async () => {
     await commands().remove();
     setup.registration.mockRejectedValue(new WslSetupError('wslMissing', 'wsl.exe was not found.'));
+    forgetHost.mockRejectedValue(new Error('EBUSY'));
     await commands().remove();
     expect(forgetHost.mock.calls).toEqual([[WSL_HOST], [WSL_HOST]]);
+    expect(setup.removeLeftovers).toHaveBeenCalledTimes(2);
     expect(window.showInformationMessage.mock.calls).toEqual([[WslSetupTexts.notInstalled], [WslSetupTexts.notInstalled]]);
     expect(setup.remove).not.toHaveBeenCalled();
+  });
+
+  it('says that the distribution is gone when only the list of Devspaces cannot be changed', async () => {
+    registered('own');
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
+    forgetHost.mockRejectedValue(new Error('EBUSY: the file is locked'));
+    await commands().remove();
+    expect(setup.remove).toHaveBeenCalledTimes(1);
+    expect(window.showErrorMessage).toHaveBeenCalledWith(WslSetupTexts.removedStillListed, Actions.showDetails);
+    expect(window.showErrorMessage).not.toHaveBeenCalledWith(WslSetupTexts.removeFailedUnknown, Actions.showDetails);
+    expect(logger.error).toHaveBeenCalledWith(`${WSL_HOST} could not be removed from the list of Devspaces: EBUSY: the file is locked`);
+  });
+
+  it('logs a cancelled check as a cancelled removal', async () => {
+    setup.registration.mockRejectedValue(abortError());
+    await commands().remove();
+    expect(logger.info).toHaveBeenCalledWith('The removal of the WSL distribution of Devspaces was cancelled.');
+    expect(window.showErrorMessage).not.toHaveBeenCalled();
   });
 
   it('keeps the host when WSL refuses the removal, and says so', async () => {

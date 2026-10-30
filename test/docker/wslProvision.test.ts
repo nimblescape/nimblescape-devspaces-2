@@ -7,9 +7,10 @@
 // the last lines of its log; with the network it installs Docker Engine from download.docker.com, enables its service
 // for systemd without starting it, and can run again. WSL itself (the registration, systemd, the restart) is not here.
 // The Debian images of Docker have a /usr/sbin/policy-rc.d that keeps services from starting; the Debian file of WSL has
-// none, so the tests remove it first, and the script brings its own for the time of the installation.
+// none, so the tests remove it first, and the script brings its own for the time of the installation. Only one run at a
+// time: a second one fails at once.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { PROVISION_SCRIPT, WSL_CONF, WSL_SETUP_LOG } from '../../src/core/docker/wslSetup';
+import { PROVISION_SCRIPT, WSL_CONF, WSL_POLICY_MARK, WSL_SETUP_LOG } from '../../src/core/docker/wslSetup';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { dockerTestContext } from './harness';
 
@@ -66,6 +67,26 @@ describe('the setup script of the WSL distribution', () => {
     const before = shell(container, 'cat /usr/sbin/policy-rc.d');
     expect(provision(container).code).toBe(1);
     expect(shell(container, 'cat /usr/sbin/policy-rc.d')).toBe(before);
+  });
+
+  it('takes over the policy-rc.d of a run that was stopped, and removes it', () => {
+    const container = startDebian('wsl-stopped', { network: 'none' });
+    shell(container, `printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d`);
+    expect(provision(container).code).toBe(1);
+    expect(shell(container, 'test -e /usr/sbin/policy-rc.d && echo present || echo absent')).toBe('absent');
+  });
+
+  it('fails at once while another run holds its lock, and keeps the log of that run', () => {
+    const container = startDebian('wsl-locked', { network: 'none' });
+    shell(container, `echo 'the other run' > ${WSL_SETUP_LOG}`);
+    cli.ok(['exec', '-d', container, 'flock', '/run/devspaces-setup.lock', 'sleep', '120']);
+    // Until the other run holds the lock.
+    shell(container, 'i=0; while flock -n /run/devspaces-setup.lock true; do i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1; done');
+    const result = provision(container);
+    expect(result.code).toBe(1);
+    expect(result.out).toBe('');
+    expect(result.err).toBe('Another setup of Docker runs in the distribution. Try again after it.');
+    expect(shell(container, `cat ${WSL_SETUP_LOG}`)).toBe('the other run');
   });
 
   it('installs Docker Engine from the repository of Docker and enables it for systemd without a start, and runs again', () => {

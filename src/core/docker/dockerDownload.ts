@@ -12,7 +12,7 @@ import * as https from 'https';
 import { pipeline } from 'stream/promises';
 import { userAgent } from '../http';
 import { abortError } from '../ports';
-import { DOCKER_DOWNLOAD_HOST, isHttpsUrlOf } from './dockerSetup';
+import { DOCKER_DOWNLOAD_HOST, isHttpsUrl, isHttpsUrlOf } from './dockerSetup';
 
 const MAX_REDIRECTS = 5;
 
@@ -65,16 +65,6 @@ export interface DownloadOptions {
   onProgress?: (received: number, total: number | undefined) => void;
   /** For tests. Default: `nodeHttpsGet`. */
   get?: HttpGet;
-}
-
-/** True for an HTTPS URL on the default port. */
-function isHttpsUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'https:' && parsed.port === '';
-  } catch {
-    return false;
-  }
 }
 
 function header(headers: DownloadResponse['headers'], name: string): string | undefined {

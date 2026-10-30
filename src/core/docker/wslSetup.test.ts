@@ -13,15 +13,19 @@ import type { DownloadOptions } from './dockerDownload';
 import { WSL_LIST_ARGS } from './dockerHost';
 import {
   DOCKER_WAIT_SCRIPT,
+  LXSS_KEY,
   PROVISION_SCRIPT,
   WSL_CONF,
   WSL_DISTRIBUTION_LIST_URL,
+  WSL_POLICY_MARK,
   WSL_TERMINATE_ARGS,
   WSL_UNREGISTER_ARGS,
   WslSetup,
   WslSetupError,
   debianImageOf,
+  parseLxssExport,
   parseWslVersion,
+  regExportArgs,
   supportsFromFile,
   wslInstallArgs,
   wslSetupFolder,
@@ -29,6 +33,7 @@ import {
 } from './wslSetup';
 
 const WSL = 'C:\\Windows\\System32\\wsl.exe';
+const REG = 'C:\\Windows\\System32\\reg.exe';
 const SHA = 'ab'.repeat(32);
 const DEBIAN_URL = 'https://salsa.debian.org/debian/WSL/-/jobs/1/artifacts/raw/Debian_WSL_AMD64_v1.0.0.0.wsl';
 const LIST = {
@@ -55,13 +60,37 @@ interface Call {
   options?: RunOptions;
 }
 
-/** A runner of `wsl.exe` that answers each call with `answer`; a call that `answer` does not know fails the test. */
-function wslRunner(answer: (args: readonly string[], options?: RunOptions) => RunResult | Error | undefined) {
+/**
+ * The file of `reg.exe export` with the distributions `folders` (name, then BasePath), in UTF-16 with a BOM, as Windows
+ * writes it.
+ */
+function lxssExport(folders: Record<string, string>): Buffer {
+  const key = LXSS_KEY.replace('HKCU', 'HKEY_CURRENT_USER');
+  const lines = ['Windows Registry Editor Version 5.00', '', `[${key}]`, '"DefaultDistribution"="{1}"', ''];
+  Object.entries(folders).forEach(([name, basePath], index) => {
+    const escaped = basePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    lines.push(`[${key}\\{${index}}]`, `"BasePath"="${escaped}"`, `"DistributionName"="${name}"`, '"Flags"=dword:0000000f', '');
+  });
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(lines.join('\r\n'), 'utf16le')]);
+}
+
+const isRunResult = (value: Record<string, string> | RunResult): value is RunResult => typeof value.timedOut === 'boolean';
+
+/**
+ * A runner of `wsl.exe` that answers each call with `answer`; a call that `answer` does not know fails the test.
+ * `reg.exe export` writes `registry` (the folders of the distributions by name), or ends with it when it is a result.
+ */
+function wslRunner(answer: (args: readonly string[], options?: RunOptions) => RunResult | Error | undefined, registry?: Record<string, string> | RunResult) {
   const calls: Call[] = [];
   return {
     calls,
     run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
       calls.push({ file, args, options });
+      if (file === REG && registry !== undefined) {
+        if (isRunResult(registry)) return registry;
+        fs.writeFileSync(args[2], lxssExport(registry));
+        return ok();
+      }
       const result = answer(args, options);
       if (result instanceof Error) throw result;
       if (result === undefined) throw new Error(`unexpected wsl.exe ${args.join(' ')}`);
@@ -230,18 +259,53 @@ describe('WslSetup.registration', () => {
     await expect(setup({ runner: others }).registration()).resolves.toBe('none');
   });
 
-  it('is own when the virtual disk is in the folder of Devspaces, else foreign (names without case)', async () => {
-    const runner = wslRunner(() => ok('Ubuntu\r\nDevspaces\r\n'));
-    await expect(setup({ runner }).registration()).resolves.toBe('foreign');
-    fs.mkdirSync(path.join(folder, 'disk'));
-    await expect(setup({ runner }).registration()).resolves.toBe('foreign');
-    fs.writeFileSync(path.join(folder, 'disk', 'ext4.vhdx'), '');
-    await expect(setup({ runner }).registration()).resolves.toBe('own');
+  it('is own when the registry names the folder of Devspaces for its virtual disk, else foreign (names without case)', async () => {
+    const list = () => ok('Ubuntu\r\nDevspaces\r\n');
+    const disk = path.join(folder, 'disk');
+    const own = wslRunner(list, { Ubuntu: 'C:\\WSL\\Ubuntu', Devspaces: `\\\\?\\${disk.toUpperCase()}\\` });
+    await expect(setup({ runner: own }).registration()).resolves.toBe('own');
+    const reg = own.calls.find((call) => call.file === REG);
+    expect(reg?.args).toEqual(regExportArgs(reg?.args[2] ?? ''));
+    expect(reg?.args[2].startsWith(os.tmpdir())).toBe(true);
+    // The export is removed after the read, and nothing is written to the folder of Devspaces.
+    expect(fs.existsSync(path.dirname(reg?.args[2] ?? ''))).toBe(false);
+    expect(fs.readdirSync(folder)).toEqual([]);
+    // A distribution of the user with that name, also with a virtual disk in the folder of Devspaces.
+    fs.mkdirSync(disk);
+    fs.writeFileSync(path.join(disk, 'ext4.vhdx'), '');
+    await expect(setup({ runner: wslRunner(list, { devspaces: 'D:\\mine' }) }).registration()).resolves.toBe('foreign');
+    await expect(setup({ runner: wslRunner(list, { Ubuntu: disk }) }).registration()).resolves.toBe('foreign');
+  });
+
+  it('is foreign when the registry cannot be read (logged)', async () => {
+    const log = logger();
+    const runner = wslRunner(() => ok('devspaces\r\n'), failed('ERROR: The system was unable to find the specified registry key or value.'));
+    await expect(setup({ runner, log }).registration()).resolves.toBe('foreign');
+    expect(log.warn).toHaveBeenCalledWith(
+      `The WSL distributions could not be read from the registry (${LXSS_KEY}): reg.exe export ended with exit code 1: ERROR: The system was unable to find the specified registry key or value.`,
+    );
   });
 
   it('says that WSL does not answer instead of none when the list ends by its time limit', async () => {
     const runner = wslRunner(() => timedOut);
     await expect(setup({ runner }).registration()).rejects.toMatchObject({ problem: 'wslNotAnswering' });
+  });
+});
+
+describe('the registry of the WSL distributions', () => {
+  it('gives the folder of each distribution by its name, from UTF-16 or UTF-8', () => {
+    const exported = lxssExport({ Ubuntu: 'C:\\Users\\ana\\WSL "x"', Devspaces: 'C:\\Users\\ana\\AppData\\Local\\nimblescape\\devspaces\\wsl\\disk' });
+    const expected = new Map([
+      ['ubuntu', 'C:\\Users\\ana\\WSL "x"'],
+      ['devspaces', 'C:\\Users\\ana\\AppData\\Local\\nimblescape\\devspaces\\wsl\\disk'],
+    ]);
+    expect(parseLxssExport(exported)).toEqual(expected);
+    expect(parseLxssExport(Buffer.from(exported.subarray(2).toString('utf16le'), 'utf8'))).toEqual(expected);
+  });
+
+  it('skips a key without a name or a folder', () => {
+    const text = ['[HKEY_CURRENT_USER\\Lxss\\{1}]', '"DistributionName"="docker-desktop"', '', '[HKEY_CURRENT_USER\\Lxss\\{2}]', '"BasePath"="C:\\\\x"'].join('\r\n');
+    expect(parseLxssExport(Buffer.from(text, 'utf8'))).toEqual(new Map());
   });
 });
 
@@ -292,8 +356,8 @@ describe('WslSetup.image', () => {
 describe('WslSetup.setUp', () => {
   const image = { name: 'Debian', url: DEBIAN_URL, sha256: SHA, size: 10 };
 
-  /** A distribution that answers each step; `override` changes the answer of one. */
-  function distribution(override: (args: readonly string[], options?: RunOptions) => RunResult | Error | undefined = () => undefined) {
+  /** A distribution that answers each step; `override` changes the answer of one; `registry` as in wslRunner. */
+  function distribution(override: (args: readonly string[], options?: RunOptions) => RunResult | Error | undefined = () => undefined, registry?: Record<string, string> | RunResult) {
     return wslRunner((args, options) => {
       const own = override(args, options);
       if (own !== undefined) return own;
@@ -308,7 +372,7 @@ describe('WslSetup.setUp', () => {
       if (args.join(' ') === WSL_TERMINATE_ARGS.join(' ')) return ok();
       if (isScript(args) && options?.input === DOCKER_WAIT_SCRIPT) return ok('29.9.2\n');
       return undefined;
-    });
+    }, registry);
   }
 
   function writingDownload() {
@@ -412,13 +476,61 @@ describe('WslSetup.setUp', () => {
     expect(runner.calls).toHaveLength(1);
   });
 
-  it('names the time limit of a script that does not end', async () => {
+  it('names the time limit of a script that does not end, and stops the distribution so that the script ends', async () => {
+    const log = logger();
     const runner = distribution((args, options) => (isScript(args) && options?.input === PROVISION_SCRIPT ? timedOut : undefined));
-    await expect(setup({ runner }).setUp(undefined, () => undefined)).rejects.toMatchObject({
+    await expect(setup({ runner, log }).setUp(undefined, () => undefined)).rejects.toMatchObject({
       problem: 'dockerFailed',
       message: expect.stringContaining('(no end within 30 minutes): (no output)'),
     });
     expect(runner.calls[0].options?.timeoutMs).toBe(30 * 60_000);
+    expect(runner.calls.map((call) => call.args[0])).toEqual(['-d', '--terminate']);
+    expect(log.info).toHaveBeenCalledWith('The WSL distribution devspaces was stopped: the script did not end within 30 minutes.');
+  });
+
+  it('stops the distribution when the script is cancelled, so that it does not go on there', async () => {
+    const abort = new AbortController();
+    const runner = distribution((args, options) => {
+      if (!isScript(args) || options?.input !== PROVISION_SCRIPT) return undefined;
+      abort.abort();
+      return new Error('The operation was aborted');
+    });
+    const error = await setup({ runner }).setUp(undefined, () => undefined, abort.signal).catch((caught: unknown) => caught);
+    expect(isAbortError(error)).toBe(true);
+    expect(runner.calls.map((call) => call.args)).toEqual([['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'], WSL_TERMINATE_ARGS]);
+    // The stop itself is not cancelled.
+    expect(runner.calls[1].options?.signal).toBeUndefined();
+  });
+
+  it('removes the virtual disk of a setup that did not end before it registers the file again', async () => {
+    const disk = path.join(folder, 'disk');
+    fs.mkdirSync(disk, { recursive: true });
+    fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'old');
+    const log = logger();
+    const runner = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
+    await expect(setup({ runner, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
+    expect(runner.calls.map((call) => call.file)).toEqual([REG, WSL, WSL, WSL, WSL]);
+    expect(fs.readdirSync(disk)).toEqual([]);
+    expect(log.info).toHaveBeenCalledWith(`The folder ${disk} has the files of a setup that did not end (ext4.vhdx); they are removed.`);
+  });
+
+  it('fails with registerFailed and keeps the virtual disk when a distribution uses it, or when the registry does not tell', async () => {
+    const disk = path.join(folder, 'disk');
+    fs.mkdirSync(disk, { recursive: true });
+    fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'in use');
+    const download = writingDownload();
+    const used = distribution(undefined, { devspaces: disk });
+    await expect(setup({ runner: used, download }).setUp(image, () => undefined)).rejects.toMatchObject({
+      problem: 'registerFailed',
+      message: `The folder ${disk} has files (ext4.vhdx), and the WSL distribution devspaces has its virtual disk there; Devspaces creates no distribution there.`,
+    });
+    const unknown = distribution(undefined, failed('Access is denied.'));
+    await expect(setup({ runner: unknown, download }).setUp(image, () => undefined)).rejects.toMatchObject({
+      problem: 'registerFailed',
+      message: expect.stringContaining('the registry does not tell whether a WSL distribution uses them'),
+    });
+    expect(download).not.toHaveBeenCalled();
+    expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
   });
 
   it('goes on after a failed restart (logged), and fails with dockerNotRunning when Docker does not answer', async () => {
@@ -452,6 +564,29 @@ describe('WslSetup.remove', () => {
   });
 });
 
+describe('WslSetup.removeLeftovers', () => {
+  beforeEach(() => {
+    fs.mkdirSync(path.join(folder, 'disk'));
+    fs.writeFileSync(path.join(folder, 'disk', 'ext4.vhdx'), 'old');
+  });
+
+  it('removes the folder of Devspaces when no WSL distribution has its virtual disk there', async () => {
+    const runner = wslRunner(() => undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
+    await setup({ runner }).removeLeftovers();
+    expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  it('keeps it when a distribution has its disk there, when the registry does not tell, and does nothing without it', async () => {
+    await setup({ runner: wslRunner(() => undefined, { other: path.join(folder, 'disk', 'other') }) }).removeLeftovers();
+    await setup({ runner: wslRunner(() => undefined, failed('Access is denied.')) }).removeLeftovers();
+    expect(fs.readdirSync(path.join(folder, 'disk'))).toEqual(['ext4.vhdx']);
+    fs.rmSync(folder, { recursive: true });
+    const runner = wslRunner(() => undefined);
+    await setup({ runner }).removeLeftovers();
+    expect(runner.calls).toEqual([]);
+  });
+});
+
 describe('the scripts in the distribution', () => {
   it('are valid for sh', () => {
     for (const script of [PROVISION_SCRIPT, DOCKER_WAIT_SCRIPT]) {
@@ -470,5 +605,12 @@ describe('the scripts in the distribution', () => {
     expect(steps).toEqual(['packages', 'repository', 'docker']);
     // No command reads the rest of the script from standard input.
     expect(PROVISION_SCRIPT.trimEnd().endsWith('main < /dev/null')).toBe(true);
+  });
+
+  it('run one at a time, end an interrupted installation first, and know their own policy-rc.d', () => {
+    expect(PROVISION_SCRIPT).toContain('exec 9> /run/devspaces-setup.lock\nif ! flock -n 9; then');
+    expect(PROVISION_SCRIPT.indexOf('run dpkg --configure -a')).toBeLessThan(PROVISION_SCRIPT.indexOf('run apt-get update'));
+    expect(PROVISION_SCRIPT).toContain(`grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d`);
+    expect(PROVISION_SCRIPT).toContain(`printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d`);
   });
 });
