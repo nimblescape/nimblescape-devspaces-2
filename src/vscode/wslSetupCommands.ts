@@ -65,7 +65,8 @@ export const WslSetupTexts = {
   notWindows: 'The WSL distribution of Devspaces exists only on Windows.',
   noLocalAppData: 'Devspaces does not find the folder LOCALAPPDATA of your Windows user, where the WSL distribution of Devspaces has its files.',
   busy: 'The WSL distribution of Devspaces is being set up or removed in this window. Try again after that.',
-  busyElsewhere: 'The WSL distribution of Devspaces is being set up or removed in another VS Code window. Try again after that.',
+  busyElsewhere:
+    'The WSL distribution of Devspaces is being set up or removed in another VS Code window, or a VS Code window runs the weekly upgrade of its packages (up to 30 minutes). Try again after that.',
   changedElsewhere: 'The WSL distribution of Devspaces was set up or removed in another VS Code window after the check, so nothing was changed. Try again.',
   confirmSetUp: 'Set up Docker for Devspaces?',
   confirmSetUpDetail: (image: WslImage, folder: string) =>

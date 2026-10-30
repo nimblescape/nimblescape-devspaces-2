@@ -703,6 +703,7 @@ async function activateExtension(
     env,
     logger,
     own: async () => (await wslSetupCore?.registration()) === 'own',
+    locked: async (task) => wslSetupCore?.locked(task),
     runs: async (distribution) => wslLifetime?.running(distribution),
   });
   context.subscriptions.push({ dispose: () => upgrade.dispose() });

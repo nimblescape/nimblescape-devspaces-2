@@ -14,15 +14,15 @@ import {
   UPGRADE_CHECK_MS,
   UPGRADE_DELAY_MS,
   UPGRADE_DONE_FILE,
-  UPGRADE_FAILED_FILE,
   UPGRADE_INTERVAL_SECONDS,
   UPGRADE_LOG,
   UPGRADE_MS,
   UPGRADE_RETRY_SECONDS,
-  UPGRADE_RUNNING_FILE,
   UPGRADE_SCRIPT,
   UPGRADE_STATE_DIR,
+  UPGRADE_TRIED_FILE,
   WslUpgrade,
+  upgradeCounts,
 } from './wslUpgrade';
 
 const WSL = 'C:\\Windows\\System32\\wsl.exe';
@@ -39,8 +39,15 @@ describe('WslUpgrade', () => {
     vi.useRealTimers();
   });
 
-  function upgrade(answer: RunResult | Error = result(0, 'devspaces-upgrade done 3 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n'), own = true, runs: boolean | null = true) {
+  function upgrade(
+    answer: RunResult | Error = result(0, 'devspaces-upgrade done 3 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n'),
+    own = true,
+    runs: boolean | null = true,
+    free = true,
+  ) {
     const log = logger();
+    // The lock of the setup for all windows: `free` false stands for another window that holds it.
+    const lockedTask = vi.fn(async (task: () => Promise<void>) => (free ? { value: await task() } : undefined));
     const calls: { file: string; args: readonly string[]; options?: RunOptions }[] = [];
     const ownCheck = vi.fn(async () => own);
     // `null` stands for a state that is not known (a default parameter takes the place of `undefined`).
@@ -57,10 +64,11 @@ describe('WslUpgrade', () => {
       env: {},
       logger: log,
       own: ownCheck,
+      locked: lockedTask,
       runs: runsCheck,
       now: () => now,
     });
-    return { subject, log, calls, ownCheck, runsCheck };
+    return { subject, log, calls, ownCheck, runsCheck, lockedTask };
   }
 
   // Mutation: a check at once fails it (the upgrade would slow the start of a devspace); so does a check for another
@@ -100,6 +108,23 @@ describe('WslUpgrade', () => {
 
   // Mutation: a check without the check of the state fails it: work in the background starts no distribution that WSL
   // stopped (only a flow of the user, or a Monitor that runs permanently).
+  // Mutation: a check without the lock of the setup can run between the steps of a setup or a removal in another window
+  // (its `wsl --terminate` would stop the upgrade in the middle of dpkg); one that reads the state outside the lock
+  // can start a distribution that a removal stopped.
+  it('runs only with the lock of the setup for all windows, and skips the check while another window holds it', async () => {
+    const free = upgrade();
+    await free.subject.check();
+    expect(free.lockedTask).toHaveBeenCalledTimes(1);
+    expect(free.lockedTask.mock.invocationCallOrder[0]).toBeLessThan(free.runsCheck.mock.invocationCallOrder[0]);
+    expect(free.calls).toHaveLength(1);
+    const held = upgrade(undefined, true, true, false);
+    await held.subject.check();
+    expect(held.runsCheck).not.toHaveBeenCalled();
+    expect(held.calls).toEqual([]);
+    expect(held.log.warn).not.toHaveBeenCalled();
+    expect(held.log.info).not.toHaveBeenCalled();
+  });
+
   // Mutation: a check that counts without a running distribution waits 6 hours after a short use of the distribution;
   // one that reads the state before the owner leaves more time for the distribution to stop before the run.
   it('starts no distribution that does not run, or whose state is not known, and checks again at the next use', async () => {
@@ -144,6 +169,25 @@ describe('WslUpgrade', () => {
     const thrown = upgrade(new Error('spawn EACCES'));
     await expect(thrown.subject.check()).resolves.toBeUndefined();
     expect(thrown.log.warn).toHaveBeenCalledWith('The weekly upgrade of the packages of the WSL distribution devspaces could not run: spawn EACCES');
+  });
+
+  // Mutation: a summary of apt 3.0 that is not read says "were upgraded" each week, also when nothing changed.
+  it('reads the summary of apt before 3.0 and of apt 3.0', async () => {
+    expect(upgradeCounts('3 upgraded, 1 newly installed, 0 to remove and 2 not upgraded.')).toEqual({ changed: 4, kept: 2 });
+    expect(upgradeCounts('0 upgraded, 0 newly installed, 1 downgraded, 0 to remove and 0 not upgraded.')).toEqual({ changed: 0, kept: 0 });
+    expect(upgradeCounts('Upgrading: 3, Installing: 1, Removing: 0, Not Upgrading: 2')).toEqual({ changed: 4, kept: 2 });
+    expect(upgradeCounts('Upgrading: 0, Installing: 0, Reinstalling: 1, Removing: 0, Not Upgrading: 0')).toEqual({ changed: 0, kept: 0 });
+    expect(upgradeCounts('')).toBeUndefined();
+    const current = upgrade(result(0, 'devspaces-upgrade done Upgrading: 0, Installing: 0, Removing: 0, Not Upgrading: 0\n'));
+    await current.subject.check();
+    expect(current.log.info).toHaveBeenCalledWith(
+      'The packages of the WSL distribution devspaces are up to date (apt-get upgrade: Upgrading: 0, Installing: 0, Removing: 0, Not Upgrading: 0).',
+    );
+    const unknown = upgrade(result(0, 'devspaces-upgrade done \n'));
+    await unknown.subject.check();
+    expect(unknown.log.info).toHaveBeenCalledWith(
+      'The weekly upgrade of the packages of the WSL distribution devspaces ended (apt-get upgrade). Its output is in /var/log/devspaces-upgrade.log there.',
+    );
   });
 
   it('warns of packages that the upgrade kept back', async () => {
@@ -198,9 +242,11 @@ describe('the script of the upgrade', () => {
 
   /**
    * Runs the script with the real `sh`, `flock` and `date`, its paths in the temporary folder, and stubs of `dpkg` and
-   * `apt-get` that write their arguments (and whether the policy-rc.d is there) to the file `calls`.
+   * `apt-get` that write their arguments (and whether the policy-rc.d is there) to the file `calls`. `failUpdate`: the
+   * number of runs of `apt-get update` that fail (all: true). `summary`: the summary line of the stub of
+   * `apt-get upgrade`. `sleep` writes its argument to `calls` and returns at once.
    */
-  function runScript(options: { failUpdate?: boolean } = {}) {
+  function runScript(options: { failUpdate?: boolean | number; summary?: string } = {}) {
     const bin = file('bin');
     fs.mkdirSync(bin, { recursive: true });
     const stub = (name: string, first: string[], extra: string[] = []) =>
@@ -210,9 +256,11 @@ describe('the script of the upgrade', () => {
         { mode: 0o755 },
       );
     stub('dpkg', []);
+    stub('sleep', []);
+    const failures = options.failUpdate === true ? 1000 : (options.failUpdate ?? 0);
     stub('apt-get', [], [
-      options.failUpdate ? 'case "$*" in update) echo "E: Could not resolve deb.debian.org"; exit 100;; esac' : ':',
-      'case "$*" in *upgrade*) echo "3 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.";; esac',
+      `case "$*" in update) n=$(grep -c '^apt-get update' '${file('calls')}'); [ "$n" -gt ${failures} ] || { echo "E: Could not resolve deb.debian.org"; exit 100; };; esac`,
+      `case "$*" in *upgrade*) echo '${options.summary ?? '3 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.'}';; esac`,
     ]);
     const script = UPGRADE_SCRIPT.split(UPGRADE_STATE_DIR)
       .join(state())
@@ -244,44 +292,55 @@ describe('the script of the upgrade', () => {
       'apt-get clean policy=yes',
     ]);
     expect(fs.existsSync(file('policy-rc.d'))).toBe(false);
-    const written = Number(fs.readFileSync(stamp(UPGRADE_DONE_FILE), 'utf8').trim());
-    expect(Math.abs(written - seconds())).toBeLessThan(60);
-    expect(fs.existsSync(stamp(UPGRADE_FAILED_FILE))).toBe(false);
-    expect(fs.existsSync(stamp(UPGRADE_RUNNING_FILE))).toBe(false);
+    for (const name of [UPGRADE_DONE_FILE, UPGRADE_TRIED_FILE]) {
+      const written = Number(fs.readFileSync(stamp(name), 'utf8').trim());
+      expect(Math.abs(written - seconds())).toBeLessThan(60);
+    }
   });
 
-  // Mutation: a script without the check of the times upgrades at each window start; one that tries a failure again at
-  // once runs `apt-get update` at each window start while the network is down; one without the mark of a run that
-  // runs leaves an interrupted upgrade for a week.
-  it('skips the upgrade within a week after the last one and within a day after a failure, and ends an interrupted one', () => {
+  // Mutation: a script without LC_ALL=C gets a summary in the language of the distribution; one that reads only the
+  // format before apt 3.0 tells no summary on Debian 13.
+  it('tells the summary of apt 3.0, in English', () => {
+    const run = runScript({ summary: '  Upgrading: 2, Installing: 0, Removing: 0, Not Upgrading: 1' });
+    expect(run.stdout.trim()).toBe('devspaces-upgrade done Upgrading: 2, Installing: 0, Removing: 0, Not Upgrading: 1');
+    expect(UPGRADE_SCRIPT).toContain('export DEBIAN_FRONTEND=noninteractive LC_ALL=C\n');
+  });
+
+  // Mutation: a script that does not try `apt-get update` again fails for a day while `apt-get check` of the timer
+  // apt-daily holds the lock for a moment.
+  it('runs apt-get update up to 3 times, 30 seconds apart', () => {
+    expect(runScript({ failUpdate: 2 }).stdout.trim()).toMatch(/^devspaces-upgrade done /);
+    expect(calls().filter((call) => /^(apt-get update|sleep)/.test(call))).toEqual([
+      'apt-get update policy=yes',
+      'sleep 30 policy=yes',
+      'apt-get update policy=yes',
+      'sleep 30 policy=yes',
+      'apt-get update policy=yes',
+    ]);
+  });
+
+  // Mutation: a script without the check of the times upgrades at each window start; one that tries a run that did not
+  // end well again at once runs `apt-get update` at each check while the network is down, or a hung upgrade again.
+  it('skips the upgrade within a week after the last one, and within a day after the last try', () => {
     fs.mkdirSync(state(), { recursive: true });
     const write = (name: string, ago: number) => fs.writeFileSync(stamp(name), `${seconds() - ago}\n`);
     write(UPGRADE_DONE_FILE, UPGRADE_INTERVAL_SECONDS - 60);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
+    // A try that did not end (the stop of the distribution, the time limit) leaves only its start.
     write(UPGRADE_DONE_FILE, UPGRADE_INTERVAL_SECONDS + 60);
-    write(UPGRADE_FAILED_FILE, UPGRADE_RETRY_SECONDS - 60);
+    write(UPGRADE_TRIED_FILE, UPGRADE_RETRY_SECONDS - 60);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
     expect(calls()).toEqual([]);
-    // An upgrade that the stop of the distribution interrupted (its mark is still there) runs again within the week.
-    write(UPGRADE_DONE_FILE, 60);
-    fs.writeFileSync(stamp(UPGRADE_RUNNING_FILE), '');
+    write(UPGRADE_TRIED_FILE, UPGRADE_RETRY_SECONDS + 60);
     expect(runScript().stdout.trim()).toMatch(/^devspaces-upgrade done /);
     expect(calls()[0]).toBe('dpkg --configure -a policy=yes');
-    expect(fs.existsSync(stamp(UPGRADE_RUNNING_FILE))).toBe(false);
-    expect(fs.existsSync(stamp(UPGRADE_FAILED_FILE))).toBe(false);
-    expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
-    fs.rmSync(file('calls'));
-    write(UPGRADE_DONE_FILE, UPGRADE_INTERVAL_SECONDS + 60);
-    write(UPGRADE_FAILED_FILE, UPGRADE_RETRY_SECONDS + 60);
-    expect(runScript().stdout.trim()).toMatch(/^devspaces-upgrade done /);
-    expect(fs.existsSync(stamp(UPGRADE_FAILED_FILE))).toBe(false);
     // A time after now (a clock that went back) counts as none.
     write(UPGRADE_DONE_FILE, -UPGRADE_INTERVAL_SECONDS);
-    write(UPGRADE_FAILED_FILE, -UPGRADE_RETRY_SECONDS);
+    write(UPGRADE_TRIED_FILE, -UPGRADE_RETRY_SECONDS);
     expect(runScript().stdout.trim()).toMatch(/^devspaces-upgrade done /);
     // A time that is not a number counts as none.
     fs.writeFileSync(stamp(UPGRADE_DONE_FILE), 'x\n');
-    fs.writeFileSync(stamp(UPGRADE_FAILED_FILE), '\n');
+    fs.writeFileSync(stamp(UPGRADE_TRIED_FILE), '\n');
     expect(runScript().stdout.trim()).toMatch(/^devspaces-upgrade done /);
   });
 
@@ -290,8 +349,8 @@ describe('the script of the upgrade', () => {
     expect(run.status).toBe(1);
     expect(run.stderr).toContain(`The upgrade failed. The last lines of ${file('upgrade.log')}:\nE: Could not resolve deb.debian.org`);
     expect(fs.existsSync(stamp(UPGRADE_DONE_FILE))).toBe(false);
-    expect(Math.abs(Number(fs.readFileSync(stamp(UPGRADE_FAILED_FILE), 'utf8').trim()) - seconds())).toBeLessThan(60);
-    expect(fs.existsSync(stamp(UPGRADE_RUNNING_FILE))).toBe(false);
+    expect(Math.abs(Number(fs.readFileSync(stamp(UPGRADE_TRIED_FILE), 'utf8').trim()) - seconds())).toBeLessThan(60);
+    expect(calls().filter((call) => call.startsWith('apt-get update'))).toHaveLength(3);
     expect(fs.existsSync(file('policy-rc.d'))).toBe(false);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
   });
