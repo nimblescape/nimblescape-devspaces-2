@@ -100,6 +100,18 @@ function wslRunner(answer: (args: readonly string[], options?: RunOptions) => Ru
   };
 }
 
+/** `runner`, with `reg.exe export` writing `lines` as they are (UTF-8): keys that lxssExport cannot write. */
+function withRawRegistry<R extends ReturnType<typeof wslRunner>>(runner: R, lines: string[]): R {
+  return {
+    ...runner,
+    run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
+      if (file !== REG) return runner.run(file, args, options);
+      fs.writeFileSync(args[2], Buffer.from(lines.join('\r\n'), 'utf8'));
+      return ok();
+    }),
+  };
+}
+
 function http(answers: Record<string, () => Partial<HttpResponse> | Error>): HttpTransport & { requests: HttpRequest[] } {
   const requests: HttpRequest[] = [];
   return {
@@ -240,6 +252,9 @@ describe('WslSetup.checkWsl', () => {
     expect(none.calls).toEqual([]);
     const notStarted = wslRunner(() => Object.assign(new Error('spawn wsl.exe ENOENT'), { code: 'ENOENT' }));
     await expect(setup({ runner: notStarted }).checkWsl()).rejects.toMatchObject({ problem: 'wslMissing' });
+    // Another failure of the start is no missing WSL: a removal must not take it for one.
+    const denied = wslRunner(() => Object.assign(new Error('spawn wsl.exe EACCES'), { code: 'EACCES' }));
+    await expect(setup({ runner: denied }).registration()).rejects.toMatchObject({ problem: 'wslNotAnswering' });
     const stub = wslRunner(() => failed('The Windows Subsystem for Linux is not installed.'));
     await expect(setup({ runner: stub }).checkWsl()).rejects.toMatchObject({
       problem: 'wslMissing',
@@ -316,13 +331,8 @@ describe('WslSetup.registration', () => {
   });
 
   it('is foreign when the registry does not tell the folder of the distribution', async () => {
-    const runner = wslRunner(() => ok('devspaces\r\n'), { devspaces: path.join(folder, 'disk') });
-    const unknownFolder = { ...runner, run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
-      if (file !== REG) return runner.run(file, args, options);
-      fs.writeFileSync(args[2], Buffer.from('[HKEY_CURRENT_USER\\Lxss\\{1}]\r\n"DistributionName"="devspaces"\r\n', 'utf8'));
-      return ok();
-    }) };
-    await expect(setup({ runner: unknownFolder }).registration()).resolves.toBe('foreign');
+    const runner = withRawRegistry(wslRunner(() => ok('devspaces\r\n')), ['[HKEY_CURRENT_USER\\Lxss\\{1}]', '"DistributionName"="devspaces"']);
+    await expect(setup({ runner }).registration()).resolves.toBe('foreign');
   });
 
   it('says that WSL does not answer instead of none when the list ends by its time limit', async () => {
@@ -605,6 +615,49 @@ describe('WslSetup.setUp', () => {
     expect(fs.readdirSync(path.join(folder, 'disk-2'))).toEqual(['ext4.vhdx']);
   });
 
+  it('keeps a disk folder that a known distribution uses, that cannot be read, or that a registration may still write', async () => {
+    const disk = path.join(folder, 'disk');
+    fs.mkdirSync(disk, { recursive: true });
+    fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'in use');
+    const file = path.join(folder, 'download', 'debian.wsl');
+    const installArgs = (runner: ReturnType<typeof wslRunner>) => runner.calls.find((call) => call.args[0] === '--install')?.args;
+    // A distribution with its disk there, next to one whose folder the registry does not tell.
+    const mixed = withRawRegistry(distribution(), [
+      '[HKEY_CURRENT_USER\\Lxss\\{1}]',
+      `"BasePath"="${disk.replace(/\\/g, '\\\\')}"`,
+      '"DistributionName"="other"',
+      '',
+      '[HKEY_CURRENT_USER\\Lxss\\{2}]',
+      '"BasePath"=hex(2):43,00',
+      '"DistributionName"="third"',
+    ]);
+    await setup({ runner: mixed, download: writingDownload() }).setUp(image, () => undefined);
+    expect(installArgs(mixed)).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
+    expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
+    // The download of a registration that ended by its time limit: WSL may still write `disk`.
+    fs.rmSync(path.join(folder, 'disk-2'), { recursive: true });
+    fs.writeFileSync(file, 'kept');
+    const free = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
+    await setup({ runner: free, download: writingDownload() }).setUp(image, () => undefined);
+    expect(installArgs(free)).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
+    expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
+    // A file in place of the folder.
+    fs.rmSync(folder, { recursive: true });
+    fs.mkdirSync(folder);
+    fs.writeFileSync(disk, 'not a folder');
+    const plain = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
+    await setup({ runner: plain, download: writingDownload() }).setUp(image, () => undefined);
+    expect(installArgs(plain)).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
+    expect(fs.readFileSync(disk, 'utf8')).toBe('not a folder');
+  });
+
+  it('removes the download that a registration kept when it sets up the distribution again', async () => {
+    fs.mkdirSync(path.join(folder, 'download'), { recursive: true });
+    fs.writeFileSync(path.join(folder, 'download', 'debian.wsl'), 'kept');
+    await setup({ runner: distribution() }).setUp(undefined, () => undefined);
+    expect(fs.existsSync(path.join(folder, 'download'))).toBe(false);
+  });
+
   it('removes the virtual disk of a setup that did not end without the registry when WSL does not list the distribution', async () => {
     const disk = path.join(folder, 'disk');
     fs.mkdirSync(disk, { recursive: true });
@@ -699,12 +752,7 @@ describe('WslSetup.removeLeftovers', () => {
   });
 
   it('keeps it when the registry does not tell the folder of a distribution and WSL lists devspaces', async () => {
-    const base = wslRunner(() => ok('devspaces\r\n'));
-    const runner = { ...base, run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
-      if (file !== REG) return base.run(file, args, options);
-      fs.writeFileSync(args[2], Buffer.from('[HKEY_CURRENT_USER\\Lxss\\{1}]\r\n"DistributionName"="devspaces"\r\n"BasePath"=hex(2):43,00\r\n', 'utf8'));
-      return ok();
-    }) };
+    const runner = withRawRegistry(wslRunner(() => ok('devspaces\r\n')), ['[HKEY_CURRENT_USER\\Lxss\\{1}]', '"DistributionName"="devspaces"', '"BasePath"=hex(2):43,00']);
     await setup({ runner }).removeLeftovers();
     expect(fs.readdirSync(path.join(folder, 'disk'))).toEqual(['ext4.vhdx']);
   });

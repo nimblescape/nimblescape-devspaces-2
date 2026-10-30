@@ -16,6 +16,7 @@ import { errorMessage } from '../errors';
 import type { HttpTransport } from '../http';
 import { abortError, isAbortError, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
 import { LockTimeoutError, withLockFolder } from '../storage/lockFolder';
+import { errorCode } from '../storage/paths';
 import { envValue } from './dockerCli';
 import { downloadFile, type DownloadOptions } from './dockerDownload';
 import { WSL_DISTRIBUTION, WSL_LIST_ARGS, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
@@ -287,7 +288,7 @@ docker version --format '{{.Server.Version}}'
 export type WslSetupProblem =
   /** No `wsl.exe`, or WSL is not installed. */
   | 'wslMissing'
-  /** `wsl.exe` did not answer a short call (its version, its list). */
+  /** `wsl.exe` did not answer a short call (its version, its list), or could not start for another reason than a missing file. */
   | 'wslNotAnswering'
   /** WSL older than 2.4.4. */
   | 'wslTooOld'
@@ -469,7 +470,12 @@ export class WslSetup {
    * from there.
    */
   async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
-    if (image !== undefined) await this.register(image, onStep, signal);
+    if (image !== undefined) {
+      await this.register(image, onStep, signal);
+    } else {
+      // The download of a registration that ended by its time limit, which WSL ended later (the distribution exists).
+      await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
+    }
     let pending = '';
     let provision: RunResult;
     try {
@@ -649,34 +655,42 @@ export class WslSetup {
   private async diskFolderFor(signal?: AbortSignal): Promise<string> {
     const first = path.join(this.deps.folder, 'disk');
     const names = await filesOf(first);
-    if (names.length === 0) return first;
-    const users = await this.diskUsers(first, signal);
-    if (users?.length === 0) {
+    if (names?.length === 0) return first;
+    // The download of a registration that ended by its time limit: WSL may still write the disk.
+    const unfinished = fs.existsSync(path.join(this.downloadFolder, DOWNLOAD_NAME));
+    const users = names === undefined || unfinished ? undefined : await this.diskUsers(first, signal);
+    if (names !== undefined && users?.length === 0) {
       this.deps.logger.info(`The folder ${first} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
       await fs.promises.rm(first, { recursive: true, force: true });
       return first;
     }
-    const why = users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses them' : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
+    const content = names === undefined ? 'cannot be read' : `has files (${names.join(', ')})`;
+    const why = unfinished
+      ? 'a registration that did not end within its time limit may still write there'
+      : users === undefined
+        ? 'neither the registry nor WSL tells whether a WSL distribution uses it'
+        : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
     for (let number = 2; number <= MAX_DISK_FOLDERS; number++) {
       const next = path.join(this.deps.folder, `disk-${number}`);
-      if ((await filesOf(next)).length > 0) continue;
-      this.deps.logger.info(`The folder ${first} has files (${names.join(', ')}), and ${why}; the new distribution gets the folder ${next}.`);
+      if ((await filesOf(next))?.length !== 0) continue;
+      this.deps.logger.info(`The folder ${first} ${content}, and ${why}; the new distribution gets the folder ${next}.`);
       return next;
     }
     throw new WslSetupError('registerFailed', `The folders ${first} to disk-${MAX_DISK_FOLDERS} all have files, and ${why}.`);
   }
 
   /**
-   * The WSL distributions (names in lower case) with their virtual disk in `parent`, from the registry. Without the
-   * registry, or when it does not tell the folder of a distribution, only the distribution `devspaces` can have it
-   * there (Devspaces registers no other one): then `wsl.exe --list` must answer. Undefined when neither tells. Throws an
-   * AbortError when the signal aborts.
+   * The WSL distributions (names in lower case) with their virtual disk in `parent`, from the registry; undefined when
+   * it names none there but does not tell the folder of a distribution. Without the registry, only the distribution
+   * `devspaces` can have it there (Devspaces registers no other one): then `wsl.exe --list` must answer. Undefined when
+   * neither tells. Throws an AbortError when the signal aborts.
    */
   private async diskUsers(parent: string, signal?: AbortSignal): Promise<string[] | undefined> {
     const folders = await this.distributionFolders(signal);
-    const entries = folders === undefined ? undefined : [...folders.entries()];
-    if (entries !== undefined && entries.every(([, diskFolder]) => diskFolder !== undefined)) {
-      return entries.filter(([, diskFolder]) => diskFolder !== undefined && isWithin(diskFolder, parent)).map(([name]) => name);
+    if (folders !== undefined) {
+      const entries = [...folders.entries()];
+      const users = entries.filter(([, diskFolder]) => diskFolder !== undefined && isWithin(diskFolder, parent)).map(([name]) => name);
+      return users.length > 0 || entries.every(([, diskFolder]) => diskFolder !== undefined) ? users : undefined;
     }
     try {
       const listed = await this.listed(signal);
@@ -740,8 +754,9 @@ export class WslSetup {
   }
 
   /**
-   * `wsl.exe` with `args` (WSL_UTF8=1). Throws WslSetupError `wslMissing` when it is not found or cannot start, and an
-   * AbortError when the signal aborts.
+   * `wsl.exe` with `args` (WSL_UTF8=1). Throws WslSetupError `wslMissing` when it is not found, `wslNotAnswering` when
+   * it cannot start for another reason (a removal must not take that for a missing WSL), and an AbortError when the
+   * signal aborts.
    */
   private async runWsl(args: readonly string[], options: RunOptions): Promise<RunResult> {
     const wsl = this.deps.wslPath();
@@ -750,14 +765,18 @@ export class WslSetup {
       return await this.deps.runner.run(wsl, args, { ...options, env: wslEnv(this.deps.env) });
     } catch (error) {
       if (options.signal?.aborted) throw abortError();
-      throw new WslSetupError('wslMissing', `wsl.exe could not be started: ${errorMessage(error)}`);
+      throw new WslSetupError(errorCode(error) === 'ENOENT' ? 'wslMissing' : 'wslNotAnswering', `wsl.exe could not be started: ${errorMessage(error)}`);
     }
   }
 }
 
-/** The names in `folder`; none when it does not exist. */
-async function filesOf(folder: string): Promise<string[]> {
-  return fs.promises.readdir(folder).catch(() => []);
+/** The names in `folder`: none when it does not exist; undefined when it cannot be read (it counts as one with files). */
+async function filesOf(folder: string): Promise<string[] | undefined> {
+  try {
+    return await fs.promises.readdir(folder);
+  } catch (error) {
+    return errorCode(error) === 'ENOENT' ? [] : undefined;
+  }
 }
 
 /** `signal`, which also aborts after `ms` (a server that never answers). */
