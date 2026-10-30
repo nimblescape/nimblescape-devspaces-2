@@ -311,6 +311,19 @@ async function activateExtension(
   // `wsl.exe` for the WSL distribution of Devspaces (docs/architecture.md "The WSL distribution of Devspaces"); only on
   // Windows.
   const wslPath = (): string | undefined => (platform === 'win32' ? findExecutable('wsl', env, platform) : undefined);
+  // The WSL distributions of this Windows user. Without WSL, or without a distribution, `wsl.exe` says so with an exit
+  // code that is not 0: then there is none. Throws when `wsl.exe` does not answer.
+  const wslDistributions = async (): Promise<string[]> => {
+    const wsl = wslPath();
+    if (wsl === undefined) return [];
+    const result = await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS });
+    if (result.timedOut) throw new Error(`wsl.exe ${WSL_LIST_ARGS.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
+    if (result.exitCode !== 0) {
+      logger.info(`wsl.exe ${WSL_LIST_ARGS.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
+      return [];
+    }
+    return parseWslList(result.stdout);
+  };
   /** Whether the program of the transport of the remote host `host` is found (`ssh`, or `wsl.exe` for WSL). */
   const transportFound = (host: string): boolean => {
     const access = hostAccessOf(host);
@@ -669,7 +682,15 @@ async function activateExtension(
     runner,
     wslPath,
     env,
-    launch: launchDetachedProcess,
+    launch: (file, args, onExit) => launchDetachedProcess(file, args, onExit, { windowsHide: true }),
+    registered: async (distribution) => {
+      try {
+        return (await wslDistributions()).some((name) => name.toLowerCase() === distribution.toLowerCase());
+      } catch (error) {
+        logger.warn(`The WSL distributions could not be listed, so the start entry of ${distribution} stays as it is: ${errorMessage(error)}`);
+        return undefined;
+      }
+    },
     monitorPermanent: (host) => monitorSettings.permanentIfKnown(host),
     logger,
   });
@@ -962,19 +983,8 @@ async function activateExtension(
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
     sshEnv: (host, callEnv) => sshKeys.dockerSshEnv(host, callEnv),
-    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host. Without
-    // WSL, or without a distribution, `wsl.exe` says so with an exit code that is not 0: then there is none.
-    wslDistributions: async () => {
-      const wsl = wslPath();
-      if (wsl === undefined) return [];
-      const result = await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS });
-      if (result.timedOut) throw new Error(`wsl.exe ${WSL_LIST_ARGS.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
-      if (result.exitCode !== 0) {
-        logger.info(`wsl.exe ${WSL_LIST_ARGS.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
-        return [];
-      }
-      return parseWslList(result.stdout);
-    },
+    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host.
+    wslDistributions,
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();

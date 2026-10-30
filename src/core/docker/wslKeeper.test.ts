@@ -64,6 +64,7 @@ function keeper(over: Partial<WslKeeperDeps> & { permanent?: boolean | 'unknown'
       launches.push({ file, args, exit: onExit });
     },
     monitorPermanent: async () => (over.permanent === 'unknown' ? undefined : (over.permanent ?? false)),
+    registered: async () => true,
     logger: log,
     exists: (file) => file === WSLG && (over.wslg ?? true),
     ...over,
@@ -79,6 +80,15 @@ describe('the keeper of the WSL distribution', () => {
     expect(launches[0]).toMatchObject({ file: WSLG, args: ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--shell-type', 'none', 'sh', '-c', KEEPER_SCRIPT] });
     expect(launches[0]?.args).toEqual(keeperWslgArgs(WSL_DISTRIBUTION));
     await vi.waitFor(() => expect(log.info).toHaveBeenCalledWith(expect.stringContaining('Devspaces starts the keeper of the WSL distribution devspaces (wslg.exe)')));
+  });
+
+  // Mutation: a keeper in a distribution of the user fails it: it would hold that distribution while any container of
+  // the user runs there.
+  it('starts only in the WSL distribution of Devspaces', async () => {
+    const { subject, launches } = keeper();
+    subject.keep('Ubuntu');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(launches).toEqual([]);
   });
 
   it('starts with wsl.exe --exec without wslg.exe, and not at all without either', async () => {
@@ -195,14 +205,32 @@ describe('the start entry of the WSL distribution', () => {
   });
 
   // Mutation: a failed read of the answer that counts as no answer fails it: a moment of a locked file at the start of
-  // a window would remove the start entry of the user.
-  it('stays as it is while the answer about the Monitor cannot be read', async () => {
+  // a window would remove the start entry of the user. So does a failed list of WSL that counts as a removed one.
+  it('stays as it is while the answer about the Monitor cannot be read, or WSL does not tell whether it lists the distribution', async () => {
     for (const entry of [true, false]) {
-      const { subject, runs, state } = keeper({ permanent: 'unknown', entry });
-      await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
-      expect(runs.map((run) => run.args[0])).toEqual(['query']);
-      expect(state.entry).toBe(entry);
+      for (const over of [{ permanent: 'unknown' as const }, { permanent: true, registered: async () => undefined }]) {
+        const { subject, runs, state } = keeper({ ...over, entry });
+        await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+        expect(runs.map((run) => run.args[0])).toEqual(['query']);
+        expect(state.entry).toBe(entry);
+      }
     }
+  });
+
+  // Mutation: an entry for a distribution that was removed by hand (`wsl --unregister devspaces`) fails it: WSL would
+  // fail at each logon. Asked only when an entry is wanted.
+  it('is removed, or not added, when WSL does not list the distribution', async () => {
+    for (const entry of [true, false]) {
+      const asked: string[] = [];
+      const { subject, state } = keeper({ permanent: true, entry, registered: async (distribution) => (asked.push(distribution), false) });
+      await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+      expect(state.entry).toBe(false);
+      expect(asked).toEqual([WSL_DISTRIBUTION]);
+    }
+    const asked: string[] = [];
+    const notWanted = keeper({ permanent: false, entry: true, registered: async (distribution) => (asked.push(distribution), true) });
+    await notWanted.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(asked).toEqual([]);
   });
 
   // Mutation: a warning when another window removed the entry between the read and the removal fails it.
@@ -274,8 +302,10 @@ describe('the start entry of the WSL distribution', () => {
   it('is not added without wslg.exe or when it would be too long (logged), and one that is there is removed then', async () => {
     const noWslg = keeper({ permanent: true, wslg: false });
     await noWslg.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    await noWslg.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     expect(noWslg.state.entry).toBe(false);
-    expect(noWslg.log.warn).toHaveBeenCalledWith(expect.stringContaining(`There is no ${WSLG}`));
+    // Once while it stays.
+    expect(noWslg.log.warn.mock.calls).toEqual([[expect.stringContaining(`There is no ${WSLG}`)]]);
     const long = 'C:\\' + 'x'.repeat(100);
     const tooLong = keeper({ permanent: true, env: { ProgramFiles: long }, exists: () => true });
     await tooLong.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);

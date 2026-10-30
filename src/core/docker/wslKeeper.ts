@@ -13,7 +13,7 @@ import * as path from 'path';
 import { errorMessage } from '../errors';
 import type { Logger, ProcessRunner, RunResult } from '../ports';
 import { envValue } from './dockerCli';
-import { wslCommandArgs } from './dockerHost';
+import { WSL_DISTRIBUTION, wslCommandArgs } from './dockerHost';
 import { endOf, outputOf, regExePath } from './wslSetup';
 
 /** A window that holds the idle session starts the keeper at most this often. */
@@ -122,10 +122,15 @@ export interface WslKeeperDeps {
   wslPath: () => string | undefined;
   env: NodeJS.ProcessEnv;
   /**
-   * Starts a program that is not a child of this process and outlives it (launchDetachedProcess); `onExit` runs when it
-   * ended while this process runs.
+   * Starts a program that is not a child of this process and outlives it, without a window (launchDetachedProcess);
+   * `onExit` runs when it ended while this process runs.
    */
   launch: (file: string, args: readonly string[], onExit: () => void) => Promise<void>;
+  /**
+   * Whether WSL lists the distribution `distribution` (`wsl.exe --list --quiet`); undefined when that cannot be told.
+   * Asked only before a start entry is kept or added. Never rejects.
+   */
+  registered: (distribution: string) => Promise<boolean | undefined>;
   /**
    * Whether the Monitor of the engine `host` runs permanently (monitorSettingsOf(...).permanentIfKnown): false also
    * after "Remove Devspaces from This Docker Engine…" there, whose mark forgets the answer; undefined when the answer
@@ -140,8 +145,9 @@ export interface WslKeeperDeps {
 }
 
 /**
- * The keeper of each WSL distribution that this window uses (the caller, WslLifetime, starts it only for those), and
- * the start entry of a distribution (the caller names only the WSL distribution of Devspaces).
+ * The keeper of the WSL distribution of Devspaces (WSL_DISTRIBUTION; a distribution of the user keeps its own rules:
+ * the keeper would hold it while any container of the user runs there), and the start entry of a distribution (the
+ * caller names only the WSL distribution of Devspaces).
  */
 export class WslKeeper {
   /** The time of the last start of the keeper, by distribution. */
@@ -152,19 +158,21 @@ export class WslKeeper {
   private entryWork: Promise<void> = Promise.resolve();
   /** The last warning about the start of the keeper, so that a failure that stays is logged once. */
   private launchWarning: string | undefined;
+  /** The last warning about a start entry that cannot be written, so that it is logged once while it stays. */
+  private entryWarning: string | undefined;
   private disposed = false;
 
   constructor(private readonly deps: WslKeeperDeps) {}
 
   /**
    * This window holds the idle session of the WSL distribution `distribution` and uses it now: starts the keeper
-   * there, unless the keeper that this window started there still runs or waits for the lock, or this window started
+   * there, only in the WSL distribution of Devspaces, and unless the keeper that this window started there still runs or waits for the lock, or this window started
    * one within the last minute (KEEPER_LAUNCH_MS). `wslg.exe` when it exists, so that no console window opens; else
    * `wsl.exe`. While another keeper runs there, the new one waits for its end (KEEPER_LOCK_WAIT_SECONDS). Nothing after
    * `dispose`. Never throws.
    */
   keep(distribution: string): void {
-    if (this.disposed || this.running.has(distribution)) return;
+    if (this.disposed || distribution !== WSL_DISTRIBUTION || this.running.has(distribution)) return;
     const now = (this.deps.now ?? Date.now)();
     const last = this.launchedAt.get(distribution);
     if (last !== undefined && Math.abs(now - last) < KEEPER_LAUNCH_MS) return;
@@ -173,10 +181,10 @@ export class WslKeeper {
   }
 
   /**
-   * Adds the start entry of the WSL distribution `distribution` while the Monitor of its host `host` runs permanently,
-   * and removes it otherwise; an entry with another command is replaced. Without `wslg.exe`, or with a command line
-   * longer than MAX_START_ENTRY, there is no entry (logged). While the answer about the Monitor cannot be read, the
-   * entry stays as it is. The caller calls it when that state may have changed. Never rejects.
+   * Adds the start entry of the WSL distribution `distribution` while the Monitor of its host `host` runs permanently and
+   * WSL lists the distribution, and removes it otherwise; an entry with another command is replaced. Without `wslg.exe`, or with a command line
+   * longer than MAX_START_ENTRY, there is no entry (logged). While the answer about the Monitor cannot be read, or WSL
+   * does not tell whether it lists the distribution, the entry stays as it is. The caller calls it when that state may have changed. Never rejects.
    */
   updateStartEntry(host: string, distribution: string): Promise<void> {
     return this.enqueue(() => this.writeStartEntry(distribution, host));
@@ -244,7 +252,9 @@ export class WslKeeper {
     try {
       const query = await run(regQueryArgs(name), 'query');
       const present = query.exitCode === 0;
-      const wanted = host === undefined ? false : await this.deps.monitorPermanent(host);
+      const permanent = host === undefined ? false : await this.deps.monitorPermanent(host);
+      // A distribution that was removed by hand (`wsl --unregister`) gets no entry: WSL would fail at each logon.
+      const wanted = permanent === true ? await this.deps.registered(distribution) : permanent;
       if (wanted === undefined) return;
       const command = wanted ? this.startCommand(distribution) : undefined;
       if (command === undefined) {
@@ -275,14 +285,15 @@ export class WslKeeper {
    */
   private startCommand(distribution: string): string | undefined {
     const wslg = wslgPathOf(this.deps.env);
-    if (!this.exists(wslg)) {
-      this.deps.logger.warn(`There is no ${wslg}, so WSL does not start the distribution ${distribution} when you log on to Windows; its Monitor runs again at the next start of Devspaces there.`);
-      return undefined;
-    }
     const command = startEntryCommand(wslg, distribution);
-    if (command.length <= MAX_START_ENTRY) return command;
-    this.deps.logger.warn(`The start entry for the WSL distribution ${distribution} would be longer than ${MAX_START_ENTRY} characters, so WSL does not start it when you log on to Windows.`);
-    return undefined;
+    const warning = !this.exists(wslg)
+      ? `There is no ${wslg}, so WSL does not start the distribution ${distribution} when you log on to Windows; its Monitor runs again at the next start of Devspaces there.`
+      : command.length > MAX_START_ENTRY
+        ? `The start entry for the WSL distribution ${distribution} would be longer than ${MAX_START_ENTRY} characters, so WSL does not start it when you log on to Windows.`
+        : undefined;
+    if (warning !== undefined && warning !== this.entryWarning) this.deps.logger.warn(warning);
+    this.entryWarning = warning;
+    return warning === undefined ? command : undefined;
   }
 
   private exists(file: string): boolean {
