@@ -207,6 +207,7 @@ describe('the start entry of the WSL distribution', () => {
     expect(command.length).toBeLessThanOrEqual(MAX_START_ENTRY);
     expect(wslgPathOf(ENV)).toBe(WSLG);
     expect(wslgPathOf({ PROGRAMFILES: 'D:\\Apps' })).toBe('D:\\Apps\\WSL\\wslg.exe');
+    expect(wslgPathOf({ ProgramFiles: 'C:\\Program Files (x86)', ProgramW6432: 'C:\\Program Files' })).toBe(WSLG);
     expect(START_ENTRY_KEY).toBe('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run');
     expect(NAME).toBe('nimblescape Devspaces WSL devspaces');
   });

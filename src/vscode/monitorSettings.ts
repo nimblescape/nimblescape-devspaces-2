@@ -52,8 +52,10 @@ export async function monitorSettingsFor(deps: MonitorSettingsDeps, host: string
  * possible. Never rejects.
  */
 export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: string): Promise<boolean> {
-  const answered = await answeredOf(deps, host);
-  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
+  // A failed read: the ensure makes the Monitor one that stops when idle, also in place of a permanent one of this
+  // computer.
+  const answered = await answeredOf(deps, host, 'the Monitor there stops when no devspace runs');
+  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered ?? false);
 }
 
 /**
@@ -63,26 +65,17 @@ export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: strin
  */
 export async function monitorPermanentIfKnown(deps: MonitorSettingsDeps, host: string): Promise<boolean | undefined> {
   if (deps.settings().stopMonitorWhenIdle === true) return false;
-  let answered: boolean;
-  try {
-    answered = await deps.answered(host);
-  } catch (error) {
-    deps.logger?.warn(`The answer about the Monitor on ${describeDockerHost(host)} could not be read, so its start entry stays as it is: ${errorMessage(error)}`);
-    return undefined;
-  }
-  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
+  const answered = await answeredOf(deps, host, 'its start entry stays as it is');
+  return answered === undefined ? undefined : monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
 }
 
-/**
- * Whether the engine `host` has an answer; false when it cannot be read (logged: the ensure then makes its Monitor one
- * that stops when idle, also in place of a permanent one of this computer).
- */
-async function answeredOf(deps: MonitorSettingsDeps, host: string): Promise<boolean> {
+/** Whether the engine `host` has an answer; undefined when it cannot be read (logged with `outcome`). */
+async function answeredOf(deps: MonitorSettingsDeps, host: string, outcome: string): Promise<boolean | undefined> {
   try {
     return await deps.answered(host);
   } catch (error) {
-    deps.logger?.warn(`The answer about the Monitor on ${describeDockerHost(host)} could not be read, so the Monitor there stops when no devspace runs: ${errorMessage(error)}`);
-    return false;
+    deps.logger?.warn(`The answer about the Monitor on ${describeDockerHost(host)} could not be read, so ${outcome}: ${errorMessage(error)}`);
+    return undefined;
   }
 }
 

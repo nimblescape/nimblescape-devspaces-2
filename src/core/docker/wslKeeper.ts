@@ -71,9 +71,13 @@ export function startEntryName(distribution: string): string {
   return `nimblescape Devspaces WSL ${distribution}`;
 }
 
-/** `wslg.exe` of WSL from the Microsoft Store: `%ProgramFiles%\WSL\wslg.exe`, a program without a console window. */
+/**
+ * `wslg.exe` of WSL from the Microsoft Store: `%ProgramFiles%\WSL\wslg.exe`, a program without a console window
+ * (`ProgramW6432` first, the 64-bit folder also for a 32-bit process, as findDockerCli).
+ */
 export function wslgPathOf(env: NodeJS.ProcessEnv): string {
-  return path.win32.join(envValue(env, 'ProgramFiles', 'win32') ?? 'C:\\Program Files', 'WSL', 'wslg.exe');
+  const programs = envValue(env, 'ProgramW6432', 'win32') ?? envValue(env, 'ProgramFiles', 'win32') ?? 'C:\\Program Files';
+  return path.win32.join(programs, 'WSL', 'wslg.exe');
 }
 
 /**

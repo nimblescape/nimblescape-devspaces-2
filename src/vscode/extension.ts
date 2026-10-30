@@ -670,16 +670,20 @@ async function activateExtension(
   // Windows while its Monitor runs permanently). A Docker call in the background starts a distribution that does not
   // run only while its Monitor runs permanently (docs/architecture.md "The WSL distribution of Devspaces"). Its sessions
   // end after the release of deactivate(), which may need them.
+  let listWarning: string | undefined;
   const keeper = new WslKeeper({
     runner,
     wslPath,
     env,
     launch: (file, args, onExit) => launchDetachedProcess(file, args, onExit, { windowsHide: true }),
-    // Only WSL_E_DEFAULT_DISTRO_NOT_FOUND counts as a list without it; another failure tells nothing.
+    // Only WSL_E_DEFAULT_DISTRO_NOT_FOUND counts as a list without it; another failure tells nothing (logged once while
+    // it stays the same).
     registered: async (distribution) => {
       const result = await runWslList().catch(() => undefined);
       const listed = result === undefined || result.timedOut ? undefined : listsDistribution(result, distribution);
-      if (listed === undefined) logger.warn(`WSL did not tell whether it lists the distribution ${distribution}, so its start entry stays as it is${result === undefined ? '' : ` (${endOf(result, WSL_LIST_TIMEOUT_MS)}: ${outputOf(result)})`}.`);
+      const warning = listed !== undefined ? undefined : `WSL did not tell whether it lists the distribution ${distribution}, so its start entry stays as it is${result === undefined ? '' : ` (${endOf(result, WSL_LIST_TIMEOUT_MS)}: ${outputOf(result)})`}.`;
+      if (warning !== undefined && warning !== listWarning) logger.warn(warning);
+      listWarning = warning;
       return listed;
     },
     monitorPermanent: (host) => monitorSettings.permanentIfKnown(host),
