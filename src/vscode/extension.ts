@@ -1123,20 +1123,20 @@ async function activateExtension(
   };
   // The start entry of the WSL distribution of Devspaces (only that one) follows the mode of its Monitor
   // (WslKeeper.updateStartEntry): at the start of the window, after an answer to the question about its Monitor, after a
-  // change of stopMonitorWhenIdle, and after "Remove Devspaces from This Docker Engine…" there. Each reads the registry.
+  // change of stopMonitorWhenIdle, and after "Remove Devspaces from This Docker Engine…" there. Each reads the registry,
+  // and only when the records of this VS Code know the engine there: another VS Code (for example VS Code Insiders, with
+  // its own storage and no answer there) does not remove the entry, and a window that never used the distribution starts
+  // no reg.exe.
   const updateStartEntry = (host: string): void => {
     if (host !== WSL_HOST || wslPath() === undefined) return;
-    background(keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION), 'update the start entry of the WSL distribution of Devspaces');
-  };
-  // At the start of the window only when the records of this VS Code know the engine there: another VS Code (for
-  // example VS Code Insiders, with its own storage and no answer there) does not remove the entry, and a window that
-  // never used the distribution starts no reg.exe.
-  if (wslPath() !== undefined) {
     background(
-      engineRecords.record(WSL_HOST).then((record) => (record === undefined ? undefined : updateStartEntry(WSL_HOST))),
-      'read the records of the Docker engines',
+      engineRecords
+        .record(WSL_HOST)
+        .then((record) => (record === undefined ? undefined : keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION))),
+      'update the start entry of the WSL distribution of Devspaces',
     );
-  }
+  };
+  updateStartEntry(WSL_HOST);
 
   // The Docker CLI of Devspaces that this window needs and does not have yet: downloaded now, with a progress notification
   // (its link Show details needs the commands above), before the window looks up its devspace and serves its pipe, and

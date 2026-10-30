@@ -485,7 +485,8 @@ describe('launchDetachedProcess', () => {
 
   it('tells the end of the program while this process runs', async () => {
     const ended = vi.fn();
-    await launchDetachedProcess(process.execPath, ['-e', ''], ended);
+    await launchDetachedProcess(process.execPath, ['-e', 'process.exit(3)'], ended);
     await vi.waitFor(() => expect(ended).toHaveBeenCalledTimes(1));
+    expect(ended).toHaveBeenCalledWith(3);
   });
 });

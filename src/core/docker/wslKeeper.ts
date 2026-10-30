@@ -18,6 +18,11 @@ import { endOf, outputOf, regExePath } from './wslSetup';
 
 /** A window that holds the idle session starts the keeper at most this often. */
 export const KEEPER_LAUNCH_MS = 60_000;
+/**
+ * A keeper that ends earlier than this after its start ended at once (logged): the script ends at the earliest after
+ * two checks, two minutes.
+ */
+export const KEEPER_EARLY_END_MS = 10_000;
 /** How often the keeper looks whether a container runs. */
 export const KEEPER_CHECK_SECONDS = 60;
 /** The keeper ends after this many checks in a row at which no container ran. */
@@ -124,9 +129,9 @@ export interface WslKeeperDeps {
   env: NodeJS.ProcessEnv;
   /**
    * Starts a program that is not a child of this process and outlives it, without a window (launchDetachedProcess);
-   * `onExit` runs when it ended while this process runs.
+   * `onExit` runs with its exit code when it ended while this process runs.
    */
-  launch: (file: string, args: readonly string[], onExit: () => void) => Promise<void>;
+  launch: (file: string, args: readonly string[], onExit: (code: number | null) => void) => Promise<void>;
   /**
    * Whether WSL lists the distribution `distribution` (`wsl.exe --list --quiet`); undefined when that cannot be told.
    * Asked only before a start entry is kept or added. Never rejects.
@@ -157,10 +162,15 @@ export class WslKeeper {
   private readonly running = new Set<string>();
   /** The work on the start entries, one after the other. */
   private entryWork: Promise<void> = Promise.resolve();
-  /** The distributions whose update of the start entry waits in entryWork and has not begun yet. */
-  private readonly updatesWaiting = new Set<string>();
-  /** The last warning about the start of the keeper, so that a failure that stays is logged once. */
+  /** The update of the start entry that waits in entryWork and has not begun yet, by distribution. */
+  private readonly updatesWaiting = new Map<string, Promise<void>>();
+  /**
+   * The last warning about the start of the keeper or its end at once, so that a failure that stays is logged once;
+   * cleared when a keeper ran longer than KEEPER_EARLY_END_MS.
+   */
   private launchWarning: string | undefined;
+  /** Whether this window logged the start of a keeper. */
+  private startLogged = false;
   /** The last warning about a start entry that cannot be written, so that it is logged once while it stays. */
   private entryWarning: string | undefined;
   private disposed = false;
@@ -169,9 +179,10 @@ export class WslKeeper {
 
   /**
    * This window holds the idle session of the WSL distribution `distribution` and uses it now: starts the keeper
-   * there, only in the WSL distribution of Devspaces, and unless the keeper that this window started there still runs or waits for the lock, or this window started
-   * one within the last minute (KEEPER_LAUNCH_MS). `wslg.exe` when it exists, so that no console window opens; else
-   * `wsl.exe`. While another keeper runs there, the new one waits for its end (KEEPER_LOCK_WAIT_SECONDS). Nothing after
+   * there, only in the WSL distribution of Devspaces, and unless the keeper that this window started there still runs
+   * or waits for the lock, or this window started one within the last minute (KEEPER_LAUNCH_MS). `wslg.exe` when it
+   * exists, so that no console window opens; else `wsl.exe`. While another keeper runs there, the new one waits for its
+   * end (KEEPER_LOCK_WAIT_SECONDS). A keeper that ends at once is logged once while it stays so. Nothing after
    * `dispose`. Never throws.
    */
   keep(distribution: string): void {
@@ -180,7 +191,7 @@ export class WslKeeper {
     const last = this.launchedAt.get(distribution);
     if (last !== undefined && Math.abs(now - last) < KEEPER_LAUNCH_MS) return;
     this.launchedAt.set(distribution, now);
-    void this.launchKeeper(distribution, last === undefined);
+    void this.launchKeeper(distribution);
   }
 
   /**
@@ -192,12 +203,14 @@ export class WslKeeper {
    * (it reads the state when it begins). Never rejects.
    */
   updateStartEntry(host: string, distribution: string): Promise<void> {
-    if (this.updatesWaiting.has(distribution)) return this.entryWork;
-    this.updatesWaiting.add(distribution);
-    return this.enqueue(() => {
-      this.updatesWaiting.delete(distribution);
+    const waiting = this.updatesWaiting.get(distribution);
+    if (waiting !== undefined) return waiting;
+    const update = this.enqueue(() => {
+      if (this.updatesWaiting.get(distribution) === update) this.updatesWaiting.delete(distribution);
       return this.writeStartEntry(distribution, host);
     });
+    this.updatesWaiting.set(distribution, update);
+    return update;
   }
 
   /**
@@ -220,24 +233,40 @@ export class WslKeeper {
     return this.entryWork;
   }
 
-  private async launchKeeper(distribution: string, first: boolean): Promise<void> {
+  private async launchKeeper(distribution: string): Promise<void> {
     const program = this.keeperProgram(distribution);
     if (program === undefined) return;
+    const now = this.deps.now ?? Date.now;
+    const startedAt = now();
     this.running.add(distribution);
     try {
-      await this.deps.launch(program.file, program.args, () => this.running.delete(distribution));
-      this.launchWarning = undefined;
-      if (first) {
+      await this.deps.launch(program.file, program.args, (code) => {
+        this.running.delete(distribution);
+        if (Math.abs(now() - startedAt) >= KEEPER_EARLY_END_MS) {
+          this.launchWarning = undefined;
+          return;
+        }
+        // A keeper that ends at once could not open the lock (no flock, no /run), or wslg.exe or wsl.exe could not run
+        // it, or does not wait for its end.
+        this.warnLaunch(`The keeper of the WSL distribution ${distribution} ended at once (exit code ${code ?? 'none'})`);
+      });
+      if (!this.startLogged) {
+        this.startLogged = true;
         this.deps.logger.info(
           `Devspaces starts the keeper of the WSL distribution ${distribution} (${path.win32.basename(program.file)}), so that it runs while a container runs there, also after VS Code closed.`,
         );
       }
     } catch (error) {
       this.running.delete(distribution);
-      const warning = `The keeper of the WSL distribution ${distribution} could not start, so WSL stops the distribution 15 seconds after VS Code closed: ${errorMessage(error)}`;
-      if (warning !== this.launchWarning) this.deps.logger.warn(warning);
-      this.launchWarning = warning;
+      this.warnLaunch(`The keeper of the WSL distribution ${distribution} could not start: ${errorMessage(error)}`);
     }
+  }
+
+  /** Logs `problem` of the keeper once while it stays. */
+  private warnLaunch(problem: string): void {
+    const warning = `${problem}. So WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.`;
+    if (warning !== this.launchWarning) this.deps.logger.warn(warning);
+    this.launchWarning = warning;
   }
 
   /** `wslg.exe` with keeperWslgArgs when it exists, else `wsl.exe --exec`; undefined without either. */

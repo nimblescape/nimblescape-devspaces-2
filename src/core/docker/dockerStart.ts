@@ -70,14 +70,20 @@ function desktopStartUnsupported(result: RunResult): boolean {
 }
 
 /**
- * Starts a GUI program without waiting for it; `onExit` runs when it ended while this process runs. `windowsHide`: no
- * window on Windows, also not a console window (a program that runs in the background).
+ * Starts a GUI program without waiting for it; `onExit` runs with its exit code (null when a signal ended it) when it
+ * ended while this process runs. `windowsHide`: no window on Windows, also not a console window (a program that runs in
+ * the background).
  */
-export function launchDetachedProcess(file: string, args: readonly string[], onExit?: () => void, options: { windowsHide?: boolean } = {}): Promise<void> {
+export function launchDetachedProcess(
+  file: string,
+  args: readonly string[],
+  onExit?: (code: number | null) => void,
+  options: { windowsHide?: boolean } = {},
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(file, [...args], { detached: true, stdio: 'ignore', shell: false, windowsHide: options.windowsHide === true });
     child.once('error', reject);
-    if (onExit !== undefined) child.once('exit', onExit);
+    if (onExit !== undefined) child.once('exit', (code) => onExit(code));
     child.once('spawn', () => {
       child.unref();
       resolve();

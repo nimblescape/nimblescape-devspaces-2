@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RunOptions, RunResult } from '../ports';
 import { WSL_DISTRIBUTION, WSL_HOST, wslCommandArgs } from './dockerHost';
 import {
+  KEEPER_EARLY_END_MS,
   KEEPER_LAUNCH_MS,
   KEEPER_LOCK,
   KEEPER_LOCK_WAIT_SECONDS,
@@ -39,11 +40,11 @@ const logger = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi
 /**
  * A keeper with fakes: `entry` is whether the start entry exists in the fake registry, `value` its command (default:
  * the command of this version); `permanent` the answer of monitorPermanent (undefined: it cannot be read). Each launch
- * keeps `exit`, the end of that keeper.
+ * keeps `exit`, the end of that keeper (default exit code 0).
  */
 function keeper(over: Partial<WslKeeperDeps> & { permanent?: boolean | 'unknown'; entry?: boolean; value?: string; wslg?: boolean; now?: () => number } = {}) {
   const runs: { file: string; args: readonly string[]; options?: RunOptions }[] = [];
-  const launches: { file: string; args: readonly string[]; exit: () => void }[] = [];
+  const launches: { file: string; args: readonly string[]; exit: (code?: number | null) => void }[] = [];
   const state = { entry: over.entry ?? false, value: over.value ?? startEntryCommand(WSLG, WSL_DISTRIBUTION) };
   const log = logger();
   const deps: WslKeeperDeps = {
@@ -61,7 +62,7 @@ function keeper(over: Partial<WslKeeperDeps> & { permanent?: boolean | 'unknown'
     wslPath: () => WSL,
     env: ENV,
     launch: async (file, args, onExit) => {
-      launches.push({ file, args, exit: onExit });
+      launches.push({ file, args, exit: (code = 0) => onExit(code) });
     },
     monitorPermanent: async () => (over.permanent === 'unknown' ? undefined : (over.permanent ?? false)),
     registered: async () => true,
@@ -135,9 +136,66 @@ describe('the keeper of the WSL distribution', () => {
     subject.keep(WSL_DISTRIBUTION);
     now += KEEPER_LAUNCH_MS;
     subject.keep(WSL_DISTRIBUTION);
-    await vi.waitFor(() => expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('could not start, so WSL stops the distribution 15 seconds after VS Code closed: spawn EPERM')));
+    await vi.waitFor(() =>
+      expect(log.warn).toHaveBeenCalledWith(
+        'The keeper of the WSL distribution devspaces could not start: spawn EPERM. So WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.',
+      ),
+    );
     await new Promise((resolve) => setImmediate(resolve));
     expect(log.warn.mock.calls.filter(([text]) => String(text).includes('could not start'))).toHaveLength(1);
+  });
+
+  // Mutation: a keeper whose end is not looked at fails it (a keeper that cannot hold the lock, or a wslg.exe that does
+  // not wait, would end at once each minute without a word); so does a warning at each end, or one that is not logged
+  // again after a keeper that ran.
+  it('logs a keeper that ends at once, once while it stays so, and again after a keeper that ran', async () => {
+    let now = 1_000_000;
+    const { subject, launches, log } = keeper({ now: () => now });
+    const endsAtOnce = () => log.warn.mock.calls.filter(([text]) => String(text).includes('ended at once'));
+    const start = async (count: number) => {
+      now += KEEPER_LAUNCH_MS;
+      subject.keep(WSL_DISTRIBUTION);
+      await vi.waitFor(() => expect(launches).toHaveLength(count));
+    };
+    await start(1);
+    now += KEEPER_EARLY_END_MS - 1;
+    launches[0]?.exit(1);
+    expect(log.warn).toHaveBeenCalledWith(
+      'The keeper of the WSL distribution devspaces ended at once (exit code 1). So WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.',
+    );
+    await start(2);
+    launches[1]?.exit(1);
+    expect(endsAtOnce()).toHaveLength(1);
+    // A keeper that ran (two checks, or a wait for the lock) is no failure, also with exit code 1 after its wait.
+    await start(3);
+    now += KEEPER_EARLY_END_MS;
+    launches[2]?.exit(1);
+    expect(endsAtOnce()).toHaveLength(1);
+    await start(4);
+    launches[3]?.exit(null);
+    expect(endsAtOnce()).toHaveLength(2);
+    expect(log.warn).toHaveBeenLastCalledWith(expect.stringContaining('ended at once (exit code none)'));
+  });
+
+  // Mutation: a start log that is used up by a keep without a program fails it.
+  it('logs the start of the first keeper that starts in the window, once', async () => {
+    let now = 1_000_000;
+    let wsl: string | undefined;
+    const { subject, launches, log } = keeper({ now: () => now, wslg: false, wslPath: () => wsl });
+    const starts = () => log.info.mock.calls.filter(([text]) => String(text).includes('Devspaces starts the keeper'));
+    subject.keep(WSL_DISTRIBUTION);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(launches).toEqual([]);
+    wsl = WSL;
+    now += KEEPER_LAUNCH_MS;
+    subject.keep(WSL_DISTRIBUTION);
+    await vi.waitFor(() => expect(starts()).toHaveLength(1));
+    expect(starts()[0]?.[0]).toContain('(wsl.exe)');
+    launches[0]?.exit();
+    now += KEEPER_LAUNCH_MS;
+    subject.keep(WSL_DISTRIBUTION);
+    await vi.waitFor(() => expect(launches).toHaveLength(2));
+    expect(starts()).toHaveLength(1);
   });
 });
 
@@ -312,6 +370,31 @@ describe('the start entry of the WSL distribution', () => {
     release();
     await Promise.all([first, second, third]);
     expect(reads).toEqual(['query', 'query']);
+  });
+
+  // Mutation: an update that clears the mark of the update after a removal when it begins fails it: a later call would
+  // then add a third update.
+  it('the update that waits after a removal covers a later call, also after the update before the removal began', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const reads: string[] = [];
+    const { subject } = keeper({
+      runner: {
+        run: async (_file, args) => {
+          reads.push(String(args[0]));
+          if (reads.length === 1) await gate;
+          return result(1);
+        },
+      },
+    });
+    const before = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    const removal = subject.removeStartEntry(WSL_DISTRIBUTION);
+    const after = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    await vi.waitFor(() => expect(reads).toEqual(['query']));
+    const later = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    release();
+    await Promise.all([before, removal, after, later]);
+    expect(reads).toEqual(['query', 'query', 'query']);
   });
 
   // Mutation: an update that joins one that waits before a removal fails it: the removal would run last.
