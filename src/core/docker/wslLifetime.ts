@@ -17,6 +17,7 @@ import { LABEL_MONITOR } from '../remoteMonitor/protocol';
 import { sshPromptsAllowed } from '../sshAskpass';
 import { hostAccessOf, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
 import type { WslKeeper } from './wslKeeper';
+import type { WslUpgrade } from './wslUpgrade';
 
 /** The arguments of `wsl.exe` that list the names of the running WSL distributions, one per line (none: no output). */
 export const WSL_RUNNING_ARGS: readonly string[] = ['--list', '--running', '--quiet'];
@@ -95,6 +96,8 @@ export interface WslLifetimeDeps {
    * none: only the idle sessions hold it.
    */
   keeper?: Pick<WslKeeper, 'keep'>;
+  /** The weekly upgrade of the packages of the distribution (WslUpgrade), checked after a use; none: no upgrade. */
+  upgrade?: Pick<WslUpgrade, 'schedule'>;
   /** For the tests. Default: Date.now. */
   now?: () => number;
   /** For the tests. Default: IDLE_RETRY_MS. */
@@ -185,12 +188,13 @@ export class WslLifetime {
    * cannot be found. Within a minute after the last one failed (IDLE_RETRY_MS: it ended with an error within a minute
    * after its start), the session starts only after that minute, and not when the distribution does not run then
    * (`retryLater`). With the session, the keeper of the distribution starts too (`keeper`: at most once a minute, also
-   * at each later use while the window holds the session). Nothing for any other host, and after `dispose`. Never
-   * throws.
+   * at each later use while the window holds the session), and each use lets the weekly upgrade check (`upgrade`, a
+   * few minutes later, at most every 6 hours). Nothing for any other host, and after `dispose`. Never throws.
    */
   use(host: string): void {
     const access = hostAccessOf(host);
     if (this.disposed || access?.kind !== 'wsl') return;
+    this.deps.upgrade?.schedule(access.distribution);
     if (this.holds(host)) {
       this.deps.keeper?.keep(access.distribution);
       return;

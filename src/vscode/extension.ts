@@ -16,6 +16,7 @@ import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } fro
 import { WslSetup, dockerDesktopIntegrates, endOf, listsDistribution, outputOf, wslSetupFolder } from '../core/docker/wslSetup';
 import { WslKeeper } from '../core/docker/wslKeeper';
 import { WslLifetime } from '../core/docker/wslLifetime';
+import { WslUpgrade } from '../core/docker/wslUpgrade';
 import {
   WSL_DISTRIBUTION,
   WSL_HOST,
@@ -691,12 +692,27 @@ async function activateExtension(
     logger,
   });
   context.subscriptions.push({ dispose: () => keeper.dispose() });
+  // The setup of the WSL distribution of Devspaces (Windows): the distribution with Docker Engine in a folder of
+  // LOCALAPPDATA. About once a week, a window that uses it upgrades its packages (WslUpgrade), only when Devspaces set
+  // it up.
+  const wslFolder = platform === 'win32' ? wslSetupFolder(env) : undefined;
+  const wslSetupCore = wslFolder === undefined ? undefined : new WslSetup({ runner, wslPath, env, arch: process.arch, folder: wslFolder, logger, http: nodeHttpsTransport });
+  const upgrade = new WslUpgrade({
+    runner,
+    wslPath,
+    env,
+    logger,
+    own: async () => (await wslSetupCore?.registration()) === 'own',
+    runs: async (distribution) => wslLifetime?.running(distribution),
+  });
+  context.subscriptions.push({ dispose: () => upgrade.dispose() });
   const lifetime = new WslLifetime({
     runner,
     wslPath,
     env,
     monitorPermanent: (host) => monitorSettings.permanent(host),
     keeper,
+    upgrade,
     logger,
   });
   wslLifetime = lifetime;
@@ -1001,14 +1017,10 @@ async function activateExtension(
       ? () => installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: undefined, failed: OwnDockerCliTexts.failedForRemoteHost })
       : undefined,
   });
-  // "Set Up Docker for Devspaces in WSL…" and "Remove the WSL Distribution of Devspaces…" (Windows): the distribution
-  // with Docker Engine in a folder of LOCALAPPDATA; after its setup, it is the Docker host of Devspaces.
-  const wslFolder = platform === 'win32' ? wslSetupFolder(env) : undefined;
+  // "Set Up Docker for Devspaces in WSL…" and "Remove the WSL Distribution of Devspaces…" (Windows): after its setup,
+  // the distribution is the Docker host of Devspaces.
   const wslSetup = new WslSetupCommands({
-    setup:
-      wslFolder === undefined
-        ? undefined
-        : new WslSetup({ runner, wslPath, env, arch: process.arch, folder: wslFolder, logger, http: nodeHttpsTransport }),
+    setup: wslSetupCore,
     folder: wslFolder,
     dockerDesktopIntegrates: (isDefault) => dockerDesktopIntegrates(env, WSL_DISTRIBUTION, isDefault),
     isWindows: platform === 'win32',
