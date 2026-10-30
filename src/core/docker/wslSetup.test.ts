@@ -534,16 +534,6 @@ describe('WslSetup.separate', () => {
     const runner = wslRunner(() => undefined, failed('ERROR: The system was unable to find the specified registry key or value.'));
     await expect(setup({ runner }).separate()).resolves.toEqual({ state: 'unknown', dockerDesktop: undefined });
   });
-
-  // Mutation: a swallowed abort fails it (the setup must end as cancelled).
-  it('throws an AbortError when the signal aborts', async () => {
-    const controller = new AbortController();
-    const base = registryRunner(() => {
-      controller.abort();
-      throw new Error('killed');
-    });
-    await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: ours() }, 1) }).separate(controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
-  });
 });
 
 describe('dockerDesktopIntegrates', () => {
@@ -578,11 +568,14 @@ describe('dockerDesktopIntegrates', () => {
     expect(await dockerDesktopIntegrates(env, 'devspaces', false, files({ 'settings.json': '{"wslEngineEnabled":true,"integratedWslDistros":["devspaces"]}' }))).toBe(true);
   });
 
-  // Mutation: a check of both files fails it (the file of an older version may stay after the move to settings-store.json).
-  it('reads only the first file that is an object', async () => {
+  // Mutation: a check of both files fails it (the file of an older version may stay after the move to settings-store.json);
+  // so does a check of the older file while the new one is no JSON object (Docker Desktop may be writing it).
+  it('reads only the first file that can be read', async () => {
     const stale = '{"IntegratedWslDistros":["devspaces"]}';
     expect(await dockerDesktopIntegrates(env, 'devspaces', false, files({ 'settings-store.json': '{"IntegratedWslDistros":[]}', 'settings.json': stale }))).toBe(false);
-    expect(await dockerDesktopIntegrates(env, 'devspaces', false, files({ 'settings-store.json': '[]', 'settings.json': stale }))).toBe(true);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', false, files({ 'settings-store.json': '{"Integrated', 'settings.json': stale }))).toBe(false);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', false, files({ 'settings-store.json': '[]', 'settings.json': stale }))).toBe(false);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', false, files({ 'settings.json': stale }))).toBe(true);
   });
 
   it('is false without a file, with a file that is not JSON or has no list, and without APPDATA', async () => {
@@ -971,26 +964,6 @@ describe('WslSetup.remove', () => {
     const runner = wslRunner(() => failed('Access is denied.'));
     await expect(setup({ runner }).remove()).rejects.toEqual(new WslSetupError('removeFailed', 'wsl.exe --unregister devspaces failed (exit code 1): Access is denied.'));
     expect(fs.existsSync(folder)).toBe(true);
-  });
-});
-
-describe('WslSetup.separateLocked', () => {
-  // Mutation: a check without the lock fails it (a setup or a removal in another window would come between); so does
-  // a lock folder without the folder of Devspaces (a window start would leave it on each computer with WSL).
-  it('checks under the lock of the setup, not while another window holds it, and without a lock folder', async () => {
-    let release = (): void => undefined;
-    const other = setup({ runner: wslRunner(() => undefined) }).locked(() => new Promise<void>((resolve) => (release = resolve)));
-    await vi.waitFor(() => expect(fs.existsSync(`${folder}.lock`)).toBe(true));
-    const runner = wslRunner(() => undefined, { Ubuntu: 'C:\\u' });
-    await expect(setup({ runner }).separateLocked()).resolves.toEqual({ state: 'none', dockerDesktop: undefined });
-    expect(runner.calls).toEqual([]);
-    release();
-    await other;
-    await expect(setup({ runner }).separateLocked()).resolves.toEqual({ state: 'none', dockerDesktop: false });
-    expect(runner.calls.map((call) => call.args[0])).toEqual(['export']);
-    fs.rmSync(folder, { recursive: true, force: true });
-    await expect(setup({ runner }).separateLocked()).resolves.toEqual({ state: 'none', dockerDesktop: undefined });
-    expect(fs.existsSync(`${folder}.lock`)).toBe(false);
   });
 });
 

@@ -281,8 +281,8 @@ export function dockerDesktopSettingsFiles(env: NodeJS.ProcessEnv): string[] {
  * Whether Docker Desktop has its WSL integration on for `distribution`: it is in the list IntegratedWslDistros, or it
  * is the default distribution of WSL (`isDefault`) while EnableIntegrationWithDefaultWslDistro is not false (on by
  * default); never while WslEngineEnabled is false (the engine of Hyper-V has no WSL integration). Keys and names
- * without case. The first settings file that can be read as an object decides (the file of an older version may stay
- * after the move to settings-store.json); false when none can. Never rejects.
+ * without case. The first settings file that can be read decides (the file of an older version may stay after the
+ * move to settings-store.json); false when it is no JSON object, or when none can be read. Never rejects.
  */
 export async function dockerDesktopIntegrates(
   env: NodeJS.ProcessEnv,
@@ -291,13 +291,20 @@ export async function dockerDesktopIntegrates(
   readFile: (file: string) => Promise<string> = (file) => fs.promises.readFile(file, 'utf8'),
 ): Promise<boolean> {
   for (const file of dockerDesktopSettingsFiles(env)) {
-    let settings: unknown;
+    let text: string;
     try {
-      settings = JSON.parse(await readFile(file));
+      text = await readFile(file);
     } catch {
       continue;
     }
-    if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) continue;
+    let settings: unknown;
+    try {
+      settings = JSON.parse(text);
+    } catch {
+      // Docker Desktop may be writing it; the file of an older version would tell old settings.
+      return false;
+    }
+    if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) return false;
     const value = (name: string): unknown => Object.entries(settings).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
     if (value('WslEngineEnabled') === false) return false;
     const list = value('IntegratedWslDistros');
@@ -631,7 +638,7 @@ export class WslSetup {
       // A download that could not be removed after the registration (WSL still had it open).
       await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
     }
-    // WSL makes a new distribution the default when it has none. Not cancelled: a cancel would leave it the default.
+    // WSL makes a new distribution the default when it has none.
     const separation = await this.separate();
     let pending = '';
     let provision: RunResult;
@@ -889,11 +896,12 @@ export class WslSetup {
    * after a call that WSL does not answer), or, when none does, WSL has no default (the value DefaultDistribution goes;
    * `wsl --list` still lists the distributions, and WSL makes the next new distribution the default). Only for a
    * distribution that Devspaces set up (the folder of its virtual disk is in the folder of Devspaces); without the
-   * folder of Devspaces, nothing runs. A failure is logged; throws only an AbortError when the signal aborts.
+   * folder of Devspaces, nothing runs. Not cancelled: a cancel would leave the distribution the default. A failure is
+   * logged; never throws.
    */
-  async separate(signal?: AbortSignal): Promise<WslSeparation> {
+  async separate(): Promise<WslSeparation> {
     if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return { state: 'none', dockerDesktop: undefined };
-    const registry = await this.readRegistry(signal);
+    const registry = await this.readRegistry();
     if (registry === undefined) return { state: 'unknown', dockerDesktop: undefined };
     const dockerDesktop = registry.distributions.some((distribution) => isDockerDesktopDistribution(distribution.name));
     const result = (state: WslSeparation['state']): WslSeparation => ({ state, dockerDesktop });
@@ -915,37 +923,25 @@ export class WslSetup {
         failures.push(`${what} ended with ${endOf(ended, SHORT_CALL_MS)}: ${outputOf(ended)}`);
         return false;
       } catch (error) {
-        if (signal?.aborted) throw abortError();
         failures.push(`${what}: ${errorMessage(error)}`);
         return error instanceof WslSetupError ? undefined : false;
       }
     };
     for (const other of others) {
       const args = wslSetDefaultArgs(other.name);
-      const done = await attempt(`wsl.exe ${args.join(' ')}`, () => this.runShort(args, signal), `now ${other.name} is`);
+      const done = await attempt(`wsl.exe ${args.join(' ')}`, () => this.runShort(args), `now ${other.name} is`);
       if (done) return result('separate');
       // The next one would wait for WSL again.
       if (done === undefined) break;
     }
     const removed = await attempt(
       'reg.exe delete',
-      () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS, signal }),
+      () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS }),
       'now WSL has no default, so "wsl" without "-d" does not open it',
     );
     if (removed) return result('separate');
     this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces stays the default distribution of WSL: ${failures.join('; ')}`);
     return result('default');
-  }
-
-  /**
-   * separate under the lock of the setup (locked), so that a setup or a removal in another window does not come between:
-   * `none` while another window holds the lock (its setup checks itself), and without the folder of Devspaces (then no
-   * lock folder is made). Throws only when the lock fails.
-   */
-  async separateLocked(): Promise<WslSeparation> {
-    const none: WslSeparation = { state: 'none', dockerDesktop: undefined };
-    if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return none;
-    return (await this.locked(() => this.separate()))?.value ?? none;
   }
 
   /**

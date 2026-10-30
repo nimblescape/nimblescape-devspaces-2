@@ -148,7 +148,7 @@ export const WslSetupTexts = {
 
 export interface WslSetupCommandsDeps {
   /** The setup of this computer; undefined where there is none (not Windows, or no LOCALAPPDATA). */
-  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked' | 'separateLocked'> | undefined;
+  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked' | 'separate'> | undefined;
   /** The folder of the distribution (wslSetupFolder), for the questions. */
   folder: string | undefined;
   /** For the message without `setup`. */
@@ -185,13 +185,13 @@ export class WslSetupCommands {
 
   /**
    * At the start of a window: the WSL distribution of Devspaces is not the default distribution of WSL
-   * (WslSetup.separateLocked; also after the user removed the default distribution, when WSL made this one the
-   * default), and a warning, once in the window, while Docker Desktop has its WSL integration on for it
-   * (warnDockerDesktop; a setup warns with what its own check found). Never throws (logged).
+   * (WslSetup.separate; also after the user removed the default distribution, when WSL made this one the default), and
+   * a warning, once in the window, while Docker Desktop has its WSL integration on for it (warnDockerDesktop; a setup
+   * warns with what its own check found). Never throws (logged).
    */
   async checkSeparation(): Promise<void> {
     try {
-      const separation = await this.deps.setup?.separateLocked();
+      const separation = await this.deps.setup?.separate();
       if (separation !== undefined) await this.warnDockerDesktop(separation);
     } catch (error) {
       this.deps.logger.error('The WSL distribution of Devspaces could not be checked.', error);
@@ -419,11 +419,11 @@ export class WslSetupCommands {
   /**
    * The warning while Docker Desktop has its WSL integration on for the distribution, once in the window (logged), after
    * `separation` (WslSetup.separate): only for a distribution that Devspaces set up, and only while the registry has
-   * the distribution of Docker Desktop (or cannot be read); the integration with the default distribution counts while
-   * the distribution stays the default. Never rejects.
+   * the distribution of Docker Desktop; the integration with the default distribution counts while the distribution
+   * stays the default. Never rejects.
    */
   private async warnDockerDesktop(separation: WslSeparation): Promise<void> {
-    if (separation.state === 'none' || separation.dockerDesktop === false) return;
+    if ((separation.state !== 'separate' && separation.state !== 'default') || separation.dockerDesktop !== true) return;
     if (this.dockerDesktopWarned || !(await this.deps.dockerDesktopIntegrates?.(separation.state === 'default'))) return;
     // Another check of the window may have warned meanwhile.
     if (this.dockerDesktopWarned) return;
