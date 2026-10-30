@@ -186,13 +186,14 @@ export class WslSetupCommands {
    * At the start of a window and after a setup: the WSL distribution of Devspaces is not the default distribution of
    * WSL (WslSetup.separate; also after the user removed the default distribution, when WSL made this one the default),
    * and a warning, once in the window, while Docker Desktop has its WSL integration on for it. Only for a distribution
-   * that Devspaces set up; when the registry cannot be read, only the list of Docker Desktop counts. Never throws
-   * (logged).
+   * that Devspaces set up, and only while the registry has the distribution of Docker Desktop (or cannot be read; then
+   * only the list of Docker Desktop counts). Never throws (logged).
    */
   async checkSeparation(): Promise<void> {
     try {
       const separation = await this.deps.setup?.separate();
-      if (separation !== undefined && separation !== 'none') await this.warnDockerDesktop(separation === 'default');
+      if (separation === undefined || separation.state === 'none' || separation.dockerDesktop === false) return;
+      await this.warnDockerDesktop(separation.state === 'default');
     } catch (error) {
       this.deps.logger.error('The WSL distribution of Devspaces could not be checked.', error);
     }
@@ -422,6 +423,8 @@ export class WslSetupCommands {
    */
   private async warnDockerDesktop(isDefault: boolean): Promise<void> {
     if (this.dockerDesktopWarned || !(await this.deps.dockerDesktopIntegrates?.(isDefault))) return;
+    // Another check of the window may have warned meanwhile.
+    if (this.dockerDesktopWarned) return;
     this.dockerDesktopWarned = true;
     this.deps.logger.warn(WslSetupTexts.dockerDesktopIntegrates);
     showWarningMessage(WslSetupTexts.dockerDesktopIntegrates).then(undefined, (error: unknown) => this.deps.logger.error('Could not show the message.', error));

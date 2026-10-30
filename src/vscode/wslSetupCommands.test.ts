@@ -79,7 +79,7 @@ beforeEach(() => {
     remove: vi.fn(async (_signal?: AbortSignal) => true),
     removeLeftovers: vi.fn(async () => true),
     locked: vi.fn(async (task: () => Promise<unknown>) => ({ value: await task() })),
-    separate: vi.fn(async (_signal?: AbortSignal): Promise<WslSeparation> => 'separate'),
+    separate: vi.fn(async (_signal?: AbortSignal): Promise<WslSeparation> => ({ state: 'separate', dockerDesktop: true })),
   };
   useHost = vi.fn(async (_host: string) => true);
   forgetHost = vi.fn(async (_host: string): Promise<'notDockerHost' | 'local' | 'unsupported'> => 'notDockerHost');
@@ -105,18 +105,31 @@ describe('the check at the start of a window', () => {
     expect(logger.warn).toHaveBeenCalledWith(WslSetupTexts.dockerDesktopIntegrates);
     expect(dockerDesktopIntegrates.mock.calls).toEqual([[false]]);
     // Not for a distribution that Devspaces did not set up, or that is not there.
-    setup.separate.mockResolvedValue('none');
+    setup.separate.mockResolvedValue({ state: 'none', dockerDesktop: true });
     const other = commands({ dockerDesktopIntegrates });
     await other.checkSeparation();
     expect(window.showWarningMessage).toHaveBeenCalledTimes(1);
     expect(dockerDesktopIntegrates).toHaveBeenCalledTimes(1);
   });
 
+  // Mutation: a check of the settings without the distribution of Docker Desktop fails it (the settings files can stay
+  // after its removal); so does a check flag that is set only before the read (two checks would both warn).
+  it('warns only while WSL has the distribution of Docker Desktop, and once also for two checks at the same time', async () => {
+    const dockerDesktopIntegrates = vi.fn(async (_isDefault: boolean) => true);
+    setup.separate.mockResolvedValueOnce({ state: 'separate', dockerDesktop: false });
+    const subject = commands({ dockerDesktopIntegrates });
+    await subject.checkSeparation();
+    expect(dockerDesktopIntegrates).not.toHaveBeenCalled();
+    await Promise.all([subject.checkSeparation(), subject.checkSeparation()]);
+    expect(dockerDesktopIntegrates).toHaveBeenCalledTimes(2);
+    expect(window.showWarningMessage).toHaveBeenCalledTimes(1);
+  });
+
   // Mutation: a check without the default integration while the distribution stays the default fails it; so does no
   // check when the registry cannot be read (the list of Docker Desktop still tells).
   it('counts the default integration of Docker Desktop while the distribution stays the default of WSL', async () => {
     const dockerDesktopIntegrates = vi.fn(async (_isDefault: boolean) => false);
-    setup.separate.mockResolvedValueOnce('default').mockResolvedValueOnce('unknown');
+    setup.separate.mockResolvedValueOnce({ state: 'default', dockerDesktop: true }).mockResolvedValueOnce({ state: 'unknown', dockerDesktop: undefined });
     await commands({ dockerDesktopIntegrates }).checkSeparation();
     await commands({ dockerDesktopIntegrates }).checkSeparation();
     expect(dockerDesktopIntegrates.mock.calls).toEqual([[true], [false]]);

@@ -240,12 +240,19 @@ export function distributionFoldersOf(registry: LxssRegistry): Map<string, strin
   return new Map(registry.distributions.map((distribution) => [distribution.name.toLowerCase(), distribution.basePath]));
 }
 
-/**
- * What WslSetup.separate found: `none`, no distribution of Devspaces (or no folder of Devspaces); `unknown`, the
- * registry cannot be read; `default`, the distribution of Devspaces stays the default of WSL (its change failed);
- * `separate`, it is not the default.
- */
-export type WslSeparation = 'none' | 'unknown' | 'default' | 'separate';
+/** What WslSetup.separate found. */
+export interface WslSeparation {
+  /**
+   * `none`, no distribution of Devspaces (or no folder of Devspaces); `unknown`, the registry cannot be read; `default`,
+   * the distribution of Devspaces stays the default of WSL (its change failed); `separate`, it is not the default.
+   */
+  state: 'none' | 'unknown' | 'default' | 'separate';
+  /**
+   * Whether the registry has a distribution of Docker Desktop, which its WSL 2 engine and so its WSL integration need;
+   * undefined when the registry cannot be read.
+   */
+  dockerDesktop: boolean | undefined;
+}
 
 /** The distributions of Docker Desktop (`docker-desktop`, and `docker-desktop-data` of older versions). */
 function isDockerDesktopDistribution(name: string): boolean {
@@ -264,8 +271,9 @@ export function dockerDesktopSettingsFiles(env: NodeJS.ProcessEnv): string[] {
 /**
  * Whether Docker Desktop has its WSL integration on for `distribution`: it is in the list IntegratedWslDistros, or it
  * is the default distribution of WSL (`isDefault`) while EnableIntegrationWithDefaultWslDistro is not false (on by
- * default). Keys and names without case. The first settings file that can be read as an object decides (the file of
- * an older version may stay after the move to settings-store.json); false when none can. Never rejects.
+ * default); never while WslEngineEnabled is false (the engine of Hyper-V has no WSL integration). Keys and names
+ * without case. The first settings file that can be read as an object decides (the file of an older version may stay
+ * after the move to settings-store.json); false when none can. Never rejects.
  */
 export async function dockerDesktopIntegrates(
   env: NodeJS.ProcessEnv,
@@ -282,6 +290,7 @@ export async function dockerDesktopIntegrates(
     }
     if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) continue;
     const value = (name: string): unknown => Object.entries(settings).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+    if (value('WslEngineEnabled') === false) return false;
     const list = value('IntegratedWslDistros');
     if (Array.isArray(list) && list.some((name) => typeof name === 'string' && name.toLowerCase() === distribution.toLowerCase())) return true;
     return isDefault && value('EnableIntegrationWithDefaultWslDistro') !== false;
@@ -607,7 +616,11 @@ export class WslSetup {
    */
   async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
     if (image !== undefined) {
-      await this.register(image, onStep, signal);
+      await this.register(image, onStep, signal).catch(async (error: unknown) => {
+        // A cancel takes effect after the registration, which WSL may have made its default.
+        if (isAbortError(error)) await this.separate();
+        throw error;
+      });
     } else {
       // A download that could not be removed after the registration (WSL still had it open).
       await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
@@ -865,50 +878,54 @@ export class WslSetup {
    * WSL would choose without the one of Devspaces; never one of Docker Desktop), or, without another one, WSL has no
    * default (the value DefaultDistribution goes; `wsl --list` still lists the distributions, and WSL makes the next new
    * distribution the default). Only for a distribution that Devspaces set up (the folder of its virtual disk is in the
-   * folder of Devspaces); without the folder of Devspaces, nothing runs. A failure is logged; throws only an AbortError
-   * when the signal aborts.
+   * folder of Devspaces); without the folder of Devspaces, nothing runs. When no other distribution takes it (or WSL
+   * does not answer), the value DefaultDistribution goes as well. A failure is logged; throws only an AbortError when
+   * the signal aborts.
    */
   async separate(signal?: AbortSignal): Promise<WslSeparation> {
-    if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return 'none';
+    if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return { state: 'none', dockerDesktop: undefined };
     const registry = await this.readRegistry(signal);
-    if (registry === undefined) return 'unknown';
+    if (registry === undefined) return { state: 'unknown', dockerDesktop: undefined };
+    const dockerDesktop = registry.distributions.some((distribution) => isDockerDesktopDistribution(distribution.name));
+    const result = (state: WslSeparation['state']): WslSeparation => ({ state, dockerDesktop });
     const ours = registry.distributions.find((distribution) => distribution.name.toLowerCase() === WSL_DISTRIBUTION);
-    if (ours?.basePath === undefined || !(await isWithinResolved(ours.basePath, this.deps.folder))) return 'none';
-    if (registry.defaultId !== ours.id) return 'separate';
+    if (ours?.basePath === undefined || !(await isWithinResolved(ours.basePath, this.deps.folder))) return result('none');
+    if (registry.defaultId !== ours.id) return result('separate');
     const others = registry.distributions.filter(
       (distribution) => distribution !== ours && distribution.installed !== false && !isDockerDesktopDistribution(distribution.name),
     );
     const failures: string[] = [];
-    const attempt = async (what: string, run: () => Promise<RunResult>, done: string): Promise<boolean> => {
+    /** True when `run` ended well; false after a failure; undefined when WSL did not answer or start (WslSetupError). */
+    const attempt = async (what: string, run: () => Promise<RunResult>, done: string): Promise<boolean | undefined> => {
       try {
-        const result = await run();
-        if (result.exitCode === 0 && !result.timedOut) {
+        const ended = await run();
+        if (ended.exitCode === 0 && !ended.timedOut) {
           this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces was the default distribution of WSL; ${done}.`);
           return true;
         }
-        failures.push(`${what} ended with ${endOf(result, SHORT_CALL_MS)}: ${outputOf(result)}`);
+        failures.push(`${what} ended with ${endOf(ended, SHORT_CALL_MS)}: ${outputOf(ended)}`);
+        return false;
       } catch (error) {
         if (signal?.aborted) throw abortError();
         failures.push(`${what}: ${errorMessage(error)}`);
+        return error instanceof WslSetupError ? undefined : false;
       }
-      return false;
     };
     for (const other of others) {
       const args = wslSetDefaultArgs(other.name);
-      if (await attempt(`wsl.exe ${args.join(' ')}`, () => this.runShort(args, signal), `now ${other.name} is`)) return 'separate';
+      const done = await attempt(`wsl.exe ${args.join(' ')}`, () => this.runShort(args, signal), `now ${other.name} is`);
+      if (done) return result('separate');
+      // The next one would wait for WSL again.
+      if (done === undefined) break;
     }
-    if (
-      others.length === 0 &&
-      (await attempt(
-        'reg.exe delete',
-        () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS, signal }),
-        'now WSL has no default, so "wsl" without "-d" does not open it',
-      ))
-    ) {
-      return 'separate';
-    }
+    const removed = await attempt(
+      'reg.exe delete',
+      () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS, signal }),
+      'now WSL has no default, so "wsl" without "-d" does not open it',
+    );
+    if (removed) return result('separate');
     this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces stays the default distribution of WSL: ${failures.join('; ')}`);
-    return 'default';
+    return result('default');
   }
 
   /**
