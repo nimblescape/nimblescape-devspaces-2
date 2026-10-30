@@ -58,6 +58,11 @@ export interface DownloadOptions {
    * the download.
    */
   maxRedirects?: number;
+  /**
+   * The download fails as soon as it has more bytes, also by its Content-Length, so that a body without an end does not
+   * fill the disk before the SHA-256 is checked. Default: no limit.
+   */
+  maxBytes?: number;
   /** The file to write. A partial download is written next to it (`.download`) and removed on failure. */
   target: string;
   signal?: AbortSignal;
@@ -122,10 +127,20 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
     discard(response);
     throw new Error(`The download of ${url} has ${total} bytes, not the ${expected.size} bytes of its pin.`);
   }
+  const { maxBytes } = options;
+  if (maxBytes !== undefined && total !== undefined && total > maxBytes) {
+    discard(response);
+    throw new Error(`The download of ${url} has ${total} bytes, more than the ${maxBytes} bytes that it may have.`);
+  }
   const hash = crypto.createHash('sha256');
   let received = 0;
-  response.body.on('data', (chunk: Buffer) => {
+  const body = response.body as NodeJS.ReadableStream & { destroy?: (error?: Error) => void };
+  body.on('data', (chunk: Buffer) => {
     received += chunk.length;
+    if (maxBytes !== undefined && received > maxBytes) {
+      body.destroy?.(new Error(`The download of ${url} has more than the ${maxBytes} bytes that it may have.`));
+      return;
+    }
     hash.update(chunk);
     options.onProgress?.(received, total);
   });

@@ -15,6 +15,7 @@ import * as path from 'path';
 import { errorMessage } from '../errors';
 import type { HttpTransport } from '../http';
 import { abortError, isAbortError, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
+import { envValue } from './dockerCli';
 import { downloadFile, type DownloadOptions } from './dockerDownload';
 import { WSL_DISTRIBUTION, WSL_LIST_ARGS, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
 import { DOCKER_ENGINE_PACKAGES, isHttpsUrl } from './dockerSetup';
@@ -41,6 +42,8 @@ const MAX_LIST_BYTES = 1024 * 1024;
 const MAX_REDIRECTS = 5;
 /** A download that receives no bytes for this long stops (also before the answer of the server). */
 const STALLED_AFTER_MS = 60_000;
+/** The largest Debian file that is downloaded (it has some 100 MB), so that a body without an end does not fill the disk. */
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024 * 1024;
 const SHORT_CALL_MS = 15_000;
 const REGISTER_MS = 15 * 60_000;
 const PROVISION_MS = 30 * 60_000;
@@ -60,8 +63,8 @@ const STEP_PREFIX = 'devspaces-step ';
  * of VS Code (which is in the roaming profile), so that the virtual disk stays on this computer. Undefined without
  * LOCALAPPDATA.
  */
-export function wslSetupFolder(env: Readonly<Record<string, string | undefined>>): string | undefined {
-  const localAppData = Object.entries(env).find(([name]) => name.toUpperCase() === 'LOCALAPPDATA')?.[1];
+export function wslSetupFolder(env: NodeJS.ProcessEnv): string | undefined {
+  const localAppData = envValue(env, 'LOCALAPPDATA', 'win32');
   return localAppData ? path.win32.join(localAppData, 'nimblescape', 'devspaces', 'wsl') : undefined;
 }
 
@@ -347,7 +350,7 @@ export class WslSetup {
 
   /** `reg.exe` in System32 of SystemRoot, not from PATH. */
   private get regPath(): string {
-    const systemRoot = Object.entries(this.deps.env).find(([name]) => name.toUpperCase() === 'SYSTEMROOT')?.[1] ?? 'C:\\Windows';
+    const systemRoot = envValue(this.deps.env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
     return path.win32.join(systemRoot, 'System32', 'reg.exe');
   }
 
@@ -371,15 +374,24 @@ export class WslSetup {
     throw new WslSetupError('wslMissing', `${detail}. wsl.exe --status ended with exit code ${status.exitCode}: ${outputOf(status)}`);
   }
 
-  /** Whether the distribution `devspaces` is registered, and whether Devspaces set it up (WslRegistration). */
+  /**
+   * Whether the distribution `devspaces` is registered, and whether Devspaces set it up (WslRegistration): from the
+   * list of WSL and the folder of its virtual disk in the registry. When `wsl.exe --list` fails (also without any
+   * distribution), the registry alone decides. When the registry cannot be read (logged), a virtual disk in `diskFolder`
+   * makes it `own`.
+   */
   async registration(signal?: AbortSignal): Promise<WslRegistration> {
-    const result = await this.runShort(WSL_LIST_ARGS, signal);
-    // Without a distribution, `wsl.exe --list` ends with an exit code that is not 0.
-    const names = result.exitCode === 0 ? parseWslList(result.stdout) : [];
-    // WSL compares the names without case.
-    if (!names.some((name) => name.toLowerCase() === WSL_DISTRIBUTION)) return 'none';
-    const diskFolder = (await this.distributionFolders(signal))?.get(WSL_DISTRIBUTION);
-    return diskFolder !== undefined && isWithin(diskFolder, this.diskFolder) ? 'own' : 'foreign';
+    const listed = await this.listed(signal);
+    if (listed === false) return 'none';
+    const folders = await this.distributionFolders(signal);
+    if (folders !== undefined) {
+      const diskFolder = folders.get(WSL_DISTRIBUTION);
+      if (diskFolder === undefined) return listed ? 'foreign' : 'none';
+      return isWithin(diskFolder, this.diskFolder) ? 'own' : 'foreign';
+    }
+    if (!listed) return 'none';
+    this.deps.logger.info(`Without the registry, a virtual disk in ${this.diskFolder} tells whether Devspaces set up the WSL distribution ${WSL_DISTRIBUTION}.`);
+    return (await this.hasDisk()) ? 'own' : 'foreign';
   }
 
   /**
@@ -476,8 +488,11 @@ export class WslSetup {
   async removeLeftovers(): Promise<void> {
     const { folder, logger } = this.deps;
     if (!fs.existsSync(folder)) return;
-    const folders = await this.distributionFolders();
-    if (folders === undefined || [...folders.values()].some((diskFolder) => isWithin(diskFolder, folder))) return;
+    const users = await this.diskUsers(folder).catch(() => undefined);
+    if (users === undefined || users.length > 0) {
+      logger.info(`The folder ${folder} stays: ${users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses it' : `the WSL distribution ${users.join(', ')} has its virtual disk there`}.`);
+      return;
+    }
     await fs.promises.rm(folder, { recursive: true, force: true }).then(
       () => logger.info(`The folder ${folder} of an earlier setup was removed.`),
       (error: unknown) => logger.warn(`The folder ${folder} could not be removed: ${errorMessage(error)}`),
@@ -526,6 +541,7 @@ export class WslSetup {
         // The file of a build server is often served from another host (its storage); the SHA-256 checks it.
         anyHttpsRedirect: true,
         target: file,
+        maxBytes: MAX_IMAGE_BYTES,
         signal: signal === undefined ? stall.signal : AbortSignal.any([signal, stall.signal]),
         onProgress: (received, total) => {
           watch();
@@ -571,14 +587,53 @@ export class WslSetup {
   private async clearDiskFolder(signal?: AbortSignal): Promise<void> {
     const names = await fs.promises.readdir(this.diskFolder).catch(() => [] as string[]);
     if (names.length === 0) return;
-    const folders = await this.distributionFolders(signal);
-    const used = folders === undefined ? undefined : [...folders.entries()].find(([, diskFolder]) => isWithin(diskFolder, this.diskFolder))?.[0];
-    if (folders === undefined || used !== undefined) {
-      const reason = used === undefined ? 'the registry does not tell whether a WSL distribution uses them' : `the WSL distribution ${used} has its virtual disk there`;
-      throw new WslSetupError('registerFailed', `The folder ${this.diskFolder} has files (${names.join(', ')}), and ${reason}; Devspaces creates no distribution there.`);
+    const users = await this.diskUsers(this.diskFolder, signal);
+    if (users === undefined) {
+      throw new WslSetupError(
+        'registerFailed',
+        `The folder ${this.diskFolder} has files (${names.join(', ')}), and neither the registry nor WSL tells whether a WSL distribution uses them; Devspaces creates no distribution there. When no WSL distribution uses them, remove the folder and try again.`,
+      );
+    }
+    if (users.length > 0) {
+      throw new WslSetupError('registerFailed', `The folder ${this.diskFolder} has files (${names.join(', ')}), and the WSL distribution ${users.join(', ')} has its virtual disk there; Devspaces creates no distribution there.`);
     }
     this.deps.logger.info(`The folder ${this.diskFolder} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
     await fs.promises.rm(this.diskFolder, { recursive: true, force: true });
+  }
+
+  /**
+   * The WSL distributions (names in lower case) with their virtual disk in `parent`, from the registry. Without the
+   * registry, only the distribution `devspaces` can have it there (Devspaces registers no other one): then `wsl.exe
+   * --list` must answer. Undefined when neither tells. Throws an AbortError when the signal aborts.
+   */
+  private async diskUsers(parent: string, signal?: AbortSignal): Promise<string[] | undefined> {
+    const folders = await this.distributionFolders(signal);
+    if (folders !== undefined) return [...folders.entries()].filter(([, diskFolder]) => isWithin(diskFolder, parent)).map(([name]) => name);
+    try {
+      const listed = await this.listed(signal);
+      return listed === undefined ? undefined : listed ? [WSL_DISTRIBUTION] : [];
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      this.deps.logger.info(`WSL does not list its distributions: ${errorMessage(error)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether `wsl.exe --list` names the distribution `devspaces` (WSL compares the names without case); undefined when
+   * the list ends with an exit code that is not 0, which it also does without any distribution. Throws WslSetupError
+   * (runShort).
+   */
+  private async listed(signal?: AbortSignal): Promise<boolean | undefined> {
+    const result = await this.runShort(WSL_LIST_ARGS, signal);
+    if (result.exitCode !== 0) return undefined;
+    return parseWslList(result.stdout).some((name) => name.toLowerCase() === WSL_DISTRIBUTION);
+  }
+
+  /** True when `diskFolder` has a virtual disk (`*.vhdx`). */
+  private async hasDisk(): Promise<boolean> {
+    const names = await fs.promises.readdir(this.diskFolder).catch(() => [] as string[]);
+    return names.some((name) => name.toLowerCase().endsWith('.vhdx'));
   }
 
   /**

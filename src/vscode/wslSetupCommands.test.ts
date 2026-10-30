@@ -66,6 +66,8 @@ beforeEach(() => {
     setUp: vi.fn(async (_image: unknown, onStep: (step: WslSetupStep) => void, _signal?: AbortSignal) => {
       onStep({ kind: 'download', received: 0, total: IMAGE.size });
       onStep({ kind: 'download', received: IMAGE.size / 2, total: IMAGE.size });
+      // Another piece of the same megabyte and percent: no new report.
+      onStep({ kind: 'download', received: IMAGE.size / 2 + 1024, total: IMAGE.size });
       onStep({ kind: 'download', received: IMAGE.size, total: IMAGE.size });
       onStep({ kind: 'register' });
       onStep({ kind: 'docker', phase: 'docker' });
@@ -115,7 +117,7 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     useHost.mockResolvedValue(false);
     await commands().setUp();
     expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.readyNotUsed);
-    expect(WslSetupTexts.readyNotUsed).toContain(`choose "${WSL_HOST}" in "Use a Remote Docker Host…"`);
+    expect(WslSetupTexts.readyNotUsed).toContain(`To use it, choose "${WSL_HOST}" in "Use a Remote Docker Host…".`);
     expect(window.showErrorMessage).not.toHaveBeenCalled();
   });
 
@@ -134,6 +136,8 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     expect(questions()).toEqual([{ message: WslSetupTexts.confirmRepair, detail: WslSetupTexts.confirmRepairDetail, button: WslSetupTexts.setUp }]);
     expect(setup.setUp).toHaveBeenCalledWith(undefined, expect.any(Function), expect.any(AbortSignal));
     expect(useHost).toHaveBeenCalledWith(WSL_HOST);
+    // Only a new distribution needs WSL 2.4.4.
+    expect(setup.checkWsl).not.toHaveBeenCalled();
   });
 
   it('never changes a distribution devspaces that Devspaces did not set up, and offers to use it', async () => {
@@ -152,7 +156,7 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     await commands().setUp();
     expect(window.showErrorMessage).toHaveBeenCalledWith(WslSetupTexts.problem('wslMissing'), WslSetupTexts.installWsl, Actions.showDetails);
     await vi.waitFor(() => expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(Commands.dockerSetupInstallWsl));
-    expect(setup.registration).not.toHaveBeenCalled();
+    expect(setup.image).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalledWith(`${WslSetupTexts.problem('wslMissing')} wsl.exe was not found.`);
   });
 
@@ -178,13 +182,13 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
 
   it('runs one setup at a time in a window', async () => {
     let release: () => void = () => {};
-    setup.checkWsl.mockImplementationOnce(() => new Promise((resolve) => (release = () => resolve('2.6.1'))));
+    setup.registration.mockImplementationOnce(() => new Promise((resolve) => (release = () => resolve('none'))));
     const instance = commands();
     const first = instance.setUp();
     await instance.setUp();
     expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.busy);
     await instance.remove();
-    expect(setup.registration).not.toHaveBeenCalled();
+    expect(setup.registration).toHaveBeenCalledTimes(1);
     release();
     await first;
     expect(setup.checkWsl).toHaveBeenCalledTimes(1);

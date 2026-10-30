@@ -61,7 +61,7 @@ export const WslSetupTexts = {
   remove: 'Remove',
   removed: (wasCurrent: boolean) => `The WSL distribution of Devspaces was removed.${wasCurrent ? ' Devspaces now uses the local Docker.' : ''}`,
   removedStillListed: `The WSL distribution of Devspaces was removed, but Devspaces could not take "${WSL_HOST}" out of its list of Docker hosts. Take it out with "Remove a Host from the List…".`,
-  readyNotUsed: `Docker Engine runs in the WSL distribution of Devspaces, but Devspaces does not use it yet. When the problem of the other message is solved, choose "${WSL_HOST}" in "Use a Remote Docker Host…".`,
+  readyNotUsed: `Docker Engine runs in the WSL distribution of Devspaces, but Devspaces does not use it yet. To use it, choose "${WSL_HOST}" in "Use a Remote Docker Host…".`,
   notInstalled: 'The WSL distribution of Devspaces is not installed.',
   foreign: `A WSL distribution with the name "${WSL_DISTRIBUTION}" exists, but Devspaces did not set it up, so Devspaces does not change it. Use it as it is?`,
   foreignRemove: `The WSL distribution "${WSL_DISTRIBUTION}" was not set up by Devspaces, so Devspaces does not remove it. If you do not need it, remove it in a terminal with "wsl --unregister ${WSL_DISTRIBUTION}".`,
@@ -135,8 +135,8 @@ export class WslSetupCommands {
   /**
    * "Set Up Docker for Devspaces…": checks WSL, asks once with the downloads and the folder, sets up the distribution
    * with a progress notification, and makes it the Docker host of Devspaces. A distribution that Devspaces set up
-   * before is set up again (Docker Engine installed or updated); one that the user made is only offered for use. Never
-   * throws.
+   * before is set up again (Docker Engine installed or updated); one that the user made is only offered for use. Only
+   * a new distribution needs the version of WSL that registers a file. Never throws.
    */
   async setUp(): Promise<void> {
     const { setup, folder } = this.deps;
@@ -147,10 +147,11 @@ export class WslSetupCommands {
     if (!this.start()) return;
     try {
       const plan = await this.withProgress(WslSetupTexts.checking, async (signal) => {
+        const registration = await setup.registration(signal);
+        if (registration !== 'none') return { registration };
         const version = await setup.checkWsl(signal);
         this.deps.logger.info(`WSL ${version} is installed.`);
-        const registration = await setup.registration(signal);
-        return registration === 'none' ? { registration, image: await setup.image(signal) } : { registration };
+        return { registration, image: await setup.image(signal) };
       });
       if (plan.registration === 'foreign') {
         this.deps.logger.info(`A WSL distribution ${WSL_DISTRIBUTION} exists that Devspaces did not set up; Devspaces does not change it.`);
@@ -246,11 +247,16 @@ export class WslSetupCommands {
         const abort = new AbortController();
         const subscription = token.onCancellationRequested(() => abort.abort());
         let percent = 0;
+        let shown: string | undefined;
         try {
           return await task(abort.signal, (step) => {
             // Only the download has a known size; it fills the bar.
             const next = step.kind === 'download' && step.total ? Math.min(100, Math.floor((step.received * 100) / step.total)) : percent;
-            progress.report({ message: WslSetupTexts.step(step), increment: next > percent ? next - percent : undefined });
+            const message = WslSetupTexts.step(step);
+            // The download reports each piece that arrives; the notification changes only with its text or its bar.
+            if (message === shown && next === percent) return;
+            progress.report({ message, increment: next > percent ? next - percent : undefined });
+            shown = message;
             percent = next;
           });
         } finally {

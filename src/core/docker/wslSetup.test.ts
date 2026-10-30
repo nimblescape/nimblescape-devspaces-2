@@ -252,11 +252,20 @@ describe('WslSetup.checkWsl', () => {
 
 describe('WslSetup.registration', () => {
   it('is none without a distribution of that name, also when WSL lists none with an exit code', async () => {
-    const empty = wslRunner(() => failed('Windows Subsystem for Linux has no installed distributions.', 4294967295));
+    const noList = () => failed('Windows Subsystem for Linux has no installed distributions.', 4294967295);
+    const empty = wslRunner(noList, failed('ERROR: The system was unable to find the specified registry key or value.'));
     await expect(setup({ runner: empty }).registration()).resolves.toBe('none');
     expect(empty.calls[0].args).toEqual(WSL_LIST_ARGS);
+    await expect(setup({ runner: wslRunner(noList, { Ubuntu: 'C:\\WSL\\Ubuntu' }) }).registration()).resolves.toBe('none');
+    // A list without it needs no registry.
     const others = wslRunner(() => ok('Ubuntu\r\ndocker-desktop\r\n'));
     await expect(setup({ runner: others }).registration()).resolves.toBe('none');
+    expect(others.calls).toHaveLength(1);
+  });
+
+  it('takes the registry when the list of WSL fails, so that a failed list does not hide the distribution', async () => {
+    const runner = wslRunner(() => failed('Wsl/Service/E_UNEXPECTED'), { devspaces: path.join(folder, 'disk') });
+    await expect(setup({ runner }).registration()).resolves.toBe('own');
   });
 
   it('is own when the registry names the folder of Devspaces for its virtual disk, else foreign (names without case)', async () => {
@@ -277,13 +286,16 @@ describe('WslSetup.registration', () => {
     await expect(setup({ runner: wslRunner(list, { Ubuntu: disk }) }).registration()).resolves.toBe('foreign');
   });
 
-  it('is foreign when the registry cannot be read (logged)', async () => {
+  it('takes a virtual disk in the folder of Devspaces when the registry cannot be read (logged)', async () => {
     const log = logger();
-    const runner = wslRunner(() => ok('devspaces\r\n'), failed('ERROR: The system was unable to find the specified registry key or value.'));
+    const runner = wslRunner(() => ok('devspaces\r\n'), failed('ERROR: Registry editing has been disabled by your administrator.'));
     await expect(setup({ runner, log }).registration()).resolves.toBe('foreign');
     expect(log.warn).toHaveBeenCalledWith(
-      `The WSL distributions could not be read from the registry (${LXSS_KEY}): reg.exe export ended with exit code 1: ERROR: The system was unable to find the specified registry key or value.`,
+      `The WSL distributions could not be read from the registry (${LXSS_KEY}): reg.exe export ended with exit code 1: ERROR: Registry editing has been disabled by your administrator.`,
     );
+    fs.mkdirSync(path.join(folder, 'disk'));
+    fs.writeFileSync(path.join(folder, 'disk', 'ext4.vhdx'), '');
+    await expect(setup({ runner, log }).registration()).resolves.toBe('own');
   });
 
   it('says that WSL does not answer instead of none when the list ends by its time limit', async () => {
@@ -524,13 +536,33 @@ describe('WslSetup.setUp', () => {
       problem: 'registerFailed',
       message: `The folder ${disk} has files (ext4.vhdx), and the WSL distribution devspaces has its virtual disk there; Devspaces creates no distribution there.`,
     });
+    // Without the registry, WSL must answer its list.
     const unknown = distribution(undefined, failed('Access is denied.'));
     await expect(setup({ runner: unknown, download }).setUp(image, () => undefined)).rejects.toMatchObject({
       problem: 'registerFailed',
-      message: expect.stringContaining('the registry does not tell whether a WSL distribution uses them'),
+      message: expect.stringContaining('neither the registry nor WSL tells whether a WSL distribution uses them'),
+    });
+    const listed = distribution((args) => (args.join(' ') === WSL_LIST_ARGS.join(' ') ? ok('devspaces\r\n') : undefined), failed('Access is denied.'));
+    await expect(setup({ runner: listed, download }).setUp(image, () => undefined)).rejects.toMatchObject({
+      message: expect.stringContaining('and the WSL distribution devspaces has its virtual disk there'),
     });
     expect(download).not.toHaveBeenCalled();
     expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
+  });
+
+  it('removes the virtual disk of a setup that did not end without the registry when WSL does not list the distribution', async () => {
+    const disk = path.join(folder, 'disk');
+    fs.mkdirSync(disk, { recursive: true });
+    fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'old');
+    const runner = distribution((args) => (args.join(' ') === WSL_LIST_ARGS.join(' ') ? ok('Ubuntu\r\n') : undefined), failed('Access is denied.'));
+    await expect(setup({ runner, download: writingDownload() }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
+    expect(fs.readdirSync(disk)).toEqual([]);
+  });
+
+  it('limits the size of the download', async () => {
+    const download = writingDownload();
+    await setup({ runner: distribution(), download }).setUp(image, () => undefined);
+    expect(download).toHaveBeenCalledWith(expect.objectContaining({ maxBytes: 2 * 1024 * 1024 * 1024 }));
   });
 
   it('goes on after a failed restart (logged), and fails with dockerNotRunning when Docker does not answer', async () => {
@@ -572,6 +604,12 @@ describe('WslSetup.removeLeftovers', () => {
 
   it('removes the folder of Devspaces when no WSL distribution has its virtual disk there', async () => {
     const runner = wslRunner(() => undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
+    await setup({ runner }).removeLeftovers();
+    expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  it('removes it without the registry when WSL lists no distribution devspaces', async () => {
+    const runner = wslRunner(() => ok('Ubuntu\r\n'), failed('Access is denied.'));
     await setup({ runner }).removeLeftovers();
     expect(fs.existsSync(folder)).toBe(false);
   });

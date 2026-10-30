@@ -203,6 +203,21 @@ describe('downloadFile with a SHA-256 and redirects to any HTTPS host', () => {
     expect(fs.readFileSync(target, 'utf8')).toBe(body);
   });
 
+  it('stops a body with more bytes than its limit, also by its Content-Length, and keeps nothing', async () => {
+    const endless = () => Readable.from((function* () { for (;;) yield Buffer.alloc(1024); })());
+    const { get } = fakeGet({ [URL_WSL]: () => respond(302, '', { location: STORAGE }), [STORAGE]: () => respond(200, endless()) });
+    await expect(downloadFile({ url: URL_WSL, target, get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true, maxBytes: 10_000 })).rejects.toThrow(
+      `The download of ${STORAGE} has more than the 10000 bytes that it may have.`,
+    );
+    expect(fs.readdirSync(dir)).toEqual([]);
+    const large = fakeGet({ [URL_WSL]: () => respond(200, body, { 'content-length': '20000' }) });
+    await expect(downloadFile({ url: URL_WSL, target, get: large.get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true, maxBytes: 10_000 })).rejects.toThrow(
+      `The download of ${URL_WSL} has 20000 bytes, more than the 10000 bytes that it may have.`,
+    );
+    await downloadFile({ url: URL_WSL, target, get: fakeGet({ [URL_WSL]: () => respond(200, body) }).get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true, maxBytes: body.length });
+    expect(fs.readFileSync(target, 'utf8')).toBe(body);
+  });
+
   it('keeps nothing of a file with another SHA-256 and names no size', async () => {
     const { get } = fakeGet({ [URL_WSL]: () => respond(302, '', { location: STORAGE }), [STORAGE]: () => respond(200, 'other') });
     await expect(downloadFile({ url: URL_WSL, target, get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true })).rejects.toThrow(
