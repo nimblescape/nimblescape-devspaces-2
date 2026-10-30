@@ -486,7 +486,7 @@ describe('WslSetup.separate', () => {
     const base = registryRunner();
     const runner = withRegistry(base, { 'docker-desktop': 'C:\\dd', 'docker-desktop-data': 'C:\\ddd', 'rancher-desktop-data': 'C:\\rdd', devspaces: ours() }, 3);
     await expect(setup({ runner }).separate()).resolves.toMatchObject({ state: 'separate' });
-    expect(base.calls.map((call) => call.args)).toEqual([expect.arrayContaining(['export']), regDeleteDefaultArgs()]);
+    expect(base.calls.map((call) => call.args)).toEqual([expect.arrayContaining(['export']), expect.arrayContaining(['export']), regDeleteDefaultArgs()]);
     expect(regDeleteDefaultArgs()).toEqual(['delete', LXSS_KEY, '/v', 'DefaultDistribution', '/f']);
   });
 
@@ -505,12 +505,29 @@ describe('WslSetup.separate', () => {
     const base = registryRunner(() => failed('Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND'));
     const log = logger();
     await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: ours() }, 1), log }).separate()).resolves.toMatchObject({ state: 'separate' });
-    expect(base.calls.map((call) => call.args[0])).toEqual(['export', '--set-default', 'delete']);
+    expect(base.calls.map((call) => call.args[0])).toEqual(['export', '--set-default', 'export', 'delete']);
     expect(log.warn).not.toHaveBeenCalled();
     // WSL may only be slow: the user keeps a default, and the next check tries again.
     const silent = registryRunner(() => timedOut);
     await expect(setup({ runner: withRegistry(silent, { Ubuntu: 'C:\\u', Debian: 'C:\\d', devspaces: ours() }, 2) }).separate()).resolves.toMatchObject({ state: 'default' });
     expect(silent.calls.map((call) => call.args[0])).toEqual(['export', '--set-default']);
+  });
+
+  // Mutation: a removal without a second read fails it (it would remove a default that the user chose meanwhile).
+  it('removes nothing when the default changed meanwhile', async () => {
+    const base = registryRunner(() => failed('Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND'));
+    let exports = 0;
+    const runner = {
+      ...base,
+      run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
+        if (file !== REG) return base.run(file, args, options);
+        base.calls.push({ file, args, options });
+        if (args[0] === 'export') fs.writeFileSync(args[2], lxssExport({ Ubuntu: 'C:\\u', devspaces: ours() }, exports++ === 0 ? 1 : 0));
+        return ok();
+      }),
+    };
+    await expect(setup({ runner }).separate()).resolves.toMatchObject({ state: 'separate' });
+    expect(base.calls.map((call) => call.args[0])).toEqual(['export', '--set-default', 'export']);
   });
 
   it('runs nothing without the folder of Devspaces, and logs a failure without a throw', async () => {

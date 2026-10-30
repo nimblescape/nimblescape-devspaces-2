@@ -939,6 +939,11 @@ export class WslSetup {
       // tries again, and the user keeps a default.
       if (done === undefined) return stays();
     }
+    // Only while the default is still the one of Devspaces: the user, or a removal in another window, may have changed
+    // it meanwhile, and that default stays.
+    const now = await this.readRegistry();
+    if (now === undefined) return stays();
+    if (now.defaultId !== ours.id) return result('separate');
     const removed = await attempt(
       'reg.exe delete',
       () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS }),
