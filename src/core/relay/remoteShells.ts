@@ -6,7 +6,7 @@
 // host (an SSH host, or the WSL distribution of Devspaces), opened by the first check or Docker call before a connection
 // of the relay to the host, used by the calls after it, and taken over by the next connection of the relay to the host
 // (takeOver). No `vscode`.
-import { hostAccessOf, wslText } from '../docker/dockerHost';
+import { hostAccessOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
 import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
@@ -137,8 +137,8 @@ export class RemoteShells {
 
   /**
    * The login of the shell to `host` (`open`, also with `fresh`), for the SSH check (RemoteShellAccess.login): undefined
-   * when the host has no transport; a failure with the error output of `ssh` or `wsl.exe` (loginDetail). Rejects only
-   * with an AbortError.
+   * when the host has no transport; a failure with the error output of `ssh` or `wsl.exe` (RemoteShellOptions.program).
+   * Rejects only with an AbortError.
    */
   async login(
     host: string,
@@ -148,7 +148,7 @@ export class RemoteShells {
     try {
       return (await this.open(host, signal, options)) === undefined ? undefined : { ok: true };
     } catch (error) {
-      if (error instanceof RemoteShellError) return { ok: false, detail: loginDetail(host, error), timedOut: error.timedOut };
+      if (error instanceof RemoteShellError) return { ok: false, detail: error.detail, timedOut: error.timedOut };
       throw error;
     }
   }
@@ -157,8 +157,8 @@ export class RemoteShells {
    * Runs `command` (one line for the shell) on the shell of `host` (`open`): its result as ProcessRunner.run gives it
    * (RemoteShell.run). A shell that was closed or taken over before the command started is replaced by a new one, once.
    * Undefined when the host has no transport, and after `dispose`. A failed login gives the result of `ssh` (or
-   * `wsl.exe`): exit code 255 (none after its time limit) and its error output (loginDetail). Rejects with an AbortError
-   * when `options.signal` aborts.
+   * `wsl.exe`): exit code 255 (none after its time limit) and its error output. Rejects with an AbortError when
+   * `options.signal` aborts.
    */
   async run(host: string, command: string, options: Pick<RunOptions, 'input' | 'timeoutMs' | 'signal'> = {}): Promise<RunResult | undefined> {
     for (let attempt = 0; ; attempt++) {
@@ -167,13 +167,11 @@ export class RemoteShells {
         shell = await this.open(host, options.signal);
       } catch (error) {
         if (!(error instanceof RemoteShellError)) throw error;
-        return { exitCode: error.timedOut ? null : 255, stdout: '', stderr: loginDetail(host, error), timedOut: error.timedOut };
+        return { exitCode: error.timedOut ? null : 255, stdout: '', stderr: error.detail, timedOut: error.timedOut };
       }
       if (shell === undefined) return undefined;
       try {
-        const result = await shell.run(command, options);
-        // When the shell ends during the command, its error output is the one of the transport (loginDetail).
-        return hostAccessOf(host)?.kind === 'wsl' ? { ...result, stderr: wslText(result.stderr) } : result;
+        return await shell.run(command, options);
       } catch (error) {
         if (!(error instanceof ShellGoneError) || attempt > 0 || isAbortError(error)) throw error;
       }
@@ -217,9 +215,4 @@ export class RemoteShells {
     }
     this.entries.clear();
   }
-}
-
-/** The error output of a failed login to `host`: for a WSL distribution, the UTF-16 of an older `wsl.exe` as text (wslText). */
-function loginDetail(host: string, error: RemoteShellError): string {
-  return hostAccessOf(host)?.kind === 'wsl' ? wslText(error.detail).trim() : error.detail;
 }

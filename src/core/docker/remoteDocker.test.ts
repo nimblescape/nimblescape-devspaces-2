@@ -182,10 +182,14 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     shells.login.mockResolvedValueOnce(undefined as never);
     await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
     expect(docker.calls).toHaveLength(1);
-    // The shell was taken over by the relay twice before docker info: the way without the shell too.
+    // The shell was taken over by the relay twice before docker info: the host did not answer for it.
     shells.run.mockRejectedValueOnce(new ShellGoneError('The shell on box is taken over by the relay.'));
-    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
-    expect(docker.calls).toHaveLength(2);
+    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toEqual({
+      ok: false,
+      problem: 'unreachable',
+      detail: 'The shell on box is taken over by the relay.',
+    });
+    expect(docker.calls).toHaveLength(1);
   });
 
   it('noPromptEnv replaces every spelling of SSH_ASKPASS_REQUIRE', () => {

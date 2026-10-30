@@ -179,9 +179,8 @@ async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal 
 
 /**
  * `docker info` (ENGINE_INFO_COMMAND) on the shell before the relay of `host`, as an EngineCheck; undefined when the
- * host has no shell. A shell that was closed or taken over twice before the command (ShellGoneError of RemoteShells.run):
- * undefined for an SSH host, which then logs in itself, and `unreachable` for the WSL distribution, which has no other
- * way. Rejects with any other error of `run`.
+ * host has no shell. A shell that was closed or taken over twice before the command (ShellGoneError of RemoteShells.run)
+ * gives `unreachable` (shellGone). Rejects with any other error of `run`.
  */
 async function engineInfoOnShell(shells: RemoteShellAccess, host: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<EngineCheck | undefined> {
   try {
@@ -189,8 +188,16 @@ async function engineInfoOnShell(shells: RemoteShellAccess, host: string, timeou
     return result === undefined ? undefined : engineCheckOf(result, timeoutMs);
   } catch (error) {
     if (!(error instanceof ShellGoneError)) throw error;
-    return hostAccessOf(host)?.kind === 'wsl' ? { ok: false, problem: 'unreachable', detail: error.message } : undefined;
+    return shellGone(error);
   }
+}
+
+/**
+ * The check after a shell before the relay was closed or taken over twice before its command (ShellGoneError): the host
+ * did not answer for it. Not the own `ssh` of an SSH host instead: after a login that asked in VS Code, it would fail.
+ */
+function shellGone(error: ShellGoneError): { ok: false; problem: DockerHostProblem; detail: string } {
+  return { ok: false, problem: 'unreachable', detail: error.message };
 }
 
 /**
@@ -273,6 +280,7 @@ export async function readRootlessSocket(
         : undefined);
   } catch (error) {
     if (isAbortError(error)) throw error;
+    if (error instanceof ShellGoneError) return shellGone(error);
     const detail = errorMessage(error);
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }

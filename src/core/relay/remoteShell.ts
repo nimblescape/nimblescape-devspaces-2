@@ -10,6 +10,7 @@
 // takes the login over (takeOver: RelayConnection.open writes its start script into the idle shell), so the open of a
 // window logs in to the host once. A shell that no call used for SHELL_IDLE_CLOSE_MS is closed. No `vscode`.
 import { randomBytes } from 'crypto';
+import { wslText } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
@@ -82,8 +83,11 @@ export interface RemoteShellOptions {
   logger: Logger;
   /** Named in the log lines, for example the host. */
   name: string;
-  /** The program of the transport, named when its login does not answer in time: `ssh` (default) or `wsl.exe`. */
-  program?: string;
+  /**
+   * The program of the transport: `ssh` (default) or `wsl.exe`. It is named when its login does not answer in time, and
+   * for `wsl.exe` the error output is read with wslText (the UTF-16 of an older `wsl.exe` as text).
+   */
+  program?: 'ssh' | 'wsl.exe';
   loginTimeoutMs?: number;
   idleCloseMs?: number;
   /** Called once when the shell ends or is taken over. */
@@ -156,7 +160,7 @@ export class RemoteShell {
       (chunk) => this.stdout(chunk),
       () => this.stdoutEnded(),
     );
-    process.onStderr((text) => this.stderr(text));
+    process.onStderr((text) => this.stderr(options.program === 'wsl.exe' ? wslText(text) : text));
     void process.exited.then(({ exitCode, error }) => this.exited(exitCode, error));
     return new Promise<RemoteShell>((resolve, reject) => {
       const marker = newMarker('ready');
@@ -245,7 +249,8 @@ export class RemoteShell {
    * as its standard input (else none), and resolves with its exit code and output as ProcessRunner.run does. After
    * `timeoutMs`, the shell is stopped and the result has `timedOut`; when `signal` aborts, the shell is stopped and the
    * call rejects with an AbortError. When the shell ends during the command (the connection broke), the result has
-   * the exit code of `ssh` and its error output. Rejects with ShellGoneError when the shell ended or was taken over
+   * the exit code of the transport (`ssh` or `wsl.exe`) and its error output. Rejects with ShellGoneError when the shell
+   * ended or was taken over
    * before the command started, and with an Error for a command or input that the line cannot carry (shellCommandLine).
    */
   run(command: string, options: Pick<RunOptions, 'input' | 'timeoutMs' | 'signal'> = {}): Promise<RunResult> {
