@@ -48,10 +48,12 @@ export async function monitorSettingsFor(deps: MonitorSettingsDeps, host: string
 
 /**
  * Whether the Monitor of the engine `host` runs permanently: the mode of monitorSettingsFor, without the other settings
- * (the WSL distribution of Devspaces, WslLifetime). Never rejects.
+ * (the WSL distribution of Devspaces, WslLifetime). The setting is read after the answer, so that both are as new as
+ * possible. Never rejects.
  */
 export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: string): Promise<boolean> {
-  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, await answeredOf(deps, host));
+  const answered = await answeredOf(deps, host);
+  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
 }
 
 /**
@@ -83,12 +85,17 @@ function computerOf(deps: MonitorSettingsDeps): { computer?: string } {
 export function monitorSettingsOf(deps: MonitorSettingsDeps): {
   forOpen(dockerHost: string): Promise<MonitorSettings>;
   forTarget(target: Pick<DockerTarget, 'kind' | 'host'>): Promise<MonitorSettings>;
-  /** Whether the Monitor of the engine `host` runs permanently (monitorPermanentFor). */
+  /**
+   * Whether the Monitor of the engine `host` runs permanently (monitorPermanentFor), for the checks in the background of
+   * WslLifetime: an answer that cannot be read is not logged here, because these checks run often; the open and the
+   * ensure of the Monitor log it.
+   */
   permanent(host: string): Promise<boolean>;
 } {
+  const quiet: MonitorSettingsDeps = { ...deps, logger: undefined };
   return {
     forOpen: (dockerHost) => monitorSettingsFor(deps, dockerHost),
     forTarget: (target) => monitorSettingsFor(deps, target.host),
-    permanent: (host) => monitorPermanentFor(deps, host),
+    permanent: (host) => monitorPermanentFor(quiet, host),
   };
 }

@@ -207,7 +207,7 @@ interface Harness {
     currentBranch: ReturnType<typeof vi.fn<(id: string) => Promise<string | undefined>>>;
     windowStateInWorker: ReturnType<typeof vi.fn<(devspace: Devspace, containerName: string, options?: { branch?: boolean; signal?: AbortSignal }) => Promise<WindowStateValue | undefined>>>;
     // The restore runs in the worker (reconcileInWorker).
-    reconcileInWorker: ReturnType<typeof vi.fn<(options: { passive: boolean; byUser?: boolean }) => Promise<number>>>;
+    reconcileInWorker: ReturnType<typeof vi.fn<(options: { passive: boolean; mayStart?: boolean }) => Promise<number>>>;
     /** The token removal, sent by the operations of the window over `flow`. */
     removeTokenInWorker: ReturnType<typeof vi.fn<(devspaceId: string, containerName: string) => Promise<TokenRemoveValue>>>;
     // The three reads of this fake service are its own fixtures (the tests of the dialogs of Delete give each list),
@@ -361,7 +361,7 @@ function createHarness(
         return undefined;
       }
     }),
-    reconcileInWorker: vi.fn(async (_options: { passive: boolean; byUser?: boolean }) => 0),
+    reconcileInWorker: vi.fn(async (_options: { passive: boolean; mayStart?: boolean }) => 0),
     // By default, Delete could remove every recorded volume (their labels make them the devspace's own).
     removableAdditionalVolumes: vi.fn(async (id: string) => (await registry.get(id))?.additionalVolumes ?? []),
     // No volumes of a Docker Compose project, unless a test gives them.
@@ -2289,7 +2289,7 @@ describe('Sign in and Refresh', () => {
     // As the Refresh of the user: a rate limit of GitHub that refuses it always gets a message.
     expect(h.sidebar.refreshDiscovery).toHaveBeenCalledWith({ again: true, byUser: true });
     // By the worker, made ready in full (the user asked for the refresh), also on a WSL distribution that does not run.
-    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, byUser: true });
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, mayStart: true });
     expect(h.sidebar.refreshStates).toHaveBeenCalled();
   });
 
@@ -3853,7 +3853,7 @@ describe('Remove Devspaces from This Docker Engine…', () => {
     // After that window ended, a Refresh restores there again, and the mark stays.
     h.alive.delete(OTHER_PID);
     await run('refresh');
-    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, byUser: true });
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, mayStart: true });
     expect(await h.engineRecords.removed('build-box')).toBe(true);
 
     // This window removes Devspaces from the engine, and the user presses Refresh while the containers are removed.
@@ -4199,7 +4199,7 @@ describe('Remove Devspaces from This Docker Engine…', () => {
       return 1;
     });
     await run('refresh');
-    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, byUser: true });
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, mayStart: true });
     expect(h.coordinator.setDevspace).not.toHaveBeenCalledWith(ENV_ID);
     expect(h.coordinator.setPlainDevspace.mock.calls).toEqual([[ENV_ID]]);
     expect(fakeVscode.window.showInformationMessage.mock.calls).toEqual([[ControllerTexts.windowOnRemovedEngine('the local Docker')]]);
@@ -5197,7 +5197,7 @@ describe('Accounts', () => {
       return 0;
     });
     await h.controller.reconcileIfRegistryLost({ passive: false, adopt: true });
-    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false });
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, mayStart: true });
     expect(h.coordinator.setDevspace).toHaveBeenCalledWith(env.id);
   });
 

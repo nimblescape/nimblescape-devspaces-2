@@ -283,6 +283,13 @@ describe('WslLifetime.use', () => {
       expect(subject.holds(WSL_HOST)).toBe(false);
     });
 
+    it('starts the session after the wait when the state cannot be told then, as leavesStopped lets a call run', async () => {
+      const { subject, started } = await failedSession(() => ({ exitCode: 1, stdout: '', stderr: 'Wsl/Service/E_UNEXPECTED', timedOut: false }));
+      await vi.advanceTimersByTimeAsync(IDLE_RETRY_MS);
+      expect(started).toHaveLength(2);
+      subject.dispose();
+    });
+
     it('starts nothing after dispose', async () => {
       const { subject, started, runs } = await failedSession(() => ok('devspaces\n'));
       subject.dispose();

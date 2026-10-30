@@ -77,10 +77,12 @@ describe('the monitor settings of extension.ts', () => {
       expect(await settings.permanent('build-box'), String(stop)).toBe(false);
       expect(given.asked).toEqual(['wsl:devspaces', 'build-box']);
     }
-    // An answer that cannot be read counts as none, with the warning of forOpen.
+    // An answer that cannot be read counts as none, without a warning (these checks run often; forOpen warns).
     const warnings: string[] = [];
     const failing = monitorSettingsOf({ ...deps({}), answered: async () => Promise.reject(new Error('EIO')), logger: { warn: (message) => warnings.push(message) } });
     expect(await failing.permanent('wsl:devspaces')).toBe(false);
+    expect(warnings).toEqual([]);
+    await failing.forOpen('wsl:devspaces');
     expect(warnings).toEqual([expect.stringContaining('could not be read, so the Monitor there stops when no devspace runs: EIO')]);
   });
 

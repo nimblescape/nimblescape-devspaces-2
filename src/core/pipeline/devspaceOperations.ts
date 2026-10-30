@@ -727,15 +727,16 @@ export class DevspaceOperations extends OperationBase {
    * reconcileFromVolumes runs; the entries come back as `record restore`, which this computer adds under its registry
    * lock). Returns the number of added entries. Does not start Docker: 0 when it does not run, and on an endpoint that
    * is neither local nor SSH. `passive`: the worker is made ready as for the refresh (the helper image only checked, the
-   * wait after a failed open kept). Without `byUser` (the Refresh that the user chooses), also the restore after the
-   * prebuild, which is not passive: 0 on a WSL distribution that a call now must leave stopped (`leavesStopped`); with
-   * it, such a distribution is started.
+   * wait after a failed open kept). `mayStart`: a restore that may start a WSL distribution that does not run (the
+   * Refresh that the user chooses, and the window of a devspace, which starts it anyway when it connects). Without it,
+   * also for the restore after the prebuild, which is not passive: 0 on a WSL distribution that a call now must leave
+   * stopped (`leavesStopped`).
    * Throws when the worker could not be reached or failed (nothing is added then).
    */
-  async reconcileInWorker(options: { passive: boolean; byUser?: boolean; signal?: AbortSignal }): Promise<number> {
+  async reconcileInWorker(options: { passive: boolean; mayStart?: boolean; signal?: AbortSignal }): Promise<number> {
     const readable = await this.readableDockerHost();
     if (readable === undefined) return 0;
-    if (options.byUser !== true && (await this.deps.leavesStopped?.(readable))) return 0;
+    if (options.mayStart !== true && (await this.deps.leavesStopped?.(readable))) return 0;
     if (!(await this.deps.dockerRunning())) return 0;
     const params = parseReconcileParams({ dockerHost: readable, owner: this.deps.owner });
     if (params === undefined) throw new Error('The rebuild of the registry cannot be sent to the worker.');

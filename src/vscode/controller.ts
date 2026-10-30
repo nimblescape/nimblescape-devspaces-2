@@ -924,7 +924,9 @@ export class Controller implements vscode.Disposable {
     const target = await this.operationTarget();
     if (!docker.canRunOn(target)) return;
     if (await this.restoreRefusedWhileRemoving(target.host, options.user === true)) return;
-    const added = await service.reconcileInWorker({ passive: options.passive, ...(options.user === true ? { byUser: true } : {}) });
+    // The Refresh of the user, and the window of a devspace (`adopt`), may start a WSL distribution that does not run.
+    const mayStart = options.user === true || options.adopt === true;
+    const added = await service.reconcileInWorker({ passive: options.passive, ...(mayStart ? { mayStart } : {}) });
     if (added === 0 && options.adopt !== true) return;
     await this.adoptWindowDevspace();
     if (added > 0) await this.deps.sidebar.render();

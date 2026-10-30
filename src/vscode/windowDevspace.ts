@@ -104,7 +104,8 @@ export async function findWindowDevspace(
     // The activation waits at most WINDOW_RESTORE_TIMEOUT_MS for it; the restore in the background of the activation,
     // and the one after the build of the helper image, adopt the window later (reconcileIfRegistryLost with `adopt`).
     try {
-      await service.reconcileInWorker({ passive: true, signal: AbortSignal.timeout(WINDOW_RESTORE_TIMEOUT_MS) });
+      // The window of a devspace starts a WSL distribution that does not run anyway, when it connects.
+      await service.reconcileInWorker({ passive: true, mayStart: true, signal: AbortSignal.timeout(WINDOW_RESTORE_TIMEOUT_MS) });
     } catch (error) {
       logger.warn(`The devspaces could not be restored from the volumes while this window started: ${errorMessage(error)}`);
     }

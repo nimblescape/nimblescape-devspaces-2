@@ -34,7 +34,7 @@ function deps(options: { found?: Devspace[]; needsRestore?: boolean; installed?:
     docker: { canRunOn: vi.fn((_target: Pick<DockerTarget, 'kind'>) => options.installed ?? true) },
     current: async () => options.target ?? LOCAL_DOCKER_TARGET,
     service: {
-      reconcileInWorker: vi.fn(async (_options: { passive: boolean; signal?: AbortSignal }) => {
+      reconcileInWorker: vi.fn(async (_options: { passive: boolean; mayStart?: boolean; signal?: AbortSignal }) => {
         if (options.added instanceof Error) throw options.added;
         return options.added ?? 0;
       }),
@@ -56,6 +56,8 @@ describe('the devspace of the window at its activation', () => {
     expect(await findWindowDevspace('devspaces-acme-api-x', all)).toBe(ENTRY);
     const [options] = all.service.reconcileInWorker.mock.calls[0];
     expect(options.passive).toBe(true);
+    // The window of a devspace starts a WSL distribution that does not run anyway, when it connects.
+    expect(options.mayStart).toBe(true);
     expect(options.signal).toBeInstanceOf(AbortSignal);
     expect(WINDOW_RESTORE_TIMEOUT_MS).toBe(30_000);
   });

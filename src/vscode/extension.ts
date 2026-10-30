@@ -258,6 +258,8 @@ async function activateExtension(
   // The idle sessions of this window in the WSL distribution of Devspaces, and the rule for the Docker calls in the
   // background there (WslLifetime); set below, once the settings of the Monitor are known.
   let wslLifetime: WslLifetime | undefined;
+  // WslLifetime.leavesStopped, for the checks whether an engine answers and for the refresh of the states.
+  const leavesStopped = (host: string): Promise<boolean> => wslLifetime?.leavesStopped(host) ?? Promise.resolve(false);
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload. The
   // Docker CLI of the extension is only the bootstrap's (BootstrapDocker). Its calls of an operation on an SSH host go
   // through the Docker pipe of the extension for the host while a connection of the relay to it is open; on the WSL
@@ -425,7 +427,7 @@ async function activateExtension(
   const engineAnswersDeps = (): DockerEngineAnswersDeps => ({
     daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs),
     ssh: remoteDeps(),
-    leavesStopped: (host) => wslLifetime?.leavesStopped(host) ?? Promise.resolve(false),
+    leavesStopped,
     logger,
   });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
@@ -825,7 +827,7 @@ async function activateExtension(
     // The refresh of the states asks nothing on an engine with the removal mark, also no `docker info`.
     engineRemoved: (host) => engineRemoved({ host }),
     // Nor on a WSL distribution that does not run, unless its Monitor runs permanently or a flow of the user asks.
-    leavesStopped: (host) => wslLifetime?.leavesStopped(host) ?? Promise.resolve(false),
+    leavesStopped,
     ui,
     logger,
     clock: systemClock,

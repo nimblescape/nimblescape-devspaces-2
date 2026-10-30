@@ -29,7 +29,7 @@ export const IDLE_QUIET_CHECKS = 2;
 /**
  * After an idle session that failed within this long after its start (it could not start, for example for a
  * distribution that is not registered), no new one starts for this long either; a use within that time starts one
- * after it, when the distribution runs then.
+ * after it, unless the distribution does not run then.
  */
 export const IDLE_RETRY_MS = 60_000;
 /**
@@ -163,7 +163,7 @@ export class WslLifetime {
    * Devspaces starts a `wsl.exe` for the WSL host `host` now (a shell, a connection of the relay, a connection of a
    * Docker pipe): this window holds the idle session of the host from now on, unless it holds one already, or `wsl.exe`
    * cannot be found. Within a minute after the last one failed (IDLE_RETRY_MS: it ended with an error within a minute
-   * after its start), the session starts only after that minute, and only when the distribution runs then
+   * after its start), the session starts only after that minute, and not when the distribution does not run then
    * (`retryLater`). Nothing for any other host, and after `dispose`. Never throws.
    */
   use(host: string): void {
@@ -176,16 +176,17 @@ export class WslLifetime {
   }
 
   /**
-   * A use within the wait after a failed session: the session starts once the wait is over, when the distribution runs
-   * then, because the `wsl.exe` of this use (for example a connection of the relay) may stay the only one for a long
-   * time. One timer per host; `dispose` stops it.
+   * A use within the wait after a failed session: the session starts once the wait is over, unless the distribution
+   * does not run then (as for leavesStopped, a state that cannot be told counts as running), because the `wsl.exe` of
+   * this use (for example a connection of the relay) may stay the only one for a long time. One timer per host;
+   * `dispose` stops it.
    */
   private retryLater(host: string, distribution: string, waitMs: number): void {
     if (this.retries.has(host)) return;
     const timer = setTimeout(() => {
       this.retries.delete(host);
       void this.running(distribution).then((runs) => {
-        if (runs === true && !this.disposed && !this.holds(host)) this.start(host, distribution);
+        if (runs !== false && !this.disposed && !this.holds(host)) this.start(host, distribution);
       });
     }, waitMs);
     timer.unref?.();
