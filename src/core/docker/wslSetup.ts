@@ -260,6 +260,15 @@ function isDockerDesktopDistribution(name: string): boolean {
 }
 
 /**
+ * The distributions that tools run as their machine, which must not be the default distribution of WSL in place of
+ * the one of Devspaces: Docker Desktop, Rancher Desktop (`rancher-desktop`, `rancher-desktop-data`) and Podman
+ * (`podman-machine-<name>`).
+ */
+function isToolDistribution(name: string): boolean {
+  return isDockerDesktopDistribution(name) || /^rancher-desktop(-data)?$/i.test(name) || /^podman-machine-/i.test(name);
+}
+
+/**
  * The settings files of Docker Desktop on Windows: `settings-store.json`, and `settings.json` of older versions, in
  * `%APPDATA%\Docker` (docs.docker.com, "Change your Docker Desktop settings"). Empty without APPDATA.
  */
@@ -622,8 +631,8 @@ export class WslSetup {
       // A download that could not be removed after the registration (WSL still had it open).
       await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
     }
-    // WSL makes a new distribution the default when it has none.
-    const separation = await this.separate(signal);
+    // WSL makes a new distribution the default when it has none. Not cancelled: a cancel would leave it the default.
+    const separation = await this.separate();
     let pending = '';
     let provision: RunResult;
     try {
@@ -876,12 +885,11 @@ export class WslSetup {
    * (as root there) and which Docker Desktop integrates by default. WSL makes a new distribution the default when it
    * has none, and the first one that is left after the removal of the default (LxssUserSession.cpp of WSL). Then the
    * first other installed distribution of the registry that takes it becomes the default (`wsl.exe --set-default`, as
-   * WSL would choose without the one of Devspaces; never one of Docker Desktop), or, without another one, WSL has no
-   * default (the value DefaultDistribution goes; `wsl --list` still lists the distributions, and WSL makes the next new
-   * distribution the default). Only for a distribution that Devspaces set up (the folder of its virtual disk is in the
-   * folder of Devspaces); without the folder of Devspaces, nothing runs. When no other distribution takes it (or WSL
-   * does not answer), the value DefaultDistribution goes as well. A failure is logged; throws only an AbortError when
-   * the signal aborts.
+   * WSL would choose without the one of Devspaces; never the machine of a tool, isToolDistribution; no further try
+   * after a call that WSL does not answer), or, when none does, WSL has no default (the value DefaultDistribution goes;
+   * `wsl --list` still lists the distributions, and WSL makes the next new distribution the default). Only for a
+   * distribution that Devspaces set up (the folder of its virtual disk is in the folder of Devspaces); without the
+   * folder of Devspaces, nothing runs. A failure is logged; throws only an AbortError when the signal aborts.
    */
   async separate(signal?: AbortSignal): Promise<WslSeparation> {
     if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return { state: 'none', dockerDesktop: undefined };
@@ -893,7 +901,7 @@ export class WslSetup {
     if (ours?.basePath === undefined || !(await isWithinResolved(ours.basePath, this.deps.folder))) return result('none');
     if (registry.defaultId !== ours.id) return result('separate');
     const others = registry.distributions.filter(
-      (distribution) => distribution !== ours && distribution.installed !== false && !isDockerDesktopDistribution(distribution.name),
+      (distribution) => distribution !== ours && distribution.installed !== false && !isToolDistribution(distribution.name),
     );
     const failures: string[] = [];
     /** True when `run` ended well; false after a failure; undefined when WSL did not answer or start (WslSetupError). */
@@ -927,6 +935,17 @@ export class WslSetup {
     if (removed) return result('separate');
     this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces stays the default distribution of WSL: ${failures.join('; ')}`);
     return result('default');
+  }
+
+  /**
+   * separate under the lock of the setup (locked), so that a setup or a removal in another window does not come between:
+   * `none` while another window holds the lock (its setup checks itself), and without the folder of Devspaces (then no
+   * lock folder is made). Throws only when the lock fails.
+   */
+  async separateLocked(): Promise<WslSeparation> {
+    const none: WslSeparation = { state: 'none', dockerDesktop: undefined };
+    if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return none;
+    return (await this.locked(() => this.separate()))?.value ?? none;
   }
 
   /**

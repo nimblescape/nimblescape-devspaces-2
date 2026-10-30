@@ -148,7 +148,7 @@ export const WslSetupTexts = {
 
 export interface WslSetupCommandsDeps {
   /** The setup of this computer; undefined where there is none (not Windows, or no LOCALAPPDATA). */
-  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked' | 'separate'> | undefined;
+  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked' | 'separateLocked'> | undefined;
   /** The folder of the distribution (wslSetupFolder), for the questions. */
   folder: string | undefined;
   /** For the message without `setup`. */
@@ -185,13 +185,13 @@ export class WslSetupCommands {
 
   /**
    * At the start of a window: the WSL distribution of Devspaces is not the default distribution of WSL
-   * (WslSetup.separate; also after the user removed the default distribution, when WSL made this one the default), and
-   * a warning, once in the window, while Docker Desktop has its WSL integration on for it (warnDockerDesktop; a setup
-   * warns with what its own check found). Never throws (logged).
+   * (WslSetup.separateLocked; also after the user removed the default distribution, when WSL made this one the
+   * default), and a warning, once in the window, while Docker Desktop has its WSL integration on for it
+   * (warnDockerDesktop; a setup warns with what its own check found). Never throws (logged).
    */
   async checkSeparation(): Promise<void> {
     try {
-      const separation = await this.deps.setup?.separate();
+      const separation = await this.deps.setup?.separateLocked();
       if (separation !== undefined) await this.warnDockerDesktop(separation);
     } catch (error) {
       this.deps.logger.error('The WSL distribution of Devspaces could not be checked.', error);

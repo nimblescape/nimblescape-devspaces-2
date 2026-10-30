@@ -459,7 +459,8 @@ describe('WslSetup.separate', () => {
   // that Devspaces did not set up.
   it('makes the first other distribution of the user the default when WSL made the one of Devspaces the default', async () => {
     const base = registryRunner();
-    const runner = withRegistry(base, { 'docker-desktop': 'C:\\dd', Ubuntu: 'C:\\u', devspaces: ours() }, 2);
+    const tools = { 'docker-desktop': 'C:\\dd', 'rancher-desktop': 'C:\\rd', 'podman-machine-default': 'C:\\pm' };
+    const runner = withRegistry(base, { ...tools, Ubuntu: 'C:\\u', devspaces: ours() }, 4);
     const log = logger();
     // The registry also tells whether Docker Desktop has its distribution (its WSL integration needs it).
     await expect(setup({ runner, log }).separate()).resolves.toEqual({ state: 'separate', dockerDesktop: true });
@@ -483,7 +484,7 @@ describe('WslSetup.separate', () => {
 
   it('removes the default of WSL when no other distribution of the user is there', async () => {
     const base = registryRunner();
-    const runner = withRegistry(base, { 'docker-desktop': 'C:\\dd', 'docker-desktop-data': 'C:\\ddd', devspaces: ours() }, 2);
+    const runner = withRegistry(base, { 'docker-desktop': 'C:\\dd', 'docker-desktop-data': 'C:\\ddd', 'rancher-desktop-data': 'C:\\rdd', devspaces: ours() }, 3);
     await expect(setup({ runner }).separate()).resolves.toMatchObject({ state: 'separate' });
     expect(base.calls.map((call) => call.args)).toEqual([expect.arrayContaining(['export']), regDeleteDefaultArgs()]);
     expect(regDeleteDefaultArgs()).toEqual(['delete', LXSS_KEY, '/v', 'DefaultDistribution', '/f']);
@@ -811,6 +812,24 @@ describe('WslSetup.setUp', () => {
     expect(wslCalls(runner)[1].options?.signal).toBeUndefined();
   });
 
+  // Mutation: a check with the signal fails it (a cancel then would leave a new distribution the default of WSL).
+  it('does not cancel the check of the default of WSL', async () => {
+    const abort = new AbortController();
+    const base = distribution((args) => (args[0] === '--set-default' ? ok() : undefined), { Ubuntu: 'C:\\u', devspaces: path.join(folder, 'disk') });
+    const runner = {
+      ...base,
+      run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
+        if (file === REG) abort.abort();
+        return base.run(file, args, options);
+      }),
+    };
+    await setup({ runner }).setUp(undefined, () => undefined, abort.signal).catch(() => undefined);
+    expect(base.calls.filter((call) => call.file === REG || call.args[0] === '--set-default').map((call) => [call.args[0], call.options?.signal])).toEqual([
+      ['export', undefined],
+      ['--set-default', undefined],
+    ]);
+  });
+
   it('removes the virtual disk of a setup that did not end before it registers the file again', async () => {
     const disk = path.join(folder, 'disk');
     fs.mkdirSync(disk, { recursive: true });
@@ -952,6 +971,26 @@ describe('WslSetup.remove', () => {
     const runner = wslRunner(() => failed('Access is denied.'));
     await expect(setup({ runner }).remove()).rejects.toEqual(new WslSetupError('removeFailed', 'wsl.exe --unregister devspaces failed (exit code 1): Access is denied.'));
     expect(fs.existsSync(folder)).toBe(true);
+  });
+});
+
+describe('WslSetup.separateLocked', () => {
+  // Mutation: a check without the lock fails it (a setup or a removal in another window would come between); so does
+  // a lock folder without the folder of Devspaces (a window start would leave it on each computer with WSL).
+  it('checks under the lock of the setup, not while another window holds it, and without a lock folder', async () => {
+    let release = (): void => undefined;
+    const other = setup({ runner: wslRunner(() => undefined) }).locked(() => new Promise<void>((resolve) => (release = resolve)));
+    await vi.waitFor(() => expect(fs.existsSync(`${folder}.lock`)).toBe(true));
+    const runner = wslRunner(() => undefined, { Ubuntu: 'C:\\u' });
+    await expect(setup({ runner }).separateLocked()).resolves.toEqual({ state: 'none', dockerDesktop: undefined });
+    expect(runner.calls).toEqual([]);
+    release();
+    await other;
+    await expect(setup({ runner }).separateLocked()).resolves.toEqual({ state: 'none', dockerDesktop: false });
+    expect(runner.calls.map((call) => call.args[0])).toEqual(['export']);
+    fs.rmSync(folder, { recursive: true, force: true });
+    await expect(setup({ runner }).separateLocked()).resolves.toEqual({ state: 'none', dockerDesktop: undefined });
+    expect(fs.existsSync(`${folder}.lock`)).toBe(false);
   });
 });
 
