@@ -10,6 +10,7 @@
 // an SSH address; how a host of the list is reached; the plain reasons of a failed connection. No `vscode`.
 import type { Devspace } from '../types';
 import { isRecord } from '../valueChecks';
+import { withEnvValue } from './dockerCli';
 
 /** The context of the Docker CLI that stands for DOCKER_HOST or the default endpoint. */
 export const DEFAULT_CONTEXT_NAME = 'default';
@@ -394,17 +395,6 @@ export function wslEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return withEnvValue(base, 'WSL_UTF8', '1');
 }
 
-/**
- * A copy of `base` with the variable `name` (in upper case) set to `value`, without its other spellings (names are
- * case-insensitive on Windows).
- */
-export function withEnvValue(base: NodeJS.ProcessEnv, name: string, value: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base };
-  for (const key of Object.keys(env)) if (key.toUpperCase() === name) delete env[key];
-  env[name] = value;
-  return env;
-}
-
 /** The arguments of `wsl.exe` that list the names of the WSL distributions of this Windows user, one per line. */
 export const WSL_LIST_ARGS: readonly string[] = ['--list', '--quiet'];
 
@@ -485,6 +475,7 @@ export type DockerHostProblem =
   | 'sshMissing'
   | 'wslMissing'
   | 'wslDistributionMissing'
+  | 'pipeNotListening'
   | 'unknown';
 
 /** The message of `wsl.exe` for a distribution that is not registered (WSL_E_DISTRO_NOT_FOUND). */

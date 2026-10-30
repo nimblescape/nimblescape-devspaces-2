@@ -266,7 +266,7 @@ describe('the ssh check before the Docker calls', () => {
     const deps = { runner, sshPath: '/usr/bin/ssh', env: {}, sshLogins, shells };
     const signal = new AbortController().signal;
     await expect(checkSshLogin('box', deps, { signal })).resolves.toEqual({ ok: true });
-    expect(login).toHaveBeenCalledWith('box', signal);
+    expect(login).toHaveBeenCalledWith('box', signal, undefined);
     expect(sshLogins.isFresh('box')).toBe(true);
     await expect(checkSshLogin('down', deps)).resolves.toEqual({ ok: false, problem: 'unreachable', detail: 'ssh: connect to host down port 22: Connection refused' });
     login.mockResolvedValueOnce({ ok: false, detail: 'ssh did not answer within 30 seconds.', timedOut: true });

@@ -39,7 +39,7 @@ import {
 } from '../../src/core/names';
 import { isoTime, systemClock } from '../../src/core/ports';
 import { NodeProcessRunner } from '../../src/core/process';
-import { sshRelayTransport } from '../../src/core/relay/transport';
+import { sshHostTransport } from '../../src/core/relay/transport';
 import { RemoteDockerState } from '../../src/core/storage/remoteDockerState';
 import { TEST_BASE_IMAGE, TEST_RUN_LABEL, createDockerConfig, removeRunObjects } from './dockerRun';
 import {
@@ -254,7 +254,7 @@ describe('Docker on another computer over SSH, a host of the list of Devspaces',
       settings: { updateImagesOnConnect: true },
       socketPath: async (target) => (target.kind === 'remote' ? ((await state.rootlessSocket(target.host)) ?? HELPER_DOCKER_SOCKET) : helperDockerSocket(env, process.platform, target.endpoint)),
       // As extension.ts: the worker behind the relay, with one SSH login (the wrapper `ssh`).
-      relay: (target) => (sshPath === undefined ? undefined : sshRelayTransport(target, sshPath, env)),
+      relay: (target) => (sshPath === undefined || target.kind !== 'remote' ? undefined : sshHostTransport(target.host, sshPath, env)),
       startDocker: async ({ onStarting, signal }) =>
         startDockerFor(
           await targets.current(),

@@ -22,9 +22,10 @@ import { dockerPipeAddress } from './pipeAddress';
 
 /**
  * The wait before the pipe of the WSL distribution of Devspaces tries to listen again after it could not: every Docker
- * call of an operation there asks for it (BootstrapDocker), and each try would log the same warning.
+ * call of an operation there asks for it (BootstrapDocker), and each try would log the same warning. Short, because the
+ * calls there that change something have no other way meanwhile.
  */
-export const WSL_PIPE_RETRY_MS = 60_000;
+export const WSL_PIPE_RETRY_MS = 10_000;
 
 export interface HostPipesDeps {
   logger: Logger;

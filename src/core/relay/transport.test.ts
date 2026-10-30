@@ -3,22 +3,22 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it, vi } from 'vitest';
-import { LOCAL_DOCKER_TARGET, WSL_HOST, remoteDockerTarget } from '../docker/dockerHost';
+import { WSL_HOST } from '../docker/dockerHost';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
 import { RelayConnectionError } from './connection';
-import { RELAY_SHELL_COMMAND, openRelayConnection, sshRelayTransport, wslHostTransport } from './transport';
+import { RELAY_SHELL_COMMAND, openRelayConnection, sshHostTransport, wslHostTransport } from './transport';
 
-describe('sshRelayTransport', () => {
+describe('sshHostTransport', () => {
   const env = { PATH: '/usr/bin', ssh_askpass_require: 'force' };
 
   it('logs in once without questions and runs sh -s, for an alias and for an address', () => {
-    expect(sshRelayTransport(remoteDockerTarget('build-box'), '/usr/bin/ssh', env)).toEqual({
+    expect(sshHostTransport('build-box', '/usr/bin/ssh', env)).toEqual({
       file: '/usr/bin/ssh',
       args: ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '--', 'build-box', RELAY_SHELL_COMMAND],
       env: { PATH: '/usr/bin', SSH_ASKPASS_REQUIRE: 'never' },
     });
-    expect(sshRelayTransport(remoteDockerTarget('me@[::1]:2222'), '/usr/bin/ssh', env)?.args).toEqual([
+    expect(sshHostTransport('me@[::1]:2222', '/usr/bin/ssh', env)?.args).toEqual([
       '-o',
       'BatchMode=yes',
       '-o',
@@ -37,7 +37,7 @@ describe('sshRelayTransport', () => {
   // A login of a flow of the user: ssh may ask, through the helper of askpassEnv, in VS Code.
   it('leaves out BatchMode and X11 and takes the environment of the questions for a login that may ask', () => {
     const prompts = { env: vi.fn((base: NodeJS.ProcessEnv) => ({ ...base, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' })) };
-    expect(sshRelayTransport(remoteDockerTarget('me@box:2222'), '/usr/bin/ssh', env, { prompts })).toEqual({
+    expect(sshHostTransport('me@box:2222', '/usr/bin/ssh', env, { prompts })).toEqual({
       file: '/usr/bin/ssh',
       args: ['-x', '-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', RELAY_SHELL_COMMAND],
       env: { ...env, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' },
@@ -47,7 +47,7 @@ describe('sshRelayTransport', () => {
 
   // A host with the key of Devspaces (sshKey.ts): every login of Devspaces gives it to ssh.
   it('gives the key of Devspaces with -i, before the destination', () => {
-    expect(sshRelayTransport(remoteDockerTarget('box'), '/usr/bin/ssh', env, { identity: '/home/me/.ssh/devspaces_ed25519' })?.args).toEqual([
+    expect(sshHostTransport('box', '/usr/bin/ssh', env, { identity: '/home/me/.ssh/devspaces_ed25519' })?.args).toEqual([
       '-o',
       'BatchMode=yes',
       '-o',
@@ -61,11 +61,10 @@ describe('sshRelayTransport', () => {
     ]);
   });
 
-  it('has no transport for the local engine and for a host that is no SSH alias or address', () => {
-    expect(sshRelayTransport(LOCAL_DOCKER_TARGET, '/usr/bin/ssh', env)).toBeUndefined();
-    expect(sshRelayTransport({ kind: 'remote', host: 'box/path', endpoint: 'ssh://box/path' }, '/usr/bin/ssh', env)).toBeUndefined();
+  it('has no transport for a host that is no SSH alias or address', () => {
+    expect(sshHostTransport('box/path', '/usr/bin/ssh', env)).toBeUndefined();
     // The WSL distribution of Devspaces has no SSH transport (wslHostTransport).
-    expect(sshRelayTransport(remoteDockerTarget(WSL_HOST), '/usr/bin/ssh', env)).toBeUndefined();
+    expect(sshHostTransport(WSL_HOST, '/usr/bin/ssh', env)).toBeUndefined();
   });
 });
 

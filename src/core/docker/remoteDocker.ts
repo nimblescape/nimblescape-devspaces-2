@@ -52,11 +52,11 @@ import {
   sshEndpoint,
   sshTargetOf,
   unsupportedTargetReason,
-  withEnvValue,
   type DockerHostProblem,
   type DockerTarget,
 } from './dockerHost';
 import { dockerShellCommand } from '../relay/remoteShell';
+import { deleteEnv, withEnvValue } from './dockerCli';
 import { runWithDockerTarget } from './dockerTargets';
 
 /** Time limit of `docker info` on a remote host: an SSH connection plus the question (the CLI gives ssh 30 s to connect). */
@@ -158,7 +158,7 @@ export async function testRemoteDockerHost(
   if (!login.ok) return login;
   const env = noPromptEnv(docker.processEnv());
   // -H decides the endpoint; DOCKER_CONTEXT would conflict with it.
-  for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT' || key.toUpperCase() === 'DOCKER_HOST') delete env[key];
+  for (const name of ['DOCKER_CONTEXT', 'DOCKER_HOST']) deleteEnv(env, name);
   // The `ssh` of the Docker CLI with the key of Devspaces when the host has it, as checkSshLogin logged in.
   ssh.sshEnv?.(host, env);
   // As a call on the remote engine: with the Docker CLI of Devspaces when it is installed (BootstrapDocker.ownCli).
@@ -180,7 +180,7 @@ async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal 
 }
 
 /**
- * The login of the shell before the relay of `host` as a check (RemoteShellAccess.login; with `options` as given): a
+ * The login of the shell before the relay of `host` as a check (RemoteShellAccess.login): a
  * success is kept in `sshLogins`, a failure forgets the last one and names its reason (a NUL of the UTF-16 messages of an
  * older wsl.exe is dropped). Undefined when the host has no shell (no transport). Rejects only with an AbortError.
  */
@@ -190,7 +190,7 @@ async function shellLoginCheck(
   signal: AbortSignal | undefined,
   options?: { fresh?: boolean },
 ): Promise<{ ok: true } | { ok: false; problem: DockerHostProblem; detail: string } | undefined> {
-  const shell = options === undefined ? await deps.shells?.login(host, signal) : await deps.shells?.login(host, signal, options);
+  const shell = await deps.shells?.login(host, signal, options);
   if (shell === undefined) return undefined;
   if (!shell.ok) {
     deps.sshLogins?.forget(host);
@@ -493,7 +493,7 @@ export async function recordRootlessSocket(
 /** The environment of `docker context ls`: without DOCKER_CONTEXT and DOCKER_HOST, which do not change the list. */
 function contextCommandEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
-  for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT' || key.toUpperCase() === 'DOCKER_HOST') delete env[key];
+  for (const name of ['DOCKER_CONTEXT', 'DOCKER_HOST']) deleteEnv(env, name);
   return env;
 }
 

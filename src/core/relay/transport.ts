@@ -7,7 +7,7 @@
 // reads the start script (startScript.ts), which starts the relay. SSH for a remote host: one login, which asks only in
 // a flow of the user (sshAskpass.ts). `wsl.exe` for the WSL distribution of Devspaces: no login and no question. No
 // `vscode`.
-import { sshCommandArgs, sshTargetOf, wslCommandArgs, wslEnv, type DockerTarget } from '../docker/dockerHost';
+import { sshCommandArgs, sshTargetOf, wslCommandArgs, wslEnv } from '../docker/dockerHost';
 import { noPromptEnv } from '../docker/remoteDocker';
 import { bundleLine } from '../loader/pipeLoader';
 import type { Logger, StartedByteProcess } from '../ports';
@@ -34,17 +34,6 @@ export function wslHostTransport(distribution: string, wslPath: string, env: Nod
   return { file: wslPath, args: wslCommandArgs(distribution, RELAY_SHELL_COMMAND.split(' ')), env: wslEnv(env) };
 }
 
-/**
- * The SSH transport to the engine of `target`: `ssh -o BatchMode=yes -o ConnectTimeout=15 -T [-i key] [-p port] [-l
- * user] -- <host> 'sh -s'` with SSH_ASKPASS_REQUIRE=never, as the SSH check (checkSshLogin). With `prompts` (a login of
- * a flow of the user), without BatchMode and with the environment of the helper that asks in VS Code (askpassEnv), so
- * the login asks for a password or an unknown host key. `identity`: the key of Devspaces (sshKey.ts). Undefined for a target that is not remote and for a host that is no
- * SSH alias or address (sshTargetOf): its worker starts with the Docker CLI.
- */
-export function sshRelayTransport(target: DockerTarget, sshPath: string, env: NodeJS.ProcessEnv, options: SshLoginOptions = {}): RelayTransport | undefined {
-  return target.kind === 'remote' ? sshHostTransport(target.host, sshPath, env, options) : undefined;
-}
-
 /** How an SSH login of Devspaces runs: with the questions of a flow of the user, and with the key of Devspaces (`-i`). */
 export interface SshLoginOptions {
   prompts?: TransportPrompts;
@@ -56,7 +45,14 @@ export interface TransportPrompts {
   env(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
 }
 
-/** sshRelayTransport for the SSH host `host` (DockerTarget.host); undefined for a host that is no SSH alias or address. */
+/**
+ * The SSH transport to the engine on the SSH host `host` (DockerTarget.host): `ssh -o BatchMode=yes -o ConnectTimeout=15
+ * -T [-i key] [-p port] [-l user] -- <host> 'sh -s'` with SSH_ASKPASS_REQUIRE=never, as the SSH check (checkSshLogin).
+ * With `prompts` (a login of a flow of the user), without BatchMode and with the environment of the helper that asks in
+ * VS Code (askpassEnv), so the login asks for a password or an unknown host key. `identity`: the key of Devspaces
+ * (sshKey.ts). Undefined for a host that is no SSH alias or address (sshTargetOf): its worker starts with the Docker
+ * CLI, except the WSL distribution of Devspaces (wslHostTransport).
+ */
 export function sshHostTransport(host: string, sshPath: string, env: NodeJS.ProcessEnv, options: SshLoginOptions = {}): RelayTransport | undefined {
   const address = sshTargetOf(host);
   if (address === undefined) return undefined;
@@ -66,7 +62,7 @@ export function sshHostTransport(host: string, sshPath: string, env: NodeJS.Proc
 }
 
 /**
- * Opens a connection of the relay on a new login of `start` (the transport, sshRelayTransport; RelayConnection.open):
+ * Opens a connection of the relay on a new login of `start` (the transport, sshHostTransport or wslHostTransport; RelayConnection.open):
  * the start script with a new marker runs `command` (`docker run … startRelay`, channelRunArgs with RELAY_ENTRY), and
  * `bundle` is the first line of its pipe loader. A login that may ask holds the time limit of the open while a question
  * is open. `takeOver`: the login of the shell before the relay to the host when one is open (RemoteShells.takeOver),

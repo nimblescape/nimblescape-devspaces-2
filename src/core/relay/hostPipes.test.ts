@@ -249,7 +249,7 @@ describe('HostPipes', () => {
     expect(seen).toEqual(Array(3).fill(dockerPipeAddress(ID, 'linux', folder).dockerHost));
   });
 
-  it('logs a pipe of the WSL distribution that cannot listen once, and tries again only after a minute', async () => {
+  it('logs a pipe of the WSL distribution that cannot listen once, and tries again only after WSL_PIPE_RETRY_MS', async () => {
     const folder = base();
     const blocked = path.join(folder, 'file');
     fs.writeFileSync(blocked, '');
@@ -261,9 +261,9 @@ describe('HostPipes', () => {
     expect(hostPipes.dockerHost(WSL_HOST)).toBeUndefined();
     expect(log.lines).toHaveLength(1);
     expect(log.lines[0]).toMatch(
-      new RegExp(`^warn The Docker pipe of the extension on ${WSL_HOST} cannot listen, so the Docker calls of the extension cannot reach ${WSL_HOST}; it tries again in 60 seconds: `),
+      new RegExp(`^warn The Docker pipe of the extension on ${WSL_HOST} cannot listen, so the Docker calls of the extension cannot reach ${WSL_HOST}; it tries again in 10 seconds: `),
     );
-    // Every call within the minute: no new try, no new warning.
+    // Every call within the wait: no new try, no new warning.
     where = folder;
     now += WSL_PIPE_RETRY_MS - 1;
     await hostPipes.serve(WSL_HOST);

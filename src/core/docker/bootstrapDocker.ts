@@ -25,7 +25,7 @@ import { CommandError, errorMessage, UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import { LABEL_BUILD_ID } from '../names';
 import { abortError, isAbortError, sleep, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
-import { dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './dockerCli';
+import { deleteEnv, dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './dockerCli';
 import { hostAccessOf, isSshClosedBeforeLogin, sshEndpoint, type DockerTarget } from './dockerHost';
 import type { ImageInfo } from './dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
@@ -134,13 +134,6 @@ export function commandText(args: readonly string[]): string {
   });
   const text = `docker ${shown.join(' ')}`;
   return text.length > 300 ? `${text.slice(0, 300)}…` : text;
-}
-
-/** Removes a variable in every spelling of its name (names are case-insensitive on Windows). */
-export function deleteEnv(env: NodeJS.ProcessEnv, name: string): void {
-  for (const key of Object.keys(env)) {
-    if (key.toUpperCase() === name) delete env[key];
-  }
 }
 
 export function labelArgs(labels: Record<string, string> | undefined, flag: string): string[] {
@@ -432,8 +425,8 @@ export class BootstrapDocker {
       if (call.noEndpoint !== undefined) {
         throw new UserFacingError(
           'dockerHostUnreachable',
-          Messages.dockerHostUnreachable(call.noEndpoint, dockerHostReason('unknown', call.noEndpoint)),
-          `${commandText(args)} has no way to ${call.noEndpoint}: the Docker pipe of the extension for it does not listen.`,
+          Messages.dockerHostUnreachable(call.noEndpoint, dockerHostReason('pipeNotListening', call.noEndpoint)),
+          `${commandText(args)} has no way to ${call.noEndpoint}: the Docker pipe of the extension for it does not listen (the log says why).`,
         );
       }
       // Each such call is one SSH login of the Docker CLI (`ssh … docker system dial-stdio`), which SSH servers limit.
@@ -523,7 +516,8 @@ export class BootstrapDocker {
       return await this.remoteShell(target, args, { timeoutMs: options.timeoutMs, signal: options.signal });
     } catch (error) {
       if (isAbortError(error)) throw error;
-      this.logger.warn(`docker ${dockerCommandWords(args).join(' ')} could not run on the shell before the relay on ${target.host}, so it logs in over SSH itself: ${errorMessage(error)}`);
+      const next = hostAccessOf(target.host)?.kind === 'wsl' ? 'so it needs the Docker pipe of the extension' : 'so it logs in over SSH itself';
+      this.logger.warn(`docker ${dockerCommandWords(args).join(' ')} could not run on the shell before the relay on ${target.host}, ${next}: ${errorMessage(error)}`);
       return undefined;
     }
   }
