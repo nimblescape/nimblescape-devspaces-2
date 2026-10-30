@@ -160,6 +160,8 @@ export interface WslSetupCommandsDeps {
    * whether the local Docker that takes its place is supported.
    */
   forgetHost: (host: string) => Promise<'notDockerHost' | 'local' | 'unsupported'>;
+  /** The distribution is gone: its start entry goes too (WslKeeper.removeStartEntry). Never rejects. */
+  removeStartEntry?: () => Promise<void>;
 }
 
 export class WslSetupCommands {
@@ -253,6 +255,7 @@ export class WslSetupCommands {
             this.deps.logger.warn(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
           });
           await setup.removeLeftovers();
+          await this.deps.removeStartEntry?.();
           return true;
         });
         if (this.finished(cleaned)) this.inform(WslSetupTexts.notInstalled);
@@ -265,6 +268,7 @@ export class WslSetupCommands {
         withNotificationProgress({ title: WslSetupTexts.removing }, async () => {
           if ((await this.removalCheck(setup)) !== 'own') return false;
           const folderGone = await setup.remove();
+          await this.deps.removeStartEntry?.();
           const forgotten = await this.deps.forgetHost(WSL_HOST).catch((error: unknown) => ({ error }));
           return { folderGone, forgotten };
         }),

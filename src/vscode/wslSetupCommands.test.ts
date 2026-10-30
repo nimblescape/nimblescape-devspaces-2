@@ -269,6 +269,28 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
     expect(setup.registration.mock.calls.every((call) => call[1] === true)).toBe(true);
   });
 
+  // Mutation: a start entry that stays after the removal fails it: Windows would run wslg.exe for a distribution that is
+  // gone at each logon.
+  it('removes the start entry with the distribution, and with the files of a distribution that is gone', async () => {
+    const removeStartEntry = vi.fn(async () => undefined);
+    registered('own');
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
+    await commands({ removeStartEntry }).remove();
+    expect(setup.remove).toHaveBeenCalledTimes(1);
+    expect(removeStartEntry).toHaveBeenCalledTimes(1);
+    registered('none');
+    await commands({ removeStartEntry }).remove();
+    expect(setup.removeLeftovers).toHaveBeenCalledTimes(1);
+    expect(removeStartEntry).toHaveBeenCalledTimes(2);
+    // Nothing without the answer Remove, and nothing for a distribution that Devspaces did not set up.
+    window.showWarningMessage.mockResolvedValue(undefined);
+    registered('own');
+    await commands({ removeStartEntry }).remove();
+    registered('foreign');
+    await commands({ removeStartEntry }).remove();
+    expect(removeStartEntry).toHaveBeenCalledTimes(2);
+  });
+
   it('names the folder of the distribution when it stays', async () => {
     registered('own');
     setup.remove.mockResolvedValue(false);

@@ -230,6 +230,27 @@ describe('WslLifetime.use', () => {
     expect(subject.holds(WSL_HOST)).toBe(true);
   });
 
+  // Mutation: a keeper that starts only with the session fails it (a container that a later flow starts would stop with
+  // the distribution after VS Code closed); so does a keeper that starts for a host that is no WSL distribution.
+  it('starts the keeper of the distribution with the session and at each later use while it holds the session', () => {
+    const keep = vi.fn();
+    const { subject } = lifetime({ keeper: { keep } });
+    subject.use(WSL_HOST);
+    expect(keep).toHaveBeenCalledTimes(1);
+    expect(keep).toHaveBeenCalledWith(WSL_HOST, 'devspaces');
+    subject.use(WSL_HOST);
+    expect(keep).toHaveBeenCalledTimes(2);
+    subject.use('');
+    subject.use('build-server');
+    expect(keep).toHaveBeenCalledTimes(2);
+    subject.dispose();
+    subject.use(WSL_HOST);
+    expect(keep).toHaveBeenCalledTimes(2);
+    const missing = lifetime({ keeper: { keep }, wslPath: () => undefined });
+    missing.subject.use(WSL_HOST);
+    expect(keep).toHaveBeenCalledTimes(2);
+  });
+
   it('leavesStopped asks WSL nothing while this window holds the idle session (the distribution runs)', async () => {
     const { subject, runs } = lifetime({ list: () => ok('') });
     subject.use(WSL_HOST);

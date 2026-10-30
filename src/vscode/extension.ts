@@ -14,8 +14,11 @@ import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
 import { WslSetup, wslSetupFolder } from '../core/docker/wslSetup';
+import { WslKeeper } from '../core/docker/wslKeeper';
 import { WslLifetime } from '../core/docker/wslLifetime';
 import {
+  WSL_DISTRIBUTION,
+  WSL_HOST,
   WSL_LIST_ARGS,
   describeDockerHost,
   devspacesOfHost,
@@ -29,7 +32,7 @@ import {
   type DockerTarget,
 } from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
-import { ensureDockerRunning } from '../core/docker/dockerStart';
+import { ensureDockerRunning, launchDetachedProcess } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { RelayConnectionError } from '../core/relay/connection';
@@ -91,7 +94,7 @@ import { DisconnectRequests } from './disconnectRequests';
 import { dockerAdapterOptions } from './dockerAdapterOptions';
 import { DockerHostIndicator } from './dockerHostIndicator';
 import { DockerSetup } from './dockerSetup';
-import { MonitorQuestion } from './monitorQuestion';
+import { MonitorQuestion, STOP_MONITOR_WHEN_IDLE_SETTING } from './monitorQuestion';
 import { OutputChannelLogger } from './logger';
 import { updateOwnersContextKey } from './ownerSelector';
 import { updateDevspacesOnlyContextKey } from './devspacesOnly';
@@ -111,6 +114,7 @@ import {
   affectsSettings,
   devContainersDefaultExtensionsValue,
   readSettings,
+  SETTINGS_SECTION,
   warnInvalidCacheUpdateSchedule,
   warnInvalidDefaultImage,
   warnInvalidHostAccessChecksOff,
@@ -657,14 +661,26 @@ async function activateExtension(
   });
   // The WSL distribution of Devspaces runs while this window holds its idle session there (from its first `wsl.exe` for
   // the distribution, until no devspace, no Monitor and no helper container of Devspaces runs there, or the window
-  // closes). A Docker call in the
-  // background starts a distribution that does not run only while its Monitor runs permanently (docs/architecture.md
-  // "The WSL distribution of Devspaces"). Its sessions end after the release of deactivate(), which may need them.
+  // closes), and while its keeper runs (while a container runs there, also after VS Code closed; and from the logon to
+  // Windows while its Monitor runs permanently). A Docker call in the background starts a distribution that does not
+  // run only while its Monitor runs permanently (docs/architecture.md "The WSL distribution of Devspaces"). Its sessions
+  // end after the release of deactivate(), which may need them.
+  const keeper = new WslKeeper({
+    runner,
+    wslPath,
+    env,
+    launch: launchDetachedProcess,
+    monitorPermanent: (host) => monitorSettings.permanent(host),
+    engineRemoved: (host) => engineRemoved({ host }),
+    logger,
+  });
+  context.subscriptions.push({ dispose: () => keeper.dispose() });
   const lifetime = new WslLifetime({
     runner,
     wslPath,
     env,
     monitorPermanent: (host) => monitorSettings.permanent(host),
+    keeper,
     logger,
   });
   wslLifetime = lifetime;
@@ -984,6 +1000,7 @@ async function activateExtension(
     showLog: () => logger.show(),
     useHost: (host) => remoteDocker.useHost(host),
     forgetHost: (host) => remoteDocker.forgetHost(host),
+    removeStartEntry: () => keeper.removeStartEntry(WSL_DISTRIBUTION),
   });
   // A Docker context or DOCKER_HOST of the user that reaches a host over SSH while Devspaces uses the local Docker: its
   // host is offered once for the list (in the background; the read that found it goes on).
@@ -1043,7 +1060,7 @@ async function activateExtension(
     startDocker,
     // The question about the Monitor of an engine, which a Start, a Rebuild and "Update All Images Now" of the user ask
     // there first (once per engine); its answer goes into the setting stopMonitorWhenIdle and the records of the engines.
-    monitorQuestion: new MonitorQuestion({ records: engineRecords, settings: getSettings, logger, showLog: () => logger.show() }),
+    monitorQuestion: new MonitorQuestion({ records: engineRecords, settings: getSettings, logger, showLog: () => logger.show(), answered: (host) => updateStartEntry(host) }),
     // The removal mark of the engines, which a Start, a Rebuild and "Update All Images Now" of the user clear there.
     engineRecords,
     // "Remove Devspaces from This Docker Engine…": whether the engine answers (as for the background builds: Docker is
@@ -1089,6 +1106,16 @@ async function activateExtension(
   const background = (promise: Promise<unknown>, what: string): void => {
     promise.catch((error: unknown) => logger.error(`Could not ${what}.`, error));
   };
+  // The start entry of a WSL distribution follows the mode of its Monitor (WslKeeper.updateStartEntry): with each start
+  // of its keeper, after an answer to the question about its Monitor, after a change of stopMonitorWhenIdle, and at the
+  // start of the window for the distribution of Devspaces, also while no window uses it (for example after "Remove
+  // Devspaces from This Docker Engine…" there): one read of the registry per window and state.
+  const updateStartEntry = (host: string): void => {
+    const access = hostAccessOf(host);
+    if (access?.kind !== 'wsl' || wslPath() === undefined) return;
+    background(keeper.updateStartEntry(host, access.distribution), `update the start entry of the WSL distribution ${access.distribution}`);
+  };
+  updateStartEntry(WSL_HOST);
 
   // The Docker CLI of Devspaces that this window needs and does not have yet: downloaded now, with a progress notification
   // (its link Show details needs the commands above), before the window looks up its devspace and serves its pipe, and
@@ -1217,6 +1244,7 @@ async function activateExtension(
       if (!affectsSettings(event)) return;
       const previous = settings;
       settings = readSettings();
+      if (event.affectsConfiguration(`${SETTINGS_SECTION}.${STOP_MONITOR_WHEN_IDLE_SETTING}`)) updateStartEntry(WSL_HOST);
       warnInvalidHostAccessChecksOff(logger, hostAccessWarnings, event);
       warnInvalidDefaultImage(logger, defaultImageWarnings, event);
       warnInvalidCacheUpdateSchedule(logger, cacheScheduleWarnings, event);

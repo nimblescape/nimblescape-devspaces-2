@@ -6,15 +6,17 @@
 // Devspaces"). WSL stops a distribution 15 seconds after the last `wsl.exe` process for it ended, with Docker and the
 // containers in it. From the first `wsl.exe` that a window starts there, it holds one idle session (`use`): a `wsl.exe`
 // whose script ends itself when no devspace, no Monitor and no helper container of Devspaces (a worker, a relay) ran
-// there at two checks in a row, and at the end of its input, so with the window. A Docker call in the background leaves
-// a distribution that does not run stopped, unless its Monitor runs permanently (`leavesStopped`); a flow of the user
-// starts it. No `vscode`.
+// there at two checks in a row, and at the end of its input, so with the window. With it, the window starts the keeper
+// of the distribution (wslKeeper.ts), which holds it while a container runs there, also after VS Code closed. A Docker
+// call in the background leaves a distribution that does not run stopped, unless its Monitor runs permanently
+// (`leavesStopped`); a flow of the user starts it. No `vscode`.
 import { errorMessage } from '../errors';
 import { LABEL_DEVSPACE_ID, LABEL_HELPER } from '../names';
 import type { Logger, ProcessRunner, RunResult, StartedProcess } from '../ports';
 import { LABEL_MONITOR } from '../remoteMonitor/protocol';
 import { sshPromptsAllowed } from '../sshAskpass';
 import { hostAccessOf, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
+import type { WslKeeper } from './wslKeeper';
 
 /** The arguments of `wsl.exe` that list the names of the running WSL distributions, one per line (none: no output). */
 export const WSL_RUNNING_ARGS: readonly string[] = ['--list', '--running', '--quiet'];
@@ -88,6 +90,11 @@ export interface WslLifetimeDeps {
    */
   monitorPermanent: (host: string) => Promise<boolean>;
   logger: Logger;
+  /**
+   * The keeper of the distribution (WslKeeper), which holds it while a container runs there, also after VS Code closed;
+   * none: only the idle sessions hold it.
+   */
+  keeper?: Pick<WslKeeper, 'keep'>;
   /** For the tests. Default: Date.now. */
   now?: () => number;
   /** For the tests. Default: IDLE_RETRY_MS. */
@@ -177,11 +184,17 @@ export class WslLifetime {
    * Docker pipe): this window holds the idle session of the host from now on, unless it holds one already, or `wsl.exe`
    * cannot be found. Within a minute after the last one failed (IDLE_RETRY_MS: it ended with an error within a minute
    * after its start), the session starts only after that minute, and not when the distribution does not run then
-   * (`retryLater`). Nothing for any other host, and after `dispose`. Never throws.
+   * (`retryLater`). With the session, the keeper of the distribution starts too (`keeper`: at most once a minute, also
+   * at each later use while the window holds the session). Nothing for any other host, and after `dispose`. Never
+   * throws.
    */
   use(host: string): void {
     const access = hostAccessOf(host);
-    if (this.disposed || access?.kind !== 'wsl' || this.holds(host)) return;
+    if (this.disposed || access?.kind !== 'wsl') return;
+    if (this.holds(host)) {
+      this.deps.keeper?.keep(host, access.distribution);
+      return;
+    }
     const failed = this.failedAt.get(host);
     const wait = failed === undefined ? 0 : this.retryMs() - Math.abs(this.now() - failed);
     if (wait > 0) this.retryLater(host, access.distribution, wait);
@@ -220,6 +233,7 @@ export class WslLifetime {
       errorOutput = (errorOutput + wslText(text)).slice(-MAX_LOGGED_ERROR);
     });
     this.deps.logger.info(`Devspaces starts an idle session of the WSL distribution ${distribution}, so that it runs while this window is open and a container of Devspaces runs there.`);
+    this.deps.keeper?.keep(host, distribution);
     void process.exited.then(({ exitCode, error }) => {
       if (this.sessions.get(host) === process) this.sessions.delete(host);
       if (this.disposed) return;
