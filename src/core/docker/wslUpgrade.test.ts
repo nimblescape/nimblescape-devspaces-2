@@ -173,7 +173,7 @@ describe('WslUpgrade', () => {
     await timedOut.subject.check();
     expect(timedOut.log.warn).toHaveBeenCalledWith(
       'The weekly upgrade of the packages of the WSL distribution devspaces did not end within 30 minutes; it goes on in the distribution while the ' +
-        'distribution runs, and a run that the stop of the distribution ended goes on at a check an hour later or after. Its output is in /var/log/devspaces-upgrade.log there.',
+        'distribution runs. When the distribution stops before its end, the next try is a day later, or an hour later when dpkg did not finish. Its output is in /var/log/devspaces-upgrade.log there.',
     );
     const thrown = upgrade(new Error('spawn EACCES'));
     await expect(thrown.subject.check()).resolves.toBeUndefined();
