@@ -670,8 +670,7 @@ async function activateExtension(
     wslPath,
     env,
     launch: launchDetachedProcess,
-    monitorPermanent: (host) => monitorSettings.permanent(host),
-    engineRemoved: (host) => engineRemoved({ host }),
+    monitorPermanent: (host) => monitorSettings.permanentIfKnown(host),
     logger,
   });
   context.subscriptions.push({ dispose: () => keeper.dispose() });

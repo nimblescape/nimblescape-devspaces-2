@@ -57,6 +57,21 @@ export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: strin
 }
 
 /**
+ * As monitorPermanentFor, but undefined when the answer cannot be read (logged): for the start entry of the WSL
+ * distribution of Devspaces, which a failed read must not remove. Never rejects.
+ */
+export async function monitorPermanentIfKnown(deps: MonitorSettingsDeps, host: string): Promise<boolean | undefined> {
+  let answered: boolean;
+  try {
+    answered = await deps.answered(host);
+  } catch (error) {
+    deps.logger?.warn(`The answer about the Monitor on ${describeDockerHost(host)} could not be read, so its start entry stays as it is: ${errorMessage(error)}`);
+    return undefined;
+  }
+  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
+}
+
+/**
  * Whether the engine `host` has an answer; false when it cannot be read (logged: the ensure then makes its Monitor one
  * that stops when idle, also in place of a permanent one of this computer).
  */
@@ -91,11 +106,14 @@ export function monitorSettingsOf(deps: MonitorSettingsDeps): {
    * ensure of the Monitor log it.
    */
   permanent(host: string): Promise<boolean>;
+  /** monitorPermanentIfKnown: undefined when the answer cannot be read (logged). */
+  permanentIfKnown(host: string): Promise<boolean | undefined>;
 } {
   const quiet: MonitorSettingsDeps = { ...deps, logger: undefined };
   return {
     forOpen: (dockerHost) => monitorSettingsFor(deps, dockerHost),
     forTarget: (target) => monitorSettingsFor(deps, target.host),
     permanent: (host) => monitorPermanentFor(quiet, host),
+    permanentIfKnown: (host) => monitorPermanentIfKnown(deps, host),
   };
 }

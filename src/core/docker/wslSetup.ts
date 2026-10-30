@@ -143,6 +143,12 @@ export function supportsFromFile(version: readonly [number, number, number]): bo
   return true;
 }
 
+/** `reg.exe` in System32 of SystemRoot, not from PATH. */
+export function regExePath(env: NodeJS.ProcessEnv): string {
+  const systemRoot = envValue(env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
+  return path.win32.join(systemRoot, 'System32', 'reg.exe');
+}
+
 /** The arguments of `reg.exe` that write the key LXSS_KEY to `file` (a `.reg` file in UTF-16). */
 export function regExportArgs(file: string): string[] {
   return ['export', LXSS_KEY, file, '/y'];
@@ -387,10 +393,8 @@ export class WslSetup {
     return path.join(this.deps.folder, 'download');
   }
 
-  /** `reg.exe` in System32 of SystemRoot, not from PATH. */
   private get regPath(): string {
-    const systemRoot = envValue(this.deps.env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
-    return path.win32.join(systemRoot, 'System32', 'reg.exe');
+    return regExePath(this.deps.env);
   }
 
   /**
@@ -827,13 +831,13 @@ function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
 }
 
 /** The output of a call for the log (wslText): standard error, else standard output. */
-function outputOf(result: RunResult): string {
+export function outputOf(result: RunResult): string {
   const text = wslText(result.stderr || result.stdout).trim();
   return text === '' ? '(no output)' : text;
 }
 
 /** How a call ended, for the log. */
-function endOf(result: RunResult, timeoutMs: number): string {
+export function endOf(result: RunResult, timeoutMs: number): string {
   return result.timedOut ? `no end within ${duration(timeoutMs)}` : `exit code ${result.exitCode}`;
 }
 

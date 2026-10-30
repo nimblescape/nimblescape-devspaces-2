@@ -482,4 +482,10 @@ describe('launchDetachedProcess', () => {
   it('rejects when the program does not exist', async () => {
     await expect(launchDetachedProcess('/nonexistent/devspace-test/Docker Desktop.exe', [])).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it('tells the end of the program while this process runs', async () => {
+    const ended = vi.fn();
+    await launchDetachedProcess(process.execPath, ['-e', ''], ended);
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledTimes(1));
+  });
 });

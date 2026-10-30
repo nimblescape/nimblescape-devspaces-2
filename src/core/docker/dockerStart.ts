@@ -69,11 +69,12 @@ function desktopStartUnsupported(result: RunResult): boolean {
   return /unknown command|is not a docker command/i.test(outputOf(result));
 }
 
-/** Starts a GUI program without waiting for it. */
-export function launchDetachedProcess(file: string, args: readonly string[]): Promise<void> {
+/** Starts a GUI program without waiting for it; `onExit` runs when it ended while this process runs. */
+export function launchDetachedProcess(file: string, args: readonly string[], onExit?: () => void): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(file, [...args], { detached: true, stdio: 'ignore', shell: false });
     child.once('error', reject);
+    if (onExit !== undefined) child.once('exit', onExit);
     child.once('spawn', () => {
       child.unref();
       resolve();

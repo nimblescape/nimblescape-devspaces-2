@@ -11,9 +11,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { errorMessage } from '../errors';
-import type { Logger, ProcessRunner } from '../ports';
+import type { Logger, ProcessRunner, RunResult } from '../ports';
 import { envValue } from './dockerCli';
 import { wslCommandArgs } from './dockerHost';
+import { endOf, outputOf, regExePath } from './wslSetup';
 
 /** A window that holds the idle session starts the keeper at most this often. */
 export const KEEPER_LAUNCH_MS = 60_000;
@@ -102,17 +103,35 @@ export function regDeleteArgs(name: string): string[] {
 /** The time limit of each call of `reg.exe`. */
 const REG_TIMEOUT_MS = 15_000;
 
+/**
+ * The data of the value `name` (REG_SZ) in the output of `reg.exe query` (regQueryArgs): the line
+ * `    <name>    REG_SZ    <data>`; undefined when there is none.
+ */
+export function startEntryValueOf(output: string, name: string): string | undefined {
+  const separator = '    REG_SZ    ';
+  for (const line of output.split(/\r?\n/)) {
+    const at = line.indexOf(separator);
+    if (at >= 0 && line.slice(0, at).trim() === name) return line.slice(at + separator.length);
+  }
+  return undefined;
+}
+
 export interface WslKeeperDeps {
   runner: Pick<ProcessRunner, 'run'>;
   /** The path of `wsl.exe` (findExecutable), or undefined (not on Windows, or without WSL); read only without `wslg.exe`. */
   wslPath: () => string | undefined;
   env: NodeJS.ProcessEnv;
-  /** Starts a program that is not a child of this process and outlives it (launchDetachedProcess). */
-  launch: (file: string, args: readonly string[]) => Promise<void>;
-  /** Whether the Monitor of the engine `host` runs permanently (monitorSettingsOf(...).permanent). Never rejects. */
-  monitorPermanent: (host: string) => Promise<boolean>;
-  /** Whether Devspaces was removed from the engine `host` (its removal mark), so that no Monitor runs there. */
-  engineRemoved: (host: string) => Promise<boolean>;
+  /**
+   * Starts a program that is not a child of this process and outlives it (launchDetachedProcess); `onExit` runs when it
+   * ended while this process runs.
+   */
+  launch: (file: string, args: readonly string[], onExit: () => void) => Promise<void>;
+  /**
+   * Whether the Monitor of the engine `host` runs permanently (monitorSettingsOf(...).permanentIfKnown): false also
+   * after "Remove Devspaces from This Docker Engine…" there, whose mark forgets the answer; undefined when the answer
+   * cannot be read (logged there). Never rejects.
+   */
+  monitorPermanent: (host: string) => Promise<boolean | undefined>;
   logger: Logger;
   /** For the tests. Default: whether the file exists. */
   exists?: (file: string) => boolean;
@@ -127,6 +146,8 @@ export interface WslKeeperDeps {
 export class WslKeeper {
   /** The time of the last start of the keeper, by distribution. */
   private readonly launchedAt = new Map<string, number>();
+  /** The distributions where the keeper that this window started still runs or waits for the lock. */
+  private readonly running = new Set<string>();
   /** The work on the start entries, one after the other. */
   private entryWork: Promise<void> = Promise.resolve();
   /** The last warning about the start of the keeper, so that a failure that stays is logged once. */
@@ -136,13 +157,14 @@ export class WslKeeper {
   constructor(private readonly deps: WslKeeperDeps) {}
 
   /**
-   * This window holds the idle session of the WSL distribution `distribution` and uses it now:
-   * starts the keeper there, unless this window started it within the last minute (KEEPER_LAUNCH_MS). `wslg.exe` when
-   * it exists, so that no console window opens; else `wsl.exe`. While another keeper runs there, the new one waits for
-   * its end (KEEPER_LOCK_WAIT_SECONDS). Nothing after `dispose`. Never throws.
+   * This window holds the idle session of the WSL distribution `distribution` and uses it now: starts the keeper
+   * there, unless the keeper that this window started there still runs or waits for the lock, or this window started
+   * one within the last minute (KEEPER_LAUNCH_MS). `wslg.exe` when it exists, so that no console window opens; else
+   * `wsl.exe`. While another keeper runs there, the new one waits for its end (KEEPER_LOCK_WAIT_SECONDS). Nothing after
+   * `dispose`. Never throws.
    */
   keep(distribution: string): void {
-    if (this.disposed) return;
+    if (this.disposed || this.running.has(distribution)) return;
     const now = (this.deps.now ?? Date.now)();
     const last = this.launchedAt.get(distribution);
     if (last !== undefined && Math.abs(now - last) < KEEPER_LAUNCH_MS) return;
@@ -151,10 +173,10 @@ export class WslKeeper {
   }
 
   /**
-   * Adds the start entry of the WSL distribution `distribution` while the Monitor of its host `host` runs permanently
-   * and Devspaces was not removed from there, and removes it otherwise; an entry with another command is replaced.
-   * Without `wslg.exe`, or with a command line longer than MAX_START_ENTRY, there is no entry (logged). The caller
-   * calls it when that state may have changed. Never rejects.
+   * Adds the start entry of the WSL distribution `distribution` while the Monitor of its host `host` runs permanently,
+   * and removes it otherwise; an entry with another command is replaced. Without `wslg.exe`, or with a command line
+   * longer than MAX_START_ENTRY, there is no entry (logged). While the answer about the Monitor cannot be read, the
+   * entry stays as it is. The caller calls it when that state may have changed. Never rejects.
    */
   updateStartEntry(host: string, distribution: string): Promise<void> {
     return this.enqueue(() => this.writeStartEntry(distribution, host));
@@ -179,8 +201,9 @@ export class WslKeeper {
   private async launchKeeper(distribution: string, first: boolean): Promise<void> {
     const program = this.keeperProgram(distribution);
     if (program === undefined) return;
+    this.running.add(distribution);
     try {
-      await this.deps.launch(program.file, program.args);
+      await this.deps.launch(program.file, program.args, () => this.running.delete(distribution));
       this.launchWarning = undefined;
       if (first) {
         this.deps.logger.info(
@@ -188,6 +211,7 @@ export class WslKeeper {
         );
       }
     } catch (error) {
+      this.running.delete(distribution);
       const warning = `The keeper of the WSL distribution ${distribution} could not start, so WSL stops the distribution 15 seconds after VS Code closed: ${errorMessage(error)}`;
       if (warning !== this.launchWarning) this.deps.logger.warn(warning);
       this.launchWarning = warning;
@@ -205,34 +229,43 @@ export class WslKeeper {
   /**
    * Brings the start entry of `distribution` into the state that the Monitor of `host` wants (updateStartEntry), or
    * removes it (no `host`). The registry is read first, and the state of the Monitor after it: an answer that another
-   * window records meanwhile is either seen here, or that window updates the entry after this read. Failures are
-   * logged.
+   * window records meanwhile is either seen here, or that window updates the entry after this read. A removal that
+   * fails because another window removed the entry meanwhile counts as done. Failures are logged.
    */
   private async writeStartEntry(distribution: string, host: string | undefined): Promise<void> {
     const name = startEntryName(distribution);
-    const reg = this.regPath();
-    let adding = false;
+    const reg = regExePath(this.deps.env);
+    const run = async (args: string[], what: string): Promise<RunResult> => {
+      const result = await this.deps.runner.run(reg, args, { timeoutMs: REG_TIMEOUT_MS });
+      if (result.timedOut) throw new Error(`reg.exe ${what} had ${endOf(result, REG_TIMEOUT_MS)}`);
+      return result;
+    };
+    let action = 'read';
     try {
-      const query = await this.deps.runner.run(reg, regQueryArgs(name), { timeoutMs: REG_TIMEOUT_MS });
-      if (query.timedOut) throw new Error(`reg.exe did not answer within ${REG_TIMEOUT_MS / 1000} seconds`);
+      const query = await run(regQueryArgs(name), 'query');
       const present = query.exitCode === 0;
-      const wanted = host !== undefined && (await this.deps.monitorPermanent(host)) && !(await this.deps.engineRemoved(host).catch(() => false));
+      const wanted = host === undefined ? false : await this.deps.monitorPermanent(host);
+      if (wanted === undefined) return;
       const command = wanted ? this.startCommand(distribution) : undefined;
       if (command === undefined) {
         if (!present) return;
-        const removed = await this.deps.runner.run(reg, regDeleteArgs(name), { timeoutMs: REG_TIMEOUT_MS });
-        if (removed.exitCode !== 0) throw new Error(`reg.exe delete ended with ${removed.timedOut ? 'its time limit' : `exit code ${removed.exitCode}`}`);
+        action = 'removed';
+        const removed = await run(regDeleteArgs(name), 'delete');
+        if (removed.exitCode !== 0) {
+          if ((await run(regQueryArgs(name), 'query')).exitCode !== 0) return;
+          throw new Error(`reg.exe delete ended with ${endOf(removed, REG_TIMEOUT_MS)}: ${outputOf(removed)}`);
+        }
         this.deps.logger.info(`Devspaces removed the start entry "${name}": WSL no longer starts the distribution ${distribution} when you log on to Windows.`);
         return;
       }
       // An entry with another command (another folder of the programs, or another script) is replaced.
-      if (present && query.stdout.includes(command)) return;
-      adding = true;
-      const added = await this.deps.runner.run(reg, regAddArgs(name, command), { timeoutMs: REG_TIMEOUT_MS });
-      if (added.exitCode !== 0) throw new Error(`reg.exe add ended with ${added.timedOut ? 'its time limit' : `exit code ${added.exitCode}`}`);
+      if (present && startEntryValueOf(query.stdout, name) === command) return;
+      action = 'added';
+      const added = await run(regAddArgs(name, command), 'add');
+      if (added.exitCode !== 0) throw new Error(`reg.exe add ended with ${endOf(added, REG_TIMEOUT_MS)}: ${outputOf(added)}`);
       this.deps.logger.info(`Devspaces added the start entry "${name}": WSL starts the distribution ${distribution} when you log on to Windows, so that its Monitor runs again.`);
     } catch (error) {
-      this.deps.logger.warn(`The start entry "${name}" could not be ${adding ? 'added' : 'read or removed'}: ${errorMessage(error)}`);
+      this.deps.logger.warn(`The start entry "${name}" could not be ${action}: ${errorMessage(error)}`);
     }
   }
 
@@ -250,12 +283,6 @@ export class WslKeeper {
     if (command.length <= MAX_START_ENTRY) return command;
     this.deps.logger.warn(`The start entry for the WSL distribution ${distribution} would be longer than ${MAX_START_ENTRY} characters, so WSL does not start it when you log on to Windows.`);
     return undefined;
-  }
-
-  /** `reg.exe` in System32 of SystemRoot, not from PATH. */
-  private regPath(): string {
-    const systemRoot = envValue(this.deps.env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
-    return path.win32.join(systemRoot, 'System32', 'reg.exe');
   }
 
   private exists(file: string): boolean {

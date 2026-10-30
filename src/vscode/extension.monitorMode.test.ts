@@ -86,6 +86,20 @@ describe('the monitor settings of extension.ts', () => {
     expect(warnings).toEqual([expect.stringContaining('could not be read, so the Monitor there stops when no devspace runs: EIO')]);
   });
 
+  // The start entry of the WSL distribution of Devspaces (WslKeeper.monitorPermanent). Mutation: a failed read that
+  // counts as no answer here fails it: a moment of a locked file would remove the start entry of the user.
+  it('permanentIfKnown: the same rule, and no answer (undefined, logged) when the answer cannot be read', async () => {
+    for (const stop of [true, false, undefined]) {
+      const settings = monitorSettingsOf(deps(stop === undefined ? {} : { stopMonitorWhenIdle: stop }, ['wsl:devspaces']));
+      expect(await settings.permanentIfKnown('wsl:devspaces'), String(stop)).toBe(stop !== true);
+      expect(await settings.permanentIfKnown('build-box'), String(stop)).toBe(false);
+    }
+    const warnings: string[] = [];
+    const failing = monitorSettingsOf({ ...deps({}), answered: async () => Promise.reject(new Error('EBUSY')), logger: { warn: (message) => warnings.push(message) } });
+    expect(await failing.permanentIfKnown('wsl:devspaces')).toBeUndefined();
+    expect(warnings).toEqual(['The answer about the Monitor on wsl:devspaces could not be read, so its start entry stays as it is: EBUSY']);
+  });
+
   // The ensure then replaces a permanent Monitor of this computer with one that stops when idle; the log says why.
   it('an answer that cannot be read counts as none, with a warning, and the open goes on', async () => {
     for (const [answered, cause] of [
@@ -129,6 +143,7 @@ describe('the monitor settings of extension.ts', () => {
     expect(source).toMatch(/const monitorSettings = monitorSettingsOf\(\{[^}]*\n\s*logger,\n\s*\}\);/);
     // The WSL distribution of Devspaces asks the same settings.
     expect(source).toContain('monitorPermanent: (host) => monitorSettings.permanent(host),');
+    expect(source).toContain('monitorPermanent: (host) => monitorSettings.permanentIfKnown(host),');
     expect(source).not.toContain('imageUpdateSchedule ??');
   });
 });
