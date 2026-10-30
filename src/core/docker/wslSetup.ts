@@ -608,25 +608,22 @@ export class WslSetup {
    * Sets up the distribution: with `image`, downloads it into the folder `download`, registers it with its virtual disk
    * in a folder `disk` (diskFolderFor), and removes the download; then the script installs Docker Engine (PROVISION_SCRIPT), the
    * distribution restarts, and Docker must answer. Without `image`, only the script, the restart and the check run (a
-   * distribution that Devspaces set up before). Returns the version of the engine. Throws WslSetupError, or an
+   * distribution that Devspaces set up before). Returns the version of the engine, and what WslSetup.separate found
+   * after the registration (or before the script). Throws WslSetupError, or an
    * AbortError when the signal aborts. The registration itself is not cancelled: the service of WSL would go on with it
    * after the end of wsl.exe, so a cancel takes effect after it. When the script is cancelled or ends by its time
    * limit, the distribution stops, because the script would go on there after the end of wsl.exe; its next run goes on
    * from there.
    */
-  async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
+  async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<{ version: string; separation: WslSeparation }> {
     if (image !== undefined) {
-      await this.register(image, onStep, signal).catch(async (error: unknown) => {
-        // A cancel takes effect after the registration, which WSL may have made its default.
-        if (isAbortError(error)) await this.separate();
-        throw error;
-      });
+      await this.register(image, onStep, signal);
     } else {
       // A download that could not be removed after the registration (WSL still had it open).
       await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
     }
-    // WSL makes a new distribution the default when it has none, also one whose registration went on after a cancel.
-    await this.separate(signal);
+    // WSL makes a new distribution the default when it has none.
+    const separation = await this.separate(signal);
     let pending = '';
     let provision: RunResult;
     try {
@@ -666,7 +663,7 @@ export class WslSetup {
     }
     const version = wslText(wait.stdout).trim();
     this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} runs Docker Engine ${version}.`);
-    return version;
+    return { version, separation };
   }
 
   /**
@@ -730,7 +727,11 @@ export class WslSetup {
         throw new WslSetupError('registerFailed', `wsl.exe --install --from-file failed (${endOf(result, REGISTER_MS)}): ${outputOf(result)}`);
       }
       this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${diskFolder}.`);
-      if (signal?.aborted) throw abortError();
+      if (signal?.aborted) {
+        // The cancel takes effect after the registration, which WSL may have made its default.
+        await this.separate();
+        throw abortError();
+      }
     } finally {
       await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
         this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);

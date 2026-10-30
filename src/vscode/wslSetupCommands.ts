@@ -17,6 +17,7 @@ import {
   type WslImage,
   type WslRegistration,
   type WslSetup,
+  type WslSeparation,
   type WslSetupProblem,
   type WslSetupStep,
 } from '../core/docker/wslSetup';
@@ -183,17 +184,15 @@ export class WslSetupCommands {
   constructor(private readonly deps: WslSetupCommandsDeps) {}
 
   /**
-   * At the start of a window and after a setup: the WSL distribution of Devspaces is not the default distribution of
-   * WSL (WslSetup.separate; also after the user removed the default distribution, when WSL made this one the default),
-   * and a warning, once in the window, while Docker Desktop has its WSL integration on for it. Only for a distribution
-   * that Devspaces set up, and only while the registry has the distribution of Docker Desktop (or cannot be read; then
-   * only the list of Docker Desktop counts). Never throws (logged).
+   * At the start of a window: the WSL distribution of Devspaces is not the default distribution of WSL
+   * (WslSetup.separate; also after the user removed the default distribution, when WSL made this one the default), and
+   * a warning, once in the window, while Docker Desktop has its WSL integration on for it (warnDockerDesktop; a setup
+   * warns with what its own check found). Never throws (logged).
    */
   async checkSeparation(): Promise<void> {
     try {
       const separation = await this.deps.setup?.separate();
-      if (separation === undefined || separation.state === 'none' || separation.dockerDesktop === false) return;
-      await this.warnDockerDesktop(separation.state === 'default');
+      if (separation !== undefined) await this.warnDockerDesktop(separation);
     } catch (error) {
       this.deps.logger.error('The WSL distribution of Devspaces could not be checked.', error);
     }
@@ -239,14 +238,14 @@ export class WslSetupCommands {
       // the lock too, so that a removal in another window does not come between.
       const done = await setup.locked(async () => {
         const ready = await this.withProgress(WslSetupTexts.settingUp, async (signal, report) => {
-          if ((await setup.registration(signal)) !== plan.registration) return false;
+          if ((await setup.registration(signal)) !== plan.registration) return undefined;
           if (plan.registration === 'none') await this.deps.forgetDistribution?.();
-          await setup.setUp(plan.image, (step) => report(step), signal);
-          return true;
+          return await setup.setUp(plan.image, (step) => report(step), signal);
         });
-        if (ready) await this.checkSeparation();
+        if (ready === undefined) return false;
+        await this.warnDockerDesktop(ready.separation);
         // useHost shows its own problem.
-        return ready && { used: await this.deps.useHost(WSL_HOST) };
+        return { used: await this.deps.useHost(WSL_HOST) };
       });
       const result = this.finished(done);
       // This message says that the setup itself is done.
@@ -418,11 +417,14 @@ export class WslSetupCommands {
   }
 
   /**
-   * The warning while Docker Desktop has its WSL integration on for the distribution, once in the window (logged).
-   * `isDefault`: the distribution stays the default distribution of WSL.
+   * The warning while Docker Desktop has its WSL integration on for the distribution, once in the window (logged), after
+   * `separation` (WslSetup.separate): only for a distribution that Devspaces set up, and only while the registry has
+   * the distribution of Docker Desktop (or cannot be read); the integration with the default distribution counts while
+   * the distribution stays the default. Never rejects.
    */
-  private async warnDockerDesktop(isDefault: boolean): Promise<void> {
-    if (this.dockerDesktopWarned || !(await this.deps.dockerDesktopIntegrates?.(isDefault))) return;
+  private async warnDockerDesktop(separation: WslSeparation): Promise<void> {
+    if (separation.state === 'none' || separation.dockerDesktop === false) return;
+    if (this.dockerDesktopWarned || !(await this.deps.dockerDesktopIntegrates?.(separation.state === 'default'))) return;
     // Another check of the window may have warned meanwhile.
     if (this.dockerDesktopWarned) return;
     this.dockerDesktopWarned = true;

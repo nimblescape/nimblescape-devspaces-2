@@ -672,7 +672,7 @@ describe('WslSetup.setUp', () => {
     const runner = distribution();
     const download = writingDownload();
     const steps: WslSetupStep[] = [];
-    await expect(setup({ runner, download }).setUp(image, (step) => steps.push(step))).resolves.toBe('29.9.2');
+    await expect(setup({ runner, download }).setUp(image, (step) => steps.push(step))).resolves.toMatchObject({ version: '29.9.2' });
     const file = path.join(folder, 'download', 'debian.wsl');
     expect(download).toHaveBeenCalledWith(
       expect.objectContaining({ url: DEBIAN_URL, host: 'salsa.debian.org', expected: { sha256: SHA }, anyHttpsRedirect: true, target: file }),
@@ -705,7 +705,8 @@ describe('WslSetup.setUp', () => {
   it('runs only the script, the restart, and the check without a file', async () => {
     const runner = distribution();
     const download = writingDownload();
-    await expect(setup({ runner, download }).setUp(undefined, () => undefined)).resolves.toBe('29.9.2');
+    // The runner writes no registry: separate tells that it cannot be read.
+    await expect(setup({ runner, download }).setUp(undefined, () => undefined)).resolves.toEqual({ version: '29.9.2', separation: { state: 'unknown', dockerDesktop: undefined } });
     expect(download).not.toHaveBeenCalled();
     expect(wslCalls(runner).map((call) => call.args[0])).toEqual(['-d', '--terminate', '-d']);
     // Also a setup again keeps the distribution off the default of WSL (WslSetup.separate).
@@ -816,7 +817,7 @@ describe('WslSetup.setUp', () => {
     fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'old');
     const log = logger();
     const runner = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
-    await expect(setup({ runner, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
+    await expect(setup({ runner, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toMatchObject({ version: '29.9.2' });
     expect(runner.calls.map((call) => call.file)).toEqual([REG, WSL, REG, WSL, WSL, WSL]);
     expect(fs.readdirSync(disk)).toEqual([]);
     expect(log.info).toHaveBeenCalledWith(`The folder ${disk} has the files of a setup that did not end (ext4.vhdx); they are removed.`);
@@ -828,7 +829,7 @@ describe('WslSetup.setUp', () => {
     fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'in use');
     const log = logger();
     const used = distribution(undefined, { other: disk });
-    await expect(setup({ runner: used, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
+    await expect(setup({ runner: used, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toMatchObject({ version: '29.9.2' });
     const file = path.join(folder, 'download', 'debian.wsl');
     expect(used.calls.find((call) => call.args[0] === '--install')?.args).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
     expect(log.info).toHaveBeenCalledWith(
@@ -905,7 +906,7 @@ describe('WslSetup.setUp', () => {
     fs.mkdirSync(disk, { recursive: true });
     fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'old');
     const runner = distribution((args) => (args.join(' ') === WSL_LIST_ARGS.join(' ') ? ok('Ubuntu\r\n') : undefined), failed('Access is denied.'));
-    await expect(setup({ runner, download: writingDownload() }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
+    await expect(setup({ runner, download: writingDownload() }).setUp(image, () => undefined)).resolves.toMatchObject({ version: '29.9.2' });
     expect(fs.readdirSync(disk)).toEqual([]);
   });
 

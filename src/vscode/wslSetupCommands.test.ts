@@ -74,7 +74,7 @@ beforeEach(() => {
       onStep({ kind: 'download', received: IMAGE.size, total: IMAGE.size });
       onStep({ kind: 'register' });
       onStep({ kind: 'docker', phase: 'docker' });
-      return '29.9.2';
+      return { version: '29.9.2', separation: { state: 'separate', dockerDesktop: true } as WslSeparation };
     }),
     remove: vi.fn(async (_signal?: AbortSignal) => true),
     removeLeftovers: vi.fn(async () => true),
@@ -140,8 +140,11 @@ describe('the check at the start of a window', () => {
     await commands().checkSeparation();
     expect(logger.error).toHaveBeenCalledWith('The WSL distribution of Devspaces could not be checked.', expect.any(Error));
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    setup.separate.mockClear();
     await commands({ dockerDesktopIntegrates: async () => true }).setUp();
     expect(window.showWarningMessage).toHaveBeenLastCalledWith(WslSetupTexts.dockerDesktopIntegrates);
+    // With what the check of the setup found, without another one.
+    expect(setup.separate).not.toHaveBeenCalled();
   });
 });
 
@@ -227,7 +230,7 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
   it('forgets the old distribution before a new one is set up, and not for a repair', async () => {
     const order: string[] = [];
     const forgetDistribution = vi.fn(async () => void order.push('forget'));
-    setup.setUp.mockImplementation(async () => (order.push('set up'), '29.9.2'));
+    setup.setUp.mockImplementation(async () => (order.push('set up'), { version: '29.9.2', separation: { state: 'separate', dockerDesktop: true } }));
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
     await commands({ forgetDistribution }).setUp();
     expect(order).toEqual(['forget', 'set up']);
