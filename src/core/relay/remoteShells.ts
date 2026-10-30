@@ -76,6 +76,8 @@ export class RemoteShells {
     const current = this.entries.get(host);
     if (current?.shell?.isOpen) {
       if (options.fresh !== true) return Promise.resolve(current.shell);
+      // The step after its login (the key offer) ends first: it may run a command on the shell.
+      if (current.afterLogin !== undefined) return untilAborted(current.afterLogin, signal).then(() => this.open(host, signal, options));
       // Its end forgets its entry (onEnd).
       current.shell.close();
     }

@@ -82,7 +82,7 @@ export interface SshKeyOfferOptions {
   sshPath(): string | undefined;
   sshKeygenPath(): string | undefined;
   env: NodeJS.ProcessEnv;
-  state: Pick<RemoteDockerState, 'sshKey' | 'sshKeyNow' | 'setSshKey'>;
+  state: Pick<RemoteDockerState, 'sshKeyNow' | 'setSshKey'>;
   dialogs: SshKeyDialogs;
   logger: Logger;
   /** Only for the tests. */
@@ -134,9 +134,9 @@ export class SshKeyOffer {
    */
   dockerSshEnv(host: string, env: NodeJS.ProcessEnv): void {
     const identity = this.identityFor(host);
-    if (identity !== undefined && this.wrapper === undefined && !this.wrapperWritten() && this.preparing === undefined) {
+    if (identity !== undefined && this.wrapper === undefined) {
       const waiting = this.wrapperFailedAt !== undefined && Date.now() - this.wrapperFailedAt < (this.options.wrapperRetryMs ?? WRAPPER_RETRY_MS);
-      if (!waiting) void this.prepare();
+      if (!waiting && !this.wrapperWritten() && this.preparing === undefined) void this.prepare();
     }
     const ssh = identity === undefined || this.wrapper === undefined ? undefined : this.options.sshPath();
     if (identity === undefined || ssh === undefined) return;
@@ -155,7 +155,8 @@ export class SshKeyOffer {
   async afterLogin(host: string, login: PasswordLogin, shell: KeyShell): Promise<void> {
     if (!login.passwordAsked) return;
     const { state, dialogs, logger } = this.options;
-    const recorded = await state.sshKey(host).catch(() => undefined);
+    // As identityFor: a read error for a moment (another window renames its write into place) keeps the last read.
+    const recorded = state.sshKeyNow(host);
     if (recorded === 'declined') return;
     if (recorded === 'installed' && this.identityFor(host) !== undefined && (await this.keyOnHost(shell))) {
       logger.info(`The login to ${host} asked for a password although it had the key of Devspaces, which is on the host; the key is not offered again.`);
