@@ -131,7 +131,7 @@
       },
       {
         "view": "devspaces.repositories",
-        "contents": "1. Install WSL 2, which Docker Desktop needs. Windows asks for administrator permission; restart afterwards.\n[Install WSL 2](command:devspaces.dockerSetup.installWsl)",
+        "contents": "1. Install WSL 2, which Docker needs on Windows. Windows asks for administrator permission; restart afterwards.\n[Install WSL 2](command:devspaces.dockerSetup.installWsl)",
         "when": "devspaces.dockerSetupRequired && isWindows && !devspaces.wslReady"
       },
       {
@@ -141,12 +141,17 @@
       },
       {
         "view": "devspaces.repositories",
+        "contents": "2. Set up Docker for Devspaces: Devspaces creates its own WSL distribution with Docker Engine, without Docker Desktop and without administrator permission. You see the downloads and the folder before anything runs.\n[Set Up Docker for Devspaces](command:devspaces.setUpWslDistribution)",
+        "when": "devspaces.dockerSetupRequired && isWindows"
+      },
+      {
+        "view": "devspaces.repositories",
         "contents": "Install Docker Desktop with Homebrew or Docker's installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)",
         "when": "devspaces.dockerSetupRequired && isMac"
       },
       {
         "view": "devspaces.repositories",
-        "contents": "2. Install Docker Desktop with winget or Docker's installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)",
+        "contents": "Or install Docker Desktop with winget or Docker's installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)",
         "when": "devspaces.dockerSetupRequired && isWindows"
       },
       {
@@ -384,6 +389,16 @@
         "category": "Devspaces"
       },
       {
+        "command": "devspaces.setUpWslDistribution",
+        "title": "Set Up Docker for Devspaces in WSL…",
+        "category": "Devspaces"
+      },
+      {
+        "command": "devspaces.removeWslDistribution",
+        "title": "Remove the WSL Distribution of Devspaces…",
+        "category": "Devspaces"
+      },
+      {
         "command": "devspaces.rowActivated",
         "title": "Start on Double-Click",
         "category": "Devspaces"
@@ -484,6 +499,14 @@
         {
           "command": "devspaces.chooseDockerHost",
           "when": "false"
+        },
+        {
+          "command": "devspaces.setUpWslDistribution",
+          "when": "isWindows"
+        },
+        {
+          "command": "devspaces.removeWslDistribution",
+          "when": "isWindows"
         }
       ],
       "view/title": [

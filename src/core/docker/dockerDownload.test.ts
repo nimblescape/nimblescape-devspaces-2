@@ -186,3 +186,46 @@ describe('downloadFile with another host and a pinned file', () => {
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 });
+
+describe('downloadFile with a SHA-256 and redirects to any HTTPS host', () => {
+  const URL_WSL = 'https://salsa.debian.org/debian/WSL/-/jobs/1/artifacts/raw/Debian_WSL_AMD64_v1.0.0.0.wsl';
+  const STORAGE = 'https://storage.example.org/artifacts/1/Debian.wsl';
+  const body = 'distribution';
+  const sha256 = crypto.createHash('sha256').update(body).digest('hex');
+
+  it('follows a redirect to another HTTPS host and keeps the file of that SHA-256, without a known size', async () => {
+    const { get, urls } = fakeGet({
+      [URL_WSL]: () => respond(302, '', { location: STORAGE }),
+      [STORAGE]: () => respond(200, body),
+    });
+    await downloadFile({ url: URL_WSL, target, get, host: 'salsa.debian.org', expected: { sha256: sha256.toUpperCase() }, anyHttpsRedirect: true });
+    expect(urls).toEqual([URL_WSL, STORAGE]);
+    expect(fs.readFileSync(target, 'utf8')).toBe(body);
+  });
+
+  it('keeps nothing of a file with another SHA-256 and names no size', async () => {
+    const { get } = fakeGet({ [URL_WSL]: () => respond(302, '', { location: STORAGE }), [STORAGE]: () => respond(200, 'other') });
+    await expect(downloadFile({ url: URL_WSL, target, get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true })).rejects.toThrow(
+      `is not the file of its pin: 5 bytes with the SHA-256 ${crypto.createHash('sha256').update('other').digest('hex')}, expected ${sha256}.`,
+    );
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('refuses a redirect that leaves HTTPS or names a port, and the first URL of another host', async () => {
+    for (const location of ['http://storage.example.org/Debian.wsl', 'https://storage.example.org:8443/Debian.wsl']) {
+      const { get } = fakeGet({ [URL_WSL]: () => respond(302, '', { location }) });
+      await expect(downloadFile({ url: URL_WSL, target, get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true })).rejects.toThrow(
+        `was redirected to ${location}, which is not HTTPS.`,
+      );
+    }
+    await expect(downloadFile({ url: STORAGE, target, get: fakeGet({}).get, host: 'salsa.debian.org', expected: { sha256 }, anyHttpsRedirect: true })).rejects.toThrow(
+      'Downloads come only from https://salsa.debian.org',
+    );
+  });
+
+  it('refuses redirects to any host without a SHA-256, before a request', async () => {
+    const { get, urls } = fakeGet({});
+    await expect(downloadFile({ url: URL_WSL, target, get, host: 'salsa.debian.org', anyHttpsRedirect: true })).rejects.toThrow('needs a SHA-256');
+    expect(urls).toEqual([]);
+  });
+});

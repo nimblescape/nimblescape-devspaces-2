@@ -66,6 +66,7 @@ import { selectOwners } from './ownerSelector';
 import { setShowOnlyDevspaces } from './devspacesOnly';
 import { FROM_PROGRESS_NOTIFICATION, HIDE_NOTIFICATIONS_COMMAND, runWithProgress, type BusyChange } from './progress';
 import type { RemoteDockerCommands } from './remoteDockerCommands';
+import type { WslSetupCommands } from './wslSetupCommands';
 import type { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import type { SessionCoordinator } from './sessionCoordinator';
 import { RowActivationTracker, activatedRow, type ListOpenMode } from './rowActivation';
@@ -171,6 +172,8 @@ export interface ControllerDeps {
   windowDockerHost?: (devspace: Devspace, containerName: string) => string | undefined;
   /** "Use a Remote Docker Host…", "Use the Local Docker", and the choice of the first row of the view. */
   remoteDocker?: Pick<RemoteDockerCommands, 'useRemoteHost' | 'useLocalDocker' | 'chooseDockerHost'>;
+  /** "Set Up Docker for Devspaces…" and "Remove the WSL Distribution of Devspaces…" (Windows). */
+  wslSetup?: Pick<WslSetupCommands, 'setUp' | 'remove'>;
   /**
    * One heartbeat with the current keep-running flag of a devspace to the Monitor container of its engine
    * (Close and Keep Running, Keep Running When Closed, Stop When Closed), on every engine, through this window's worker
@@ -516,6 +519,8 @@ export class Controller implements vscode.Disposable {
       useRemoteDockerHost: async () => this.deps.remoteDocker?.useRemoteHost(),
       useLocalDocker: async () => this.deps.remoteDocker?.useLocalDocker(),
       chooseDockerHost: async () => this.deps.remoteDocker?.chooseDockerHost(),
+      setUpWslDistribution: async () => this.deps.wslSetup?.setUp(),
+      removeWslDistribution: async () => this.deps.wslSetup?.remove(),
       rowActivated: (argument) => this.rowActivated(argument),
       rowEnter: () => this.rowEnter(),
     };
@@ -524,7 +529,16 @@ export class Controller implements vscode.Disposable {
     // themselves. A click or Enter on a row is no operation: only the Start of a double-click or of Enter is one. Show
     // Log reads no Docker host, so the log opens at once also while the Docker CLI does not answer (the link Show
     // details of a running operation).
-    const ownTarget = new Set<CommandName>(['useRemoteDockerHost', 'useLocalDocker', 'chooseDockerHost', 'rowActivated', 'rowEnter', 'showLog']);
+    const ownTarget = new Set<CommandName>([
+      'useRemoteDockerHost',
+      'useLocalDocker',
+      'chooseDockerHost',
+      'setUpWslDistribution',
+      'removeWslDistribution',
+      'rowActivated',
+      'rowEnter',
+      'showLog',
+    ]);
     const run = async (name: CommandName, argument: unknown): Promise<void> => {
       // Enter on a row whose command is another command of Devspaces (the Sign in row, the Docker host row) ends with
       // that command: a click on a repository row right after it only selects that row (rowActivation.ts).

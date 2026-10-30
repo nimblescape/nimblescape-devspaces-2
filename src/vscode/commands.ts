@@ -59,6 +59,10 @@ export const Commands = {
   // The choice of the Docker host, the command of the first row of the view (hidden in the Command Palette): another
   // remote host, or the local Docker.
   chooseDockerHost: 'devspaces.chooseDockerHost',
+  // The WSL distribution of Devspaces on Windows (wslSetupCommands.ts): set up with Docker Engine inside (also a button
+  // of the Docker setup in the sidebar), and removed.
+  setUpWslDistribution: 'devspaces.setUpWslDistribution',
+  removeWslDistribution: 'devspaces.removeWslDistribution',
   // The command of a repository row (TreeItem.command, hidden in the Command Palette): a double-click runs Start
   // (rowActivation.ts).
   rowActivated: 'devspaces.rowActivated',

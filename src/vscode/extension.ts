@@ -13,6 +13,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
+import { WslSetup, wslSetupFolder } from '../core/docker/wslSetup';
 import {
   WSL_LIST_ARGS,
   describeDockerHost,
@@ -102,6 +103,7 @@ import { SshKeyOffer, vscodeSshKeyDialogs } from './sshKeyOffer';
 import { GroupMatchWorkerRunner } from './groupMatcher';
 import { PreviewWorkerRunner } from './groupsPreviewRunner';
 import { RemoteDockerCommands } from './remoteDockerCommands';
+import { WslSetupCommands } from './wslSetupCommands';
 import { RepositoryGroupsEditor } from './repositoryGroupsEditor';
 import { SessionCoordinator } from './sessionCoordinator';
 import {
@@ -938,6 +940,20 @@ async function activateExtension(
       ? () => installOwnDockerCliWithProgress({ folder: paths.dockerCliDir, platform, arch: process.arch, logger, fallback: undefined, failed: OwnDockerCliTexts.failedForRemoteHost })
       : undefined,
   });
+  // "Set Up Docker for Devspaces in WSL…" and "Remove the WSL Distribution of Devspaces…" (Windows): the distribution
+  // with Docker Engine in a folder of LOCALAPPDATA; after its setup, it is the Docker host of Devspaces.
+  const wslFolder = platform === 'win32' ? wslSetupFolder(env) : undefined;
+  const wslSetup = new WslSetupCommands({
+    setup:
+      wslFolder === undefined
+        ? undefined
+        : new WslSetup({ runner, wslPath, env, arch: process.arch, folder: wslFolder, logger, http: nodeHttpsTransport }),
+    folder: wslFolder,
+    logger,
+    showLog: () => logger.show(),
+    useHost: (host) => remoteDocker.useHost(host),
+    forgetHost: (host) => remoteDocker.forgetHost(host),
+  });
   // A Docker context or DOCKER_HOST of the user that reaches a host over SSH while Devspaces uses the local Docker: its
   // host is offered once for the list (in the background; the read that found it goes on).
   context.subscriptions.push({
@@ -980,6 +996,7 @@ async function activateExtension(
         current: connection.currentDockerHost(),
       }),
     remoteDocker,
+    wslSetup,
     // Close and Keep Running tells the Monitor at once, on every engine, and Keep Running When Closed and Stop
     // When Closed too, through this window's worker of the engine.
     sessionMonitor: {

@@ -274,6 +274,35 @@ export class RemoteDockerCommands {
   }
 
   /**
+   * Devspaces uses `host` after its test, without a choice (the WSL distribution of Devspaces after its setup): the
+   * Docker CLI of Devspaces first when this computer has none (ensureRemoteCli). True when Devspaces uses it afterwards;
+   * a failure is shown. Never throws.
+   */
+  async useHost(host: string): Promise<boolean> {
+    try {
+      if (!(await this.ensureRemoteCli())) return false;
+      return await this.switchToRemote(host);
+    } catch (error) {
+      this.showFailure(error);
+      return false;
+    }
+  }
+
+  /**
+   * `host` leaves the list of Devspaces without a choice and a message (the removal of the WSL distribution of
+   * Devspaces); when Devspaces used it, the local Docker takes its place and the sidebar follows. True when it was the
+   * Docker host of Devspaces.
+   */
+  async forgetHost(host: string): Promise<boolean> {
+    const { removed, wasDockerHost } = await this.deps.state.removeHost(host);
+    if (removed) this.deps.logger.info(`${host} was removed from the list of Devspaces.`);
+    if (!wasDockerHost) return false;
+    await this.deps.targets.resolve();
+    await this.afterSwitch();
+    return true;
+  }
+
+  /**
    * Whether offerDockerContextHost asks about `host`: one that Devspaces can use, and that is neither in the list nor
    * offered before (RemoteDockerState.claimOffer, which remembers it). False when the file cannot be changed (logged).
    */

@@ -54,7 +54,8 @@ export const DOCKER_APP_PATH = '/Applications/Docker.app';
 export const WINGET_INSTALL_COMMAND =
   'winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements';
 
-const DOCKER_ENGINE_PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
+/** The packages of Docker Engine from download.docker.com (apt and dnf). */
+export const DOCKER_ENGINE_PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
 /** An absolute path that the shell reads as one word, without quotes (otherwise: no Homebrew, the download instead). */
 const SAFE_PATH_PATTERN = /^\/[A-Za-z0-9_./+-]+$/;
 /** A user name that `usermod` accepts and that the shell reads as one word, without quotes. */
