@@ -66,6 +66,7 @@ function keeper(over: Partial<WslKeeperDeps> & { permanent?: boolean | 'unknown'
     },
     monitorPermanent: async () => (over.permanent === 'unknown' ? undefined : (over.permanent ?? false)),
     registered: async () => true,
+    knows: async () => true,
     logger: log,
     exists: (file) => file === WSLG && (over.wslg ?? true),
     ...over,
@@ -470,6 +471,34 @@ describe('the start entry of the WSL distribution', () => {
     fail = false;
     await failing.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     expect(failing.log.info).toHaveBeenCalledWith(expect.stringContaining('added the start entry'));
+  });
+
+  // Mutation: a VS Code without records that follows its (missing) answer fails it (VS Code Insiders next to VS Code
+  // would remove the entry of VS Code); so does one that never removes an entry of a removed distribution (a removal of
+  // the entry that failed, or an entry that another window added at the same moment, would stay at each logon).
+  it('without records of this VS Code, only an entry of a distribution that WSL does not list is removed', async () => {
+    const registered = vi.fn(async () => true as boolean | undefined);
+    const monitorPermanent = vi.fn(async () => true as boolean | undefined);
+    const none = keeper({ knows: async () => false, registered, monitorPermanent });
+    await none.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(none.runs.map((run) => run.args[0])).toEqual(['query']);
+    expect(none.state.entry).toBe(false);
+    expect(registered).not.toHaveBeenCalled();
+    const listed = keeper({ knows: async () => false, registered, monitorPermanent, entry: true, value: 'another command' });
+    await listed.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(listed.runs.map((run) => run.args[0])).toEqual(['query']);
+    expect(listed.state).toMatchObject({ entry: true, value: 'another command' });
+    registered.mockResolvedValue(undefined);
+    await listed.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(listed.state.entry).toBe(true);
+    registered.mockResolvedValue(false);
+    await listed.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(listed.state.entry).toBe(false);
+    expect(monitorPermanent).not.toHaveBeenCalled();
+    const failing = keeper({ knows: async () => Promise.reject(new Error('EBUSY')), entry: true });
+    await failing.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(failing.state.entry).toBe(true);
+    expect(failing.log.warn).toHaveBeenCalledWith(`The start entry "${NAME}" could not be read: EBUSY`);
   });
 
   it('removeStartEntry removes it whatever the Monitor mode', async () => {

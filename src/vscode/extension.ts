@@ -683,6 +683,7 @@ async function activateExtension(
       return listed;
     },
     monitorPermanent: (host) => monitorSettings.permanentIfKnown(host),
+    knows: async (host) => (await engineRecords.record(host)) !== undefined,
     logger,
   });
   context.subscriptions.push({ dispose: () => keeper.dispose() });
@@ -1123,18 +1124,12 @@ async function activateExtension(
   };
   // The start entry of the WSL distribution of Devspaces (only that one) follows the mode of its Monitor
   // (WslKeeper.updateStartEntry): at the start of the window, after an answer to the question about its Monitor, after a
-  // change of stopMonitorWhenIdle, and after "Remove Devspaces from This Docker Engine…" there. Each reads the registry,
-  // and only when the records of this VS Code know the engine there: another VS Code (for example VS Code Insiders, with
-  // its own storage and no answer there) does not remove the entry, and a window that never used the distribution starts
-  // no reg.exe.
+  // change of stopMonitorWhenIdle, and after "Remove Devspaces from This Docker Engine…" there. Each reads the
+  // registry; another VS Code (for example VS Code Insiders, with its own storage and no answer there) only removes an
+  // entry of a distribution that WSL does not list (WslKeeperDeps.knows).
   const updateStartEntry = (host: string): void => {
     if (host !== WSL_HOST || wslPath() === undefined) return;
-    background(
-      engineRecords
-        .record(WSL_HOST)
-        .then((record) => (record === undefined ? undefined : keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION))),
-      'update the start entry of the WSL distribution of Devspaces',
-    );
+    background(keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION), 'update the start entry of the WSL distribution of Devspaces');
   };
   updateStartEntry(WSL_HOST);
 

@@ -143,6 +143,11 @@ export interface WslKeeperDeps {
    * cannot be read (logged there). Never rejects.
    */
   monitorPermanent: (host: string) => Promise<boolean | undefined>;
+  /**
+   * Whether the records of this VS Code know the engine `host` (DockerEngineRecords.record): without, this VS Code
+   * never used it, and an entry stays unless WSL does not list the distribution. Rejects when they cannot be read.
+   */
+  knows: (host: string) => Promise<boolean>;
   logger: Logger;
   /** For the tests. Default: whether the file exists. */
   exists?: (file: string) => boolean;
@@ -199,7 +204,8 @@ export class WslKeeper {
    * WSL lists the distribution, and removes it otherwise; an entry with another command is replaced. With a command
    * line longer than MAX_START_ENTRY, there is no entry (logged). Without `wslg.exe` (logged), while the answer about
    * the Monitor cannot be read, or while WSL does not tell whether it lists the distribution, the entry stays as it
-   * is. The caller calls it when that state may have changed; an update that waits and has not begun yet covers a
+   * is. While the records of this VS Code do not know the engine (`knows`), it only removes an entry of a distribution
+   * that WSL does not list. The caller calls it when that state may have changed; an update that waits and has not begun yet covers a
    * later call (it reads the state when it begins). Never rejects.
    */
   updateStartEntry(host: string, distribution: string): Promise<void> {
@@ -295,12 +301,23 @@ export class WslKeeper {
     try {
       const query = await run(regQueryArgs(name), 'query');
       const present = query.exitCode === 0;
-      let wanted = host === undefined ? false : await this.deps.monitorPermanent(host);
-      if (wanted === true && host !== undefined) {
-        // A distribution that was removed by hand (`wsl --unregister`) gets no entry: WSL would fail at each logon. The
-        // state of the Monitor is read again after the list of WSL, which can take seconds.
-        const listed = await this.deps.registered(distribution);
-        wanted = listed === true ? await this.deps.monitorPermanent(host) : listed;
+      let wanted: boolean | undefined;
+      if (host === undefined) {
+        wanted = false;
+      } else if (!(await this.deps.knows(host))) {
+        // This VS Code has no answer there and never used the engine (for example VS Code Insiders next to VS Code,
+        // which keeps its own answers): it adds no entry and removes only one of a distribution that WSL does not list
+        // (removed by hand, or while another window added the entry), so that no logon starts a removed distribution.
+        if (!present) return;
+        wanted = (await this.deps.registered(distribution)) === false ? false : undefined;
+      } else {
+        wanted = await this.deps.monitorPermanent(host);
+        if (wanted === true) {
+          // A distribution that was removed by hand (`wsl --unregister`) gets no entry: WSL would fail at each logon.
+          // The state of the Monitor is read again after the list of WSL, which can take seconds.
+          const listed = await this.deps.registered(distribution);
+          wanted = listed === true ? await this.deps.monitorPermanent(host) : listed;
+        }
       }
       if (wanted === undefined) return;
       let command: string | undefined;
