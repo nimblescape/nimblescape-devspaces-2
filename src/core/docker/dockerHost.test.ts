@@ -30,6 +30,7 @@ import {
   hostAccessOf,
   hostEndpoint,
   parseWslList,
+  wslText,
   wslCommandArgs,
   wslDistributionOf,
   wslEnv,
@@ -296,6 +297,13 @@ describe('the WSL distribution of Devspaces as a host', () => {
     const utf16 = Buffer.from('\uFEFFUbuntu\r\ndevspaces\r\n', 'utf16le').toString('utf8');
     expect(parseWslList(utf16)).toEqual(['Ubuntu', 'devspaces']);
     expect(parseWslList('')).toEqual([]);
+  });
+
+  it('reads the UTF-16 error output of an older wsl.exe as text, and leaves other text as it is', () => {
+    const utf16 = Buffer.from('\uFEFFsh: 1: docker: not found\r\n', 'utf16le').toString('utf8');
+    expect(wslText(utf16)).toBe('sh: 1: docker: not found\r\n');
+    expect(dockerHostProblem(utf16)).toBe('dockerMissing');
+    expect(wslText('ssh: connect to host box port 22: Connection refused')).toBe('ssh: connect to host box port 22: Connection refused');
   });
 });
 

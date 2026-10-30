@@ -26,7 +26,7 @@ import { Messages, dockerHostReason } from '../messages';
 import { LABEL_BUILD_ID } from '../names';
 import { abortError, isAbortError, sleep, systemClock, type Clock, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { deleteEnv, dockerCommandWords, dockerProcessEnv, isReadOnlyDockerCall } from './dockerCli';
-import { hostAccessOf, isSshClosedBeforeLogin, sshEndpoint, type DockerTarget } from './dockerHost';
+import { hostAccessOf, hostEndpoint, isSshClosedBeforeLogin, type DockerTarget } from './dockerHost';
 import type { ImageInfo } from './dockerObjects';
 import { DOCKER_INFO_TIMEOUT_MS, DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
 import { operationDockerTarget, outsideOperation } from './dockerTargets';
@@ -490,7 +490,9 @@ export class BootstrapDocker {
       const pipe = viaPipe || wsl ? this.pipeOf(target) : undefined;
       const env: NodeJS.ProcessEnv = { ...this.env };
       for (const name of REMOTE_CLEARED_VARIABLES) deleteEnv(env, name);
-      env.DOCKER_HOST = pipe ?? sshEndpoint(target.host);
+      // For the WSL distribution without its pipe: `wsl://<distribution>` (hostEndpoint), which the Docker CLI refuses, so
+      // a call with this environment never reaches another engine.
+      env.DOCKER_HOST = pipe ?? hostEndpoint(target.host);
       if (pipe !== undefined) return { env };
       // No `ssh://` for it: a call that only reads runs on the shell before the relay, any other one fails.
       if (wsl) return { env, shellTarget: target, noEndpoint: target.host };

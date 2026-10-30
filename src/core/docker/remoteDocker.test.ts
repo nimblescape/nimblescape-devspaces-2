@@ -348,6 +348,12 @@ describe('the WSL distribution of Devspaces: no SSH', () => {
     });
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(null) })).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     await expect(testRemoteDockerHost(docker, WSL_HOST, deps)).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    // The shell that started is gone before docker info (the window closes): wsl.exe is there.
+    await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, null) })).resolves.toEqual({
+      ok: false,
+      problem: 'unreachable',
+      detail: 'The shell of wsl.exe in wsl:devspaces ended before docker info ran.',
+    });
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, fail('sh: 1: docker: not found', 127)) })).resolves.toMatchObject({
       ok: false,
       problem: 'dockerMissing',
@@ -393,6 +399,13 @@ describe('the WSL distribution of Devspaces: no SSH', () => {
     await expect(readRootlessSocket(runner, undefined, WSL_HOST, {}, undefined, wslShells({ ok: true }, ok('/run/user/0')))).resolves.toEqual({ ok: true, socket: '/run/user/0/docker.sock' });
     await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {}, undefined, wslShells({ ok: true }, null))).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {})).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    // The UTF-16 error output of an older wsl.exe as text.
+    const utf16 = fail(Buffer.from('sh: 1: docker: not found', 'utf16le').toString('utf8'), 1);
+    await expect(readRootlessSocket(runner, undefined, WSL_HOST, {}, undefined, wslShells({ ok: true }, utf16))).resolves.toEqual({
+      ok: false,
+      problem: 'dockerMissing',
+      detail: 'sh: 1: docker: not found',
+    });
     expect(runner.run).not.toHaveBeenCalled();
   });
 });

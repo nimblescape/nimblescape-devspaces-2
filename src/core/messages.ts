@@ -447,16 +447,27 @@ export function dockerHostReason(
   host: string,
 ): string {
   const distribution = wslDistributionOf(host);
-  // The WSL distribution of Devspaces is on this computer: no network, no SSH.
+  // The WSL distribution of Devspaces is on this computer: no network, no SSH. The patterns of an SSH problem
+  // (dockerHostProblem) can match a message of wsl.exe, so these get a text of WSL too.
   if (distribution !== undefined) {
     switch (problem) {
       case 'unreachable':
         return 'WSL did not answer in time. Try again. When it does not help, run "wsl --shutdown" in a terminal, then try again.';
+      case 'closedBeforeLogin':
+      case 'login':
+      case 'hostKey':
+      case 'sshMissing':
+        return `WSL could not start a shell in the WSL distribution ${distribution}. The details show why.`;
       case 'dockerMissing':
         return `Docker is not installed in the WSL distribution ${distribution}.`;
       case 'dockerNotRunning':
         return `Docker is not running in the WSL distribution ${distribution}.`;
-      default:
+      case 'dockerPermission':
+        return `Docker in the WSL distribution ${distribution} refused the call. The details show why.`;
+      case 'wslMissing':
+      case 'wslDistributionMissing':
+      case 'pipeNotListening':
+      case 'unknown':
         break;
     }
   }

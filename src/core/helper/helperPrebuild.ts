@@ -12,7 +12,7 @@
 // for, the weekly check of the base image), and its maintaining ensure then also runs the daily cleanup when that is due;
 // the cleanup alone never makes it run.
 import * as fs from 'fs';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, hostAccessOf, unsupportedTargetReason, type DockerTarget } from '../docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, hostAccessOf, unsupportedTargetReason, wslDistributionOf, type DockerTarget } from '../docker/dockerHost';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS, checkSshLogin, type SshCheckDeps } from '../docker/remoteDocker';
 import { errorMessage } from '../errors';
@@ -73,6 +73,11 @@ export interface DockerEngineAnswersDeps {
   daemonStatus: (signal: AbortSignal, timeoutMs?: number) => Promise<{ running: boolean }>;
   /** For the SSH check before a remote host (checkSshLogin). */
   ssh: SshCheckDeps;
+  /**
+   * Whether the WSL distribution `distribution` runs (`wsl.exe --list --running --quiet`, which starts nothing). False
+   * when it cannot tell.
+   */
+  wslRunning: (distribution: string, signal: AbortSignal) => Promise<boolean>;
   logger: Logger;
 }
 
@@ -81,7 +86,9 @@ export interface DockerEngineAnswersDeps {
  * The local Docker: `docker info`. A remote host: first our own `ssh -o BatchMode=yes` (checkSshLogin, a success of the
  * last minute counts), so no password, passphrase or host key is ever asked, also on Windows where the ssh of the Docker
  * CLI could ask on a hidden console; then `docker info` in the context of the operation with the time limit
- * of a remote host. An endpoint that is neither local nor SSH: false. Never throws, except an AbortError.
+ * of a remote host. The WSL distribution of Devspaces: false while it does not run (`wsl.exe` would start it, and its
+ * Docker engine with it), else the start of its shell (checkSshLogin) and `docker info`. An endpoint that is neither
+ * local nor SSH: false. Never throws, except an AbortError.
  */
 export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngineAnswersDeps, signal: AbortSignal): Promise<boolean> {
   switch (target.kind) {
@@ -90,6 +97,11 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
     case 'unsupported':
       return false;
     case 'remote': {
+      const distribution = wslDistributionOf(target.host);
+      if (distribution !== undefined && !(await deps.wslRunning(distribution, signal))) {
+        deps.logger.info(`The WSL distribution ${distribution} does not run, so it is not started for this.`);
+        return false;
+      }
       const login = await checkSshLogin(target.host, deps.ssh, { signal });
       if (!login.ok) {
         deps.logger.info(`The Docker host ${target.host} cannot be reached ${hostAccessOf(target.host)?.kind === 'wsl' ? 'through wsl.exe' : 'over SSH'}: ${login.detail}`);

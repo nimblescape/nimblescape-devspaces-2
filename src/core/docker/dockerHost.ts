@@ -399,13 +399,20 @@ export function wslEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 export const WSL_LIST_ARGS: readonly string[] = ['--list', '--quiet'];
 
 /**
- * The names in the output of `wsl.exe --list --quiet` (WSL_LIST_ARGS): one per line. An older `wsl.exe` writes UTF-16
- * also with WSL_UTF8=1; read as UTF-8, its text has a NUL byte after each character, and a byte order mark becomes
- * replacement characters. Both are dropped here (no name of a distribution has them).
+ * A text that `wsl.exe` wrote (its list, or its error output), read as UTF-8, as text. An older `wsl.exe` writes UTF-16
+ * also with WSL_UTF8=1: read as UTF-8, its text has a NUL after each character, and its byte order mark becomes
+ * replacement characters. Both are dropped (no message and no name of a distribution has them). Any other text stays.
  */
+export function wslText(text: string): string {
+  return text.replace(/[\u0000\uFEFF\uFFFD]/g, '');
+}
+
+/** The arguments of `wsl.exe` that list the names of the running WSL distributions of this Windows user, one per line. */
+export const WSL_RUNNING_ARGS: readonly string[] = ['--list', '--running', '--quiet'];
+
+/** The names in the output of `wsl.exe --list --quiet` (WSL_LIST_ARGS, WSL_RUNNING_ARGS): one per line (wslText). */
 export function parseWslList(stdout: string): string[] {
-  return stdout
-    .replace(/[\u0000\uFEFF\uFFFD]/g, '')
+  return wslText(stdout)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line !== '');
@@ -483,9 +490,9 @@ const WSL_DISTRIBUTION_MISSING = /WSL_E_DISTRO_NOT_FOUND|There is no distributio
 
 /** Maps the error text of `docker -H ssh://… info` (or of `ssh`, or of `wsl.exe`) to a DockerHostProblem. */
 export function dockerHostProblem(detail: string): DockerHostProblem {
-  const text = detail;
-  // An older wsl.exe writes UTF-16 also with WSL_UTF8=1 (parseWslList): its text has a NUL after each character.
-  if (WSL_DISTRIBUTION_MISSING.test(text.replace(/\u0000/g, ''))) return 'wslDistributionMissing';
+  // The UTF-16 of an older wsl.exe (wslText).
+  const text = wslText(detail);
+  if (WSL_DISTRIBUTION_MISSING.test(text)) return 'wslDistributionMissing';
   if (/executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
     return 'sshMissing';
   }
