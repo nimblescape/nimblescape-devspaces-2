@@ -338,7 +338,7 @@ On Windows, Devspaces can use Docker Engine in a WSL distribution of its own, na
 
 - **Set it up**: click **Set Up Docker for Devspaces** in the Docker setup of the view, or run **Devspaces: Set Up Docker for Devspaces in WSL…**. It needs WSL 2.4.4 or later; without WSL, the message offers **Install WSL 2** (Windows asks for administrator permission, and you restart the computer afterwards). One question shows what Devspaces downloads and the folder. Then Devspaces:
   1. downloads the Debian file for WSL from the list of WSL distributions of Microsoft, the list that `wsl --install` uses, and checks it against the SHA-256 in that list;
-  2. creates the distribution `devspaces` for your Windows user with `wsl --install --from-file`, with its virtual disk in `%LOCALAPPDATA%\nimblescape\devspaces\wsl\disk`; this needs no administrator permission;
+  2. creates the distribution `devspaces` of WSL 2 for your Windows user with `wsl --install --from-file`, with its virtual disk in `%LOCALAPPDATA%\nimblescape\devspaces\wsl\disk`; this needs no administrator permission;
   3. installs Docker Engine there as root from the package repository of Docker (`download.docker.com`), and turns on systemd, which starts Docker;
   4. restarts the distribution, waits for Docker, and then uses it as the Docker host of Devspaces. On a computer without a Docker CLI, it first downloads the Docker CLI of Devspaces.
 

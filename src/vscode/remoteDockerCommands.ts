@@ -289,17 +289,19 @@ export class RemoteDockerCommands {
   }
 
   /**
-   * `host` leaves the list of Devspaces without a choice and a message (the removal of the WSL distribution of
-   * Devspaces); when Devspaces used it, the local Docker takes its place and the sidebar follows. True when it was the
-   * Docker host of Devspaces.
+   * `host` leaves the list of Devspaces without a choice (the removal of the WSL distribution of Devspaces); when
+   * Devspaces used it, the local Docker takes its place and the sidebar follows. Returns `notDockerHost` when Devspaces
+   * did not use it; else `local`, or `unsupported` when the local Docker of Devspaces is not supported (its warning is
+   * shown, as for "Use the Local Docker").
    */
-  async forgetHost(host: string): Promise<boolean> {
+  async forgetHost(host: string): Promise<'notDockerHost' | 'local' | 'unsupported'> {
     const { removed, wasDockerHost } = await this.deps.state.removeHost(host);
     if (removed) this.deps.logger.info(`${host} was removed from the list of Devspaces.`);
-    if (!wasDockerHost) return false;
-    await this.deps.targets.resolve();
+    if (!wasDockerHost) return 'notDockerHost';
+    const now = await this.deps.targets.resolve();
+    await this.reportLocal(now);
     await this.afterSwitch();
-    return true;
+    return now.kind === 'local' ? 'local' : 'unsupported';
   }
 
   /**
@@ -379,12 +381,13 @@ export class RemoteDockerCommands {
   }
 
   /**
-   * Says `local` when the local Docker of Devspaces, as read in `now`, is supported; else its message, except for the
-   * SSH host of a context of the user that this window offers now (the read of `now` started the offer, extension.ts).
+   * Says `local` (when given) when the local Docker of Devspaces, as read in `now`, is supported; else its message,
+   * except for the SSH host of a context of the user that this window offers now (the read of `now` started the offer,
+   * extension.ts).
    */
-  private async reportLocal(now: DockerTarget, local: string): Promise<void> {
+  private async reportLocal(now: DockerTarget, local?: string): Promise<void> {
     if (now.kind === 'local') {
-      this.inform(local);
+      if (local !== undefined) this.inform(local);
       return;
     }
     this.deps.logger.warn(`The local Docker of Devspaces is not supported now: ${now.endpoint || now.host}`);

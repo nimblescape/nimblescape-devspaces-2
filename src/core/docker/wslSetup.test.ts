@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../http';
 import { isAbortError, type RunOptions, type RunResult } from '../ports';
 import type { DownloadOptions } from './dockerDownload';
+import { LockTimeoutError } from '../storage/lockFolder';
 import { WSL_LIST_ARGS } from './dockerHost';
 import {
   DOCKER_WAIT_SCRIPT,
@@ -157,7 +158,7 @@ describe('wslSetupFolder', () => {
 });
 
 describe('wslInstallArgs', () => {
-  it('registers the file under the name devspaces in the folder, without a start', () => {
+  it('registers the file under the name devspaces in the folder as WSL 2, without a start', () => {
     expect(wslInstallArgs('C:\\x\\debian.wsl', 'C:\\x\\disk')).toEqual([
       '--install',
       '--from-file',
@@ -166,6 +167,8 @@ describe('wslInstallArgs', () => {
       'devspaces',
       '--location',
       'C:\\x\\disk',
+      '--version',
+      '2',
       '--no-launch',
     ]);
   });
@@ -410,6 +413,7 @@ describe('WslSetup.setUp', () => {
       WSL_TERMINATE_ARGS,
       ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'],
     ]);
+    expect(runner.calls[0].args.join(' ')).toContain('--version 2 --no-launch');
     expect(runner.calls.every((call) => call.options?.env?.WSL_UTF8 === '1')).toBe(true);
     expect(steps).toEqual([
       { kind: 'download', received: 0, total: 10 },
@@ -594,42 +598,24 @@ describe('WslSetup.remove', () => {
   });
 });
 
-describe('WslSetup.lock', () => {
-  const lockFile = () => `${folder}.lock`;
-
-  afterEach(() => {
-    fs.rmSync(lockFile(), { force: true });
+describe('WslSetup.locked', () => {
+  it('runs one setup or removal at a time for all windows', async () => {
+    let release: () => void = () => {};
+    const first = setup({ runner: wslRunner(() => undefined) }).locked(() => new Promise<string>((resolve) => (release = () => resolve('first'))));
+    // Until the first task holds the lock.
+    await vi.waitFor(() => expect(fs.existsSync(`${folder}.lock`)).toBe(true));
+    const task = vi.fn(async () => 'second');
+    await expect(setup({ runner: wslRunner(() => undefined) }).locked(task)).resolves.toBeUndefined();
+    expect(task).not.toHaveBeenCalled();
+    release();
+    await expect(first).resolves.toEqual({ value: 'first' });
+    expect(fs.existsSync(`${folder}.lock`)).toBe(false);
+    await expect(setup({ runner: wslRunner(() => undefined) }).locked(task)).resolves.toEqual({ value: 'second' });
   });
 
-  it('holds one setup or removal at a time for all windows, until its release', async () => {
-    const first = await setup({ runner: wslRunner(() => undefined) }).lock();
-    expect(first).toBeDefined();
-    expect(JSON.parse(fs.readFileSync(lockFile(), 'utf8'))).toMatchObject({ pid: process.pid });
-    await expect(setup({ runner: wslRunner(() => undefined) }).lock()).resolves.toBeUndefined();
-    await first?.();
-    expect(fs.existsSync(lockFile())).toBe(false);
-    const second = await setup({ runner: wslRunner(() => undefined) }).lock();
-    expect(second).toBeDefined();
-    await second?.();
-  });
-
-  it('takes over the lock of a process that ended or of an old one, but not one that is being written', async () => {
-    for (const stale of [{ pid: 999_999_999, started: Date.now() }, { pid: process.pid, started: Date.now() - 3 * 60 * 60_000 }]) {
-      fs.writeFileSync(lockFile(), JSON.stringify(stale));
-      const release = await setup({ runner: wslRunner(() => undefined) }).lock();
-      expect(release).toBeDefined();
-      await release?.();
-    }
-    fs.writeFileSync(lockFile(), '');
-    await expect(setup({ runner: wslRunner(() => undefined) }).lock()).resolves.toBeUndefined();
-  });
-
-  it('releases only its own lock', async () => {
-    const release = await setup({ runner: wslRunner(() => undefined) }).lock();
-    const other = JSON.stringify({ pid: process.pid, started: Date.now() + 1 });
-    fs.writeFileSync(lockFile(), other);
-    await release?.();
-    expect(fs.readFileSync(lockFile(), 'utf8')).toBe(other);
+  it('gives the failure of its task, also a lock time-out of the task itself', async () => {
+    await expect(setup({ runner: wslRunner(() => undefined) }).locked(async () => Promise.reject(new LockTimeoutError('other.lock')))).rejects.toBeInstanceOf(LockTimeoutError);
+    await expect(setup({ runner: wslRunner(() => undefined) }).locked(async () => Promise.reject(new Error('EACCES')))).rejects.toThrow('EACCES');
   });
 });
 

@@ -82,7 +82,8 @@ export const WslSetupTexts = {
       `The folder of the distribution is removed too:\n${folder}`,
     ].join('\n\n'),
   remove: 'Remove',
-  removed: (wasCurrent: boolean) => `The WSL distribution of Devspaces was removed.${wasCurrent ? ' Devspaces now uses the local Docker.' : ''}`,
+  /** `local`: Devspaces used it, and now uses the local Docker (when that is not supported, its own warning says so). */
+  removed: (nowLocal: boolean) => `The WSL distribution of Devspaces was removed.${nowLocal ? ' Devspaces now uses the local Docker.' : ''}`,
   removedStillListed: `The WSL distribution of Devspaces was removed, but Devspaces could not take "${WSL_HOST}" out of its list of Docker hosts. Take it out with "Remove a Host from the List…".`,
   readyNotUsed: `Docker Engine runs in the WSL distribution of Devspaces, but Devspaces does not use it yet. To use it, choose "${WSL_HOST}" in "Use a Remote Docker Host…".`,
   notInstalled: 'The WSL distribution of Devspaces is not installed.',
@@ -140,7 +141,7 @@ export const WslSetupTexts = {
 
 export interface WslSetupCommandsDeps {
   /** The setup of this computer; undefined where there is none (not Windows, or no LOCALAPPDATA). */
-  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'lock'> | undefined;
+  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked'> | undefined;
   /** The folder of the distribution (wslSetupFolder), for the questions. */
   folder: string | undefined;
   /** For the message without `setup`. */
@@ -149,8 +150,11 @@ export interface WslSetupCommandsDeps {
   showLog: () => void;
   /** Devspaces uses the host after its test (RemoteDockerCommands.useHost); true when it does. */
   useHost: (host: string) => Promise<boolean>;
-  /** The host leaves the list of Devspaces (RemoteDockerCommands.forgetHost); true when it was the Docker host. */
-  forgetHost: (host: string) => Promise<boolean>;
+  /**
+   * The host leaves the list of Devspaces (RemoteDockerCommands.forgetHost): whether it was the Docker host, and
+   * whether the local Docker that takes its place is supported.
+   */
+  forgetHost: (host: string) => Promise<'notDockerHost' | 'local' | 'unsupported'>;
 }
 
 export class WslSetupCommands {
@@ -171,8 +175,7 @@ export class WslSetupCommands {
       this.inform(this.deps.isWindows ? WslSetupTexts.noLocalAppData : WslSetupTexts.notWindows);
       return;
     }
-    const release = await this.start(setup);
-    if (release === undefined) return;
+    if (!this.start()) return;
     try {
       const plan = await this.withProgress(WslSetupTexts.checking, async (signal) => {
         const registration = await setup.registration(signal);
@@ -193,13 +196,17 @@ export class WslSetupCommands {
           : await this.confirm(WslSetupTexts.confirmSetUp, WslSetupTexts.confirmSetUpDetail(plan.image, folder), WslSetupTexts.setUp);
       if (!confirmed) return;
       this.deps.logger.info(plan.image === undefined ? `The WSL distribution ${WSL_DISTRIBUTION} is set up again.` : `The WSL distribution ${WSL_DISTRIBUTION} is set up in ${folder}.`);
-      await this.withProgress(WslSetupTexts.settingUp, (signal, report) => setup.setUp(plan.image, (step) => report(step), signal));
+      // The lock of all windows only from here: an open question holds nothing.
+      const done = await setup.locked(() => this.withProgress(WslSetupTexts.settingUp, (signal, report) => setup.setUp(plan.image, (step) => report(step), signal)));
+      if (done === undefined) {
+        this.inform(WslSetupTexts.busyElsewhere);
+        return;
+      }
       // useHost shows its own problem; this message says that the setup itself is done.
       if (!(await this.deps.useHost(WSL_HOST))) this.inform(WslSetupTexts.readyNotUsed);
     } catch (error) {
       this.showFailure(error, WslSetupTexts.failed, 'The setup of the WSL distribution of Devspaces was cancelled.');
     } finally {
-      await release();
       this.running = false;
     }
   }
@@ -215,8 +222,7 @@ export class WslSetupCommands {
       this.inform(this.deps.isWindows ? WslSetupTexts.noLocalAppData : WslSetupTexts.notWindows);
       return;
     }
-    const release = await this.start(setup);
-    if (release === undefined) return;
+    if (!this.start()) return;
     try {
       let registration: WslRegistration;
       try {
@@ -236,53 +242,48 @@ export class WslSetupCommands {
         await this.deps.forgetHost(WSL_HOST).catch((error: unknown) => {
           this.deps.logger.warn(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
         });
-        await setup.removeLeftovers();
+        // While another window sets it up, its files stay.
+        await setup.locked(() => setup.removeLeftovers()).catch((error: unknown) => {
+          this.deps.logger.warn(`The files of an earlier setup could not be removed: ${errorMessage(error)}`);
+        });
         this.inform(WslSetupTexts.notInstalled);
         return;
       }
       if (!(await this.confirm(WslSetupTexts.confirmRemove, WslSetupTexts.confirmRemoveDetail(folder), WslSetupTexts.remove))) return;
       // `wsl --unregister` is not cancelled: a half removed distribution would help nobody.
-      await withNotificationProgress({ title: WslSetupTexts.removing }, () => setup.remove());
-      let wasCurrent: boolean;
+      const done = await setup.locked(async () => withNotificationProgress({ title: WslSetupTexts.removing }, () => setup.remove()));
+      if (done === undefined) {
+        this.inform(WslSetupTexts.busyElsewhere);
+        return;
+      }
+      let forgotten: 'notDockerHost' | 'local' | 'unsupported';
       try {
-        wasCurrent = await this.deps.forgetHost(WSL_HOST);
+        forgotten = await this.deps.forgetHost(WSL_HOST);
       } catch (error) {
         // The distribution is gone; only the list of Devspaces still names it.
         this.deps.logger.error(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
         this.showError(WslSetupTexts.removedStillListed);
         return;
       }
-      this.inform(WslSetupTexts.removed(wasCurrent));
+      this.inform(WslSetupTexts.removed(forgotten === 'local'));
     } catch (error) {
       this.showFailure(error, WslSetupTexts.removeFailedUnknown, 'The removal of the WSL distribution of Devspaces was cancelled.');
     } finally {
-      await release();
       this.running = false;
     }
   }
 
   /**
-   * Marks a setup or a removal as running in this window and, with WslSetup.lock, in all windows; returns its release.
-   * Undefined (with a message) while one runs in this or another window. Without the lock file (logged), it runs.
+   * False (with a message) while a setup or a removal runs in this window; else marks one as running. The work itself
+   * runs with WslSetup.locked, for all windows.
    */
-  private async start(setup: Pick<WslSetup, 'lock'>): Promise<(() => Promise<void>) | undefined> {
+  private start(): boolean {
     if (this.running) {
       this.inform(WslSetupTexts.busy);
-      return undefined;
+      return false;
     }
     this.running = true;
-    let release: (() => Promise<void>) | undefined;
-    try {
-      release = await setup.lock();
-    } catch (error) {
-      this.deps.logger.warn(`The setup of the WSL distribution of Devspaces runs without a lock for the other windows: ${errorMessage(error)}`);
-      return async () => undefined;
-    }
-    if (release === undefined) {
-      this.running = false;
-      this.inform(WslSetupTexts.busyElsewhere);
-    }
-    return release;
+    return true;
   }
 
   /** `task` with a cancellable progress notification; `report` shows a step of the setup. */

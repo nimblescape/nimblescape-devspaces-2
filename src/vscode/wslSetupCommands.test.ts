@@ -27,15 +27,16 @@ const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), output: vi.fn() }
 /** The messages of the progress notifications, as reported. */
 let reports: Array<{ message?: string; increment?: number }>;
 type Setup = NonNullable<WslSetupCommandsDeps['setup']>;
-let setup: { [K in keyof Setup]: Mock<Setup[K]> };
+/** The lock of all windows: runs the task, or undefined (another window holds it). */
+type Locked = (task: () => Promise<unknown>) => Promise<{ value: unknown } | undefined>;
+let setup: { [K in Exclude<keyof Setup, 'locked'>]: Mock<Setup[K]> } & { locked: Mock<Locked> };
 let useHost: Mock<WslSetupCommandsDeps['useHost']>;
 let forgetHost: Mock<WslSetupCommandsDeps['forgetHost']>;
 let showLog: Mock<() => void>;
-let release: Mock<() => Promise<void>>;
 
 function commands(extra: Partial<WslSetupCommandsDeps> = {}): WslSetupCommands {
   return new WslSetupCommands({
-    setup,
+    setup: setup as unknown as Setup,
     folder: FOLDER,
     isWindows: true,
     logger,
@@ -77,11 +78,10 @@ beforeEach(() => {
     }),
     remove: vi.fn(async (_signal?: AbortSignal) => undefined),
     removeLeftovers: vi.fn(async () => undefined),
-    lock: vi.fn(async () => release),
+    locked: vi.fn(async (task: () => Promise<unknown>) => ({ value: await task() })),
   };
-  release = vi.fn(async () => undefined);
   useHost = vi.fn(async (_host: string) => true);
-  forgetHost = vi.fn(async (_host: string) => false);
+  forgetHost = vi.fn(async (_host: string): Promise<'notDockerHost' | 'local' | 'unsupported'> => 'notDockerHost');
   showLog = vi.fn();
   window.withProgress.mockImplementation(async (_options: unknown, task: (...args: unknown[]) => Promise<unknown>) =>
     task(
@@ -115,22 +115,24 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     ]);
     // The download fills 40 percent; the other steps start at their places, so the bar is full only at the end.
     expect(reports.map((report) => report.increment).filter((increment) => increment !== undefined)).toEqual([20, 20, 25]);
-    expect(setup.lock).toHaveBeenCalledTimes(1);
-    expect(release).toHaveBeenCalledTimes(1);
+    // Only the work after the question holds the lock of all windows.
+    expect(setup.locked).toHaveBeenCalledTimes(1);
   });
 
-  it('waits for a setup or a removal in another window, and runs without the lock when it cannot be written', async () => {
-    setup.lock.mockResolvedValueOnce(undefined);
+  it('sets up and removes nothing while another window sets up or removes the distribution', async () => {
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    setup.locked.mockResolvedValueOnce(undefined);
     await commands().setUp();
     expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.busyElsewhere);
-    expect(setup.registration).not.toHaveBeenCalled();
-    setup.lock.mockResolvedValueOnce(undefined);
+    expect(setup.setUp).not.toHaveBeenCalled();
+    expect(useHost).not.toHaveBeenCalled();
+    registered('own');
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
+    setup.locked.mockResolvedValueOnce(undefined);
     await commands().remove();
-    expect(setup.registration).not.toHaveBeenCalled();
-    setup.lock.mockRejectedValueOnce(new Error('EACCES'));
-    await commands().remove();
-    expect(setup.registration).toHaveBeenCalledTimes(1);
-    expect(logger.warn).toHaveBeenCalledWith('The setup of the WSL distribution of Devspaces runs without a lock for the other windows: EACCES');
+    expect(setup.remove).not.toHaveBeenCalled();
+    expect(forgetHost).not.toHaveBeenCalled();
+    expect(window.showInformationMessage.mock.calls.filter((call: unknown[]) => call[0] === WslSetupTexts.busyElsewhere)).toHaveLength(2);
   });
 
   it('says that the setup is done when Devspaces cannot use the distribution yet', async () => {
@@ -226,7 +228,7 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
 describe('Remove the WSL Distribution of Devspaces…', () => {
   it('removes the distribution of Devspaces after a warning and forgets its host', async () => {
     registered('own');
-    forgetHost.mockResolvedValue(true);
+    forgetHost.mockResolvedValue('local');
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
     await commands().remove();
     expect(questions()).toEqual([{ message: WslSetupTexts.confirmRemove, detail: WslSetupTexts.confirmRemoveDetail(FOLDER), button: WslSetupTexts.remove }]);
@@ -235,6 +237,15 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
     expect(forgetHost).toHaveBeenCalledWith(WSL_HOST);
     expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.removed(true));
     expect(WslSetupTexts.removed(true)).toBe('The WSL distribution of Devspaces was removed. Devspaces now uses the local Docker.');
+  });
+
+  it('does not say "local Docker" after the removal when the local Docker is not supported', async () => {
+    registered('own');
+    forgetHost.mockResolvedValue('unsupported');
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
+    await commands().remove();
+    expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.removed(false));
+    expect(WslSetupTexts.removed(false)).toBe('The WSL distribution of Devspaces was removed.');
   });
 
   it('removes nothing when the warning is closed', async () => {

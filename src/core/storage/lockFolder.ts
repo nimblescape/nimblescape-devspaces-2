@@ -38,6 +38,14 @@ export class LockLostError extends Error {
   }
 }
 
+/** Thrown when the lock folder stays held by another process for the whole `timeoutMs`. */
+export class LockTimeoutError extends Error {
+  constructor(lockDir: string) {
+    super(`Timeout while waiting for the lock ${lockDir}.`);
+    this.name = 'LockTimeoutError';
+  }
+}
+
 /**
  * Runs `fn` while holding the lock folder `lockDir` (created with mkdir, removed after `fn`, stale when older than
  * `staleMs`). Beyond a plain mkdir lock:
@@ -86,7 +94,7 @@ async function acquireLockFolder(lockDir: string, { staleMs, timeoutMs }: LockTi
         throw error;
       }
     }
-    if (Date.now() - start > timeoutMs) throw new Error(`Timeout while waiting for the lock ${lockDir}.`);
+    if (Date.now() - start > timeoutMs) throw new LockTimeoutError(lockDir);
     await sleep(LOCK_RETRY_MS);
   }
 }

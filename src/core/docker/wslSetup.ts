@@ -15,6 +15,7 @@ import * as path from 'path';
 import { errorMessage } from '../errors';
 import type { HttpTransport } from '../http';
 import { abortError, isAbortError, type Logger, type ProcessRunner, type RunOptions, type RunResult } from '../ports';
+import { LockTimeoutError, withLockFolder } from '../storage/lockFolder';
 import { envValue } from './dockerCli';
 import { downloadFile, type DownloadOptions } from './dockerDownload';
 import { WSL_DISTRIBUTION, WSL_LIST_ARGS, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
@@ -57,10 +58,13 @@ const DOWNLOAD_NAME = 'debian.wsl';
 const REGISTRY_EXPORT_NAME = 'distributions.reg';
 /** The start of the lines of the script that name its next step. */
 const STEP_PREFIX = 'devspaces-step ';
-/** A lock of a setup or a removal that is older is taken over: the longest setup ends within about 80 minutes. */
-const LOCK_MAX_AGE_MS = 2 * 60 * 60_000;
-/** A lock file without its content yet (it is being written) is taken over only after this time. */
-const LOCK_WRITE_MS = 10_000;
+/**
+ * The lock of the setup for all windows (withLockFolder): its holder refreshes it every 15 seconds, so that a lock
+ * older than a minute is of a window that ended; another window waits for it one second.
+ */
+const LOCK_TIMINGS = { staleMs: 60_000, timeoutMs: 1_000 };
+/** The longest wait for the list of WSL distributions and for the size of the Debian file. */
+const REQUEST_MS = 30_000;
 /** The folders `disk-2` and so on that a new registration may take when `disk` has files of unknown use. */
 const MAX_DISK_FOLDERS = 20;
 
@@ -74,9 +78,12 @@ export function wslSetupFolder(env: NodeJS.ProcessEnv): string | undefined {
   return localAppData ? path.win32.join(localAppData, 'nimblescape', 'devspaces', 'wsl') : undefined;
 }
 
-/** The arguments of `wsl.exe` that register the file `file` as the distribution `devspaces`, without a start. */
+/**
+ * The arguments of `wsl.exe` that register the file `file` as the distribution `devspaces` of WSL 2 (also when the
+ * default of the user is WSL 1, which has no systemd), without a start.
+ */
 export function wslInstallArgs(file: string, location: string): string[] {
-  return ['--install', '--from-file', file, '--name', WSL_DISTRIBUTION, '--location', location, '--no-launch'];
+  return ['--install', '--from-file', file, '--name', WSL_DISTRIBUTION, '--location', location, '--version', '2', '--no-launch'];
 }
 
 /** One file of the list of WSL distributions. */
@@ -398,41 +405,36 @@ export class WslSetup {
   }
 
   /**
-   * Marks a setup or a removal as running for all windows of the Windows user (the file `<folder>.lock` with the
-   * process and the time), so that two windows never work on the distribution at the same time. Returns its release,
-   * or undefined while another process holds it. The lock of a process that ended, or one older than two hours, is
-   * taken over.
+   * Runs `task` while this window holds the lock of the setup for all windows of the Windows user (the lock folder
+   * `<folder>.lock`, withLockFolder), so that two windows never set up or remove the distribution at the same time.
+   * Undefined, without `task`, while another window holds it.
    */
-  async lock(): Promise<(() => Promise<void>) | undefined> {
-    const file = `${this.deps.folder}.lock`;
-    await fs.promises.mkdir(path.dirname(file), { recursive: true });
-    const content = JSON.stringify({ pid: process.pid, started: Date.now() });
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await fs.promises.writeFile(file, content, { flag: 'wx' });
-        return async () => {
-          // Only its own lock: another window may have taken over an old one.
-          const now = await fs.promises.readFile(file, 'utf8').catch(() => undefined);
-          if (now === content) await fs.promises.rm(file, { force: true }).catch(() => undefined);
-        };
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        if (!(await isStaleLock(file))) return undefined;
-        this.deps.logger.info(`The lock ${file} of a setup that ended is taken over.`);
-        await fs.promises.rm(file, { force: true });
-      }
+  async locked<T>(task: () => Promise<T>): Promise<{ value: T } | undefined> {
+    let started = false;
+    try {
+      const value = await withLockFolder(
+        `${this.deps.folder}.lock`,
+        () => {
+          started = true;
+          return task();
+        },
+        LOCK_TIMINGS,
+      );
+      return { value };
+    } catch (error) {
+      if (!started && error instanceof LockTimeoutError) return undefined;
+      throw error;
     }
-    return undefined;
   }
 
   /**
    * The Debian file of the list of WSL distributions for this computer, with its size when a HEAD request tells it.
-   * Throws WslSetupError `listFailed` or `noImage`.
+   * Throws WslSetupError `listFailed` (also when the list does not arrive within 30 seconds) or `noImage`.
    */
   async image(signal?: AbortSignal): Promise<WslImage> {
     let list: unknown;
     try {
-      const response = await this.deps.http.request({ method: 'GET', url: WSL_DISTRIBUTION_LIST_URL, maxBodyBytes: MAX_LIST_BYTES }, signal);
+      const response = await this.deps.http.request({ method: 'GET', url: WSL_DISTRIBUTION_LIST_URL, maxBodyBytes: MAX_LIST_BYTES }, withTimeout(signal, REQUEST_MS));
       if (response.status !== 200) throw new Error(`HTTP status ${response.status}`);
       list = JSON.parse(response.body);
     } catch (error) {
@@ -588,12 +590,12 @@ export class WslSetup {
     }
   }
 
-  /** The size of the file at `url` from a HEAD request (HTTPS redirects followed), or undefined (logged). */
+  /** The size of the file at `url` from HEAD requests (HTTPS redirects followed, each within 30 seconds), or undefined (logged). */
   private async sizeOf(url: string, signal?: AbortSignal): Promise<number | undefined> {
     let current = url;
     try {
       for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
-        const response = await this.deps.http.request({ method: 'HEAD', url: current }, signal);
+        const response = await this.deps.http.request({ method: 'HEAD', url: current }, withTimeout(signal, REQUEST_MS));
         const location = response.headers.location;
         if (response.status >= 300 && response.status < 400 && location) {
           current = new URL(location, current).href;
@@ -725,38 +727,10 @@ async function filesOf(folder: string): Promise<string[]> {
   return fs.promises.readdir(folder).catch(() => []);
 }
 
-/**
- * True when the lock `file` is of a process that ended, or older than LOCK_MAX_AGE_MS; a file without a readable
- * content counts so only when it is older than LOCK_WRITE_MS (else its process is writing it). A lock that is gone
- * counts as stale.
- */
-async function isStaleLock(file: string): Promise<boolean> {
-  let text: string;
-  let modified: number;
-  try {
-    text = await fs.promises.readFile(file, 'utf8');
-    modified = (await fs.promises.stat(file)).mtimeMs;
-  } catch {
-    return true;
-  }
-  let lock: { pid?: unknown; started?: unknown } | undefined;
-  try {
-    lock = JSON.parse(text) as { pid?: unknown; started?: unknown };
-  } catch {
-    lock = undefined;
-  }
-  if (typeof lock?.pid !== 'number' || typeof lock.started !== 'number') return Date.now() - modified > LOCK_WRITE_MS;
-  return Date.now() - lock.started > LOCK_MAX_AGE_MS || !isRunning(lock.pid);
-}
-
-/** Whether the process `pid` runs (signal 0 only checks it, also on Windows). */
-function isRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
+/** `signal`, which also aborts after `ms` (a server that never answers). */
+function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  const timeout = AbortSignal.timeout(ms);
+  return signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
 }
 
 /** The output of a call for the log (wslText): standard error, else standard output. */

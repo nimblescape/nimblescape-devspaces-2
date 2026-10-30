@@ -660,20 +660,29 @@ describe('useHost and forgetHost (the WSL distribution of Devspaces after its se
 
   it('forgetHost removes the host from the list without a message; when it was current, the local Docker takes its place', async () => {
     await state.setDockerHost(WSL_HOST);
-    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe(true);
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('local');
     expect(await state.dockerHost()).toBeUndefined();
     expect(await state.remoteHosts()).toEqual([]);
     expect(onDidSwitch).toHaveBeenCalledTimes(1);
     expect(window.showInformationMessage).not.toHaveBeenCalled();
     // Not in the list (anymore): nothing changes.
-    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe(false);
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('notDockerHost');
     expect(onDidSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  it('forgetHost says why the local Docker that takes the place of the host is not supported', async () => {
+    await state.setDockerHost(WSL_HOST);
+    cli.contexts.set('tcp', 'tcp://192.0.2.10:2376');
+    cli.current = 'tcp';
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('unsupported');
+    expect(window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerEndpointUnsupported('tcp://192.0.2.10:2376'), 'Show details');
+    expect(window.showInformationMessage).not.toHaveBeenCalled();
   });
 
   it('forgetHost keeps the current host when it removes another one', async () => {
     await state.setDockerHost(WSL_HOST);
     await state.setDockerHost('build-box');
-    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe(false);
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('notDockerHost');
     expect(await state.dockerHost()).toBe('build-box');
     expect(await state.remoteHosts()).toEqual(['build-box']);
     expect(onDidSwitch).not.toHaveBeenCalled();
