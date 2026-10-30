@@ -204,17 +204,20 @@ export class WslSetupCommands {
       if (!confirmed) return;
       this.deps.logger.info(plan.image === undefined ? `The WSL distribution ${WSL_DISTRIBUTION} is set up again.` : `The WSL distribution ${WSL_DISTRIBUTION} is set up in ${folder}.`);
       // The lock of all windows only from here: an open question holds nothing. Under the lock, the distribution must
-      // still be as checked: another window may have set it up or removed it meanwhile.
-      const done = await setup.locked(() =>
-        this.withProgress(WslSetupTexts.settingUp, async (signal, report) => {
+      // still be as checked: another window may have set it up or removed it meanwhile. Devspaces chooses the host under
+      // the lock too, so that a removal in another window does not come between.
+      const done = await setup.locked(async () => {
+        const ready = await this.withProgress(WslSetupTexts.settingUp, async (signal, report) => {
           if ((await setup.registration(signal)) !== plan.registration) return false;
           await setup.setUp(plan.image, (step) => report(step), signal);
           return true;
-        }),
-      );
-      if (!this.finished(done)) return;
-      // useHost shows its own problem; this message says that the setup itself is done.
-      if (!(await this.deps.useHost(WSL_HOST))) this.inform(WslSetupTexts.readyNotUsed);
+        });
+        // useHost shows its own problem.
+        return ready && { used: await this.deps.useHost(WSL_HOST) };
+      });
+      const result = this.finished(done);
+      // This message says that the setup itself is done.
+      if (result !== undefined && !result.used) this.inform(WslSetupTexts.readyNotUsed);
     } catch (error) {
       this.showFailure(error, WslSetupTexts.failed, 'The setup of the WSL distribution of Devspaces was cancelled.');
     } finally {
@@ -256,26 +259,25 @@ export class WslSetupCommands {
         return;
       }
       if (!(await this.confirm(WslSetupTexts.confirmRemove, WslSetupTexts.confirmRemoveDetail(folder), WslSetupTexts.remove))) return;
-      // `wsl --unregister` is not cancelled: a half removed distribution would help nobody.
-      let folderGone = true;
+      // `wsl --unregister` is not cancelled: a half removed distribution would help nobody. The host leaves the list
+      // under the lock too, so that a setup in another window afterwards keeps its host.
       const done = await setup.locked(async () =>
         withNotificationProgress({ title: WslSetupTexts.removing }, async () => {
           if ((await this.removalCheck(setup)) !== 'own') return false;
-          folderGone = await setup.remove();
-          return true;
+          const folderGone = await setup.remove();
+          const forgotten = await this.deps.forgetHost(WSL_HOST).catch((error: unknown) => ({ error }));
+          return { folderGone, forgotten };
         }),
       );
-      if (!this.finished(done)) return;
-      let forgotten: 'notDockerHost' | 'local' | 'unsupported';
-      try {
-        forgotten = await this.deps.forgetHost(WSL_HOST);
-      } catch (error) {
+      const result = this.finished(done);
+      if (result === undefined) return;
+      if (typeof result.forgotten === 'object') {
         // The distribution is gone; only the list of Devspaces still names it.
-        this.deps.logger.error(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
+        this.deps.logger.error(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(result.forgotten.error)}`);
         this.showError(WslSetupTexts.removedStillListed);
         return;
       }
-      this.inform(WslSetupTexts.removed(forgotten === 'local', folderGone ? undefined : folder));
+      this.inform(WslSetupTexts.removed(result.forgotten === 'local', result.folderGone ? undefined : folder));
     } catch (error) {
       this.showFailure(error, WslSetupTexts.removeFailedUnknown, 'The removal of the WSL distribution of Devspaces was cancelled.');
     } finally {
@@ -295,13 +297,14 @@ export class WslSetupCommands {
   }
 
   /**
-   * True when the work under the lock of all windows ran (`done` true); else its message: another window holds the
+   * The result of the work under the lock of all windows; else undefined, after its message: another window holds the
    * lock (undefined), or it changed the distribution after the check (false).
    */
-  private finished(done: { value: boolean } | undefined): boolean {
+  private finished<T>(done: { value: T | false } | undefined): T | undefined {
     if (done === undefined) this.inform(WslSetupTexts.busyElsewhere);
-    else if (!done.value) this.inform(WslSetupTexts.changedElsewhere);
-    return done?.value === true;
+    else if (done.value === false) this.inform(WslSetupTexts.changedElsewhere);
+    else return done.value;
+    return undefined;
   }
 
   /**

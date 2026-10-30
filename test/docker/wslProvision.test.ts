@@ -10,7 +10,7 @@
 // none, so the tests remove it first, and the script brings its own for the time of the installation. Only one run at a
 // time: a second one fails at once.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { PROVISION_SCRIPT, WSL_CONF, WSL_POLICY_MARK, WSL_SETUP_LOG } from '../../src/core/docker/wslSetup';
+import { PROVISION_SCRIPT, WSL_CONF, WSL_POLICY, WSL_SETUP_LOG } from '../../src/core/docker/wslSetup';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { dockerTestContext } from './harness';
 
@@ -35,6 +35,18 @@ describe('the setup script of the WSL distribution', () => {
 
   function shell(container: string, script: string): string {
     return cli.ok(['exec', container, 'sh', '-c', script]);
+  }
+
+  /** The policy-rc.d that the script writes, as a run that `wsl --terminate` stopped leaves it. */
+  function writePolicy(container: string): void {
+    shell(container, `cat > /usr/sbin/policy-rc.d <<'POLICY'\n${WSL_POLICY}\nPOLICY\nchmod 755 /usr/sbin/policy-rc.d`);
+  }
+
+  /** Another run holds the lock of the script for two minutes. */
+  function holdLock(container: string): void {
+    cli.ok(['exec', '-d', container, 'flock', '/run/devspaces-setup.lock', 'sleep', '120']);
+    // Until it holds the lock.
+    shell(container, 'i=0; while flock -n /run/devspaces-setup.lock true; do i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1; done');
   }
 
   function provision(container: string): { code: number | null; out: string; err: string } {
@@ -72,17 +84,23 @@ describe('the setup script of the WSL distribution', () => {
 
   it('takes over the policy-rc.d of a run that was stopped, and removes it', () => {
     const container = startDebian('wsl-stopped', { network: 'none' });
-    shell(container, `printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d`);
+    writePolicy(container);
     expect(provision(container).code).toBe(1);
     expect(shell(container, 'test -e /usr/sbin/policy-rc.d && echo present || echo absent')).toBe('absent');
+  });
+
+  it('keeps services from starting only while a run holds its lock, also with the policy-rc.d of a run that was stopped', () => {
+    const container = startDebian('wsl-guard', { network: 'none' });
+    writePolicy(container);
+    expect(shell(container, '/usr/sbin/policy-rc.d docker start; echo $?')).toBe('0');
+    holdLock(container);
+    expect(shell(container, '/usr/sbin/policy-rc.d docker start; echo $?')).toBe('101');
   });
 
   it('fails at once while another run holds its lock, and keeps the log of that run', () => {
     const container = startDebian('wsl-locked', { network: 'none' });
     shell(container, `echo 'the other run' > ${WSL_SETUP_LOG}`);
-    cli.ok(['exec', '-d', container, 'flock', '/run/devspaces-setup.lock', 'sleep', '120']);
-    // Until the other run holds the lock.
-    shell(container, 'i=0; while flock -n /run/devspaces-setup.lock true; do i=$((i + 1)); [ "$i" -lt 100 ] || exit 1; sleep 0.1; done');
+    holdLock(container);
     const result = provision(container);
     expect(result.code).toBe(1);
     expect(result.out).toBe('');

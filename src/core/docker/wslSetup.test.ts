@@ -18,6 +18,7 @@ import {
   PROVISION_SCRIPT,
   WSL_CONF,
   WSL_DISTRIBUTION_LIST_URL,
+  WSL_POLICY,
   WSL_POLICY_MARK,
   WSL_TERMINATE_ARGS,
   WSL_UNREGISTER_ARGS,
@@ -308,6 +309,14 @@ describe('WslSetup.registration', () => {
     await expect(setup({ runner: wslRunner(list, { Ubuntu: disk }) }).registration()).resolves.toBe('foreign');
     // The disk of a later registration may be in another folder of Devspaces.
     await expect(setup({ runner: wslRunner(list, { devspaces: path.join(folder, 'disk-2') }) }).registration()).resolves.toBe('own');
+    // The registry may name the folder in another form: through a link (or a junction, or a short name on Windows).
+    const link = `${folder}-link`;
+    fs.symlinkSync(folder, link);
+    try {
+      await expect(setup({ runner: wslRunner(list, { devspaces: path.join(link, 'disk') }) }).registration()).resolves.toBe('own');
+    } finally {
+      fs.rmSync(link);
+    }
   });
 
   it('never guesses the owner when WSL lists the distribution but the registry cannot be read', async () => {
@@ -813,6 +822,8 @@ describe('the scripts in the distribution', () => {
     // systemd is on only after its installation.
     expect(PROVISION_SCRIPT.indexOf('systemd systemd-sysv')).toBeLessThan(PROVISION_SCRIPT.indexOf('cat > /etc/wsl.conf'));
     expect(PROVISION_SCRIPT).toContain(`grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d`);
-    expect(PROVISION_SCRIPT).toContain(`printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d`);
+    expect(PROVISION_SCRIPT).toContain(`cat > /usr/sbin/policy-rc.d <<'POLICY'\n${WSL_POLICY}\nPOLICY\n`);
+    // It keeps services from starting only while a run holds the lock.
+    expect(WSL_POLICY).toBe(`#!/bin/sh\n${WSL_POLICY_MARK}\nflock -n /run/devspaces-setup.lock true || exit 101`);
   });
 });

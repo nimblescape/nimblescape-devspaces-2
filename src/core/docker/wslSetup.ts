@@ -36,6 +36,13 @@ export const WSL_UNREGISTER_ARGS: readonly string[] = ['--unregister', WSL_DISTR
 export const WSL_SETUP_LOG = '/var/log/devspaces-setup.log';
 /** The line of the policy-rc.d of the script, so that a later run knows the file of a run that was stopped. */
 export const WSL_POLICY_MARK = '# Written by the setup of Devspaces.';
+/** The lock of the script in the distribution (flock): one run at a time. */
+const SETUP_LOCK = '/run/devspaces-setup.lock';
+/**
+ * The policy-rc.d of the script: no service starts while a run holds SETUP_LOCK. The file of a run that `wsl
+ * --terminate` stopped, whose trap did not remove it, keeps no service from starting after that.
+ */
+export const WSL_POLICY = ['#!/bin/sh', WSL_POLICY_MARK, `flock -n ${SETUP_LOCK} true || exit 101`].join('\n');
 /** The key of the registry with the WSL distributions of the Windows user: one subkey for each, with its name and folder. */
 export const LXSS_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss';
 
@@ -174,8 +181,23 @@ function unescapeRegistry(text: string): string {
 
 /** Whether the Windows path `folder` is `parent` or inside it: without case, without `\\?\` and closing separators. */
 function isWithin(folder: string, parent: string): boolean {
-  const plain = (name: string): string => path.win32.normalize(name.replace(/^\\\\\?\\/, '')).replace(/[\\/]+$/, '').toLowerCase();
+  const plain = (name: string): string => path.win32.normalize(withoutLongPrefix(name)).replace(/[\\/]+$/, '').toLowerCase();
   return plain(folder) === plain(parent) || plain(folder).startsWith(`${plain(parent)}\\`);
+}
+
+function withoutLongPrefix(name: string): string {
+  return name.replace(/^\\\\\?\\/, '');
+}
+
+/**
+ * isWithin, also after links, junctions and short names are resolved (realpath), when both folders exist: the
+ * registry may name the folder of a virtual disk in another form than LOCALAPPDATA.
+ */
+async function isWithinResolved(folder: string, parent: string): Promise<boolean> {
+  if (isWithin(folder, parent)) return true;
+  const resolve = (name: string): Promise<string | undefined> => fs.promises.realpath(withoutLongPrefix(name)).catch(() => undefined);
+  const [realFolder, realParent] = await Promise.all([resolve(folder), resolve(parent)]);
+  return realFolder !== undefined && realParent !== undefined && isWithin(realFolder, realParent);
 }
 
 /** The steps of the script in the distribution (PROVISION_SCRIPT), in this order. */
@@ -217,7 +239,7 @@ export const WSL_CONF = [
 export const PROVISION_SCRIPT = `set -eu
 main() {
 log=${WSL_SETUP_LOG}
-exec 9> /run/devspaces-setup.lock
+exec 9> ${SETUP_LOCK}
 if ! flock -n 9; then
 echo "Another setup of Docker runs in the distribution. Try again after it." >&2
 exit 1
@@ -228,7 +250,9 @@ fail() { echo "The setup failed. The last lines of $log:" >&2; tail -n 40 "$log"
 run() { "$@" >> "$log" 2>&1 || fail; }
 export DEBIAN_FRONTEND=noninteractive
 if [ ! -e /usr/sbin/policy-rc.d ] || grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d; then
-printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d
+cat > /usr/sbin/policy-rc.d <<'POLICY'
+${WSL_POLICY}
+POLICY
 chmod 755 /usr/sbin/policy-rc.d
 trap 'rm -f /usr/sbin/policy-rc.d' EXIT
 trap 'exit 1' HUP INT TERM
@@ -413,7 +437,7 @@ export class WslSetup {
     }
     if (!folders.has(WSL_DISTRIBUTION)) return listed ? 'foreign' : 'none';
     const diskFolder = folders.get(WSL_DISTRIBUTION);
-    return diskFolder !== undefined && isWithin(diskFolder, this.deps.folder) ? 'own' : 'foreign';
+    return diskFolder !== undefined && (await isWithinResolved(diskFolder, this.deps.folder)) ? 'own' : 'foreign';
   }
 
   /**
@@ -666,9 +690,11 @@ export class WslSetup {
     const why =
       removalError !== undefined
         ? `they could not be removed (${errorMessage(removalError)})`
-        : users === undefined
-          ? 'neither the registry nor WSL tells whether a WSL distribution uses it'
-          : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
+        : names === undefined
+          ? 'what is in it is not known'
+          : users === undefined
+            ? 'neither the registry nor WSL tells whether a WSL distribution uses it'
+            : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
     for (let number = 2; number <= MAX_DISK_FOLDERS; number++) {
       const next = path.join(this.deps.folder, `disk-${number}`);
       if ((await filesOf(next))?.length !== 0) continue;
@@ -688,7 +714,10 @@ export class WslSetup {
     const folders = await this.distributionFolders(signal);
     if (folders !== undefined) {
       const entries = [...folders.entries()];
-      const users = entries.filter(([, diskFolder]) => diskFolder !== undefined && isWithin(diskFolder, parent)).map(([name]) => name);
+      const users: string[] = [];
+      for (const [name, diskFolder] of entries) {
+        if (diskFolder !== undefined && (await isWithinResolved(diskFolder, parent))) users.push(name);
+      }
       return users.length > 0 || entries.every(([, diskFolder]) => diskFolder !== undefined) ? users : undefined;
     }
     try {
