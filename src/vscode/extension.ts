@@ -21,6 +21,7 @@ import {
   hostAccessOf,
   parseWslList,
   sshCommandArgs,
+  transportProgramOf,
   wslCommandArgs,
   wslEnv,
   type DockerTarget,
@@ -576,8 +577,7 @@ async function activateExtension(
             const start = () => {
               const started = startLogin(target.host);
               if (started === undefined) {
-                const reason = access.kind === 'wsl' ? 'wsl.exe was not found' : 'ssh was not found';
-                throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ${reason}.`);
+                throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ${transportProgramOf(target.host)} was not found.`);
               }
               return started;
             };
