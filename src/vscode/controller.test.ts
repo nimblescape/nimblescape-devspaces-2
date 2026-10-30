@@ -293,6 +293,8 @@ function createHarness(
     readyPollMs?: number;
     /** "Remove Devspaces from This Docker Engine…". Default: none (the command does nothing). */
     engineRemoval?: ControllerDeps['engineRemoval'];
+    /** The end of "Remove Devspaces from This Docker Engine…". Default: none. */
+    engineRemovalEnded?: ControllerDeps['engineRemovalEnded'];
     /** "Update All Images Now". Default: none (the command does nothing). */
     updateImagesNow?: ControllerDeps['updateImagesNow'];
     /** The step "Docker start" that "Update All Images Now" runs in its progress. Default: none. */
@@ -491,6 +493,7 @@ function createHarness(
     monitorQuestion,
     engineRecords,
     engineRemoval: options.engineRemoval,
+    engineRemovalEnded: options.engineRemovalEnded,
     updateImagesNow: options.updateImagesNow,
     startDocker: options.startDocker,
     listOpenMode: () => listOpenMode.value,
@@ -3096,6 +3099,20 @@ describe('Remove Devspaces from This Docker Engine…', () => {
     );
     expect(h.progressTitles.some((title) => title.startsWith('Removing Devspaces from build-box…'))).toBe(true);
     expect(h.progressTitles.some((title) => title.includes('Removing the container devspaces-monitor.'))).toBe(true);
+  });
+
+  // Mutation: a removal that does not tell its end fails it: the start entry of the WSL distribution of Devspaces would
+  // stay until the next window starts, also after the mark was set.
+  it('tells its end with the mark written, also after a Cancel', async () => {
+    const fake = removalFake({ engine: { inUse: ['devspaces-vscode'] } });
+    const ended: Array<Promise<string>> = [];
+    onBuildBox(fake, BUILD_BOX, { engineRemovalEnded: (host) => void ended.push(h.engineRecords.removed(host).then((marked) => `${host} ${marked}`)) });
+    await h.registry.add(ownRemote());
+    fakeVscode.window.showWarningMessage.mockResolvedValueOnce(ControllerTexts.remove).mockResolvedValueOnce(ControllerTexts.keepDevspaces);
+    await run('removeFromDockerEngine');
+    expect(await Promise.all(ended)).toEqual(['build-box true']);
+    await run('removeFromDockerEngine');
+    expect(ended).toHaveLength(2);
   });
 
   it('with several accounts, deletes the devspaces of all accounts of Devspaces and names the accounts', async () => {

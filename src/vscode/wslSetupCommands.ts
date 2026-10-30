@@ -160,6 +160,12 @@ export interface WslSetupCommandsDeps {
    * whether the local Docker that takes its place is supported.
    */
   forgetHost: (host: string) => Promise<'notDockerHost' | 'local' | 'unsupported'>;
+  /**
+   * The distribution is gone, or a new one takes its place: the answer about its Monitor goes (a new distribution is a
+   * new engine, which is asked again, also after a removal with `wsl --unregister` by hand), and its start entry
+   * (WslKeeper.removeStartEntry). Never rejects.
+   */
+  forgetDistribution?: () => Promise<void>;
 }
 
 export class WslSetupCommands {
@@ -209,6 +215,7 @@ export class WslSetupCommands {
       const done = await setup.locked(async () => {
         const ready = await this.withProgress(WslSetupTexts.settingUp, async (signal, report) => {
           if ((await setup.registration(signal)) !== plan.registration) return false;
+          if (plan.registration === 'none') await this.deps.forgetDistribution?.();
           await setup.setUp(plan.image, (step) => report(step), signal);
           return true;
         });
@@ -253,6 +260,7 @@ export class WslSetupCommands {
             this.deps.logger.warn(`${WSL_HOST} could not be removed from the list of Devspaces: ${errorMessage(error)}`);
           });
           await setup.removeLeftovers();
+          await this.deps.forgetDistribution?.();
           return true;
         });
         if (this.finished(cleaned)) this.inform(WslSetupTexts.notInstalled);
@@ -265,6 +273,7 @@ export class WslSetupCommands {
         withNotificationProgress({ title: WslSetupTexts.removing }, async () => {
           if ((await this.removalCheck(setup)) !== 'own') return false;
           const folderGone = await setup.remove();
+          await this.deps.forgetDistribution?.();
           const forgotten = await this.deps.forgetHost(WSL_HOST).catch((error: unknown) => ({ error }));
           return { folderGone, forgotten };
         }),

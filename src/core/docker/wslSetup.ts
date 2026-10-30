@@ -143,6 +143,22 @@ export function supportsFromFile(version: readonly [number, number, number]): bo
   return true;
 }
 
+/**
+ * Whether the result of `wsl.exe --list --quiet` (WSL_LIST_ARGS) names the distribution `distribution` (without case):
+ * false also when WSL has no distribution (NO_DISTRIBUTIONS); undefined when the list ends with another exit code
+ * that is not 0.
+ */
+export function listsDistribution(result: RunResult, distribution: string): boolean | undefined {
+  if (result.exitCode !== 0) return NO_DISTRIBUTIONS.test(wslText(`${result.stdout}\n${result.stderr}`)) ? false : undefined;
+  return parseWslList(result.stdout).some((name) => name.toLowerCase() === distribution.toLowerCase());
+}
+
+/** `reg.exe` in System32 of SystemRoot, not from PATH. */
+export function regExePath(env: NodeJS.ProcessEnv): string {
+  const systemRoot = envValue(env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
+  return path.win32.join(systemRoot, 'System32', 'reg.exe');
+}
+
 /** The arguments of `reg.exe` that write the key LXSS_KEY to `file` (a `.reg` file in UTF-16). */
 export function regExportArgs(file: string): string[] {
   return ['export', LXSS_KEY, file, '/y'];
@@ -387,10 +403,8 @@ export class WslSetup {
     return path.join(this.deps.folder, 'download');
   }
 
-  /** `reg.exe` in System32 of SystemRoot, not from PATH. */
   private get regPath(): string {
-    const systemRoot = envValue(this.deps.env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
-    return path.win32.join(systemRoot, 'System32', 'reg.exe');
+    return regExePath(this.deps.env);
   }
 
   /**
@@ -749,9 +763,7 @@ export class WslSetup {
    * Throws WslSetupError (runShort).
    */
   private async listed(signal?: AbortSignal): Promise<boolean | undefined> {
-    const result = await this.runShort(WSL_LIST_ARGS, signal);
-    if (result.exitCode !== 0) return NO_DISTRIBUTIONS.test(wslText(`${result.stdout}\n${result.stderr}`)) ? false : undefined;
-    return parseWslList(result.stdout).some((name) => name.toLowerCase() === WSL_DISTRIBUTION);
+    return listsDistribution(await this.runShort(WSL_LIST_ARGS, signal), WSL_DISTRIBUTION);
   }
 
   /**
@@ -827,13 +839,13 @@ function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
 }
 
 /** The output of a call for the log (wslText): standard error, else standard output. */
-function outputOf(result: RunResult): string {
+export function outputOf(result: RunResult): string {
   const text = wslText(result.stderr || result.stdout).trim();
   return text === '' ? '(no output)' : text;
 }
 
 /** How a call ended, for the log. */
-function endOf(result: RunResult, timeoutMs: number): string {
+export function endOf(result: RunResult, timeoutMs: number): string {
   return result.timedOut ? `no end within ${duration(timeoutMs)}` : `exit code ${result.exitCode}`;
 }
 

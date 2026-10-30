@@ -72,7 +72,7 @@ describe('the question about the Monitor of an engine', () => {
     expect(modals()).toEqual([
       [
         'Keep the Devspaces background container running on build-box?',
-        { modal: true, detail: ControllerTexts.monitorQuestionDetail },
+        { modal: true, detail: ControllerTexts.monitorQuestionDetail(false) },
         'Keep Running',
         'Stop When Idle',
       ],
@@ -88,8 +88,32 @@ describe('the question about the Monitor of an engine', () => {
     expect(modals()[1][0]).toBe('Keep the Devspaces background container running on the local Docker?');
   });
 
+  // Mutation: a detail without the start entry for the WSL distribution, or with it for another engine, fails it.
+  // Mutation: a hook before the record of the engine (the start entry would follow the old mode), or after an answer
+  // that was not stored, fails it.
+  it('on the WSL distribution of Devspaces, the detail names the start entry at the logon to Windows', async () => {
+    fakeVscode.window.showInformationMessage.mockResolvedValueOnce(ControllerTexts.keepMonitorRunning);
+    const answered = vi.fn((host: string) => writes.push(`answered ${host}`));
+    await question({ answered }).askIfNeeded('wsl:devspaces');
+    expect(writes).toEqual(['stopMonitorWhenIdle=false', 'record wsl:devspaces', 'answered wsl:devspaces']);
+    // Nothing stored: no call.
+    await question({ answered }).askIfNeeded('');
+    update.mockRejectedValueOnce(new Error('Unable to write into user settings.'));
+    fakeVscode.window.showInformationMessage.mockResolvedValueOnce(ControllerTexts.keepMonitorRunning);
+    await question({ answered }).askIfNeeded('build-box');
+    expect(answered).toHaveBeenCalledTimes(1);
+    const [, options] = modals()[0] as [string, { detail: string }];
+    expect(options.detail).toBe(ControllerTexts.monitorQuestionDetail(true));
+    expect(options.detail).toContain('Devspaces adds a start entry of your Windows user, so that WSL starts the distribution when you log on to Windows.');
+    expect(ControllerTexts.monitorQuestionDetail(false)).not.toContain('start entry');
+    // Another WSL distribution gets no start entry.
+    fakeVscode.window.showInformationMessage.mockResolvedValueOnce(undefined);
+    await question().askIfNeeded('wsl:Ubuntu');
+    expect((modals()[3] as [string, { detail: string }])[1].detail).toBe(ControllerTexts.monitorQuestionDetail(false));
+  });
+
   it('the detail says that only Stop When Idle applies to all engines, and names the build of the next image', () => {
-    const detail = ControllerTexts.monitorQuestionDetail;
+    const detail = ControllerTexts.monitorQuestionDetail(false);
     // Keep Running records this engine only: the next engine asks again (see the test above).
     expect(detail).toContain('Keep Running applies to this Docker engine only. If you choose Stop When Idle, this applies to all Docker engines');
     // A running Monitor keeps its mode until the next ensure on its engine: a start of a devspace, or Update All Images Now.

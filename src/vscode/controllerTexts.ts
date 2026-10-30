@@ -37,10 +37,12 @@ export const ControllerTexts = {
    * that would keep running (`engine`: describeDockerHost). "Keep Running" is the first and default button.
    */
   monitorQuestion: (engine: string) => `Keep the Devspaces background container running on ${engine}?`,
-  monitorQuestionDetail:
+  /** `wsl`: the engine is the WSL distribution of Devspaces, which Windows starts at the logon for a Monitor that keeps running (WslKeeper). */
+  monitorQuestionDetail: (wsl: boolean): string =>
     'The container devspaces-monitor updates the images of your devspaces, the VS Code Server and your extensions, by default once a day. ' +
     'When the base image or the Features of a devspace changed, it also builds the next image of that devspace, so that the update at the next start is fast. ' +
     'If you keep it running, it also runs while VS Code is closed, and Docker starts it again after a restart. ' +
+    (wsl ? 'For this, Devspaces adds a start entry of your Windows user, so that WSL starts the distribution when you log on to Windows. ' : '') +
     'It ends itself after 30 days in which no devspace was used on this Docker engine. ' +
     'If it stops when idle, it ends 5 minutes after the last devspace stops, and this work runs only while a devspace runs. ' +
     'Keep Running applies to this Docker engine only. If you choose Stop When Idle, this applies to all Docker engines, each from the next start of a devspace or "Update All Images Now" there. ' +

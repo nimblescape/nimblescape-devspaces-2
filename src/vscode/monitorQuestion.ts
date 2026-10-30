@@ -13,7 +13,7 @@
 // then the engine is recorded as answered (DockerEngineRecords). A closed question stores nothing: the flow goes on
 // with a Monitor that stops when idle, and the next flow of the user asks again.
 import * as vscode from 'vscode';
-import { describeDockerHost } from '../core/docker/dockerHost';
+import { WSL_HOST, describeDockerHost } from '../core/docker/dockerHost';
 import { errorMessage } from '../core/errors';
 import { Actions } from '../core/messages';
 import { systemClock, type Clock, type Logger } from '../core/ports';
@@ -40,6 +40,8 @@ export interface MonitorQuestionDeps {
   logger: Logger;
   /** Opens the log (action Show details of the warning that the answer could not be saved). */
   showLog: () => void;
+  /** The answer for the engine `host` is stored (the setting and the record of the engine). Never throws. */
+  answered?: (host: string) => void;
   clock?: Clock;
 }
 
@@ -72,7 +74,7 @@ export class MonitorQuestion {
       if (this.deps.settings().stopMonitorWhenIdle === true || (await records.monitorAnswered(host))) return 'notNeeded';
       choice = await showInformationMessage(
         ControllerTexts.monitorQuestion(engine),
-        { modal: true, detail: ControllerTexts.monitorQuestionDetail },
+        { modal: true, detail: ControllerTexts.monitorQuestionDetail(host === WSL_HOST) },
         ControllerTexts.keepMonitorRunning,
         ControllerTexts.stopMonitorWhenIdle,
       );
@@ -109,6 +111,7 @@ export class MonitorQuestion {
       );
       return 'closed';
     }
+    this.deps.answered?.(host);
     logger.info(
       stop
         ? `The Monitor on ${engine} stops when no devspace runs (the answer to the question; the setting stopMonitorWhenIdle is on, for every engine).`

@@ -52,20 +52,30 @@ export async function monitorSettingsFor(deps: MonitorSettingsDeps, host: string
  * possible. Never rejects.
  */
 export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: string): Promise<boolean> {
-  const answered = await answeredOf(deps, host);
-  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
+  // A failed read: the ensure makes the Monitor one that stops when idle, also in place of a permanent one of this
+  // computer.
+  const answered = await answeredOf(deps, host, 'the Monitor there stops when no devspace runs');
+  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered ?? false);
 }
 
 /**
- * Whether the engine `host` has an answer; false when it cannot be read (logged: the ensure then makes its Monitor one
- * that stops when idle, also in place of a permanent one of this computer).
+ * As monitorPermanentFor, but undefined when the answer cannot be read (logged): for the start entry of the WSL
+ * distribution of Devspaces, which a failed read must not remove. With stopMonitorWhenIdle on, false without a read of
+ * the answer. Never rejects.
  */
-async function answeredOf(deps: MonitorSettingsDeps, host: string): Promise<boolean> {
+export async function monitorPermanentIfKnown(deps: MonitorSettingsDeps, host: string): Promise<boolean | undefined> {
+  if (deps.settings().stopMonitorWhenIdle === true) return false;
+  const answered = await answeredOf(deps, host, 'its start entry stays as it is');
+  return answered === undefined ? undefined : monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, answered);
+}
+
+/** Whether the engine `host` has an answer; undefined when it cannot be read (logged with `outcome`). */
+async function answeredOf(deps: MonitorSettingsDeps, host: string, outcome: string): Promise<boolean | undefined> {
   try {
     return await deps.answered(host);
   } catch (error) {
-    deps.logger?.warn(`The answer about the Monitor on ${describeDockerHost(host)} could not be read, so the Monitor there stops when no devspace runs: ${errorMessage(error)}`);
-    return false;
+    deps.logger?.warn(`The answer about the Monitor on ${describeDockerHost(host)} could not be read, so ${outcome}: ${errorMessage(error)}`);
+    return undefined;
   }
 }
 
@@ -91,11 +101,14 @@ export function monitorSettingsOf(deps: MonitorSettingsDeps): {
    * ensure of the Monitor log it.
    */
   permanent(host: string): Promise<boolean>;
+  /** monitorPermanentIfKnown: undefined when the answer cannot be read (logged). */
+  permanentIfKnown(host: string): Promise<boolean | undefined>;
 } {
   const quiet: MonitorSettingsDeps = { ...deps, logger: undefined };
   return {
     forOpen: (dockerHost) => monitorSettingsFor(deps, dockerHost),
     forTarget: (target) => monitorSettingsFor(deps, target.host),
     permanent: (host) => monitorPermanentFor(quiet, host),
+    permanentIfKnown: (host) => monitorPermanentIfKnown(deps, host),
   };
 }
