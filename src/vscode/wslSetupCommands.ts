@@ -13,6 +13,7 @@ import { WSL_INSTALL_COMMAND } from '../core/docker/dockerSetup';
 import {
   WSL_DISTRIBUTION_LIST_URL,
   WSL_FROM_FILE_VERSION,
+  duration,
   isWslSetupError,
   type ProvisionPhase,
   type WslImage,
@@ -22,6 +23,7 @@ import {
   type WslSetupProblem,
   type WslSetupStep,
 } from '../core/docker/wslSetup';
+import { UPGRADE_MS } from '../core/docker/wslUpgrade';
 import { errorMessage } from '../core/errors';
 import { Actions } from '../core/messages';
 import { isAbortError, type Logger } from '../core/ports';
@@ -65,7 +67,9 @@ export const WslSetupTexts = {
   notWindows: 'The WSL distribution of Devspaces exists only on Windows.',
   noLocalAppData: 'Devspaces does not find the folder LOCALAPPDATA of your Windows user, where the WSL distribution of Devspaces has its files.',
   busy: 'The WSL distribution of Devspaces is being set up or removed in this window. Try again after that.',
-  busyElsewhere: 'The WSL distribution of Devspaces is being set up or removed in another VS Code window. Try again after that.',
+  busyElsewhere:
+    'The WSL distribution of Devspaces is being set up or removed in another VS Code window, or a VS Code window runs the weekly upgrade of its packages ' +
+    `(up to ${duration(UPGRADE_MS)}). Try again after that.`,
   changedElsewhere: 'The WSL distribution of Devspaces was set up or removed in another VS Code window after the check, so nothing was changed. Try again.',
   confirmSetUp: 'Set up Docker for Devspaces?',
   confirmSetUpDetail: (image: WslImage, folder: string) =>

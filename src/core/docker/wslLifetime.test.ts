@@ -251,6 +251,20 @@ describe('WslLifetime.use', () => {
     expect(keep).toHaveBeenCalledTimes(2);
   });
 
+  // Mutation: an upgrade that is told only at the start of the session fails it (a window open for weeks would never
+  // upgrade again); so does one for a host that is no WSL distribution.
+  it('lets the weekly upgrade check at each use of a WSL distribution', () => {
+    const schedule = vi.fn();
+    const { subject } = lifetime({ upgrade: { schedule } });
+    subject.use(WSL_HOST);
+    subject.use(WSL_HOST);
+    expect(schedule.mock.calls).toEqual([['devspaces'], ['devspaces']]);
+    subject.use('build-server');
+    subject.dispose();
+    subject.use(WSL_HOST);
+    expect(schedule).toHaveBeenCalledTimes(2);
+  });
+
   it('leavesStopped asks WSL nothing while this window holds the idle session (the distribution runs)', async () => {
     const { subject, runs } = lifetime({ list: () => ok('') });
     subject.use(WSL_HOST);

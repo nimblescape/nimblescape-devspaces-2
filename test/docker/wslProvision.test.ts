@@ -104,7 +104,7 @@ describe('the setup script of the WSL distribution', () => {
     const result = provision(container);
     expect(result.code).toBe(1);
     expect(result.out).toBe('');
-    expect(result.err).toBe('Another setup of Docker runs in the distribution. Try again after it.');
+    expect(result.err).toBe('Another setup of Docker, or the weekly upgrade of the packages, runs in the distribution. Try again after it.');
     expect(shell(container, `cat ${WSL_SETUP_LOG}`)).toBe('the other run');
   });
 

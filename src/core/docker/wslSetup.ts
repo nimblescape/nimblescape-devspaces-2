@@ -36,13 +36,25 @@ export const WSL_UNREGISTER_ARGS: readonly string[] = ['--unregister', WSL_DISTR
 export const WSL_SETUP_LOG = '/var/log/devspaces-setup.log';
 /** The line of the policy-rc.d of the script, so that a later run knows the file of a run that was stopped. */
 export const WSL_POLICY_MARK = '# Written by the setup of Devspaces.';
-/** The lock of the script in the distribution (flock): one run at a time. */
-const SETUP_LOCK = '/run/devspaces-setup.lock';
+/** The lock of the script in the distribution (flock): one run at a time, also of the upgrade (wslUpgrade.ts). */
+export const WSL_SETUP_LOCK = '/run/devspaces-setup.lock';
 /**
- * The policy-rc.d of the script: no service starts while a run holds SETUP_LOCK. The file of a run that `wsl
+ * The policy-rc.d of the script: no service starts while a run holds WSL_SETUP_LOCK. The file of a run that `wsl
  * --terminate` stopped, whose trap did not remove it, keeps no service from starting after that.
  */
-export const WSL_POLICY = ['#!/bin/sh', WSL_POLICY_MARK, `flock -n ${SETUP_LOCK} true || exit 101`].join('\n');
+export const WSL_POLICY = ['#!/bin/sh', WSL_POLICY_MARK, `flock -n ${WSL_SETUP_LOCK} true || exit 101`].join('\n');
+/**
+ * The lines of a script that write WSL_POLICY to /usr/sbin/policy-rc.d for the run (not over a policy-rc.d of another
+ * origin), and remove it at its end.
+ */
+export const WSL_POLICY_INSTALL = `if [ ! -e /usr/sbin/policy-rc.d ] || grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d; then
+cat > /usr/sbin/policy-rc.d <<'POLICY'
+${WSL_POLICY}
+POLICY
+chmod 755 /usr/sbin/policy-rc.d
+trap 'rm -f /usr/sbin/policy-rc.d' EXIT
+trap 'exit 1' HUP INT TERM
+fi`;
 /** The key of the registry with the WSL distributions of the Windows user: one subkey for each, with its name and folder. */
 export const LXSS_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss';
 
@@ -378,9 +390,9 @@ export const WSL_CONF = [
 export const PROVISION_SCRIPT = `set -eu
 main() {
 log=${WSL_SETUP_LOG}
-exec 9> ${SETUP_LOCK}
+exec 9> ${WSL_SETUP_LOCK}
 if ! flock -n 9; then
-echo "Another setup of Docker runs in the distribution. Try again after it." >&2
+echo "Another setup of Docker, or the weekly upgrade of the packages, runs in the distribution. Try again after it." >&2
 exit 1
 fi
 : > "$log"
@@ -388,14 +400,7 @@ step() { echo "${STEP_PREFIX}$1"; echo "== $1" >> "$log"; }
 fail() { echo "The setup failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
 run() { "$@" >> "$log" 2>&1 || fail; }
 export DEBIAN_FRONTEND=noninteractive
-if [ ! -e /usr/sbin/policy-rc.d ] || grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d; then
-cat > /usr/sbin/policy-rc.d <<'POLICY'
-${WSL_POLICY}
-POLICY
-chmod 755 /usr/sbin/policy-rc.d
-trap 'rm -f /usr/sbin/policy-rc.d' EXIT
-trap 'exit 1' HUP INT TERM
-fi
+${WSL_POLICY_INSTALL}
 step packages
 run dpkg --configure -a
 run apt-get update
@@ -1052,6 +1057,7 @@ export function endOf(result: RunResult, timeoutMs: number): string {
   return result.timedOut ? `no end within ${duration(timeoutMs)}` : `exit code ${result.exitCode}`;
 }
 
-function duration(ms: number): string {
+/** A time limit in words: `30 minutes`, `90 seconds`. */
+export function duration(ms: number): string {
   return ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1000)} seconds`;
 }

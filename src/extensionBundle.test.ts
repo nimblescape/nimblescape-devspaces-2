@@ -58,6 +58,8 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
     'wslKeeper.ts',
     // The setup and the removal of the WSL distribution of Devspaces on Windows.
     'wslSetup.ts',
+    // The weekly upgrade of the packages of the WSL distribution of Devspaces.
+    'wslUpgrade.ts',
   ],
   // missingHelperBuild.ts: the background build of a helper image that the refresh found missing.
   'src/core/helper': ['analysisLimits.ts', 'batchStepKinds.ts', 'helperImage.ts', 'helperImages.ts', 'helperPrebuild.ts', 'helperState.ts', 'missingHelperBuild.ts'],
