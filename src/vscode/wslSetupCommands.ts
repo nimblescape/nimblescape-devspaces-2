@@ -243,11 +243,12 @@ export class WslSetupCommands {
           return await setup.setUp(plan.image, (step) => report(step), signal);
         });
         if (ready === undefined) return false;
-        await this.warnDockerDesktop(ready.separation);
         // useHost shows its own problem.
-        return { used: await this.deps.useHost(WSL_HOST) };
+        return { used: await this.deps.useHost(WSL_HOST), separation: ready.separation };
       });
       const result = this.finished(done);
+      // Not under the lock: only a message.
+      if (result !== undefined) await this.warnDockerDesktop(result.separation);
       // This message says that the setup itself is done.
       if (result !== undefined && !result.used) this.inform(WslSetupTexts.readyNotUsed);
     } catch (error) {

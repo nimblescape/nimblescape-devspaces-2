@@ -499,17 +499,18 @@ describe('WslSetup.separate', () => {
     expect(base.calls.map((call) => call.args[0])).toEqual(['export', 'export', 'export', 'export']);
   });
 
-  // Mutation: a stop after the failures of `wsl --set-default` fails it; so does a wait for each distribution while WSL
-  // does not answer.
-  it('removes the default of WSL when no other distribution takes it, or when WSL does not answer', async () => {
+  // Mutation: a stop after the refusals of `wsl --set-default` fails it; so does a wait for each distribution, or a
+  // removal of the default, while WSL does not answer.
+  it('removes the default of WSL when WSL refuses each other distribution, and not while WSL does not answer', async () => {
     const base = registryRunner(() => failed('Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND'));
     const log = logger();
     await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: ours() }, 1), log }).separate()).resolves.toMatchObject({ state: 'separate' });
     expect(base.calls.map((call) => call.args[0])).toEqual(['export', '--set-default', 'delete']);
     expect(log.warn).not.toHaveBeenCalled();
+    // WSL may only be slow: the user keeps a default, and the next check tries again.
     const silent = registryRunner(() => timedOut);
-    await expect(setup({ runner: withRegistry(silent, { Ubuntu: 'C:\\u', Debian: 'C:\\d', devspaces: ours() }, 2) }).separate()).resolves.toMatchObject({ state: 'separate' });
-    expect(silent.calls.map((call) => call.args[0])).toEqual(['export', '--set-default', 'delete']);
+    await expect(setup({ runner: withRegistry(silent, { Ubuntu: 'C:\\u', Debian: 'C:\\d', devspaces: ours() }, 2) }).separate()).resolves.toMatchObject({ state: 'default' });
+    expect(silent.calls.map((call) => call.args[0])).toEqual(['export', '--set-default']);
   });
 
   it('runs nothing without the folder of Devspaces, and logs a failure without a throw', async () => {

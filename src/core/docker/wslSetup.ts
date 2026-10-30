@@ -892,12 +892,12 @@ export class WslSetup {
    * (as root there) and which Docker Desktop integrates by default. WSL makes a new distribution the default when it
    * has none, and the first one that is left after the removal of the default (LxssUserSession.cpp of WSL). Then the
    * first other installed distribution of the registry that takes it becomes the default (`wsl.exe --set-default`, as
-   * WSL would choose without the one of Devspaces; never the machine of a tool, isToolDistribution; no further try
-   * after a call that WSL does not answer), or, when none does, WSL has no default (the value DefaultDistribution goes;
-   * `wsl --list` still lists the distributions, and WSL makes the next new distribution the default). Only for a
-   * distribution that Devspaces set up (the folder of its virtual disk is in the folder of Devspaces); without the
-   * folder of Devspaces, nothing runs. Not cancelled: a cancel would leave the distribution the default. A failure is
-   * logged; never throws.
+   * WSL would choose without the one of Devspaces; never the machine of a tool, isToolDistribution), or, when WSL
+   * refuses all, WSL has no default (the value DefaultDistribution goes; `wsl --list` still lists the distributions,
+   * and WSL makes the next new distribution the default). After a call that WSL does not answer, nothing more is tried
+   * until the next check. Only for a distribution that Devspaces set up (the folder of its virtual disk is in the
+   * folder of Devspaces); without the folder of Devspaces, nothing runs. Not cancelled: a cancel would leave the
+   * distribution the default. A failure is logged; never throws.
    */
   async separate(): Promise<WslSeparation> {
     if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return { state: 'none', dockerDesktop: undefined };
@@ -912,6 +912,10 @@ export class WslSetup {
       (distribution) => distribution !== ours && distribution.installed !== false && !isToolDistribution(distribution.name),
     );
     const failures: string[] = [];
+    const stays = (): WslSeparation => {
+      this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces stays the default distribution of WSL: ${failures.join('; ')}`);
+      return result('default');
+    };
     /** True when `run` ended well; false after a failure; undefined when WSL did not answer or start (WslSetupError). */
     const attempt = async (what: string, run: () => Promise<RunResult>, done: string): Promise<boolean | undefined> => {
       try {
@@ -931,17 +935,16 @@ export class WslSetup {
       const args = wslSetDefaultArgs(other.name);
       const done = await attempt(`wsl.exe ${args.join(' ')}`, () => this.runShort(args), `now ${other.name} is`);
       if (done) return result('separate');
-      // The next one would wait for WSL again.
-      if (done === undefined) break;
+      // WSL may only be slow (just after the logon, or busy with a setup in another window): the next window start
+      // tries again, and the user keeps a default.
+      if (done === undefined) return stays();
     }
     const removed = await attempt(
       'reg.exe delete',
       () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS }),
       'now WSL has no default, so "wsl" without "-d" does not open it',
     );
-    if (removed) return result('separate');
-    this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces stays the default distribution of WSL: ${failures.join('; ')}`);
-    return result('default');
+    return removed ? result('separate') : stays();
   }
 
   /**
