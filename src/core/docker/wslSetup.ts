@@ -473,7 +473,7 @@ export class WslSetup {
     if (image !== undefined) {
       await this.register(image, onStep, signal);
     } else {
-      // The download of a registration that ended by its time limit, which WSL ended later (the distribution exists).
+      // A download that could not be removed after the registration (WSL still had it open).
       await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
     }
     let pending = '';
@@ -561,8 +561,6 @@ export class WslSetup {
     const diskFolder = await this.diskFolderFor(signal);
     await fs.promises.mkdir(this.downloadFolder, { recursive: true });
     await fs.promises.mkdir(diskFolder, { recursive: true });
-    // After the time limit of the registration, WSL may still read the file.
-    let mayBeRead = false;
     try {
       onStep({ kind: 'download', received: 0, total: image.size });
       await this.downloadImage(image, file, onStep, signal);
@@ -570,22 +568,18 @@ export class WslSetup {
       const args = wslInstallArgs(file, diskFolder);
       this.deps.logger.info(`wsl.exe ${args.join(' ')}`);
       // Without the signal (setUp). After the time limit, WSL may still end the registration: the next setup then finds
-      // the distribution of Devspaces and only runs the script.
+      // the distribution of Devspaces and only runs the script. Windows removes no file that WSL still has open (the
+      // download, the virtual disk): such a removal fails, below and in diskFolderFor, and changes nothing.
       const result = await this.runWsl(args, { timeoutMs: REGISTER_MS });
-      mayBeRead = result.timedOut;
       if (result.exitCode !== 0) {
         throw new WslSetupError('registerFailed', `wsl.exe --install --from-file failed (${endOf(result, REGISTER_MS)}): ${outputOf(result)}`);
       }
       this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${diskFolder}.`);
       if (signal?.aborted) throw abortError();
     } finally {
-      if (mayBeRead) {
-        this.deps.logger.info(`The download ${file} stays, because WSL may still read it; the next setup or the removal removes it.`);
-      } else {
-        await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
-          this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
-        });
-      }
+      await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
+        this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
+      });
     }
   }
 
@@ -656,20 +650,14 @@ export class WslSetup {
     const first = path.join(this.deps.folder, 'disk');
     const names = await filesOf(first);
     if (names?.length === 0) return first;
-    // The download of a registration that ended by its time limit: WSL may still write the disk.
-    const unfinished = fs.existsSync(path.join(this.downloadFolder, DOWNLOAD_NAME));
-    const users = names === undefined || unfinished ? undefined : await this.diskUsers(first, signal);
+    const users = names === undefined ? undefined : await this.diskUsers(first, signal);
     if (names !== undefined && users?.length === 0) {
       this.deps.logger.info(`The folder ${first} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
       await fs.promises.rm(first, { recursive: true, force: true });
       return first;
     }
     const content = names === undefined ? 'cannot be read' : `has files (${names.join(', ')})`;
-    const why = unfinished
-      ? 'a registration that did not end within its time limit may still write there'
-      : users === undefined
-        ? 'neither the registry nor WSL tells whether a WSL distribution uses it'
-        : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
+    const why = users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses it' : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
     for (let number = 2; number <= MAX_DISK_FOLDERS; number++) {
       const next = path.join(this.deps.folder, `disk-${number}`);
       if ((await filesOf(next))?.length !== 0) continue;

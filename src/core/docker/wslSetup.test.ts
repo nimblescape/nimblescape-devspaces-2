@@ -539,12 +539,6 @@ describe('WslSetup.setUp', () => {
     expect(fs.existsSync(path.join(folder, 'download', 'debian.wsl'))).toBe(false);
   });
 
-  it('keeps the download when the registration ends by its time limit, because WSL may still read it', async () => {
-    const runner = distribution((args) => (args[0] === '--install' ? timedOut : undefined));
-    await expect(setup({ runner, download: writingDownload() }).setUp(image, () => undefined)).rejects.toMatchObject({ problem: 'registerFailed' });
-    expect(fs.existsSync(path.join(folder, 'download', 'debian.wsl'))).toBe(true);
-  });
-
   it('fails with dockerFailed and the lines of the log that the script wrote to standard error', async () => {
     const runner = distribution((args, options) =>
       isScript(args) && options?.input === PROVISION_SCRIPT ? failed('The setup failed. The last lines of /var/log/devspaces-setup.log:\nE: Unable to locate package curl', 1) : undefined,
@@ -615,7 +609,7 @@ describe('WslSetup.setUp', () => {
     expect(fs.readdirSync(path.join(folder, 'disk-2'))).toEqual(['ext4.vhdx']);
   });
 
-  it('keeps a disk folder that a known distribution uses, that cannot be read, or that a registration may still write', async () => {
+  it('keeps a disk folder that a known distribution uses, or that cannot be read', async () => {
     const disk = path.join(folder, 'disk');
     fs.mkdirSync(disk, { recursive: true });
     fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'in use');
@@ -634,13 +628,6 @@ describe('WslSetup.setUp', () => {
     await setup({ runner: mixed, download: writingDownload() }).setUp(image, () => undefined);
     expect(installArgs(mixed)).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
     expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
-    // The download of a registration that ended by its time limit: WSL may still write `disk`.
-    fs.rmSync(path.join(folder, 'disk-2'), { recursive: true });
-    fs.writeFileSync(file, 'kept');
-    const free = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
-    await setup({ runner: free, download: writingDownload() }).setUp(image, () => undefined);
-    expect(installArgs(free)).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
-    expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
     // A file in place of the folder.
     fs.rmSync(folder, { recursive: true });
     fs.mkdirSync(folder);
@@ -651,7 +638,7 @@ describe('WslSetup.setUp', () => {
     expect(fs.readFileSync(disk, 'utf8')).toBe('not a folder');
   });
 
-  it('removes the download that a registration kept when it sets up the distribution again', async () => {
+  it('removes a download that stayed after a registration when it sets up the distribution again', async () => {
     fs.mkdirSync(path.join(folder, 'download'), { recursive: true });
     fs.writeFileSync(path.join(folder, 'download', 'debian.wsl'), 'kept');
     await setup({ runner: distribution() }).setUp(undefined, () => undefined);
