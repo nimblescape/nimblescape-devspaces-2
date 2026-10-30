@@ -193,13 +193,22 @@ describe('the login without setup: password and host key in VS Code', () => {
     const home = path.join(dir, 'home');
     fs.mkdirSync(home, { recursive: true });
     const offered: string[] = [];
+    // The offer runs after the login while the calls go on (RemoteShellStart.afterLogin): its end is the last dialog.
+    let offerEnded: () => void = () => undefined;
+    const ended = new Promise<void>((resolve) => (offerEnded = resolve));
     const keyDialogs: SshKeyDialogs = {
       offer: async (host) => {
         offered.push(`offer ${host}`);
         return 'use';
       },
-      installed: (host) => offered.push(`installed ${host}`),
-      failed: (host, detail) => offered.push(`failed ${host}: ${detail}`),
+      installed: (host) => {
+        offered.push(`installed ${host}`);
+        offerEnded();
+      },
+      failed: (host, detail) => {
+        offered.push(`failed ${host}: ${detail}`);
+        offerEnded();
+      },
     };
     const keys = new SshKeyOffer({
       home,
@@ -217,6 +226,7 @@ describe('the login without setup: password and host key in VS Code', () => {
     await keys.prepare();
     const first = shells(keys);
     await expect(withSshPrompts(() => first.run(KEY_ALIAS, 'printf one'))).resolves.toMatchObject({ exitCode: 0, stdout: 'one' });
+    await ended;
     first.dispose();
     expect(asked.filter((line) => line.startsWith('secret'))).toHaveLength(1);
     expect(offered).toEqual([`offer ${KEY_ALIAS}`, `installed ${KEY_ALIAS}`]);
