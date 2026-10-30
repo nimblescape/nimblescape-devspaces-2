@@ -90,9 +90,9 @@ export class RemoteDockerState {
 
   /**
    * Removes `host` from the list; when it is the Docker host of Devspaces, the local Docker takes its place. Its rootless
-   * socket, an installed SSH key and the devspaces on it stay; a `declined` SSH key is forgotten, so the key is offered
-   * again after the host is added again. `removed`: it was in the list; `wasDockerHost`: it was the Docker host of
-   * Devspaces (both as found under the lock).
+   * socket, an installed SSH key and the devspaces on it stay; a `declined` SSH key is forgotten (also for a host that
+   * is not in the list, for example after a failed test), so the key is offered again after the host is added again.
+   * `removed`: it was in the list; `wasDockerHost`: it was the Docker host of Devspaces (both as found under the lock).
    */
   async removeHost(host: string): Promise<{ removed: boolean; wasDockerHost: boolean }> {
     let result = { removed: false, wasDockerHost: false };
@@ -100,13 +100,13 @@ export class RemoteDockerState {
       // Set on each run: the last run counts (change).
       const hosts = state.remoteHosts ?? [];
       result = { removed: hosts.includes(host) || state.dockerHost === host, wasDockerHost: state.dockerHost === host };
-      if (!result.removed) return false;
+      const declined = state.hosts?.find((entry) => entry.host === host)?.sshKey === 'declined';
+      if (!result.removed && !declined) return false;
       const rest = hosts.filter((entry) => entry !== host);
       if (rest.length > 0) state.remoteHosts = rest;
       else delete state.remoteHosts;
       if (state.dockerHost === host) delete state.dockerHost;
-      const record = state.hosts?.find((entry) => entry.host === host);
-      if (record?.sshKey === 'declined') delete record.sshKey;
+      if (declined) changeRecord(state, host, (record) => delete record.sshKey);
       return true;
     });
     return result;
@@ -177,19 +177,12 @@ export class RemoteDockerState {
     });
   }
 
-  /** Changes the record of `host` (a new one when it has none); a record that knows nothing more is removed. */
+  /** Changes the record of `host` (changeRecord) when `update` says that it changed it. */
   private async changeHost(host: string, update: (record: RemoteDockerHostRecord) => boolean): Promise<void> {
     await this.change((state) => {
-      const hosts = state.hosts ?? [];
-      const found = hosts.find((entry) => entry.host === host);
-      const record: RemoteDockerHostRecord = found ?? { host };
-      if (!update(record)) return false;
-      const rest = hosts.filter((entry) => entry !== found);
-      const kept = record.rootlessSocket !== undefined || record.sshKey !== undefined ? [...rest, record] : rest;
-      if (found !== undefined && kept.length === hosts.length) state.hosts = hosts;
-      else if (kept.length > 0) state.hosts = kept;
-      else delete state.hosts;
-      return true;
+      let changed = false;
+      changeRecord(state, host, (record) => (changed = update(record)));
+      return changed;
     });
   }
 
@@ -269,6 +262,23 @@ function hostNames(value: unknown): string[] | undefined {
  * The fields of the file that Devspaces knows; others are dropped at the next write. A Docker host that is not in the
  * list is added to it.
  */
+/**
+ * Runs `update` on the record of `host` in `state`, a new one at the end when it has none. A record that knows nothing
+ * more afterwards is removed, and so is the list when it is empty.
+ */
+function changeRecord(state: RemoteDockerStateFile, host: string, update: (record: RemoteDockerHostRecord) => void): void {
+  const hosts = state.hosts ?? [];
+  let record = hosts.find((entry) => entry.host === host);
+  if (record === undefined) {
+    record = { host };
+    hosts.push(record);
+  }
+  update(record);
+  const kept = hosts.filter((entry) => entry.rootlessSocket !== undefined || entry.sshKey !== undefined);
+  if (kept.length > 0) state.hosts = kept;
+  else delete state.hosts;
+}
+
 function normalize(value: unknown): RemoteDockerStateFile {
   const result: RemoteDockerStateFile = {};
   if (typeof value !== 'object' || value === null) return result;

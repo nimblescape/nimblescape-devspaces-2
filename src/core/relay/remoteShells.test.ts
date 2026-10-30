@@ -103,8 +103,8 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
-  // The key offer (SshKeyOffer.afterLogin) asks the user and runs a command on the shell before the callers get it.
-  it('runs the step after the login once, before the callers get the shell, and keeps the shell open meanwhile', async () => {
+  // The key offer (SshKeyOffer.afterLogin) asks the user and runs a command on the shell; the other calls go on.
+  it('runs the step after the login once, gives the shell to the calls at once, and to the relay only after the step', async () => {
     const steps: string[] = [];
     const warnings: string[] = [];
     let release: () => void = () => undefined;
@@ -123,15 +123,20 @@ describeUnix('RemoteShells', () => {
         },
       }),
     });
-    const first = registry.run('box', 'printf one').then((result) => steps.push(`call ${result?.stdout}`));
-    const second = registry.login('box').then((result) => steps.push(`login ${JSON.stringify(result)}`));
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    await expect(registry.login('box')).resolves.toEqual({ ok: true });
+    const taking = registry.takeOver('box').then((taken) => {
+      steps.push('taken');
+      return taken;
+    });
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(steps).toEqual(['asked']);
     release();
-    await Promise.all([first, second]);
-    expect(steps.slice(0, 2)).toEqual(['asked', 'ran key']);
-    expect(steps.slice(2).sort()).toEqual(['call one', 'login {"ok":true}']);
+    const taken = await taking;
+    expect(taken).toBeDefined();
+    expect(steps).toEqual(['asked', 'ran key', 'taken']);
     expect(warnings).toEqual([]);
+    taken?.kill();
     registry.dispose();
   });
 
@@ -143,6 +148,7 @@ describeUnix('RemoteShells', () => {
       start: () => ({ process: runner.startBytes('sh', ['-c', 'exec sh -s']), afterLogin: () => Promise.reject(new Error('no answer')) }),
     });
     await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    await expect(registry.takeOver('box')).resolves.toBeDefined();
     expect(warnings).toEqual(['The step after the login on box failed: no answer']);
     registry.dispose();
   });

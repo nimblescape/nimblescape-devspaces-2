@@ -41,17 +41,19 @@ export function keyComment(computerName: string): string {
  * One line for the shell before the relay that adds `key` to `~/.ssh/authorized_keys` of the account, as `ssh-copy-id`
  * does: in the home folder, with umask 077 (a new folder 0700, a new file 0600), only when the key is not in the file
  * yet, after a line feed when the file does not end with one, and with `restorecon` when the host has it (SELinux).
- * Its exit code is 0 when the key is in the file.
+ * In a subshell, so the folder and the umask of the shell stay as they are for the commands after it and for the
+ * relay. Its exit code is 0 when the key is in the file.
  */
 export function authorizedKeysCommand(key: PublicKey, comment: string): string {
   const file = '.ssh/authorized_keys';
   const known = shellWord(`${key.type} ${key.blob}`);
   const line = shellWord(`${key.type} ${key.blob} ${comment}`);
-  return [
+  const steps = [
     `cd && umask 077 && mkdir -p .ssh`,
     `{ grep -qF ${known} ${file} 2>/dev/null || { { [ -z "$(tail -c 1 ${file} 2>/dev/null)" ] || echo >> ${file}; } && printf '%s\\n' ${line} >> ${file}; }; }`,
     `{ ! command -v restorecon >/dev/null 2>&1 || restorecon -F .ssh ${file} >/dev/null 2>&1 || true; }`,
-  ].join(' && ');
+  ];
+  return `( ${steps.join(' && ')} )`;
 }
 
 /** The program that the Docker CLI starts as `ssh` for a host with the key of Devspaces, and its environment. */

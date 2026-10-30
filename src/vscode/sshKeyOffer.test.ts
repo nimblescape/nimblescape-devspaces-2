@@ -168,6 +168,30 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     expect(await state.read()).toEqual({});
   });
 
+  // For example a jump host that asks for a password, or a server that wants a key and a password.
+  it('does not offer the key again after a login that had it and still asked for a password', async () => {
+    const keys = offer();
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked).toHaveLength(2);
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked).toHaveLength(2);
+    // Without the key file, the offer comes again.
+    fs.rmSync(keys.keyPath);
+    fs.rmSync(`${keys.keyPath}.pub`);
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked.slice(2)).toEqual([`offer box ${keys.keyPath}`, 'installed box']);
+  });
+
+  it('writes over no public key file that is there without its private key', async () => {
+    fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
+    const keys = offer();
+    fs.writeFileSync(`${keys.keyPath}.pub`, 'mine');
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked[1]).toBe(`failed box: ${keys.keyPath}.pub is there without its private key; remove it, then try again.`);
+    expect(fs.readFileSync(`${keys.keyPath}.pub`, 'utf8')).toBe('mine');
+    expect(fs.existsSync(keys.keyPath)).toBe(false);
+  });
+
   it('gives no key for a host whose key file is gone', async () => {
     const keys = offer();
     await keys.afterLogin('box', { passwordAsked: true }, shell);

@@ -73,6 +73,14 @@ describe('the command that adds the key to authorized_keys (run by sh in a home 
     expect(fs.readFileSync(file(), 'utf8')).toBe(`ssh-ed25519 ${BLOB} renamed@other\n`);
   });
 
+  it('changes neither the folder nor the umask of the shell that runs it', () => {
+    const out = execFileSync('sh', ['-c', `umask 022; ${authorizedKeysCommand(KEY, 'devspaces@box')}; umask; pwd`], {
+      env: { HOME: home, PATH: process.env.PATH },
+      cwd: os.tmpdir(),
+    }).toString();
+    expect(out.trim().split('\n')).toEqual(['0022', fs.realpathSync(os.tmpdir())]);
+  });
+
   it('fails when the file cannot be written', () => {
     fs.mkdirSync(path.join(home, '.ssh', 'authorized_keys'), { recursive: true });
     expect(() => runCommand()).toThrow();

@@ -128,13 +128,19 @@ export class SshKeyOffer {
 
   /**
    * After the login of the shell before the relay to `host` (RemoteShellStart.afterLogin): when it asked for the
-   * password, the offer (unless the host declined it), and on yes the key on the host. A failure is logged and shown;
-   * it never fails the login.
+   * password, the offer, and on yes the key on the host. Not for a host that declined it, and not for a host whose
+   * login had the key already: there the password was asked for something that a key does not replace (for example a
+   * jump host, or a server that wants a key and a password). A failure is logged and shown; it never fails the login.
    */
   async afterLogin(host: string, login: PasswordLogin, shell: { run(command: string, options?: { timeoutMs?: number }): Promise<RunResult> }): Promise<void> {
     if (!login.passwordAsked) return;
     const { state, dialogs, logger } = this.options;
-    if ((await state.sshKey(host).catch(() => undefined)) === 'declined') return;
+    const recorded = await state.sshKey(host).catch(() => undefined);
+    if (recorded === 'declined') return;
+    if (recorded === 'installed' && this.identityFor(host) !== undefined) {
+      logger.info(`The login to ${host} asked for a password although it had the key of Devspaces; the key is not offered again.`);
+      return;
+    }
     const answer = await dialogs.offer(host, this.keyPath);
     if (answer === undefined) {
       logger.info(`The key of Devspaces for ${host} was not set up now; Devspaces asks again after the next login with a password.`);
@@ -172,6 +178,8 @@ export class SshKeyOffer {
     if (keygen === undefined) throw new Error('ssh-keygen was not found on this computer.');
     const quiet = noPromptEnv(env);
     if (!this.exists(this.keyPath)) {
+      // ssh-keygen would write over it.
+      if (this.exists(`${this.keyPath}.pub`)) throw new Error(`${this.keyPath}.pub is there without its private key; remove it, then try again.`);
       await fs.promises.mkdir(path.dirname(this.keyPath), { recursive: true, mode: 0o700 });
       // ssh-keygen never writes over a file: another window that made the key meanwhile wins.
       const made = await runner.run(keygen, ['-q', '-t', 'ed25519', '-N', '', '-C', keyComment(computerName), '-f', this.keyPath], {

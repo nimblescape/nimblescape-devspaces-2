@@ -182,6 +182,14 @@ describe('RemoteDockerState: the SSH key of Devspaces', () => {
     await state.removeHost('b');
     expect(await state.sshKey('a')).toBeUndefined();
     expect(await state.sshKey('b')).toBe('installed');
+    expect((await state.read()).hosts).toEqual([{ host: 'b', sshKey: 'installed' }]);
+  });
+
+  // "Not for This Host" in the test of a host that then failed: the host never came into the list.
+  it('forgets a declined key of a host that is not in the list', async () => {
+    await state.setSshKey('a', 'declined');
+    await expect(state.removeHost('a')).resolves.toEqual({ removed: false, wasDockerHost: false });
+    expect(await state.read()).toEqual({});
   });
 
   it('gives the key without waiting, and reads the file again after a change of another window', async () => {

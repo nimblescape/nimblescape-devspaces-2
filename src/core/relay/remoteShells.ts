@@ -15,9 +15,9 @@ export interface RemoteShellStart {
   process: StartedByteProcess;
   prompts?: SshLoginPrompts;
   /**
-   * Runs once the shell is open, before the callers get it (the key offer of SshKeyOffer, which may ask the user and run
-   * a command on it); the shell is not closed for a time without use meanwhile. A failure is logged; the shell is given
-   * out after it as well.
+   * Runs once the shell is open (the key offer of SshKeyOffer, which may ask the user and run a command on it). The
+   * callers get the shell at once, and its commands run in order; the relay takes it over only after this step, and it
+   * is not closed for a time without use meanwhile. A failure is logged.
    */
   afterLogin?: (shell: RemoteShell) => Promise<void>;
 }
@@ -38,6 +38,8 @@ interface Entry {
   flow?: object;
   shell?: RemoteShell;
   opening?: Promise<RemoteShell>;
+  /** The step after the login (RemoteShellStart.afterLogin) while it runs; takeOver waits for it. */
+  afterLogin?: Promise<void>;
 }
 
 /** `promise`, or an AbortError as soon as `signal` aborts; the work of `promise` goes on for its other callers. */
@@ -97,16 +99,23 @@ export class RemoteShells {
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
     entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
-      async (shell) => {
-        if (afterLogin !== undefined && !this.disposed) {
-          await shell
-            .keepOpenDuring(() => afterLogin(shell))
-            .catch((error: unknown) => logger.warn(`The step after the login on ${host} failed: ${errorMessage(error)}`));
-        }
+      (shell) => {
         entry.shell = shell;
         entry.opening = undefined;
-        if (this.disposed) shell.killNow();
-        else logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        if (this.disposed) {
+          shell.killNow();
+          return shell;
+        }
+        logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        if (afterLogin !== undefined) {
+          const step: Promise<void> = shell
+            .keepOpenDuring(() => afterLogin(shell))
+            .catch((error: unknown) => logger.warn(`The step after the login on ${host} failed: ${errorMessage(error)}`))
+            .finally(() => {
+              if (entry.afterLogin === step) entry.afterLogin = undefined;
+            });
+          entry.afterLogin = step;
+        }
         return shell;
       },
       (error: unknown) => {
@@ -170,7 +179,8 @@ export class RemoteShells {
 
   /**
    * The process of the shell to `host` for a connection of the relay (RemoteShell.takeOver), also of a login that is
-   * in progress; undefined when there is none or it failed. The shell is no longer one of this window then.
+   * in progress, after the step after its login; undefined when there is none or it failed. The shell is no longer one
+   * of this window then.
    */
   async takeOver(host: string): Promise<StartedByteProcess | undefined> {
     const entry = this.entries.get(host);
@@ -181,6 +191,7 @@ export class RemoteShells {
     } catch {
       return undefined;
     }
+    await entry.afterLogin;
     return shell?.takeOver();
   }
 
