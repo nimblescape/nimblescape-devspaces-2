@@ -111,8 +111,7 @@ function engineCheckOf(result: RunResult, timeoutMs: number): EngineCheck {
   }
   const info = result.exitCode === 0 ? parseEngineInfo(result.stdout) : undefined;
   if (info) return { ok: true, ...info };
-  // The error output can be the one of wsl.exe (its shell could not start again): wslText.
-  const detail = wslText(result.stderr || result.stdout).trim() || `docker info failed with exit code ${result.exitCode}.`;
+  const detail = (result.stderr || result.stdout).trim() || `docker info failed with exit code ${result.exitCode}.`;
   return { ok: false, problem: dockerHostProblem(detail), detail };
 }
 
@@ -177,9 +176,9 @@ async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal 
   const shell = await wslShellLogin(host, ssh, signal, { fresh: true });
   if (!shell.ok) return shell;
   const result = await ssh.shells?.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal });
-  // The shell started a moment ago: it is gone only when the window closes meanwhile.
-  if (result === undefined) return { ok: false, problem: 'unreachable', detail: `The shell of wsl.exe in ${host} ended before docker info ran.` };
-  return engineCheckOf(result, timeoutMs);
+  if (result === undefined) return WSL_NOT_FOUND;
+  // The error output can be the one of wsl.exe (its shell could not start again).
+  return engineCheckOf({ ...result, stderr: wslText(result.stderr) }, timeoutMs);
 }
 
 /**
@@ -204,7 +203,10 @@ async function shellLoginCheck(
   return { ok: true };
 }
 
-/** The check of a WSL distribution without its shell: there is no `wsl.exe` on this computer (RemoteShells.run). */
+/**
+ * The check of a WSL distribution without its shell (RemoteShells.run): there is no `wsl.exe` on this computer. After a
+ * shell started, the shells have none only when the window closes meanwhile, and then nobody reads this.
+ */
 const WSL_NOT_FOUND = { ok: false, problem: 'wslMissing', detail: 'wsl.exe was not found.' } as const;
 
 /**
@@ -263,13 +265,11 @@ export async function readRootlessSocket(
     const detail = errorMessage(error);
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
-  // The shells before the relay have no shell for the distribution: without wsl.exe, or after a successful check (the
-  // caller's) only when the window closes meanwhile.
-  if (result === undefined) return shells === undefined ? WSL_NOT_FOUND : { ok: false, problem: 'unreachable', detail: `The shell of wsl.exe in ${host} ended.` };
+  if (result === undefined) return WSL_NOT_FOUND;
   const program = access.kind === 'wsl' ? 'wsl.exe' : 'ssh';
   if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `${program} did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
   if (result.exitCode !== 0) {
-    const detail = wslText(result.stderr).trim() || `${program} failed with exit code ${result.exitCode}.`;
+    const detail = (access.kind === 'wsl' ? wslText(result.stderr) : result.stderr).trim() || `${program} failed with exit code ${result.exitCode}.`;
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
   const socket = rootlessSocketPath(result.stdout);

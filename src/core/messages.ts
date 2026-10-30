@@ -452,7 +452,7 @@ export function dockerHostReason(
   if (distribution !== undefined) {
     switch (problem) {
       case 'unreachable':
-        return 'WSL did not answer in time. Try again. When it does not help, run "wsl --shutdown" in a terminal, then try again.';
+        return 'WSL did not answer. Try again. When it does not help, run "wsl --shutdown" in a terminal, then try again.';
       case 'closedBeforeLogin':
       case 'login':
       case 'hostKey':

@@ -85,7 +85,7 @@ describe('the messages of a remote Docker host', () => {
 
   // The WSL distribution of Devspaces has no network and no SSH: never the advice of an SSH host.
   it.each([
-    ['unreachable', 'WSL did not answer in time.'],
+    ['unreachable', 'WSL did not answer.'],
     ['closedBeforeLogin', 'WSL could not start a shell in the WSL distribution devspaces.'],
     ['login', 'WSL could not start a shell in the WSL distribution devspaces.'],
     ['hostKey', 'WSL could not start a shell in the WSL distribution devspaces.'],

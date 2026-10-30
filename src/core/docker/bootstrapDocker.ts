@@ -490,8 +490,8 @@ export class BootstrapDocker {
       const pipe = viaPipe || wsl ? this.pipeOf(target) : undefined;
       const env: NodeJS.ProcessEnv = { ...this.env };
       for (const name of REMOTE_CLEARED_VARIABLES) deleteEnv(env, name);
-      // For the WSL distribution without its pipe: `wsl://<distribution>` (hostEndpoint), which the Docker CLI refuses, so
-      // a call with this environment never reaches another engine.
+      // For the WSL distribution without its pipe: `wsl://<distribution>` (hostEndpoint). No call runs with it (`noEndpoint`
+      // below, and `start` starts nothing there); should one run anyway, the Docker CLI refuses it.
       env.DOCKER_HOST = pipe ?? hostEndpoint(target.host);
       if (pipe !== undefined) return { env };
       // No `ssh://` for it: a call that only reads runs on the shell before the relay, any other one fails.

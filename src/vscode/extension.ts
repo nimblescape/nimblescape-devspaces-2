@@ -410,8 +410,8 @@ async function activateExtension(
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
   });
-  // What the checks whether an engine answers need (dockerEngineAnswers): Docker is never started, and a remote host gets
-  // the SSH check without questions first.
+  // What the checks whether an engine answers need (dockerEngineAnswers): Docker is never started (except the WSL
+  // distribution of Devspaces, which `wsl.exe` starts), and a remote host gets the SSH check without questions first.
   const engineAnswersDeps = (): DockerEngineAnswersDeps => ({ daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs), ssh: remoteDeps(), logger });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();

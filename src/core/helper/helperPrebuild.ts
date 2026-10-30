@@ -51,8 +51,9 @@ export interface HelperPrebuildDeps {
    */
   checkBaseImage: () => boolean;
   /**
-   * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker. Called within the
-   * operation on `target`. Never throws, except an AbortError.
+   * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker (except the WSL
+   * distribution of Devspaces, which `wsl.exe` starts). Called within the operation on `target`. Never throws, except
+   * an AbortError.
    */
   dockerRunning: (target: DockerTarget, signal: AbortSignal) => Promise<boolean>;
   /** resources/helper/Dockerfile of the installed extension: its content gives the current helper tag. */
@@ -123,7 +124,7 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  * is not due, so an activation does not wake Docker Desktop from its Resource Saver mode, nor connect to a remote host,
  * for housekeeping. It runs on the Docker engine of the target that `start` gets, local or remote alike (it runs as an
  * operation on it, so the engine key, the state file and every Docker call are those of an open on that engine), and
- * only when that engine answers (Docker is never started for this). The ensure is the maintaining one of
+ * only when that engine answers (Docker is never started for this, except the WSL distribution of Devspaces). The ensure is the maintaining one of
  * HelperImages.prebuildImage (it builds a missing tag, runs the rebuild itself so that the next open does not wait for
  * it, starts the check, and runs the cleanup when that is due too), shared with the preparation of a worker in the same
  * window, so one that needs the missing tag meanwhile never builds a second time, and one before an open joins the
