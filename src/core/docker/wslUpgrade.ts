@@ -46,7 +46,9 @@ export const UPGRADE_CHECK_MS = 6 * 60 * 60_000;
  * began is a day old; else `skipped`. While dpkg has packages that a run left unfinished (`dpkg --audit`, for example
  * after the stop of the distribution in the middle of dpkg), it runs when the last one that began is an hour old, and
  * `dpkg --configure -a` ends the unfinished one. A time after now (a clock that went back) counts as none. Without its
- * own policy-rc.d (one of another program is there), it fails: then the packages could start Docker again. `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg --configure -a`
+ * own policy-rc.d (one of another program is there), it fails and keeps the log of the last run: then the packages
+ * could start Docker again. `APT::Update::Error-Mode=any` makes a network failure of `apt-get update` a failure (by
+ * default only a warning, and the upgrade would count as done with the old lists). `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg --configure -a`
  * and `apt-get update`, which do not wait for a lock, run up to 3 times, 30 seconds apart (`apt-get check` of the timer
  * apt-daily, or apt of the user). `--with-new-pkgs` also installs a new package that an upgrade needs, but removes
  * none. The summary line of apt is in the format of apt before 3.0 or in that of apt 3.0 (`Upgrading: …`); `LC_ALL=C`
@@ -80,7 +82,6 @@ echo "${UPGRADE_PREFIX}skipped"
 exit 0
 fi
 echo "$now" > ${UPGRADE_TRIED_FILE}
-: > "$log"
 fail() { echo "The upgrade failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
 run() { "$@" 9>&- >> "$log" 2>&1 || fail; }
 again() { tries=1; until "$@" 9>&- >> "$log" 2>&1; do [ "$tries" -lt 3 ] || fail; tries=$((tries + 1)); sleep 30 9>&-; done; }
@@ -91,8 +92,9 @@ echo "The upgrade did not run: /usr/sbin/policy-rc.d of another program is there
 exit 1
 fi
 trap '' HUP
+: > "$log"
 again dpkg --configure -a
-again apt-get update
+again apt-get -o APT::Update::Error-Mode=any update
 run apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs
 run apt-get clean
 echo "$now" > ${UPGRADE_DONE_FILE}

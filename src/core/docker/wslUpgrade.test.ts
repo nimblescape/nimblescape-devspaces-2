@@ -277,7 +277,7 @@ describe('the script of the upgrade', () => {
     stub('sleep', []);
     const failures = options.failUpdate === true ? 1000 : (options.failUpdate ?? 0);
     stub('apt-get', [], [
-      `case "$*" in update) n=$(grep -c '^apt-get update' '${file('calls')}'); [ "$n" -gt ${failures} ] || { echo "E: Could not resolve deb.debian.org"; exit 100; };; esac`,
+      `case "$*" in *update) n=$(grep -c '^apt-get .*update policy' '${file('calls')}'); [ "$n" -gt ${failures} ] || { echo "E: Could not resolve deb.debian.org"; exit 100; };; esac`,
       `case "$*" in *upgrade*) echo '${options.summary ?? '3 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.'}';; esac`,
       // The hangup of `wsl.exe` at the time limit, to the script and to the command.
       options.hangup ? 'case "$*" in *upgrade*) kill -HUP $$ $PPID;; esac' : ':',
@@ -307,7 +307,7 @@ describe('the script of the upgrade', () => {
     expect(run.stdout.trim()).toBe('devspaces-upgrade done 3 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.');
     expect(calls()).toEqual([
       'dpkg --configure -a policy=yes',
-      'apt-get update policy=yes',
+      'apt-get -o APT::Update::Error-Mode=any update policy=yes',
       'apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs policy=yes',
       'apt-get clean policy=yes',
     ]);
@@ -341,12 +341,12 @@ describe('the script of the upgrade', () => {
   // apt-daily holds the lock for a moment.
   it('runs apt-get update up to 3 times, 30 seconds apart', () => {
     expect(runScript({ failUpdate: 2 }).stdout.trim()).toMatch(/^devspaces-upgrade done /);
-    expect(calls().filter((call) => /^(apt-get update|sleep)/.test(call))).toEqual([
-      'apt-get update policy=yes',
+    expect(calls().filter((call) => /^(apt-get .*update|sleep)/.test(call))).toEqual([
+      'apt-get -o APT::Update::Error-Mode=any update policy=yes',
       'sleep 30 policy=yes',
-      'apt-get update policy=yes',
+      'apt-get -o APT::Update::Error-Mode=any update policy=yes',
       'sleep 30 policy=yes',
-      'apt-get update policy=yes',
+      'apt-get -o APT::Update::Error-Mode=any update policy=yes',
     ]);
   });
 
@@ -391,7 +391,7 @@ describe('the script of the upgrade', () => {
     expect(run.stderr).toContain(`The upgrade failed. The last lines of ${file('upgrade.log')}:\nE: Could not resolve deb.debian.org`);
     expect(fs.existsSync(stamp(UPGRADE_DONE_FILE))).toBe(false);
     expect(Math.abs(Number(fs.readFileSync(stamp(UPGRADE_TRIED_FILE), 'utf8').trim()) - seconds())).toBeLessThan(60);
-    expect(calls().filter((call) => call.startsWith('apt-get update'))).toHaveLength(3);
+    expect(calls().filter((call) => /^apt-get .*update policy/.test(call))).toHaveLength(3);
     expect(fs.existsSync(file('policy-rc.d'))).toBe(false);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
   });
@@ -400,11 +400,14 @@ describe('the script of the upgrade', () => {
   // running devspaces.
   it('fails without changing anything while a policy-rc.d of another program is there', () => {
     fs.writeFileSync(file('policy-rc.d'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(file('upgrade.log'), 'the last run\n');
     const run = runScript();
     expect(run.status).toBe(1);
     expect(run.stderr).toContain(`The upgrade did not run: ${file('policy-rc.d')} of another program is there`);
     expect(calls()).toEqual([]);
     expect(fs.readFileSync(file('policy-rc.d'), 'utf8')).toBe('#!/bin/sh\nexit 0\n');
+    // The log of the last run stays.
+    expect(fs.readFileSync(file('upgrade.log'), 'utf8')).toBe('the last run\n');
   });
 
   // Mutation: a script without the lock runs next to a setup of Docker.
