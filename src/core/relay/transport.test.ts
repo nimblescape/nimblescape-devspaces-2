@@ -7,7 +7,7 @@ import { WSL_HOST } from '../docker/dockerHost';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
 import { RelayConnectionError } from './connection';
-import { RELAY_SHELL_COMMAND, openRelayConnection, sshHostTransport, wslHostTransport } from './transport';
+import { RELAY_SHELL_COMMAND, openRelayConnection, sshHostTransport, wslHostTransport, wslProcess } from './transport';
 
 describe('sshHostTransport', () => {
   const env = { PATH: '/usr/bin', ssh_askpass_require: 'force' };
@@ -76,6 +76,34 @@ describe('wslHostTransport', () => {
       args: ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'],
       env: { Path: 'C:\\Windows', WSL_UTF8: '1' },
     });
+  });
+});
+
+// An older wsl.exe writes UTF-16 also with WSL_UTF8=1: read as UTF-8, a NUL after each character.
+describe('wslProcess', () => {
+  it('gives the error output of wsl.exe as text, and leaves everything else to the process', () => {
+    const listeners: ((text: string) => void)[] = [];
+    const kill = vi.fn();
+    const process = {
+      write: () => true,
+      onDrain: () => {},
+      end: () => {},
+      kill,
+      onStdout: () => {},
+      pauseStdout: () => {},
+      resumeStdout: () => {},
+      onStderr: (listener: (text: string) => void) => listeners.push(listener),
+      exited: new Promise<{ exitCode: number | null }>(() => {}),
+    };
+    const texts: string[] = [];
+    const wsl = wslProcess(process);
+    wsl.onStderr((text) => texts.push(text));
+    listeners.forEach((listener) => listener(Buffer.from('\uFEFFThere is no distribution', 'utf16le').toString('utf8')));
+    listeners.forEach((listener) => listener('sh: 1: docker: not found\n'));
+    expect(texts).toEqual(['There is no distribution', 'sh: 1: docker: not found\n']);
+    wsl.kill();
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(wsl.exited).toBe(process.exited);
   });
 });
 

@@ -51,6 +51,7 @@ import {
   sshCommandArgs,
   sshEndpoint,
   sshTargetOf,
+  transportProgramOf,
   unsupportedTargetReason,
   type DockerHostProblem,
   type DockerTarget,
@@ -179,8 +180,9 @@ async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal 
 
 /**
  * `docker info` (ENGINE_INFO_COMMAND) on the shell before the relay of `host`, as an EngineCheck; undefined when the
- * host has no shell. A shell that was closed or taken over twice before the command (ShellGoneError of RemoteShells.run)
- * gives `unreachable` (shellGone). Rejects with any other error of `run`.
+ * host has no shell. A shell that was closed or taken over twice before the command (ShellGoneError of RemoteShells.run):
+ * undefined for an SSH host, which then logs in with its own `ssh`, and shellGone for the WSL distribution, which has
+ * no other way. Rejects with any other error of `run`.
  */
 async function engineInfoOnShell(shells: RemoteShellAccess, host: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<EngineCheck | undefined> {
   try {
@@ -188,15 +190,12 @@ async function engineInfoOnShell(shells: RemoteShellAccess, host: string, timeou
     return result === undefined ? undefined : engineCheckOf(result, timeoutMs);
   } catch (error) {
     if (!(error instanceof ShellGoneError)) throw error;
-    return shellGone(error);
+    return hostAccessOf(host)?.kind === 'wsl' ? shellGone(error) : undefined;
   }
 }
 
-/**
- * The check after a shell before the relay was closed or taken over twice before its command (ShellGoneError): the host
- * did not answer for it. Not the own `ssh` of an SSH host instead: after a login that asked in VS Code, it would fail.
- */
-function shellGone(error: ShellGoneError): { ok: false; problem: DockerHostProblem; detail: string } {
+/** The check of the WSL distribution after its shell was closed or taken over twice before its command (ShellGoneError). */
+function shellGone(error: ShellGoneError): Extract<EngineCheck, { ok: false }> {
   return { ok: false, problem: 'unreachable', detail: error.message };
 }
 
@@ -268,9 +267,14 @@ export async function readRootlessSocket(
   if (access.kind === 'ssh' && sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
   let result: RunResult | undefined;
   try {
-    // On the shell before the relay when the host has one (`shells`), else with a login of its own (only over SSH).
+    // On the shell before the relay when the host has one (`shells`), else with a login of its own (only over SSH; also
+    // when its shell was closed or taken over twice before the command, ShellGoneError).
+    const onShell = shells?.run(host, RUNTIME_DIR_COMMAND, { timeoutMs: SSH_TIMEOUT_MS, signal }).catch((error: unknown) => {
+      if (error instanceof ShellGoneError && access.kind === 'ssh') return undefined;
+      throw error;
+    });
     result =
-      (await shells?.run(host, RUNTIME_DIR_COMMAND, { timeoutMs: SSH_TIMEOUT_MS, signal })) ??
+      (await onShell) ??
       (access.kind === 'ssh' && sshPath !== undefined
         ? await runner.run(sshPath, sshCommandArgs(access.address, RUNTIME_DIR_COMMAND, undefined, { identity }), {
             env: noPromptEnv(env),
@@ -285,7 +289,7 @@ export async function readRootlessSocket(
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
   if (result === undefined) return WSL_NOT_FOUND;
-  const program = access.kind === 'wsl' ? 'wsl.exe' : 'ssh';
+  const program = transportProgramOf(host);
   if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `${program} did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
   if (result.exitCode !== 0) {
     const detail = result.stderr.trim() || `${program} failed with exit code ${result.exitCode}.`;

@@ -13,7 +13,7 @@
 // docker system dial-stdio`, which needs no login, so the pipe never depends on a connection of the relay. No `vscode`.
 import { randomBytes } from 'crypto';
 import type * as net from 'net';
-import { hostAccessOf } from '../docker/dockerHost';
+import { hostAccessOf, transportProgramOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import type { Logger, StartedByteProcess } from '../ports';
 import type { RelayConnection } from './connection';
@@ -99,7 +99,7 @@ export class HostPipes {
       () => {
         const process = this.deps.dialStdio(host);
         // Only a host with a transport gets a pipe (see serve).
-        if (process === undefined) throw new Error(`${access.kind === 'wsl' ? 'wsl.exe' : 'ssh'} was not found`);
+        if (process === undefined) throw new Error(`${transportProgramOf(host)} was not found`);
         return process;
       },
       logger,

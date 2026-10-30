@@ -182,14 +182,10 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     shells.login.mockResolvedValueOnce(undefined as never);
     await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
     expect(docker.calls).toHaveLength(1);
-    // The shell was taken over by the relay twice before docker info: the host did not answer for it.
+    // The shell was taken over by the relay twice before docker info: the way without the shell too.
     shells.run.mockRejectedValueOnce(new ShellGoneError('The shell on box is taken over by the relay.'));
-    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toEqual({
-      ok: false,
-      problem: 'unreachable',
-      detail: 'The shell on box is taken over by the relay.',
-    });
-    expect(docker.calls).toHaveLength(1);
+    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
+    expect(docker.calls).toHaveLength(2);
   });
 
   it('noPromptEnv replaces every spelling of SSH_ASKPASS_REQUIRE', () => {
@@ -433,6 +429,17 @@ describe('readRootlessSocket', () => {
     expect(runner.run).not.toHaveBeenCalled();
     await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'other', {}, undefined, shells)).resolves.toEqual({ ok: true, socket: '/run/user/9/docker.sock' });
     expect(runner.run).toHaveBeenCalledTimes(1);
+    // A shell that was taken over twice before the command: an SSH host logs in itself, the WSL distribution cannot.
+    run.mockRejectedValueOnce(new ShellGoneError('The shell on box is taken over by the relay.'));
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', 'box', {}, undefined, shells)).resolves.toEqual({ ok: true, socket: '/run/user/9/docker.sock' });
+    expect(runner.run).toHaveBeenCalledTimes(2);
+    run.mockRejectedValueOnce(new ShellGoneError('The shell on wsl:devspaces is closed.'));
+    await expect(readRootlessSocket(runner, undefined, WSL_HOST, {}, undefined, shells)).resolves.toEqual({
+      ok: false,
+      problem: 'unreachable',
+      detail: 'The shell on wsl:devspaces is closed.',
+    });
+    expect(runner.run).toHaveBeenCalledTimes(2);
   });
 
   it('fails without ssh, for an unusable host, and without XDG_RUNTIME_DIR', async () => {

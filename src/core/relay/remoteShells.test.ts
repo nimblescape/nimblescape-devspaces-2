@@ -7,7 +7,6 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
-import { WSL_HOST } from '../docker/dockerHost';
 import { silentLogger, type Logger, type StartedByteProcess } from '../ports';
 import { NodeProcessRunner } from '../process';
 import { sshPromptSignal, sshPromptsAllowed, withSshPrompts } from '../sshAskpass';
@@ -78,15 +77,6 @@ describeUnix('RemoteShells', () => {
     await expect(registry.login('box')).resolves.toEqual({ ok: false, detail: 'ssh: connect to host box port 22: Connection refused', timedOut: false });
     await expect(registry.run('box', 'true')).resolves.toEqual({ exitCode: 255, stdout: '', stderr: 'ssh: connect to host box port 22: Connection refused', timedOut: false });
     expect(logins).toEqual(['box', 'box']);
-  });
-
-  // An older wsl.exe writes UTF-16 also with WSL_UTF8=1: read as UTF-8, a NUL after each character.
-  it('gives the UTF-16 error output of an older wsl.exe as text, and the one of ssh as it is', async () => {
-    const { registry } = shells({ script: `printf '\\377\\376T\\000h\\000e\\000r\\000e\\000\\n\\000' >&2; exit 1` });
-    await expect(registry.login(WSL_HOST)).resolves.toEqual({ ok: false, detail: 'There', timedOut: false });
-    await expect(registry.run(WSL_HOST, 'true')).resolves.toMatchObject({ exitCode: 255, stderr: 'There' });
-    const ssh = shells({ script: `printf 'box\\377\\n' >&2; exit 255` }).registry;
-    await expect(ssh.login('box')).resolves.toEqual({ ok: false, detail: 'box\uFFFD', timedOut: false });
   });
 
   // A login of the background runs with BatchMode and fails for a host that needs a password or an unknown host key.

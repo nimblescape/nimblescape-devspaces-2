@@ -10,7 +10,6 @@
 // takes the login over (takeOver: RelayConnection.open writes its start script into the idle shell), so the open of a
 // window logs in to the host once. A shell that no call used for SHELL_IDLE_CLOSE_MS is closed. No `vscode`.
 import { randomBytes } from 'crypto';
-import { wslText } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { readableStderr } from '../loader/pipeLoader';
 import { abortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
@@ -83,10 +82,7 @@ export interface RemoteShellOptions {
   logger: Logger;
   /** Named in the log lines, for example the host. */
   name: string;
-  /**
-   * The program of the transport: `ssh` (default) or `wsl.exe`. It is named when its login does not answer in time, and
-   * for `wsl.exe` the error output is read with wslText (the UTF-16 of an older `wsl.exe` as text).
-   */
+  /** The program of the transport, named when its login does not answer in time: `ssh` (default) or `wsl.exe`. */
   program?: 'ssh' | 'wsl.exe';
   loginTimeoutMs?: number;
   idleCloseMs?: number;
@@ -160,7 +156,7 @@ export class RemoteShell {
       (chunk) => this.stdout(chunk),
       () => this.stdoutEnded(),
     );
-    process.onStderr((text) => this.stderr(options.program === 'wsl.exe' ? wslText(text) : text));
+    process.onStderr((text) => this.stderr(text));
     void process.exited.then(({ exitCode, error }) => this.exited(exitCode, error));
     return new Promise<RemoteShell>((resolve, reject) => {
       const marker = newMarker('ready');

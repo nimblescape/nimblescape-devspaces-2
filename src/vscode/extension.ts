@@ -30,7 +30,7 @@ import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { RelayConnectionError } from '../core/relay/connection';
-import { openRelayConnection, sshHostTransport, wslHostTransport } from '../core/relay/transport';
+import { openRelayConnection, sshHostTransport, wslHostTransport, wslProcess } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { HostPipes } from '../core/relay/hostPipes';
@@ -331,7 +331,7 @@ async function activateExtension(
     if (access?.kind === 'wsl') {
       dialWsl ??= wslPath();
       if (dialWsl === undefined) return undefined;
-      return runner.startBytes(dialWsl, wslCommandArgs(access.distribution, ['docker', 'system', 'dial-stdio']), { env: wslEnv(env) });
+      return wslProcess(runner.startBytes(dialWsl, wslCommandArgs(access.distribution, ['docker', 'system', 'dial-stdio']), { env: wslEnv(env) }));
     }
     dialSsh ??= sshPath();
     if (dialSsh === undefined || access === undefined) return undefined;
@@ -376,7 +376,7 @@ async function activateExtension(
       const wsl = wslPath();
       if (wsl === undefined) return undefined;
       const transport = wslHostTransport(access.distribution, wsl, env);
-      return { process: runner.startBytes(transport.file, transport.args, { env: transport.env }) };
+      return { process: wslProcess(runner.startBytes(transport.file, transport.args, { env: transport.env })) };
     }
     const ssh = sshPath();
     if (ssh === undefined) return undefined;

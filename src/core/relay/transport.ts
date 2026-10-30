@@ -7,7 +7,7 @@
 // reads the start script (startScript.ts), which starts the relay. SSH for a remote host: one login, which asks only in
 // a flow of the user (sshAskpass.ts). `wsl.exe` for the WSL distribution of Devspaces: no login and no question. No
 // `vscode`.
-import { sshCommandArgs, sshTargetOf, wslCommandArgs, wslEnv } from '../docker/dockerHost';
+import { sshCommandArgs, sshTargetOf, wslCommandArgs, wslEnv, wslText } from '../docker/dockerHost';
 import { noPromptEnv } from '../docker/remoteDocker';
 import { bundleLine } from '../loader/pipeLoader';
 import type { Logger, StartedByteProcess } from '../ports';
@@ -32,6 +32,14 @@ export const RELAY_SHELL_COMMAND = 'sh -s';
  */
 export function wslHostTransport(distribution: string, wslPath: string, env: NodeJS.ProcessEnv): RelayTransport {
   return { file: wslPath, args: wslCommandArgs(distribution, RELAY_SHELL_COMMAND.split(' ')), env: wslEnv(env) };
+}
+
+/**
+ * A process of `wsl.exe` (wslHostTransport, or its `docker system dial-stdio`) with its error output as text: an older
+ * `wsl.exe` writes its own messages in UTF-16 also with WSL_UTF8=1 (wslText). Everything else is the one of `process`.
+ */
+export function wslProcess(process: StartedByteProcess): StartedByteProcess {
+  return { ...process, onStderr: (listener) => process.onStderr((text) => listener(wslText(text))) };
 }
 
 /** How an SSH login of Devspaces runs: with the questions of a flow of the user, and with the key of Devspaces (`-i`). */

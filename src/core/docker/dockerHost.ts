@@ -378,6 +378,11 @@ export function hostAccessOf(host: string): HostAccess | undefined {
   return address === undefined ? undefined : { kind: 'ssh', address };
 }
 
+/** The program of the transport to `host` (hostAccessOf): `wsl.exe` for a WSL distribution, else `ssh`. */
+export function transportProgramOf(host: string): 'ssh' | 'wsl.exe' {
+  return hostAccessOf(host)?.kind === 'wsl' ? 'wsl.exe' : 'ssh';
+}
+
 /**
  * The arguments of `wsl.exe` that run `command` in the WSL distribution `distribution` as root, without a shell of the
  * distribution in between (`--exec`), in the root folder: `-d <distribution> -u root --cd / --exec <command…>`. The
@@ -491,7 +496,7 @@ export function dockerHostProblem(detail: string): DockerHostProblem {
   // The UTF-16 of an older wsl.exe (wslText).
   const text = wslText(detail);
   if (WSL_DISTRIBUTION_MISSING.test(text)) return 'wslDistributionMissing';
-  if (/exec: "?(?:[^"]*[\\/])?ssh(?:\.exe)?"?: executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
+  if (/exec: (?:"(?:[^"]*[\\/])?ssh(?:\.exe)?"|(?:[^"\s]*[\\/])?ssh(?:\.exe)?): executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
     return 'sshMissing';
   }
   if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|host key .*(?:not known|is unknown|mismatch)|No \S+ host key is known/i.test(text)) {
@@ -501,7 +506,7 @@ export function dockerHostProblem(detail: string): DockerHostProblem {
   if (/Permission denied \(|Permission denied, please try again|Too many authentication failures|Authentication failed|no supported authentication methods/i.test(text)) {
     return 'login';
   }
-  if (/docker: (?:command )?not found|command not found: docker|docker: No such file or directory|exec: "?(?:[^"]*[\\/])?docker(?:\.exe)?"?: executable/i.test(text)) {
+  if (/docker: (?:command )?not found|command not found: docker|docker: No such file or directory|exec: (?:"(?:[^"]*[\\/])?docker(?:\.exe)?"|(?:[^"\s]*[\\/])?docker(?:\.exe)?): executable/i.test(text)) {
     return 'dockerMissing';
   }
   if (/Cannot connect to the Docker daemon|Is the docker daemon running|dial unix [^\s]*docker\.sock: connect: (?:no such file|connection refused)/i.test(text)) {

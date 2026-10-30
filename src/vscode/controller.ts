@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark, isFreshPending, statusNamesDevspace, type WindowMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, hostAccessOf, isOnDockerHost, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, hostAccessOf, isOnDockerHost, transportProgramOf, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
 import { dockerEndpointUnsupported } from '../core/docker/remoteDocker';
 import { engineInventory, inventoryIsEmpty, removalEndedNote, removeEngineInfrastructure, type EngineInventory, type RemovalResult } from '../core/docker/engineRemoval';
 import { operationDockerTarget, outsideOperation, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
@@ -4202,7 +4202,7 @@ const usesDevspace = statusNamesDevspace;
  */
 function noWindowPipe(host: string): UserFacingError {
   const access = hostAccessOf(host);
-  const program = access?.kind === 'wsl' ? 'wsl.exe' : 'ssh';
+  const program = transportProgramOf(host);
   return new UserFacingError(
     'dockerHostUnreachable',
     Messages.dockerHostUnreachable(host, dockerHostReason(access === undefined ? 'unknown' : access.kind === 'wsl' ? 'wslMissing' : 'sshMissing', host)),

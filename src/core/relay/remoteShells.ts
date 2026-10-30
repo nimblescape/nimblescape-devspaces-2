@@ -6,7 +6,7 @@
 // host (an SSH host, or the WSL distribution of Devspaces), opened by the first check or Docker call before a connection
 // of the relay to the host, used by the calls after it, and taken over by the next connection of the relay to the host
 // (takeOver). No `vscode`.
-import { hostAccessOf } from '../docker/dockerHost';
+import { transportProgramOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
 import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
@@ -105,8 +105,7 @@ export class RemoteShells {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
-    const program = hostAccessOf(host)?.kind === 'wsl' ? 'wsl.exe' : 'ssh';
-    entry.opening = RemoteShell.open(process, { logger, name: host, program, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
+    entry.opening = RemoteShell.open(process, { logger, name: host, program: transportProgramOf(host), loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
       (shell) => {
         entry.shell = shell;
         entry.opening = undefined;
@@ -137,8 +136,8 @@ export class RemoteShells {
 
   /**
    * The login of the shell to `host` (`open`, also with `fresh`), for the SSH check (RemoteShellAccess.login): undefined
-   * when the host has no transport; a failure with the error output of `ssh` or `wsl.exe` (RemoteShellOptions.program).
-   * Rejects only with an AbortError.
+   * when the host has no transport; a failure with the error output of `ssh` or `wsl.exe`. Rejects only with an
+   * AbortError.
    */
   async login(
     host: string,
