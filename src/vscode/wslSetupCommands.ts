@@ -34,13 +34,36 @@ const PHASE_TEXTS: Record<ProvisionPhase, string> = {
   docker: 'Installing Docker Engine.',
 };
 
+/** The part of the bar of the setup that the download fills with its bytes, in percent. */
+const DOWNLOAD_PART = 40;
+/** Where the other steps start on the bar, in percent, so that the bar is full only at the end. */
+const PHASE_STARTS: Record<ProvisionPhase, number> = { packages: 50, repository: 60, docker: 65 };
+
+/** The place of `step` on the bar of the setup, in percent. */
+function barPosition(step: WslSetupStep): number {
+  switch (step.kind) {
+    case 'download':
+      return step.total ? Math.min(DOWNLOAD_PART, Math.floor((step.received * DOWNLOAD_PART) / step.total)) : 0;
+    case 'register':
+      return DOWNLOAD_PART;
+    case 'docker':
+      return PHASE_STARTS[step.phase];
+    case 'restart':
+      return 90;
+    case 'start':
+      return 95;
+  }
+}
+
 /** User-visible texts of the WSL distribution of Devspaces (plain language). No `vscode` in them. */
 export const WslSetupTexts = {
   checking: 'Checking WSL…',
   settingUp: 'Setting up Docker for Devspaces…',
   removing: 'Removing the WSL distribution of Devspaces…',
   notWindows: 'The WSL distribution of Devspaces exists only on Windows.',
+  noLocalAppData: 'Devspaces does not find the folder LOCALAPPDATA of your Windows user, where the WSL distribution of Devspaces has its files.',
   busy: 'The WSL distribution of Devspaces is being set up or removed in this window. Try again after that.',
+  busyElsewhere: 'The WSL distribution of Devspaces is being set up or removed in another VS Code window. Try again after that.',
   confirmSetUp: 'Set up Docker for Devspaces?',
   confirmSetUpDetail: (image: WslImage, folder: string) =>
     [
@@ -109,15 +132,19 @@ export const WslSetupTexts = {
         return `Docker does not start in the WSL distribution "${WSL_DISTRIBUTION}". The details show why.`;
       case 'removeFailed':
         return `WSL could not remove the distribution "${WSL_DISTRIBUTION}". The details show why.`;
+      case 'registryFailed':
+        return `Devspaces cannot tell whether it set up the WSL distribution "${WSL_DISTRIBUTION}", because it cannot read the list of WSL distributions in the registry of Windows. The details show why.`;
     }
   },
 } as const;
 
 export interface WslSetupCommandsDeps {
   /** The setup of this computer; undefined where there is none (not Windows, or no LOCALAPPDATA). */
-  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers'> | undefined;
+  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'lock'> | undefined;
   /** The folder of the distribution (wslSetupFolder), for the questions. */
   folder: string | undefined;
+  /** For the message without `setup`. */
+  isWindows: boolean;
   logger: Logger;
   showLog: () => void;
   /** Devspaces uses the host after its test (RemoteDockerCommands.useHost); true when it does. */
@@ -141,10 +168,11 @@ export class WslSetupCommands {
   async setUp(): Promise<void> {
     const { setup, folder } = this.deps;
     if (setup === undefined || folder === undefined) {
-      this.inform(WslSetupTexts.notWindows);
+      this.inform(this.deps.isWindows ? WslSetupTexts.noLocalAppData : WslSetupTexts.notWindows);
       return;
     }
-    if (!this.start()) return;
+    const release = await this.start(setup);
+    if (release === undefined) return;
     try {
       const plan = await this.withProgress(WslSetupTexts.checking, async (signal) => {
         const registration = await setup.registration(signal);
@@ -171,6 +199,7 @@ export class WslSetupCommands {
     } catch (error) {
       this.showFailure(error, WslSetupTexts.failed, 'The setup of the WSL distribution of Devspaces was cancelled.');
     } finally {
+      await release();
       this.running = false;
     }
   }
@@ -183,10 +212,11 @@ export class WslSetupCommands {
   async remove(): Promise<void> {
     const { setup, folder } = this.deps;
     if (setup === undefined || folder === undefined) {
-      this.inform(WslSetupTexts.notWindows);
+      this.inform(this.deps.isWindows ? WslSetupTexts.noLocalAppData : WslSetupTexts.notWindows);
       return;
     }
-    if (!this.start()) return;
+    const release = await this.start(setup);
+    if (release === undefined) return;
     try {
       let registration: WslRegistration;
       try {
@@ -226,18 +256,33 @@ export class WslSetupCommands {
     } catch (error) {
       this.showFailure(error, WslSetupTexts.removeFailedUnknown, 'The removal of the WSL distribution of Devspaces was cancelled.');
     } finally {
+      await release();
       this.running = false;
     }
   }
 
-  /** False (with a message) while a setup or a removal runs in this window; else marks one as running. */
-  private start(): boolean {
+  /**
+   * Marks a setup or a removal as running in this window and, with WslSetup.lock, in all windows; returns its release.
+   * Undefined (with a message) while one runs in this or another window. Without the lock file (logged), it runs.
+   */
+  private async start(setup: Pick<WslSetup, 'lock'>): Promise<(() => Promise<void>) | undefined> {
     if (this.running) {
       this.inform(WslSetupTexts.busy);
-      return false;
+      return undefined;
     }
     this.running = true;
-    return true;
+    let release: (() => Promise<void>) | undefined;
+    try {
+      release = await setup.lock();
+    } catch (error) {
+      this.deps.logger.warn(`The setup of the WSL distribution of Devspaces runs without a lock for the other windows: ${errorMessage(error)}`);
+      return async () => undefined;
+    }
+    if (release === undefined) {
+      this.running = false;
+      this.inform(WslSetupTexts.busyElsewhere);
+    }
+    return release;
   }
 
   /** `task` with a cancellable progress notification; `report` shows a step of the setup. */
@@ -250,8 +295,8 @@ export class WslSetupCommands {
         let shown: string | undefined;
         try {
           return await task(abort.signal, (step) => {
-            // Only the download has a known size; it fills the bar.
-            const next = step.kind === 'download' && step.total ? Math.min(100, Math.floor((step.received * 100) / step.total)) : percent;
+            // The download fills its part of the bar with its bytes; each other step starts at its place.
+            const next = Math.max(percent, barPosition(step));
             const message = WslSetupTexts.step(step);
             // The download reports each piece that arrives; the notification changes only with its text or its bar.
             if (message === shown && next === percent) return;

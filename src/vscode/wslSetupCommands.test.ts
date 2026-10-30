@@ -31,11 +31,13 @@ let setup: { [K in keyof Setup]: Mock<Setup[K]> };
 let useHost: Mock<WslSetupCommandsDeps['useHost']>;
 let forgetHost: Mock<WslSetupCommandsDeps['forgetHost']>;
 let showLog: Mock<() => void>;
+let release: Mock<() => Promise<void>>;
 
 function commands(extra: Partial<WslSetupCommandsDeps> = {}): WslSetupCommands {
   return new WslSetupCommands({
     setup,
     folder: FOLDER,
+    isWindows: true,
     logger,
     showLog,
     useHost,
@@ -75,7 +77,9 @@ beforeEach(() => {
     }),
     remove: vi.fn(async (_signal?: AbortSignal) => undefined),
     removeLeftovers: vi.fn(async () => undefined),
+    lock: vi.fn(async () => release),
   };
+  release = vi.fn(async () => undefined);
   useHost = vi.fn(async (_host: string) => true);
   forgetHost = vi.fn(async (_host: string) => false);
   showLog = vi.fn();
@@ -109,7 +113,24 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
       `${WslSetupTexts.settingUp} Creating the WSL distribution.`,
       `${WslSetupTexts.settingUp} Installing Docker Engine.`,
     ]);
-    expect(reports.map((report) => report.increment).filter((increment) => increment !== undefined)).toEqual([50, 50]);
+    // The download fills 40 percent; the other steps start at their places, so the bar is full only at the end.
+    expect(reports.map((report) => report.increment).filter((increment) => increment !== undefined)).toEqual([20, 20, 25]);
+    expect(setup.lock).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for a setup or a removal in another window, and runs without the lock when it cannot be written', async () => {
+    setup.lock.mockResolvedValueOnce(undefined);
+    await commands().setUp();
+    expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.busyElsewhere);
+    expect(setup.registration).not.toHaveBeenCalled();
+    setup.lock.mockResolvedValueOnce(undefined);
+    await commands().remove();
+    expect(setup.registration).not.toHaveBeenCalled();
+    setup.lock.mockRejectedValueOnce(new Error('EACCES'));
+    await commands().remove();
+    expect(setup.registration).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith('The setup of the WSL distribution of Devspaces runs without a lock for the other windows: EACCES');
   });
 
   it('says that the setup is done when Devspaces cannot use the distribution yet', async () => {
@@ -194,10 +215,11 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     expect(setup.checkWsl).toHaveBeenCalledTimes(1);
   });
 
-  it('says that the distribution exists only on Windows', async () => {
+  it('says that the distribution exists only on Windows, or that LOCALAPPDATA is missing on Windows', async () => {
+    await commands({ setup: undefined, folder: undefined, isWindows: false }).setUp();
+    await commands({ setup: undefined, folder: undefined, isWindows: false }).remove();
     await commands({ setup: undefined, folder: undefined }).setUp();
-    await commands({ setup: undefined, folder: undefined }).remove();
-    expect(window.showInformationMessage.mock.calls).toEqual([[WslSetupTexts.notWindows], [WslSetupTexts.notWindows]]);
+    expect(window.showInformationMessage.mock.calls).toEqual([[WslSetupTexts.notWindows], [WslSetupTexts.notWindows], [WslSetupTexts.noLocalAppData]]);
   });
 });
 
@@ -258,6 +280,14 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
     await commands().remove();
     expect(logger.info).toHaveBeenCalledWith('The removal of the WSL distribution of Devspaces was cancelled.');
     expect(window.showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it('removes nothing when the registry does not tell whether Devspaces set up the distribution', async () => {
+    setup.registration.mockRejectedValue(new WslSetupError('registryFailed', 'WSL lists the distribution devspaces, but the registry cannot be read.'));
+    await commands().remove();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(WslSetupTexts.problem('registryFailed'), Actions.showDetails);
+    expect(setup.remove).not.toHaveBeenCalled();
+    expect(forgetHost).not.toHaveBeenCalled();
   });
 
   it('keeps the host when WSL refuses the removal, and says so', async () => {

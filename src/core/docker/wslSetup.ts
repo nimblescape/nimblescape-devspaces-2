@@ -57,6 +57,12 @@ const DOWNLOAD_NAME = 'debian.wsl';
 const REGISTRY_EXPORT_NAME = 'distributions.reg';
 /** The start of the lines of the script that name its next step. */
 const STEP_PREFIX = 'devspaces-step ';
+/** A lock of a setup or a removal that is older is taken over: the longest setup ends within about 80 minutes. */
+const LOCK_MAX_AGE_MS = 2 * 60 * 60_000;
+/** A lock file without its content yet (it is being written) is taken over only after this time. */
+const LOCK_WRITE_MS = 10_000;
+/** The folders `disk-2` and so on that a new registration may take when `disk` has files of unknown use. */
+const MAX_DISK_FOLDERS = 20;
 
 /**
  * The folder of the WSL distribution of Devspaces: `%LOCALAPPDATA%\nimblescape\devspaces\wsl`, outside of the storage
@@ -286,7 +292,9 @@ export type WslSetupProblem =
   /** Docker did not answer after the restart. */
   | 'dockerNotRunning'
   /** `wsl --unregister` failed. */
-  | 'removeFailed';
+  | 'removeFailed'
+  /** WSL lists the distribution, but the registry cannot be read, so it is not known whether Devspaces set it up. */
+  | 'registryFailed';
 
 /** A failure of the setup or the removal; the message is technical (for the log), the problem chooses the text. */
 export class WslSetupError extends Error {
@@ -304,9 +312,9 @@ export function isWslSetupError(error: unknown): error is WslSetupError {
 }
 
 /**
- * Whether the distribution `devspaces` is registered: `none`; `own`, set up by Devspaces (the registry names the folder
- * of Devspaces as the folder of its virtual disk); or `foreign`, a distribution with that name that the user made,
- * which Devspaces never sets up or removes.
+ * Whether the distribution `devspaces` is registered: `none`; `own`, set up by Devspaces (the registry names a folder
+ * in the folder of Devspaces as the folder of its virtual disk); or `foreign`, a distribution with that name that the
+ * user made, which Devspaces never sets up or removes.
  */
 export type WslRegistration = 'none' | 'own' | 'foreign';
 
@@ -338,11 +346,6 @@ export interface WslSetupDeps {
 
 export class WslSetup {
   constructor(private readonly deps: WslSetupDeps) {}
-
-  /** The folder of the virtual disk of the distribution (`--location`). */
-  get diskFolder(): string {
-    return path.join(this.deps.folder, 'disk');
-  }
 
   private get downloadFolder(): string {
     return path.join(this.deps.folder, 'download');
@@ -376,22 +379,50 @@ export class WslSetup {
 
   /**
    * Whether the distribution `devspaces` is registered, and whether Devspaces set it up (WslRegistration): from the
-   * list of WSL and the folder of its virtual disk in the registry. When `wsl.exe --list` fails (also without any
-   * distribution), the registry alone decides. When the registry cannot be read (logged), a virtual disk in `diskFolder`
-   * makes it `own`.
+   * list of WSL and the folder of its virtual disk in the registry, `own` only when that folder is in the folder of
+   * Devspaces. When `wsl.exe --list` fails (it also does without any distribution), the registry alone decides, and
+   * without the registry it is `none`. Throws WslSetupError `registryFailed` when WSL lists the distribution but the
+   * registry cannot be read: Devspaces never guesses that it set up a distribution.
    */
   async registration(signal?: AbortSignal): Promise<WslRegistration> {
     const listed = await this.listed(signal);
     if (listed === false) return 'none';
     const folders = await this.distributionFolders(signal);
-    if (folders !== undefined) {
-      const diskFolder = folders.get(WSL_DISTRIBUTION);
-      if (diskFolder === undefined) return listed ? 'foreign' : 'none';
-      return isWithin(diskFolder, this.diskFolder) ? 'own' : 'foreign';
+    if (folders === undefined) {
+      if (listed === undefined) return 'none';
+      throw new WslSetupError('registryFailed', `WSL lists the distribution ${WSL_DISTRIBUTION}, but the registry (${LXSS_KEY}) cannot be read, so Devspaces cannot tell whether it set it up.`);
     }
-    if (!listed) return 'none';
-    this.deps.logger.info(`Without the registry, a virtual disk in ${this.diskFolder} tells whether Devspaces set up the WSL distribution ${WSL_DISTRIBUTION}.`);
-    return (await this.hasDisk()) ? 'own' : 'foreign';
+    const diskFolder = folders.get(WSL_DISTRIBUTION);
+    if (diskFolder === undefined) return listed ? 'foreign' : 'none';
+    return isWithin(diskFolder, this.deps.folder) ? 'own' : 'foreign';
+  }
+
+  /**
+   * Marks a setup or a removal as running for all windows of the Windows user (the file `<folder>.lock` with the
+   * process and the time), so that two windows never work on the distribution at the same time. Returns its release,
+   * or undefined while another process holds it. The lock of a process that ended, or one older than two hours, is
+   * taken over.
+   */
+  async lock(): Promise<(() => Promise<void>) | undefined> {
+    const file = `${this.deps.folder}.lock`;
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    const content = JSON.stringify({ pid: process.pid, started: Date.now() });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await fs.promises.writeFile(file, content, { flag: 'wx' });
+        return async () => {
+          // Only its own lock: another window may have taken over an old one.
+          const now = await fs.promises.readFile(file, 'utf8').catch(() => undefined);
+          if (now === content) await fs.promises.rm(file, { force: true }).catch(() => undefined);
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        if (!(await isStaleLock(file))) return undefined;
+        this.deps.logger.info(`The lock ${file} of a setup that ended is taken over.`);
+        await fs.promises.rm(file, { force: true });
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -416,7 +447,7 @@ export class WslSetup {
 
   /**
    * Sets up the distribution: with `image`, downloads it into the folder `download`, registers it with its virtual disk
-   * in `diskFolder`, and removes the download; then the script installs Docker Engine (PROVISION_SCRIPT), the
+   * in a folder `disk` (diskFolderFor), and removes the download; then the script installs Docker Engine (PROVISION_SCRIPT), the
    * distribution restarts, and Docker must answer. Without `image`, only the script, the restart and the check run (a
    * distribution that Devspaces set up before). Returns the version of the engine. Throws WslSetupError, or an
    * AbortError when the signal aborts. When the script is cancelled or ends by its time limit, the distribution stops,
@@ -501,20 +532,20 @@ export class WslSetup {
 
   private async register(image: WslImage, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<void> {
     const file = path.join(this.downloadFolder, DOWNLOAD_NAME);
-    await this.clearDiskFolder(signal);
+    const diskFolder = await this.diskFolderFor(signal);
     await fs.promises.mkdir(this.downloadFolder, { recursive: true });
-    await fs.promises.mkdir(this.diskFolder, { recursive: true });
+    await fs.promises.mkdir(diskFolder, { recursive: true });
     try {
       onStep({ kind: 'download', received: 0, total: image.size });
       await this.downloadImage(image, file, onStep, signal);
       onStep({ kind: 'register' });
-      const args = wslInstallArgs(file, this.diskFolder);
+      const args = wslInstallArgs(file, diskFolder);
       this.deps.logger.info(`wsl.exe ${args.join(' ')}`);
       const result = await this.runWsl(args, { timeoutMs: REGISTER_MS, signal });
       if (result.exitCode !== 0) {
         throw new WslSetupError('registerFailed', `wsl.exe --install --from-file failed (${endOf(result, REGISTER_MS)}): ${outputOf(result)}`);
       }
-      this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${this.diskFolder}.`);
+      this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${diskFolder}.`);
     } finally {
       await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
         this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
@@ -580,25 +611,28 @@ export class WslSetup {
   }
 
   /**
-   * Empties `diskFolder` before a registration: a virtual disk of a setup that did not end may be there, and WSL creates
-   * no distribution on it. Throws WslSetupError `registerFailed` when a WSL distribution has its disk there, or when the
-   * registry cannot tell.
+   * The folder for the virtual disk of a new registration (`--location`), so that WSL creates it in an empty folder:
+   * `disk`, emptied when it has the files of a setup that did not end and no WSL distribution uses them. When that is
+   * not known, nothing is removed on a guess: the first empty folder `disk-2`, `disk-3` and so on.
    */
-  private async clearDiskFolder(signal?: AbortSignal): Promise<void> {
-    const names = await fs.promises.readdir(this.diskFolder).catch(() => [] as string[]);
-    if (names.length === 0) return;
-    const users = await this.diskUsers(this.diskFolder, signal);
-    if (users === undefined) {
-      throw new WslSetupError(
-        'registerFailed',
-        `The folder ${this.diskFolder} has files (${names.join(', ')}), and neither the registry nor WSL tells whether a WSL distribution uses them; Devspaces creates no distribution there. When no WSL distribution uses them, remove the folder and try again.`,
-      );
+  private async diskFolderFor(signal?: AbortSignal): Promise<string> {
+    const first = path.join(this.deps.folder, 'disk');
+    const names = await filesOf(first);
+    if (names.length === 0) return first;
+    const users = await this.diskUsers(first, signal);
+    if (users?.length === 0) {
+      this.deps.logger.info(`The folder ${first} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
+      await fs.promises.rm(first, { recursive: true, force: true });
+      return first;
     }
-    if (users.length > 0) {
-      throw new WslSetupError('registerFailed', `The folder ${this.diskFolder} has files (${names.join(', ')}), and the WSL distribution ${users.join(', ')} has its virtual disk there; Devspaces creates no distribution there.`);
+    const why = users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses them' : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
+    for (let number = 2; number <= MAX_DISK_FOLDERS; number++) {
+      const next = path.join(this.deps.folder, `disk-${number}`);
+      if ((await filesOf(next)).length > 0) continue;
+      this.deps.logger.info(`The folder ${first} has files (${names.join(', ')}), and ${why}; the new distribution gets the folder ${next}.`);
+      return next;
     }
-    this.deps.logger.info(`The folder ${this.diskFolder} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
-    await fs.promises.rm(this.diskFolder, { recursive: true, force: true });
+    throw new WslSetupError('registerFailed', `The folders ${first} to disk-${MAX_DISK_FOLDERS} all have files, and ${why}.`);
   }
 
   /**
@@ -628,12 +662,6 @@ export class WslSetup {
     const result = await this.runShort(WSL_LIST_ARGS, signal);
     if (result.exitCode !== 0) return undefined;
     return parseWslList(result.stdout).some((name) => name.toLowerCase() === WSL_DISTRIBUTION);
-  }
-
-  /** True when `diskFolder` has a virtual disk (`*.vhdx`). */
-  private async hasDisk(): Promise<boolean> {
-    const names = await fs.promises.readdir(this.diskFolder).catch(() => [] as string[]);
-    return names.some((name) => name.toLowerCase().endsWith('.vhdx'));
   }
 
   /**
@@ -689,6 +717,45 @@ export class WslSetup {
       if (options.signal?.aborted) throw abortError();
       throw new WslSetupError('wslMissing', `wsl.exe could not be started: ${errorMessage(error)}`);
     }
+  }
+}
+
+/** The names in `folder`; none when it does not exist. */
+async function filesOf(folder: string): Promise<string[]> {
+  return fs.promises.readdir(folder).catch(() => []);
+}
+
+/**
+ * True when the lock `file` is of a process that ended, or older than LOCK_MAX_AGE_MS; a file without a readable
+ * content counts so only when it is older than LOCK_WRITE_MS (else its process is writing it). A lock that is gone
+ * counts as stale.
+ */
+async function isStaleLock(file: string): Promise<boolean> {
+  let text: string;
+  let modified: number;
+  try {
+    text = await fs.promises.readFile(file, 'utf8');
+    modified = (await fs.promises.stat(file)).mtimeMs;
+  } catch {
+    return true;
+  }
+  let lock: { pid?: unknown; started?: unknown } | undefined;
+  try {
+    lock = JSON.parse(text) as { pid?: unknown; started?: unknown };
+  } catch {
+    lock = undefined;
+  }
+  if (typeof lock?.pid !== 'number' || typeof lock.started !== 'number') return Date.now() - modified > LOCK_WRITE_MS;
+  return Date.now() - lock.started > LOCK_MAX_AGE_MS || !isRunning(lock.pid);
+}
+
+/** Whether the process `pid` runs (signal 0 only checks it, also on Windows). */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 

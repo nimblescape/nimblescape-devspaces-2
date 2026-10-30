@@ -949,6 +949,7 @@ async function activateExtension(
         ? undefined
         : new WslSetup({ runner, wslPath, env, arch: process.arch, folder: wslFolder, logger, http: nodeHttpsTransport }),
     folder: wslFolder,
+    isWindows: platform === 'win32',
     logger,
     showLog: () => logger.show(),
     useHost: (host) => remoteDocker.useHost(host),

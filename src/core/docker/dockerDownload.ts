@@ -9,6 +9,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as https from 'https';
+import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { userAgent } from '../http';
 import { abortError } from '../ports';
@@ -111,7 +112,8 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
     const next = new URL(location, url).href;
     if (maxRedirects === 0) throw new Error(`The download of ${options.url} was redirected to ${next}; it takes no redirect.`);
     if (redirects >= maxRedirects) throw new Error(`Too many redirects for ${options.url}.`);
-    // Docker's link of the latest version points to a versioned file of the same host: a redirect never leaves it.
+    // Docker's link of the latest version points to a versioned file of the same host: a redirect stays there, unless
+    // `anyHttpsRedirect` lets the SHA-256 alone check the file.
     if (options.anyHttpsRedirect === true ? !isHttpsUrl(next) : !isHttpsUrlOf(next, host)) {
       throw new Error(`The download of ${options.url} was redirected to ${next}, which is not HTTPS${options.anyHttpsRedirect === true ? '' : ` on ${host}`}.`);
     }
@@ -134,19 +136,23 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
   }
   const hash = crypto.createHash('sha256');
   let received = 0;
-  const body = response.body as NodeJS.ReadableStream & { destroy?: (error?: Error) => void };
-  body.on('data', (chunk: Buffer) => {
-    received += chunk.length;
-    if (maxBytes !== undefined && received > maxBytes) {
-      body.destroy?.(new Error(`The download of ${url} has more than the ${maxBytes} bytes that it may have.`));
-      return;
-    }
-    hash.update(chunk);
-    options.onProgress?.(received, total);
+  const source = url;
+  // Counts, hashes and limits each piece before it is written.
+  const meter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      if (maxBytes !== undefined && received > maxBytes) {
+        callback(new Error(`The download of ${source} has more than the ${maxBytes} bytes that it may have.`));
+        return;
+      }
+      hash.update(chunk);
+      options.onProgress?.(received, total);
+      callback(null, chunk);
+    },
   });
   const partial = `${options.target}.download`;
   try {
-    await pipeline(response.body, fs.createWriteStream(partial, { flags: 'wx' }), { signal });
+    await pipeline(response.body, meter, fs.createWriteStream(partial, { flags: 'wx' }), { signal });
     if (total !== undefined && received !== total) {
       throw new Error(`The download of ${url} ended after ${received} of ${total} bytes.`);
     }

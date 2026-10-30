@@ -284,18 +284,19 @@ describe('WslSetup.registration', () => {
     fs.writeFileSync(path.join(disk, 'ext4.vhdx'), '');
     await expect(setup({ runner: wslRunner(list, { devspaces: 'D:\\mine' }) }).registration()).resolves.toBe('foreign');
     await expect(setup({ runner: wslRunner(list, { Ubuntu: disk }) }).registration()).resolves.toBe('foreign');
+    // The disk of a later registration may be in another folder of Devspaces.
+    await expect(setup({ runner: wslRunner(list, { devspaces: path.join(folder, 'disk-2') }) }).registration()).resolves.toBe('own');
   });
 
-  it('takes a virtual disk in the folder of Devspaces when the registry cannot be read (logged)', async () => {
+  it('never guesses the owner when WSL lists the distribution but the registry cannot be read', async () => {
     const log = logger();
+    fs.mkdirSync(path.join(folder, 'disk'));
+    fs.writeFileSync(path.join(folder, 'disk', 'ext4.vhdx'), '');
     const runner = wslRunner(() => ok('devspaces\r\n'), failed('ERROR: Registry editing has been disabled by your administrator.'));
-    await expect(setup({ runner, log }).registration()).resolves.toBe('foreign');
+    await expect(setup({ runner, log }).registration()).rejects.toMatchObject({ problem: 'registryFailed' });
     expect(log.warn).toHaveBeenCalledWith(
       `The WSL distributions could not be read from the registry (${LXSS_KEY}): reg.exe export ended with exit code 1: ERROR: Registry editing has been disabled by your administrator.`,
     );
-    fs.mkdirSync(path.join(folder, 'disk'));
-    fs.writeFileSync(path.join(folder, 'disk', 'ext4.vhdx'), '');
-    await expect(setup({ runner, log }).registration()).resolves.toBe('own');
   });
 
   it('says that WSL does not answer instead of none when the list ends by its time limit', async () => {
@@ -526,28 +527,25 @@ describe('WslSetup.setUp', () => {
     expect(log.info).toHaveBeenCalledWith(`The folder ${disk} has the files of a setup that did not end (ext4.vhdx); they are removed.`);
   });
 
-  it('fails with registerFailed and keeps the virtual disk when a distribution uses it, or when the registry does not tell', async () => {
+  it('registers in another folder and removes nothing when a distribution uses the disk, or when nothing tells', async () => {
     const disk = path.join(folder, 'disk');
     fs.mkdirSync(disk, { recursive: true });
     fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'in use');
-    const download = writingDownload();
-    const used = distribution(undefined, { devspaces: disk });
-    await expect(setup({ runner: used, download }).setUp(image, () => undefined)).rejects.toMatchObject({
-      problem: 'registerFailed',
-      message: `The folder ${disk} has files (ext4.vhdx), and the WSL distribution devspaces has its virtual disk there; Devspaces creates no distribution there.`,
-    });
-    // Without the registry, WSL must answer its list.
+    const log = logger();
+    const used = distribution(undefined, { other: disk });
+    await expect(setup({ runner: used, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
+    const file = path.join(folder, 'download', 'debian.wsl');
+    expect(used.calls.find((call) => call.args[0] === '--install')?.args).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
+    expect(log.info).toHaveBeenCalledWith(
+      `The folder ${disk} has files (ext4.vhdx), and the WSL distribution other has its virtual disk there; the new distribution gets the folder ${path.join(folder, 'disk-2')}.`,
+    );
+    // Without the registry and the list of WSL, the next free folder.
+    fs.writeFileSync(path.join(folder, 'disk-2', 'ext4.vhdx'), 'of the first one');
     const unknown = distribution(undefined, failed('Access is denied.'));
-    await expect(setup({ runner: unknown, download }).setUp(image, () => undefined)).rejects.toMatchObject({
-      problem: 'registerFailed',
-      message: expect.stringContaining('neither the registry nor WSL tells whether a WSL distribution uses them'),
-    });
-    const listed = distribution((args) => (args.join(' ') === WSL_LIST_ARGS.join(' ') ? ok('devspaces\r\n') : undefined), failed('Access is denied.'));
-    await expect(setup({ runner: listed, download }).setUp(image, () => undefined)).rejects.toMatchObject({
-      message: expect.stringContaining('and the WSL distribution devspaces has its virtual disk there'),
-    });
-    expect(download).not.toHaveBeenCalled();
+    await setup({ runner: unknown, download: writingDownload() }).setUp(image, () => undefined);
+    expect(unknown.calls.find((call) => call.args[0] === '--install')?.args).toEqual(wslInstallArgs(file, path.join(folder, 'disk-3')));
     expect(fs.readdirSync(disk)).toEqual(['ext4.vhdx']);
+    expect(fs.readdirSync(path.join(folder, 'disk-2'))).toEqual(['ext4.vhdx']);
   });
 
   it('removes the virtual disk of a setup that did not end without the registry when WSL does not list the distribution', async () => {
@@ -593,6 +591,45 @@ describe('WslSetup.remove', () => {
     const runner = wslRunner(() => failed('Access is denied.'));
     await expect(setup({ runner }).remove()).rejects.toEqual(new WslSetupError('removeFailed', 'wsl.exe --unregister devspaces failed (exit code 1): Access is denied.'));
     expect(fs.existsSync(folder)).toBe(true);
+  });
+});
+
+describe('WslSetup.lock', () => {
+  const lockFile = () => `${folder}.lock`;
+
+  afterEach(() => {
+    fs.rmSync(lockFile(), { force: true });
+  });
+
+  it('holds one setup or removal at a time for all windows, until its release', async () => {
+    const first = await setup({ runner: wslRunner(() => undefined) }).lock();
+    expect(first).toBeDefined();
+    expect(JSON.parse(fs.readFileSync(lockFile(), 'utf8'))).toMatchObject({ pid: process.pid });
+    await expect(setup({ runner: wslRunner(() => undefined) }).lock()).resolves.toBeUndefined();
+    await first?.();
+    expect(fs.existsSync(lockFile())).toBe(false);
+    const second = await setup({ runner: wslRunner(() => undefined) }).lock();
+    expect(second).toBeDefined();
+    await second?.();
+  });
+
+  it('takes over the lock of a process that ended or of an old one, but not one that is being written', async () => {
+    for (const stale of [{ pid: 999_999_999, started: Date.now() }, { pid: process.pid, started: Date.now() - 3 * 60 * 60_000 }]) {
+      fs.writeFileSync(lockFile(), JSON.stringify(stale));
+      const release = await setup({ runner: wslRunner(() => undefined) }).lock();
+      expect(release).toBeDefined();
+      await release?.();
+    }
+    fs.writeFileSync(lockFile(), '');
+    await expect(setup({ runner: wslRunner(() => undefined) }).lock()).resolves.toBeUndefined();
+  });
+
+  it('releases only its own lock', async () => {
+    const release = await setup({ runner: wslRunner(() => undefined) }).lock();
+    const other = JSON.stringify({ pid: process.pid, started: Date.now() + 1 });
+    fs.writeFileSync(lockFile(), other);
+    await release?.();
+    expect(fs.readFileSync(lockFile(), 'utf8')).toBe(other);
   });
 });
 
