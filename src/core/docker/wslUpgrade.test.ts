@@ -17,6 +17,7 @@ import {
   UPGRADE_INTERVAL_SECONDS,
   UPGRADE_LOG,
   UPGRADE_MS,
+  UPGRADE_REPAIR_SECONDS,
   UPGRADE_RETRY_SECONDS,
   UPGRADE_SCRIPT,
   UPGRADE_STATE_DIR,
@@ -172,7 +173,7 @@ describe('WslUpgrade', () => {
     await timedOut.subject.check();
     expect(timedOut.log.warn).toHaveBeenCalledWith(
       'The weekly upgrade of the packages of the WSL distribution devspaces did not end within 30 minutes; it goes on in the distribution while the ' +
-        'distribution runs, and a run that the stop of the distribution ended is tried again after a day. Its output is in /var/log/devspaces-upgrade.log there.',
+        'distribution runs, and a run that the stop of the distribution ended goes on at a check an hour later or after. Its output is in /var/log/devspaces-upgrade.log there.',
     );
     const thrown = upgrade(new Error('spawn EACCES'));
     await expect(thrown.subject.check()).resolves.toBeUndefined();
@@ -205,7 +206,7 @@ describe('WslUpgrade', () => {
       [
         'The weekly upgrade kept 2 package(s) of the WSL distribution devspaces back (apt-get upgrade: 0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.): ' +
           'packages on hold (apt-mark hold), or new versions that need the removal of other packages, which it never does. ' +
-          '"wsl -d devspaces -u root -- apt-get full-upgrade" in a terminal upgrades the latter.',
+          '"wsl -d devspaces -u root -- apt-get full-upgrade" in a terminal upgrades the latter; it restarts Docker, so stop your devspaces there first.',
       ],
     ]);
     expect(kept.log.warn).not.toHaveBeenCalled();
@@ -254,9 +255,10 @@ describe('the script of the upgrade', () => {
    * Runs the script with the real `sh`, `flock` and `date`, its paths in the temporary folder, and stubs of `dpkg` and
    * `apt-get` that write their arguments (and whether the policy-rc.d is there) to the file `calls`. `failUpdate`: the
    * number of runs of `apt-get update` that fail (all: true). `summary`: the summary line of the stub of
-   * `apt-get upgrade`. `sleep` writes its argument to `calls` and returns at once.
+   * `apt-get upgrade`. `audit`: the output of `dpkg --audit`, which writes nothing to `calls`. `sleep` writes its
+   * argument to `calls` and returns at once.
    */
-  function runScript(options: { failUpdate?: boolean | number; summary?: string; hangup?: boolean } = {}) {
+  function runScript(options: { failUpdate?: boolean | number; summary?: string; hangup?: boolean; audit?: string } = {}) {
     const bin = file('bin');
     fs.mkdirSync(bin, { recursive: true });
     const stub = (name: string, first: string[], extra: string[] = []) =>
@@ -271,7 +273,7 @@ describe('the script of the upgrade', () => {
         ].join('\n'),
         { mode: 0o755 },
       );
-    stub('dpkg', []);
+    stub('dpkg', [`[ "$1" = --audit ] && { printf '%s' '${options.audit ?? ''}'; exit 0; }`]);
     stub('sleep', []);
     const failures = options.failUpdate === true ? 1000 : (options.failUpdate ?? 0);
     stub('apt-get', [], [
@@ -363,6 +365,16 @@ describe('the script of the upgrade', () => {
     write(UPGRADE_TRIED_FILE, UPGRADE_RETRY_SECONDS + 60);
     expect(runScript().stdout.trim()).toMatch(/^devspaces-upgrade done /);
     expect(calls()[0]).toBe('dpkg --configure -a policy=yes');
+    // Packages that a run left unfinished: a run an hour after the last try, also within the week.
+    fs.rmSync(file('calls'));
+    const audit = 'The following packages are only half configured';
+    write(UPGRADE_DONE_FILE, 60);
+    write(UPGRADE_TRIED_FILE, UPGRADE_REPAIR_SECONDS - 60);
+    expect(runScript({ audit }).stdout.trim()).toBe('devspaces-upgrade skipped');
+    expect(calls()).toEqual([]);
+    write(UPGRADE_TRIED_FILE, UPGRADE_REPAIR_SECONDS + 60);
+    expect(runScript({ audit }).stdout.trim()).toMatch(/^devspaces-upgrade done /);
+    expect(calls()[0]).toBe('dpkg --configure -a policy=yes');
     // A time after now (a clock that went back) counts as none.
     write(UPGRADE_DONE_FILE, -UPGRADE_INTERVAL_SECONDS);
     write(UPGRADE_TRIED_FILE, -UPGRADE_RETRY_SECONDS);
@@ -382,6 +394,17 @@ describe('the script of the upgrade', () => {
     expect(calls().filter((call) => call.startsWith('apt-get update'))).toHaveLength(3);
     expect(fs.existsSync(file('policy-rc.d'))).toBe(false);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
+  });
+
+  // Mutation: a script that upgrades without its own policy-rc.d lets the packages start Docker again, which stops the
+  // running devspaces.
+  it('fails without changing anything while a policy-rc.d of another program is there', () => {
+    fs.writeFileSync(file('policy-rc.d'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const run = runScript();
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain(`The upgrade did not run: ${file('policy-rc.d')} of another program is there`);
+    expect(calls()).toEqual([]);
+    expect(fs.readFileSync(file('policy-rc.d'), 'utf8')).toBe('#!/bin/sh\nexit 0\n');
   });
 
   // Mutation: a script without the lock runs next to a setup of Docker.

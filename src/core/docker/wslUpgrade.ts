@@ -12,7 +12,7 @@
 import { errorMessage } from '../errors';
 import type { Logger, ProcessRunner, RunResult } from '../ports';
 import { WSL_DISTRIBUTION, wslCommandArgs, wslEnv, wslText } from './dockerHost';
-import { WSL_POLICY_INSTALL, WSL_SETUP_LOCK, duration, endOf, outputOf } from './wslSetup';
+import { WSL_POLICY_INSTALL, WSL_POLICY_MARK, WSL_SETUP_LOCK, duration, endOf, outputOf } from './wslSetup';
 
 /** The folder of the times of the upgrade in the distribution. */
 export const UPGRADE_STATE_DIR = '/var/lib/devspaces';
@@ -29,6 +29,8 @@ export const UPGRADE_LOG = '/var/log/devspaces-upgrade.log';
 export const UPGRADE_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
 /** An upgrade runs only when the last one that began is this old. */
 export const UPGRADE_RETRY_SECONDS = 24 * 60 * 60;
+/** While dpkg has packages that a run left unfinished (`dpkg --audit`), the last one that began needs only be this old. */
+export const UPGRADE_REPAIR_SECONDS = 60 * 60;
 /** The start of the line of the script that tells its result: `busy`, `skipped`, or `done <the summary of apt-get>`. */
 export const UPGRADE_PREFIX = 'devspaces-upgrade ';
 /** The time limit of the script. */
@@ -41,8 +43,10 @@ export const UPGRADE_CHECK_MS = 6 * 60 * 60_000;
 /**
  * The script of the upgrade (`sh -s`, as root). It runs only with the lock of the setup in the distribution (another
  * setup or upgrade runs: `busy`), and only when the last upgrade that ended well is a week old and the last one that
- * began is a day old; else `skipped`. A time after now (a clock that went back) counts as none. `dpkg --configure -a`
- * ends an upgrade that did not end. `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg --configure -a`
+ * began is a day old; else `skipped`. While dpkg has packages that a run left unfinished (`dpkg --audit`, for example
+ * after the stop of the distribution in the middle of dpkg), it runs when the last one that began is an hour old, and
+ * `dpkg --configure -a` ends the unfinished one. A time after now (a clock that went back) counts as none. Without its
+ * own policy-rc.d (one of another program is there), it fails: then the packages could start Docker again. `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg --configure -a`
  * and `apt-get update`, which do not wait for a lock, run up to 3 times, 30 seconds apart (`apt-get check` of the timer
  * apt-daily, or apt of the user). `--with-new-pkgs` also installs a new package that an upgrade needs, but removes
  * none. The summary line of apt is in the format of apt before 3.0 or in that of apt 3.0 (`Upgrading: …`); `LC_ALL=C`
@@ -64,7 +68,14 @@ fi
 mkdir -p ${UPGRADE_STATE_DIR}
 now=$(date +%s)
 since() { last=$(cat "$1" 2>/dev/null || echo 0); case "$last" in ''|*[!0-9]*) last=0;; esac; [ "$last" -le "$now" ] || last=0; echo $((now - last)); }
-if [ "$(since ${UPGRADE_DONE_FILE})" -lt ${UPGRADE_INTERVAL_SECONDS} ] || [ "$(since ${UPGRADE_TRIED_FILE})" -lt ${UPGRADE_RETRY_SECONDS} ]; then
+retry=${UPGRADE_RETRY_SECONDS}
+if [ -n "$(dpkg --audit 2>/dev/null)" ]; then
+retry=${UPGRADE_REPAIR_SECONDS}
+elif [ "$(since ${UPGRADE_DONE_FILE})" -lt ${UPGRADE_INTERVAL_SECONDS} ]; then
+echo "${UPGRADE_PREFIX}skipped"
+exit 0
+fi
+if [ "$(since ${UPGRADE_TRIED_FILE})" -lt "$retry" ]; then
 echo "${UPGRADE_PREFIX}skipped"
 exit 0
 fi
@@ -75,6 +86,10 @@ run() { "$@" 9>&- >> "$log" 2>&1 || fail; }
 again() { tries=1; until "$@" 9>&- >> "$log" 2>&1; do [ "$tries" -lt 3 ] || fail; tries=$((tries + 1)); sleep 30 9>&-; done; }
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 ${WSL_POLICY_INSTALL}
+if ! grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d 2>/dev/null; then
+echo "The upgrade did not run: /usr/sbin/policy-rc.d of another program is there, so the packages could start Docker again and stop the running devspaces." >&2
+exit 1
+fi
 trap '' HUP
 again dpkg --configure -a
 again apt-get update
@@ -195,7 +210,7 @@ export class WslUpgrade {
     if (result.timedOut) {
       this.deps.logger.warn(
         `The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} did not end within ${duration(UPGRADE_MS)}; ` +
-          `it goes on in the distribution while the distribution runs, and a run that the stop of the distribution ended is tried again after a day. ` +
+          `it goes on in the distribution while the distribution runs, and a run that the stop of the distribution ended goes on at a check an hour later or after. ` +
           `Its output is in ${UPGRADE_LOG} there.`,
       );
       return;
@@ -226,7 +241,7 @@ export class WslUpgrade {
       this.deps.logger.info(
         `The weekly upgrade kept ${kept} package(s) of the WSL distribution ${WSL_DISTRIBUTION} back ${of}: packages on hold (apt-mark hold), ` +
           `or new versions that need the removal of other packages, which it never does. ` +
-          `"wsl -d ${WSL_DISTRIBUTION} -u root -- apt-get full-upgrade" in a terminal upgrades the latter.`,
+          `"wsl -d ${WSL_DISTRIBUTION} -u root -- apt-get full-upgrade" in a terminal upgrades the latter; it restarts Docker, so stop your devspaces there first.`,
       );
     }
   }
