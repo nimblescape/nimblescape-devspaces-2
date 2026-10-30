@@ -70,14 +70,15 @@ export function authorizedKeysCommand(key: PublicKey, comment: string): string {
  * One line for the shell before the relay that removes the line `<type> <key> <comment>` that authorizedKeysCommand
  * added from `~/.ssh/authorized_keys` again (only lines that are exactly this line). The other lines go into a copy of
  * the file (`cp -p`: its mode and owner), which then replaces it, so a failed write (a full disk) leaves the file as it
- * was; `restorecon` when the host has it. Its exit code is 0 when the file was replaced.
+ * was; `restorecon` when the host has it. A file that is a symbolic link (for example of a configuration management)
+ * is not changed: the exit code is not 0 then. Its exit code is 0 when the file was replaced.
  */
 export function removeAuthorizedKeyCommand(key: PublicKey, comment: string): string {
   const file = AUTHORIZED_KEYS;
   const line = shellWord(`${key.type} ${key.blob} ${comment}`);
   const copy = `${file}.devspaces-$$`;
   return [
-    `( cd || exit; kept=$(grep -vxF -- ${line} ${file}); [ $? -le 1 ] || exit`,
+    `( cd || exit; [ ! -L ${file} ] || { echo '~/${file} is a symbolic link' >&2; exit 3; }; kept=$(grep -vxF -- ${line} ${file}); [ $? -le 1 ] || exit`,
     `cp -p ${file} ${copy} && { [ -z "$kept" ] || printf '%s\\n' "$kept"; } > ${copy} && mv -f ${copy} ${file} || { s=$?; rm -f ${copy}; exit $s; }`,
     `{ ! command -v restorecon >/dev/null 2>&1 || restorecon -F ${file} >/dev/null 2>&1 || true; } )`,
   ].join('; ');

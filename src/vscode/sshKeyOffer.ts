@@ -248,8 +248,10 @@ export class SshKeyOffer {
     if (keygen === undefined) throw new Error('ssh-keygen was not found on this computer.');
     const quiet = noPromptEnv(env);
     if (!this.exists(this.keyPath)) {
-      // ssh-keygen would write over it.
-      if (this.exists(`${this.keyPath}.pub`)) throw new Error(`${this.keyPath}.pub is there without its private key; remove it, then try again.`);
+      // ssh-keygen would write over it; not when another window made both files in between.
+      if (this.exists(`${this.keyPath}.pub`) && !this.exists(this.keyPath)) {
+        throw new Error(`${this.keyPath}.pub is there without its private key; remove it, then try again.`);
+      }
       await fs.promises.mkdir(path.dirname(this.keyPath), { recursive: true, mode: 0o700 });
       // ssh-keygen does not write over a private key (its question gets no answer: the input is empty), so another
       // window that made the key meanwhile wins.

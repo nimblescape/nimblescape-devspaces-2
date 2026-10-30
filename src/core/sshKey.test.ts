@@ -114,6 +114,13 @@ describe('the command that adds the key to authorized_keys (run by sh in a home 
     fs.writeFileSync(file(), `ssh-ed25519 ${BLOB} devspaces@box\n`);
     runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'));
     expect(fs.readFileSync(file(), 'utf8')).toBe('');
+    // A symbolic link stays as it is.
+    fs.writeFileSync(path.join(home, 'managed'), `ssh-ed25519 ${BLOB} devspaces@box\n`);
+    fs.rmSync(file());
+    fs.symlinkSync(path.join(home, 'managed'), file());
+    expect(() => runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'))).toThrow(/is a symbolic link/);
+    expect(fs.lstatSync(file()).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(file(), 'utf8')).toBe(`ssh-ed25519 ${BLOB} devspaces@box\n`);
     // No file: it fails and creates none.
     fs.rmSync(file());
     expect(() => runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'))).toThrow();
