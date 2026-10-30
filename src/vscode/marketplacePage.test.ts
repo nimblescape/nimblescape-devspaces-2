@@ -24,7 +24,7 @@ import { TreeTexts } from './treeModel';
 // a link to docs/security.md. The scopes come from the code, so a change of the scopes also changes these texts.
 const ROOT = path.join(__dirname, '..', '..');
 const HEADING = 'What Devspaces does on your computer';
-const SECURITY_LINK = 'https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/security.md#what-devspaces-does-on-your-computer';
+const SECURITY_LINK = 'https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/security.md#what-devspaces-does-on-your-computer';
 const read = (file: string) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 // What a start of VS Code does before the first devspace, and that a registry is asked without a login first.
 const FIRST_USE_AND_LOGINS = ['Before your first devspace, Devspaces only reads its Docker host and, for the local Docker, the current Docker context when VS Code starts.', 'first without a login'];
@@ -140,7 +140,7 @@ describe('the behaviors of Devspaces at the top of the Marketplace page', () => 
     const text = section(readme, 'Uninstall');
     expect(text).toContain(`**Devspaces: ${REMOVE_COMMAND}**`);
     for (const volume of SHARED_VOLUMES) expect(text).toContain(`\`${volume}\``);
-    expect(text).toContain('(https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#uninstall)');
+    expect(text).toContain('(https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#uninstall)');
   });
 
   it('has the section Uninstall in the user guide, with the commands that the log names and the files of Devspaces', () => {
@@ -192,7 +192,7 @@ describe('the texts of the Monitor question and of the removal in the docs', () 
     const shared =
       'On an engine that several computers use, a monitor that keeps running and that another computer created stays; the computer that created it replaces it when it turns the setting on (see [Shared Docker engines](#shared-docker-engines)).';
     expect(setting?.markdownDescription).toContain('the first Start or Rebuild on an engine, or **Update All Images Now** there, asks');
-    expect(setting?.markdownDescription).toContain('(https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/docs/guide.md#the-background-run)');
+    expect(setting?.markdownDescription).toContain('(https://github.com/nimblescape/devspaces-vscode-2/blob/main/docs/guide.md#the-background-run)');
     const start = guide.indexOf('\n### The background run\n');
     expect(start, 'the section "The background run"').toBeGreaterThan(0);
     const backgroundRun = guide.slice(start, guide.indexOf('\n### ', start + 1));
@@ -247,7 +247,7 @@ describe('the Marketplace page and the files of the package', () => {
     expect(codicons).toEqual(['vm', 'vm-connect', 'vm-outline', 'vm-pending', 'vm-running']);
     for (const codicon of codicons) expect(notices).toContain(`"${codicon}"`);
     expect(read('.vscodeignore').split('\n').map((line) => line.trim())).toContain('!ThirdPartyNotices.txt');
-    expect(read('README.md')).toContain('(https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/ThirdPartyNotices.txt)');
+    expect(read('README.md')).toContain('(https://github.com/nimblescape/devspaces-vscode-2/blob/main/ThirdPartyNotices.txt)');
   });
 
   it('has SUPPORT.md in the package, linked from the README and the user guide, and the Q&A link opens the issues', () => {
@@ -265,7 +265,7 @@ describe('the Marketplace page and the files of the package', () => {
       expect(support).toContain(words);
     }
     expect(read('.vscodeignore').split('\n').map((line) => line.trim())).toContain('!SUPPORT.md');
-    expect(read('README.md')).toContain('(https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/SUPPORT.md)');
+    expect(read('README.md')).toContain('(https://github.com/nimblescape/devspaces-vscode-2/blob/main/SUPPORT.md)');
     expect(section(read('docs/guide.md'), 'Troubleshooting')).toContain('(../SUPPORT.md)');
   });
 

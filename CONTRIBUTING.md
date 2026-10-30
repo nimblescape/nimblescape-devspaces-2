@@ -84,24 +84,38 @@ links.
 
 ## Naming
 
-Every extension of the publisher `nimblescape` uses one name,
-`nimblescape-<name>`, for the repository, the package and the extension:
+Every extension of the publisher `nimblescape` has a short name `<name>`,
+for example `devspaces` or `commentlinks`. The repository and the extension
+use it in different forms:
 
 | What | Form | This extension |
 | --- | --- | --- |
-| Repository | `nimblescape/nimblescape-<name>` | `nimblescape/nimblescape-devspaces-2` |
+| Repository | `nimblescape/<name>-vscode` | `nimblescape/devspaces-vscode-2` |
 | `name` in `package.json` | `nimblescape-<name>` | `nimblescape-devspaces-2` |
 | Extension ID | `nimblescape.nimblescape-<name>` | `nimblescape.nimblescape-devspaces-2` |
 | Package file | `nimblescape-<name>-<version>.vsix` | `nimblescape-devspaces-2-<version>.vsix` |
 | Display name | `nimblescape <Title>` | `nimblescape Devspaces 2` |
 
-The prefix keeps the name apart from the names of other publishers, because
-the Marketplace accepts a `name` only once. The Marketplace cannot rename an
-extension ID: another `name` publishes a new extension, and the old one stays
-with its installations. An extension that is no longer wanted is unpublished
-(More Actions > Unpublish; this can be undone), never removed: the Marketplace
-keeps the `name` of a removed extension reserved permanently, also for its own
-publisher.
+The organization `nimblescape` is the namespace of the repository, as the
+scope `@nimblescape` is the namespace of an npm package, so the name of the
+repository does not repeat `nimblescape`. The suffix `-vscode` says that the
+repository holds a VS Code extension. When the `name` ends with a number
+`-<n>`, the name of the repository ends with the same number: the `name`
+`nimblescape-devspaces-2` has the repository `devspaces-vscode-2`.
+
+The prefix `nimblescape-` keeps the `name` apart from the names of other
+publishers, because the Marketplace accepts a `name` only once. The
+Marketplace cannot rename an extension ID: another `name` publishes a new
+extension, and the old one stays with its installations. An extension that is
+no longer wanted is unpublished (More Actions > Unpublish; this can be
+undone), never removed: the Marketplace keeps the `name` of a removed
+extension reserved permanently, also for its own publisher.
+
+A repository can get a new name. GitHub forwards the links and the clones of
+the old name to the repository, as long as no other repository takes the old
+name, so a new repository never uses an old name. After a rename, the
+publishing needs a new federated credential (see
+[Setup of a repository](#setup-of-a-repository)).
 
 ## Release
 
@@ -195,8 +209,8 @@ grants the role of a member for the whole publisher.
 
 A new extension repository needs its federated credential and its
 environment. The script `scripts/marketplace-setup.sh` sets both up for the
-GitHub repository of the remote `origin` of the clone, whose name must be the
-`name` of `package.json`; it needs the Azure CLI, the GitHub CLI and Node.js,
+GitHub repository of the remote `origin` of the clone, whose name must follow
+[Naming](#naming); it needs the Azure CLI, the GitHub CLI and Node.js,
 the two CLIs signed in with an account that may change the app registration
 and the settings of the repository. It shows what it sets up and
 asks before it changes anything. It changes nothing that already exists, so it
@@ -217,14 +231,15 @@ The script gives the credential these values. For this repository:
 | Field of the federated credential | Value |
 | --- | --- |
 | Issuer | `https://token.actions.githubusercontent.com` |
-| Subject | `repo:nimblescape@156021698/nimblescape-devspaces-2@1434983344:environment:marketplace` |
+| Subject | `repo:nimblescape@156021698/devspaces-vscode-2@1434983344:environment:marketplace` |
 | Audience | `api://AzureADTokenExchange` |
 
 GitHub puts the owner ID and the repository ID into the subject of every
 repository created after 15 July 2026, so a new owner of a reused name gets no
 token. The subject also holds the name of the repository: after a rename of
-the repository, run the script again and delete the credential of the old
-name. One app accepts at most 20 federated credentials.
+the repository, run the script again. It adds the credential of the new name
+and shows the command that deletes the credential of the old name. One app
+accepts at most 20 federated credentials.
 
 ### Setup from scratch
 
