@@ -60,6 +60,30 @@ describe('the monitor settings of extension.ts', () => {
     }
   });
 
+  // The rule of the WSL distribution of Devspaces for its work in the background (WslLifetime.monitorPermanent).
+  it('permanent: the mode alone, by the same rule, without the computer ID and the time zone', async () => {
+    for (const stop of [true, false, undefined]) {
+      const given = {
+        ...deps(stop === undefined ? {} : { stopMonitorWhenIdle: stop }, ['wsl:devspaces']),
+        computerId: (): string => {
+          throw new Error('not read');
+        },
+        timeZone: (): string => {
+          throw new Error('not read');
+        },
+      };
+      const settings = monitorSettingsOf(given);
+      expect(await settings.permanent('wsl:devspaces'), String(stop)).toBe(stop !== true);
+      expect(await settings.permanent('build-box'), String(stop)).toBe(false);
+      expect(given.asked).toEqual(['wsl:devspaces', 'build-box']);
+    }
+    // An answer that cannot be read counts as none, with the warning of forOpen.
+    const warnings: string[] = [];
+    const failing = monitorSettingsOf({ ...deps({}), answered: async () => Promise.reject(new Error('EIO')), logger: { warn: (message) => warnings.push(message) } });
+    expect(await failing.permanent('wsl:devspaces')).toBe(false);
+    expect(warnings).toEqual([expect.stringContaining('could not be read, so the Monitor there stops when no devspace runs: EIO')]);
+  });
+
   // The ensure then replaces a permanent Monitor of this computer with one that stops when idle; the log says why.
   it('an answer that cannot be read counts as none, with a warning, and the open goes on', async () => {
     for (const [answered, cause] of [
@@ -101,6 +125,8 @@ describe('the monitor settings of extension.ts', () => {
     // The answers of the engines come from their records; one that cannot be read is logged.
     expect(source).toContain('answered: (host) => engineRecords.monitorAnswered(host),');
     expect(source).toMatch(/const monitorSettings = monitorSettingsOf\(\{[^}]*\n\s*logger,\n\s*\}\);/);
+    // The WSL distribution of Devspaces asks the same settings.
+    expect(source).toContain('monitorPermanent: (host) => monitorSettings.permanent(host),');
     expect(source).not.toContain('imageUpdateSchedule ??');
   });
 });

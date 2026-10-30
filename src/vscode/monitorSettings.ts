@@ -35,17 +35,23 @@ export interface MonitorSettingsDeps {
 
 /** The settings of the monitor of the engine `host` of this computer (local and remote alike). Never rejects. */
 export async function monitorSettingsFor(deps: MonitorSettingsDeps, host: string): Promise<MonitorSettings> {
-  const answered = await answeredOf(deps, host);
-  const settings = deps.settings();
-  const permanent = monitorRunsPermanently(settings.stopMonitorWhenIdle, answered);
+  const permanent = await monitorPermanentFor(deps, host);
   return {
-    schedule: settings.cacheUpdateSchedule ?? DEFAULT_CACHE_UPDATE_SCHEDULE,
+    schedule: deps.settings().cacheUpdateSchedule ?? DEFAULT_CACHE_UPDATE_SCHEDULE,
     timeZone: deps.timeZone(),
     permanent,
     // This computer: the owner of a permanent monitor that it creates (LABEL_MONITOR_OWNER), and how an ensure tells
     // its own permanent monitor from one that another computer keeps.
     ...computerOf(deps),
   };
+}
+
+/**
+ * Whether the Monitor of the engine `host` runs permanently: the mode of monitorSettingsFor, without the other settings
+ * (the WSL distribution of Devspaces, WslLifetime). Never rejects.
+ */
+export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: string): Promise<boolean> {
+  return monitorRunsPermanently(deps.settings().stopMonitorWhenIdle, await answeredOf(deps, host));
 }
 
 /**
@@ -77,9 +83,12 @@ function computerOf(deps: MonitorSettingsDeps): { computer?: string } {
 export function monitorSettingsOf(deps: MonitorSettingsDeps): {
   forOpen(dockerHost: string): Promise<MonitorSettings>;
   forTarget(target: Pick<DockerTarget, 'kind' | 'host'>): Promise<MonitorSettings>;
+  /** Whether the Monitor of the engine `host` runs permanently (monitorPermanentFor). */
+  permanent(host: string): Promise<boolean>;
 } {
   return {
     forOpen: (dockerHost) => monitorSettingsFor(deps, dockerHost),
     forTarget: (target) => monitorSettingsFor(deps, target.host),
+    permanent: (host) => monitorPermanentFor(deps, host),
   };
 }

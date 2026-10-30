@@ -195,25 +195,18 @@ describe('WslLifetime.use', () => {
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('holds an idle session'));
   });
 
-  // Mutation: a background call that starts a new session after the end, so that each refresh of the sidebar keeps the
-  // distribution running, fails it.
-  it('after the session ended itself (exit code 0), only a flow of the user starts a new one; then the background may again', async () => {
-    let now = 1_000_000;
-    const { subject, started, log } = lifetime({ now: () => now });
+  // Mutation: a rule that blocks the next session after a quiet end (in the background, a connection of a Docker pipe,
+  // which runs outside of the flow of the user) fails it; so would a quiet end that counts as a failure.
+  it('after the session ended itself (exit code 0), the next wsl.exe of the window starts a new one at once', async () => {
+    const { subject, started, log } = lifetime({ now: () => 1_000_000 });
     subject.use(WSL_HOST);
     started[0]?.exit({ exitCode: 0 });
     await vi.waitFor(() => expect(subject.holds(WSL_HOST)).toBe(false));
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('ended: no devspace and no Monitor ran there'));
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('ended: no container of Devspaces ran there.'));
+    expect(log.warn).not.toHaveBeenCalled();
     subject.use(WSL_HOST);
-    expect(started).toHaveLength(1);
-    await withSshPrompts(async () => subject.use(WSL_HOST));
     expect(started).toHaveLength(2);
-    // That one ended with an error after a minute or longer (not by itself): a call in the background starts the next one.
-    now += IDLE_RETRY_MS;
-    started[1]?.exit({ exitCode: null });
-    await vi.waitFor(() => expect(subject.holds(WSL_HOST)).toBe(false));
-    subject.use(WSL_HOST);
-    expect(started).toHaveLength(3);
+    expect(subject.holds(WSL_HOST)).toBe(true);
   });
 
   it('leavesStopped asks WSL nothing while this window holds the idle session (the distribution runs)', async () => {
@@ -332,19 +325,22 @@ describe.skipIf(process.platform === 'win32')('the idle script', () => {
     return { child, exited, calls, args: () => fs.readFileSync(path.join(folder as string, 'args'), 'utf8') };
   }
 
-  it('ends with exit code 0 after two checks in a row without a running devspace or Monitor, while its input stays open', async () => {
+  it('ends with exit code 0 after two checks in a row without a running container of Devspaces, while its input stays open', async () => {
     const { child, exited, calls, args } = startScript(['none']);
     expect(await exited).toBe(0);
     expect(calls()).toBe(2);
-    expect(args()).toContain('ps --filter status=running --format {{.Label "nimblescape.devspaces.id"}}{{.Label "nimblescape.devspaces.monitor"}}');
+    expect(args()).toContain(
+      'ps --filter status=running --format {{.Label "nimblescape.devspaces.id"}}{{.Label "nimblescape.devspaces.monitor"}}{{.Label "nimblescape.devspaces.worker"}}',
+    );
     child.stdin.end();
   });
 
-  it('runs on while a devspace or the Monitor runs; a running container without either label counts as quiet', async () => {
-    // A devspace, the Monitor (the value of its label), then an empty line: a container without either label.
-    const { child, exited, calls } = startScript(['abc', '1f2e3d4c5b6a', '', 'none']);
+  it('runs on while a devspace, the Monitor or a helper container runs; a running container without these labels counts as quiet', async () => {
+    // A devspace, the Monitor (the value of its label), a worker or a relay (`true`), then an empty line: a container
+    // without these labels.
+    const { child, exited, calls } = startScript(['abc', '1f2e3d4c5b6a', 'true', '', 'none']);
     expect(await exited).toBe(0);
-    expect(calls()).toBe(4);
+    expect(calls()).toBe(5);
     child.stdin.end();
   });
 

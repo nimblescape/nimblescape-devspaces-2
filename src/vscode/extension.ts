@@ -55,7 +55,6 @@ import { nodeHttpsTransport, takeUserAgentVersion } from '../core/http';
 import { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { isoTime, systemClock, type StartedByteProcess } from '../core/ports';
-import { monitorRunsPermanently } from '../core/remoteMonitor/cacheSettings';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
 import { monitorSettingsOf } from './monitorSettings';
 import { REMOTE_MONITOR_VOLUME } from '../core/remoteMonitor/protocol';
@@ -655,15 +654,15 @@ async function activateExtension(
     logger,
   });
   // The WSL distribution of Devspaces runs while this window holds its idle session there (from its first `wsl.exe` for
-  // the distribution, until no devspace and no Monitor runs there, or the window closes). A Docker call in the
+  // the distribution, until no devspace, no Monitor and no helper container of Devspaces runs there, or the window
+  // closes). A Docker call in the
   // background starts a distribution that does not run only while its Monitor runs permanently (docs/architecture.md
   // "The WSL distribution of Devspaces"). Its sessions end after the release of deactivate(), which may need them.
   const lifetime = new WslLifetime({
     runner,
     wslPath,
     env,
-    // As monitorSettingsFor: an answer that cannot be read counts as none.
-    monitorPermanent: async (host) => monitorRunsPermanently(getSettings().stopMonitorWhenIdle, await engineRecords.monitorAnswered(host).catch(() => false)),
+    monitorPermanent: (host) => monitorSettings.permanent(host),
     logger,
   });
   wslLifetime = lifetime;

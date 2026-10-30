@@ -728,7 +728,8 @@ export class DevspaceOperations extends OperationBase {
    * lock). Returns the number of added entries. Does not start Docker: 0 when it does not run, and on an endpoint that
    * is neither local nor SSH. `passive`: a call in the background; the worker is made ready as for the refresh (the
    * helper image only checked, the wait after a failed open kept), and it is 0 on a WSL distribution that a call now
-   * must leave stopped (`leavesStopped`). Without `passive` (the Refresh of the user), such a distribution is started.
+   * must leave stopped (`leavesStopped`). Without `passive` (only the Refresh that the user chooses, while the registry
+   * is lost: Controller.reconcileIfRegistryLost), such a distribution is started.
    * Throws when the worker could not be reached or failed (nothing is added then).
    */
   async reconcileInWorker(options: { passive: boolean; signal?: AbortSignal }): Promise<number> {

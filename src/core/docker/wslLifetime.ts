@@ -5,12 +5,12 @@
 // The lifetime of a WSL distribution that is a Docker host of Devspaces (docs/architecture.md "The WSL distribution of
 // Devspaces"). WSL stops a distribution 15 seconds after the last `wsl.exe` process for it ended, with Docker and the
 // containers in it. From the first `wsl.exe` that a window starts there, it holds one idle session (`use`): a `wsl.exe`
-// whose script ends itself when no devspace and no Monitor ran there at two checks in a row, and at the end of its input,
-// so with the window. After such an end, only a flow of the user starts a new one. A Docker call in the background
-// leaves a distribution that does not run stopped, unless its Monitor runs permanently (`leavesStopped`); a flow of the
-// user starts it. No `vscode`.
+// whose script ends itself when no devspace, no Monitor and no helper container of Devspaces (a worker, a relay) ran
+// there at two checks in a row, and at the end of its input, so with the window. A Docker call in the background leaves
+// a distribution that does not run stopped, unless its Monitor runs permanently (`leavesStopped`); a flow of the user
+// starts it. No `vscode`.
 import { errorMessage } from '../errors';
-import { LABEL_DEVSPACE_ID } from '../names';
+import { LABEL_DEVSPACE_ID, LABEL_HELPER } from '../names';
 import type { Logger, ProcessRunner, StartedProcess } from '../ports';
 import { LABEL_MONITOR } from '../remoteMonitor/protocol';
 import { sshPromptsAllowed } from '../sshAskpass';
@@ -22,9 +22,9 @@ export const WSL_RUNNING_ARGS: readonly string[] = ['--list', '--running', '--qu
 export const WSL_RUNNING_TIMEOUT_MS = 5_000;
 /** How often the idle session looks whether its input ended. */
 export const IDLE_INPUT_SECONDS = 15;
-/** How often the idle session looks whether a devspace or a Monitor runs (a multiple of IDLE_INPUT_SECONDS). */
+/** How often the idle session looks whether a container of Devspaces runs (a multiple of IDLE_INPUT_SECONDS). */
 export const IDLE_CHECK_SECONDS = 60;
-/** The idle session ends after this many checks in a row at which no devspace and no Monitor ran. */
+/** The idle session ends after this many checks in a row at which no container of Devspaces ran. */
 export const IDLE_QUIET_CHECKS = 2;
 /**
  * After an idle session that failed within this long after its start (it could not start, for example for a
@@ -32,10 +32,11 @@ export const IDLE_QUIET_CHECKS = 2;
  */
 export const IDLE_RETRY_MS = 60_000;
 /**
- * The output of `docker ps` in the idle session: one line per running container, with the value of its label of a
- * devspace or of the Monitor, or empty for a container without either.
+ * The output of `docker ps` in the idle session: one line per running container, with the values of its labels of a
+ * devspace, of the Monitor and of a helper container (a worker or a relay, which close 10 minutes after their last use;
+ * they inherit the label from the helper image), or empty for a container without any of them.
  */
-export const IDLE_PS_FORMAT = `{{.Label "${LABEL_DEVSPACE_ID}"}}{{.Label "${LABEL_MONITOR}"}}`;
+export const IDLE_PS_FORMAT = `{{.Label "${LABEL_DEVSPACE_ID}"}}{{.Label "${LABEL_MONITOR}"}}{{.Label "${LABEL_HELPER}"}}`;
 /** The last characters of the error output of an idle session that are logged. */
 const MAX_LOGGED_ERROR = 2000;
 
@@ -44,7 +45,7 @@ const MAX_LOGGED_ERROR = 2000;
  * of it holds the output of `wsl.exe`. `cat` reads its input until the end (from the file descriptor 3: a command in
  * the background of a shell without job control reads /dev/null), so the loop ends within IDLE_INPUT_SECONDS after the
  * input ended (the window closed). Every IDLE_CHECK_SECONDS, `docker ps` looks for a running container with
- * the label of a devspace or of the Monitor; a check that finds none, also a failed one, counts as quiet. After
+ * one of the labels of IDLE_PS_FORMAT; a check that finds none, also a failed one, counts as quiet. After
  * IDLE_QUIET_CHECKS quiet checks in a row, the session ends with exit code 0. One line, so that the command line of
  * `wsl.exe` has no line break.
  */
@@ -85,25 +86,15 @@ export interface WslLifetimeDeps {
   retryMs?: number;
 }
 
-/** The idle session of a host: its process while it runs. */
-interface IdleSession {
-  process: StartedProcess;
-}
-
 /**
  * The idle sessions of this window, one per WSL host, and the rule for the Docker calls in the background on such a
  * host. Hosts that are no WSL distribution are not touched.
  */
 export class WslLifetime {
-  private readonly sessions = new Map<string, IdleSession>();
+  /** The process of the idle session of each host, while it runs. */
+  private readonly sessions = new Map<string, StartedProcess>();
   /** The time of the end of the last idle session that failed, by host. */
   private readonly failedAt = new Map<string, number>();
-  /**
-   * The hosts whose last idle session ended itself because no devspace and no Monitor ran there: until a flow of the
-   * user there, a call in the background starts no new one, so that the refreshes of the sidebar do not keep the
-   * distribution running.
-   */
-  private readonly endedQuiet = new Set<string>();
   /** The last state that `leavesStopped` logged, by host: true while it leaves the distribution stopped. */
   private readonly saidStopped = new Map<string, boolean>();
   /** The last warning of `running`, by distribution, so that a failure that stays is logged once. */
@@ -147,7 +138,7 @@ export class WslLifetime {
    */
   async leavesStopped(host: string): Promise<boolean> {
     const access = hostAccessOf(host);
-    if (access?.kind !== 'wsl' || sshPromptsAllowed() || this.sessions.has(host)) return false;
+    if (access?.kind !== 'wsl' || sshPromptsAllowed() || this.holds(host)) return false;
     const stopped = !(await this.deps.monitorPermanent(host)) && (await this.running(access.distribution)) === false;
     if (stopped !== (this.saidStopped.get(host) ?? false)) {
       this.saidStopped.set(host, stopped);
@@ -164,14 +155,12 @@ export class WslLifetime {
    * Devspaces starts a `wsl.exe` for the WSL host `host` now (a shell, a connection of the relay, a connection of a
    * Docker pipe): this window holds the idle session of the host from now on, unless it holds one already, the last one
    * failed within the last minute (IDLE_RETRY_MS: it ended with an error within a minute after its start), or `wsl.exe`
-   * cannot be found. Outside of a flow of the user (withSshPrompts), also not after the last one ended itself because
-   * nothing ran there, until a flow of the user there. Nothing for any other host, and after `dispose`. Never throws.
+   * cannot be found. Nothing for any other host, and after `dispose`. Never throws.
    */
   use(host: string): void {
     const access = hostAccessOf(host);
     if (this.disposed || access?.kind !== 'wsl') return;
-    if (sshPromptsAllowed()) this.endedQuiet.delete(host);
-    if (this.sessions.has(host) || this.endedQuiet.has(host)) return;
+    if (this.holds(host)) return;
     const failed = this.failedAt.get(host);
     if (failed !== undefined && Math.abs(this.now() - failed) < this.retryMs()) return;
     const wsl = this.deps.wslPath();
@@ -184,21 +173,19 @@ export class WslLifetime {
       this.deps.logger.warn(`The idle session of the WSL distribution ${access.distribution} could not start: ${errorMessage(error)}`);
       return;
     }
-    const session: IdleSession = { process };
     const startedAt = this.now();
-    this.sessions.set(host, session);
+    this.sessions.set(host, process);
     let errorOutput = '';
     process.onStdout(() => undefined);
     process.onStderr((text) => {
       errorOutput = (errorOutput + wslText(text)).slice(-MAX_LOGGED_ERROR);
     });
-    this.deps.logger.info(`Devspaces holds an idle session of the WSL distribution ${access.distribution}, so that it runs while this window is open and a devspace or the Monitor runs there.`);
+    this.deps.logger.info(`Devspaces holds an idle session of the WSL distribution ${access.distribution}, so that it runs while this window is open and a container of Devspaces runs there.`);
     void process.exited.then(({ exitCode, error }) => {
-      if (this.sessions.get(host) === session) this.sessions.delete(host);
+      if (this.sessions.get(host) === process) this.sessions.delete(host);
       if (this.disposed) return;
       if (exitCode === 0 && error === undefined) {
-        this.endedQuiet.add(host);
-        this.deps.logger.info(`The idle session of the WSL distribution ${access.distribution} ended: no devspace and no Monitor ran there.`);
+        this.deps.logger.info(`The idle session of the WSL distribution ${access.distribution} ended: no container of Devspaces ran there.`);
         return;
       }
       const reason = error !== undefined ? errorMessage(error) : `exit code ${exitCode}${errorOutput.trim() ? `: ${errorOutput.trim()}` : ''}`;
@@ -224,7 +211,7 @@ export class WslLifetime {
    */
   dispose(): void {
     this.disposed = true;
-    for (const { process } of this.sessions.values()) {
+    for (const process of this.sessions.values()) {
       process.end();
       if (process.killNow !== undefined) process.killNow();
       else process.kill();
