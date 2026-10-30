@@ -26,6 +26,8 @@ export const IDLE_INPUT_SECONDS = 15;
 export const IDLE_CHECK_SECONDS = 60;
 /** The idle session ends after this many checks in a row at which no container of Devspaces ran. */
 export const IDLE_QUIET_CHECKS = 2;
+/** The time limit of the `docker ps` of the idle session. */
+export const IDLE_PS_TIMEOUT_SECONDS = 10;
 /**
  * After an idle session that failed within this long after its start (it could not start, for example for a
  * distribution that is not registered), no new one starts for this long either; a use within that time starts one
@@ -47,7 +49,9 @@ const MAX_LOGGED_ERROR = 2000;
  * of it holds the output of `wsl.exe`. `cat` reads its input until the end (from the file descriptor 3: a command in
  * the background of a shell without job control reads /dev/null), so the loop ends within IDLE_INPUT_SECONDS after the
  * input ended (the window closed). Every IDLE_CHECK_SECONDS, `docker ps` looks for a running container with
- * one of the labels of IDLE_PS_FORMAT; a check that finds none, also a failed one, counts as quiet. After
+ * one of the labels of IDLE_PS_FORMAT, with the time limit IDLE_PS_TIMEOUT_SECONDS when the distribution has `timeout`
+ * (so that an engine that does not answer cannot hold the loop after the end of the input); a check that finds none,
+ * also a failed one, counts as quiet. After
  * IDLE_QUIET_CHECKS quiet checks in a row, the session ends with exit code 0. One line, so that the command line of
  * `wsl.exe` has no line break, and without a double quote and a backslash, so that the quoting of the command line on
  * Windows (Node.js) and its parsing by `wsl.exe --exec` (CommandLineToArgvW) cannot change it.
@@ -55,6 +59,7 @@ const MAX_LOGGED_ERROR = 2000;
 export const IDLE_SESSION_SCRIPT = [
   'exec 3<&0 >/dev/null 2>&1',
   'cat <&3 >/dev/null & input=$!',
+  't=$(command -v timeout)',
   'tick=0',
   'quiet=0',
   [
@@ -62,7 +67,7 @@ export const IDLE_SESSION_SCRIPT = [
     `sleep ${IDLE_INPUT_SECONDS};`,
     'tick=$((tick + 1));',
     `[ $((tick % ${IDLE_CHECK_SECONDS / IDLE_INPUT_SECONDS})) -eq 0 ] || continue;`,
-    `if docker ps --filter status=running --format '${IDLE_PS_FORMAT}' | grep -q .;`,
+    `if $t \${t:+${IDLE_PS_TIMEOUT_SECONDS}} docker ps --filter status=running --format '${IDLE_PS_FORMAT}' | grep -q .;`,
     'then quiet=0;',
     `else quiet=$((quiet + 1)); [ $quiet -lt ${IDLE_QUIET_CHECKS} ] || break;`,
     'fi;',

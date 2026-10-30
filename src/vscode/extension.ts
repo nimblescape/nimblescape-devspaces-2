@@ -1255,7 +1255,7 @@ async function activateExtension(
   const adopt = Boolean(containerName) && currentDevspace === undefined;
   const startEngine = startWork ? backgroundEngineAtStart({ current: () => targets.current(), removed: engineRemoved, logger }) : Promise.resolve(undefined);
   background(
-    startEngine.then((target) => (target === undefined ? undefined : controller.reconcileIfRegistryLost({ passive: true, adopt, mayStart: adopt && windowPipeOn(target.host) }))),
+    startEngine.then((target) => (target === undefined ? undefined : controller.reconcileIfRegistryLost({ passive: true, adopt, mayStart: windowPipeOn(target.host) }))),
     'restore the devspaces from the volumes',
   );
   // When helper.json does not know the current helper tag (after the installation, or an update that changed it; there
@@ -1288,7 +1288,7 @@ async function activateExtension(
       const outcome = await helperPrebuild.start(target);
       // A lost registry is restored again once the helper image was built. A failed restore is logged as such, not as
       // a failed preparation.
-      await restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt, mayStart: adopt && windowPipeOn(target.host) })).catch((error: unknown) =>
+      await restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt, mayStart: windowPipeOn(target.host) })).catch((error: unknown) =>
         logger.error('Could not restore the devspaces from the volumes after the helper image was prepared.', error),
       );
     }),

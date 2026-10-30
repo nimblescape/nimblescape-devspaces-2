@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunOptions, RunResult, StartedProcess, StartOptions } from '../ports';
 import { withSshPrompts } from '../sshAskpass';
 import { WSL_HOST, wslCommandArgs } from './dockerHost';
-import { IDLE_RETRY_MS, IDLE_SESSION_SCRIPT, WSL_RUNNING_ARGS, WSL_RUNNING_TIMEOUT_MS, WslLifetime, type WslLifetimeDeps } from './wslLifetime';
+import { IDLE_PS_TIMEOUT_SECONDS, IDLE_RETRY_MS, IDLE_SESSION_SCRIPT, WSL_RUNNING_ARGS, WSL_RUNNING_TIMEOUT_MS, WslLifetime, type WslLifetimeDeps } from './wslLifetime';
 
 const WSL = 'C:\\Windows\\System32\\wsl.exe';
 const ok = (stdout = ''): RunResult => ({ exitCode: 0, stdout, stderr: '', timedOut: false });
@@ -377,10 +377,23 @@ describe.skipIf(process.platform === 'win32')('the idle script', () => {
    * Starts the script with stubs: `docker` prints the next line of `answers` (one per check; the last one stays) as its
    * output, or fails for the line `fail`; it counts its calls in `calls`.
    */
-  function startScript(answers: readonly string[]) {
+  function startScript(answers: readonly string[], options: { timeout?: 'stub' | 'missing' } = {}) {
     folder = fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-idle-'));
     const bin = path.join(folder, 'bin');
     fs.mkdirSync(bin);
+    // A `timeout` that writes its time limit to the file `timeout` and runs the command.
+    if (options.timeout === 'stub') fs.writeFileSync(path.join(bin, 'timeout'), `#!/bin/sh\necho "$1" >> '${folder}/timeout'\nshift\nexec "$@"\n`, { mode: 0o755 });
+    // Without `timeout`: only the programs of the script and of the stubs, as links.
+    let searchPath = `${bin}:${process.env.PATH ?? ''}`;
+    if (options.timeout === 'missing') {
+      const tools = path.join(folder, 'tools');
+      fs.mkdirSync(tools);
+      for (const tool of ['sh', 'cat', 'grep', 'sed', 'wc']) {
+        const found = (process.env.PATH ?? '').split(':').map((dir) => path.join(dir, tool)).find((file) => fs.existsSync(file));
+        if (found !== undefined) fs.symlinkSync(found, path.join(tools, tool));
+      }
+      searchPath = `${bin}:${tools}`;
+    }
     fs.writeFileSync(path.join(folder, 'answers'), answers.join('\n') + '\n');
     fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexec /bin/sleep 0.01\n', { mode: 0o755 });
     fs.writeFileSync(
@@ -399,10 +412,11 @@ describe.skipIf(process.platform === 'win32')('the idle script', () => {
       ].join('\n'),
       { mode: 0o755 },
     );
-    const child = spawn('sh', ['-c', IDLE_SESSION_SCRIPT], { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` }, stdio: ['pipe', 'ignore', 'ignore'] });
+    const child = spawn('sh', ['-c', IDLE_SESSION_SCRIPT], { env: { ...process.env, PATH: searchPath }, stdio: ['pipe', 'ignore', 'ignore'] });
     const exited = new Promise<number | null>((resolve) => child.on('exit', (code) => resolve(code)));
     const calls = () => Number(fs.readFileSync(path.join(folder as string, 'calls'), 'utf8').trim() || '0');
-    return { child, exited, calls, args: () => fs.readFileSync(path.join(folder as string, 'args'), 'utf8') };
+    const read = (name: string) => fs.readFileSync(path.join(folder as string, name), 'utf8');
+    return { child, exited, calls, args: () => read('args'), timeouts: () => read('timeout').split('\n').filter(Boolean) };
   }
 
   it('ends with exit code 0 after two checks in a row without a running container of Devspaces, while its input stays open', async () => {
@@ -433,6 +447,24 @@ describe.skipIf(process.platform === 'win32')('the idle script', () => {
 
   it('starts the count again after a check that found a running container with a label', async () => {
     const { child, exited, calls } = startScript(['none', 'abc', 'none', 'none']);
+    expect(await exited).toBe(0);
+    expect(calls()).toBe(4);
+    child.stdin.end();
+  });
+
+  // Mutation: a `docker ps` without the time limit (an engine that does not answer would hold the loop after the end of
+  // the input) fails the first; a script that needs `timeout` (every check fails, so the session ends while a devspace
+  // runs) fails the second.
+  it('runs docker ps with the time limit of timeout', async () => {
+    const { child, exited, calls, timeouts } = startScript(['abc', 'none'], { timeout: 'stub' });
+    expect(await exited).toBe(0);
+    expect(calls()).toBe(3);
+    expect(timeouts()).toEqual([String(IDLE_PS_TIMEOUT_SECONDS), String(IDLE_PS_TIMEOUT_SECONDS), String(IDLE_PS_TIMEOUT_SECONDS)]);
+    child.stdin.end();
+  });
+
+  it('runs docker ps without a time limit in a distribution without timeout', async () => {
+    const { child, exited, calls } = startScript(['abc', 'abc', 'none'], { timeout: 'missing' });
     expect(await exited).toBe(0);
     expect(calls()).toBe(4);
     child.stdin.end();
