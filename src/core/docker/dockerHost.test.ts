@@ -306,6 +306,8 @@ describe('the WSL distribution of Devspaces as a host', () => {
     // The program that the Docker CLI did not find is docker, not ssh.
     expect(dockerHostProblem('exec: "docker": executable file not found in $PATH')).toBe('dockerMissing');
     expect(dockerHostProblem('exec: "ssh": executable file not found in $PATH')).toBe('sshMissing');
+    expect(dockerHostProblem('exec: "C:\\Windows\\System32\\OpenSSH\\ssh.exe": executable file not found in %PATH%')).toBe('sshMissing');
+    expect(dockerHostProblem('exec: "/usr/local/bin/docker": executable file not found in $PATH')).toBe('dockerMissing');
     expect(wslText('ssh: connect to host box port 22: Connection refused')).toBe('ssh: connect to host box port 22: Connection refused');
   });
 });

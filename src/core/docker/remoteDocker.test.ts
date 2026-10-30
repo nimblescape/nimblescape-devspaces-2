@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import type { RunOptions, RunResult } from '../ports';
+import { ShellGoneError } from '../relay/remoteShell';
 import { RemoteDockerState } from '../storage/remoteDockerState';
 import { WSL_HOST, remoteDockerTarget } from './dockerHost';
 import { UNREADABLE_DOCKER_TARGET, operationDockerTarget } from './dockerTargets';
@@ -181,6 +182,10 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     shells.login.mockResolvedValueOnce(undefined as never);
     await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
     expect(docker.calls).toHaveLength(1);
+    // The shell was taken over by the relay twice before docker info: the way without the shell too.
+    shells.run.mockRejectedValueOnce(new ShellGoneError('The shell on box is taken over by the relay.'));
+    await expect(testRemoteDockerHost(docker, 'box', { ...sshDeps(), shells })).resolves.toMatchObject({ ok: true });
+    expect(docker.calls).toHaveLength(2);
   });
 
   it('noPromptEnv replaces every spelling of SSH_ASKPASS_REQUIRE', () => {
@@ -346,12 +351,12 @@ describe('the WSL distribution of Devspaces: no SSH', () => {
     await expect(testRemoteDockerHost(docker, WSL_HOST, deps)).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     // After the start, the shells have none only when the window closes.
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, null) })).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
-    // The shell ended twice before docker info (RemoteShells.run): its reason, not a rejection.
-    const gone = { ...wslShells(), run: vi.fn(async (): Promise<RunResult | undefined> => Promise.reject(new Error('The shell before the relay to wsl:devspaces ended.'))) };
+    // The shell was closed twice before docker info (RemoteShells.run): unreachable, not a rejection.
+    const gone = { ...wslShells(), run: vi.fn(async (): Promise<RunResult | undefined> => Promise.reject(new ShellGoneError('The shell on wsl:devspaces is closed.'))) };
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: gone })).resolves.toEqual({
       ok: false,
-      problem: 'unknown',
-      detail: 'The shell before the relay to wsl:devspaces ended.',
+      problem: 'unreachable',
+      detail: 'The shell on wsl:devspaces is closed.',
     });
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, fail('sh: 1: docker: not found', 127)) })).resolves.toMatchObject({
       ok: false,

@@ -55,7 +55,7 @@ import {
   type DockerHostProblem,
   type DockerTarget,
 } from './dockerHost';
-import { dockerShellCommand } from '../relay/remoteShell';
+import { ShellGoneError, dockerShellCommand } from '../relay/remoteShell';
 import { deleteEnv, withEnvValue } from './dockerCli';
 import { runWithDockerTarget } from './dockerTargets';
 
@@ -179,17 +179,17 @@ async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal 
 
 /**
  * `docker info` (ENGINE_INFO_COMMAND) on the shell before the relay of `host`, as an EngineCheck; undefined when the
- * host has no shell. A shell that ended twice before the command (RemoteShells.run) gives its reason. Rejects only with an
- * AbortError.
+ * host has no shell. A shell that was closed or taken over twice before the command (ShellGoneError of RemoteShells.run):
+ * undefined for an SSH host, which then logs in itself, and `unreachable` for the WSL distribution, which has no other
+ * way. Rejects with any other error of `run`.
  */
 async function engineInfoOnShell(shells: RemoteShellAccess, host: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<EngineCheck | undefined> {
   try {
     const result = await shells.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal });
     return result === undefined ? undefined : engineCheckOf(result, timeoutMs);
   } catch (error) {
-    if (isAbortError(error)) throw error;
-    const detail = errorMessage(error);
-    return { ok: false, problem: dockerHostProblem(detail), detail };
+    if (!(error instanceof ShellGoneError)) throw error;
+    return hostAccessOf(host)?.kind === 'wsl' ? { ok: false, problem: 'unreachable', detail: error.message } : undefined;
   }
 }
 
@@ -328,8 +328,9 @@ export class SshLoginCache {
 export interface RemoteShellAccess {
   /**
    * The login of the shell to `host` (the open shell, or a new one; with `fresh` always a new one): undefined when the
-   * host has no transport (then the caller uses its own `ssh`); a failure has the error output of `ssh`, `timedOut` when
-   * it did not answer in time. Rejects only with an AbortError.
+   * host has no transport (then the caller uses its own `ssh`); a failure has the error output of `ssh`, or of `wsl.exe`
+   * as text (the UTF-16 of an older one too, wslText), `timedOut` when it did not answer in time. Rejects only with an
+   * AbortError.
    */
   login(host: string, signal?: AbortSignal, options?: { fresh?: boolean }): Promise<{ ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined>;
   /** `command` (one line for the shell) on the shell of `host`, as RemoteShells.run; undefined without a transport. */

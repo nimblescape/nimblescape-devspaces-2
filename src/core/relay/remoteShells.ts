@@ -105,7 +105,8 @@ export class RemoteShells {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
-    entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
+    const program = hostAccessOf(host)?.kind === 'wsl' ? 'wsl.exe' : 'ssh';
+    entry.opening = RemoteShell.open(process, { logger, name: host, program, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
       (shell) => {
         entry.shell = shell;
         entry.opening = undefined;
@@ -170,7 +171,9 @@ export class RemoteShells {
       }
       if (shell === undefined) return undefined;
       try {
-        return await shell.run(command, options);
+        const result = await shell.run(command, options);
+        // When the shell ends during the command, its error output is the one of the transport (loginDetail).
+        return hostAccessOf(host)?.kind === 'wsl' ? { ...result, stderr: wslText(result.stderr) } : result;
       } catch (error) {
         if (!(error instanceof ShellGoneError) || attempt > 0 || isAbortError(error)) throw error;
       }
