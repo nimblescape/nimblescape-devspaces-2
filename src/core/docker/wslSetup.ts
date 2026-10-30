@@ -142,16 +142,16 @@ export function regExportArgs(file: string): string[] {
 
 /**
  * The folders of the WSL distributions (the value BasePath: the folder of the virtual disk) by their name in lower case
- * (DistributionName), from the file of `reg.exe export` (UTF-16 with a BOM, else UTF-8).
+ * (DistributionName), from the file of `reg.exe export` (UTF-16 with a BOM, else UTF-8). Undefined for a distribution
+ * whose BasePath is missing or not a plain string: its folder is not known.
  */
-export function parseLxssExport(content: Buffer): Map<string, string> {
+export function parseLxssExport(content: Buffer): Map<string, string | undefined> {
   const text = content[0] === 0xff && content[1] === 0xfe ? content.subarray(2).toString('utf16le') : content.toString('utf8');
-  const folders = new Map<string, string>();
+  const folders = new Map<string, string | undefined>();
   let values = new Map<string, string>();
   const close = (): void => {
     const name = values.get('distributionname');
-    const basePath = values.get('basepath');
-    if (name !== undefined && basePath !== undefined) folders.set(name.toLowerCase(), basePath);
+    if (name !== undefined) folders.set(name.toLowerCase(), values.get('basepath'));
   };
   for (const line of text.split(/\r?\n/)) {
     if (line.startsWith('[')) {
@@ -392,20 +392,27 @@ export class WslSetup {
    * Whether the distribution `devspaces` is registered, and whether Devspaces set it up (WslRegistration): from the
    * list of WSL and the folder of its virtual disk in the registry, `own` only when that folder is in the folder of
    * Devspaces. When `wsl.exe --list` fails otherwise than without any distribution, the registry alone decides, and
-   * without the registry it is `none` (a WSL with no distribution may have no key in the registry yet). Throws WslSetupError `registryFailed` when WSL lists the distribution but the
-   * registry cannot be read: Devspaces never guesses that it set up a distribution.
+   * without the registry it is `none` (a WSL with no distribution may have no key in the registry yet); with `sure`
+   * (a removal, which must not forget a distribution that still exists), it throws WslSetupError `registryFailed`
+   * instead. It throws that too when WSL lists the distribution but the registry cannot be read: Devspaces never
+   * guesses that it set up a distribution.
    */
-  async registration(signal?: AbortSignal): Promise<WslRegistration> {
+  async registration(signal?: AbortSignal, sure = false): Promise<WslRegistration> {
     const listed = await this.listed(signal);
     if (listed === false) return 'none';
     const folders = await this.distributionFolders(signal);
     if (folders === undefined) {
-      if (listed === undefined) return 'none';
-      throw new WslSetupError('registryFailed', `WSL lists the distribution ${WSL_DISTRIBUTION}, but the registry (${LXSS_KEY}) cannot be read, so Devspaces cannot tell whether it set it up.`);
+      if (listed === undefined && !sure) return 'none';
+      throw new WslSetupError(
+        'registryFailed',
+        listed
+          ? `WSL lists the distribution ${WSL_DISTRIBUTION}, but the registry (${LXSS_KEY}) cannot be read, so Devspaces cannot tell whether it set it up.`
+          : `Neither the list of WSL nor the registry (${LXSS_KEY}) can be read, so Devspaces cannot tell whether the distribution ${WSL_DISTRIBUTION} exists.`,
+      );
     }
+    if (!folders.has(WSL_DISTRIBUTION)) return listed ? 'foreign' : 'none';
     const diskFolder = folders.get(WSL_DISTRIBUTION);
-    if (diskFolder === undefined) return listed ? 'foreign' : 'none';
-    return isWithin(diskFolder, this.deps.folder) ? 'own' : 'foreign';
+    return diskFolder !== undefined && isWithin(diskFolder, this.deps.folder) ? 'own' : 'foreign';
   }
 
   /**
@@ -508,32 +515,38 @@ export class WslSetup {
   /**
    * `wsl --unregister devspaces`, which deletes the distribution with everything in it, then the folder of Devspaces,
    * unless another WSL distribution has its virtual disk there (removeLeftovers). Only for a distribution that Devspaces
-   * set up (the caller checks `registration`). Throws WslSetupError `removeFailed`.
+   * set up (the caller checks `registration`). True when the folder is gone. Throws WslSetupError `removeFailed`.
    */
-  async remove(signal?: AbortSignal): Promise<void> {
+  async remove(signal?: AbortSignal): Promise<boolean> {
     const result = await this.runWsl(WSL_UNREGISTER_ARGS, { timeoutMs: UNREGISTER_MS, signal });
     if (result.exitCode !== 0) {
       throw new WslSetupError('removeFailed', `wsl.exe ${WSL_UNREGISTER_ARGS.join(' ')} failed (${endOf(result, UNREGISTER_MS)}): ${outputOf(result)}`);
     }
     this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was removed.`);
-    await this.removeLeftovers();
+    return this.removeLeftovers();
   }
 
   /**
    * Removes the folder of Devspaces when no WSL distribution has its virtual disk there (the registry): after the
-   * removal, or the files of a setup that did not end. Never throws (logged).
+   * removal, or the files of a setup that did not end. True when the folder is gone. Never throws (logged).
    */
-  async removeLeftovers(): Promise<void> {
+  async removeLeftovers(): Promise<boolean> {
     const { folder, logger } = this.deps;
-    if (!fs.existsSync(folder)) return;
+    if (!fs.existsSync(folder)) return true;
     const users = await this.diskUsers(folder).catch(() => undefined);
     if (users === undefined || users.length > 0) {
-      logger.info(`The folder ${folder} stays: ${users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses it' : `the WSL distribution ${users.join(', ')} has its virtual disk there`}.`);
-      return;
+      logger.warn(`The folder ${folder} stays: ${users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses it' : `the WSL distribution ${users.join(', ')} has its virtual disk there`}.`);
+      return false;
     }
-    await fs.promises.rm(folder, { recursive: true, force: true }).then(
-      () => logger.info(`The folder ${folder} was removed.`),
-      (error: unknown) => logger.warn(`The folder ${folder} could not be removed: ${errorMessage(error)}`),
+    return fs.promises.rm(folder, { recursive: true, force: true }).then(
+      () => {
+        logger.info(`The folder ${folder} was removed.`);
+        return true;
+      },
+      (error: unknown) => {
+        logger.warn(`The folder ${folder} could not be removed: ${errorMessage(error)}`);
+        return false;
+      },
     );
   }
 
@@ -542,6 +555,8 @@ export class WslSetup {
     const diskFolder = await this.diskFolderFor(signal);
     await fs.promises.mkdir(this.downloadFolder, { recursive: true });
     await fs.promises.mkdir(diskFolder, { recursive: true });
+    // After the time limit of the registration, WSL may still read the file.
+    let mayBeRead = false;
     try {
       onStep({ kind: 'download', received: 0, total: image.size });
       await this.downloadImage(image, file, onStep, signal);
@@ -551,15 +566,20 @@ export class WslSetup {
       // Without the signal (setUp). After the time limit, WSL may still end the registration: the next setup then finds
       // the distribution of Devspaces and only runs the script.
       const result = await this.runWsl(args, { timeoutMs: REGISTER_MS });
+      mayBeRead = result.timedOut;
       if (result.exitCode !== 0) {
         throw new WslSetupError('registerFailed', `wsl.exe --install --from-file failed (${endOf(result, REGISTER_MS)}): ${outputOf(result)}`);
       }
       this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${diskFolder}.`);
       if (signal?.aborted) throw abortError();
     } finally {
-      await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
-        this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
-      });
+      if (mayBeRead) {
+        this.deps.logger.info(`The download ${file} stays, because WSL may still read it; the next setup or the removal removes it.`);
+      } else {
+        await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
+          this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
+        });
+      }
     }
   }
 
@@ -648,12 +668,16 @@ export class WslSetup {
 
   /**
    * The WSL distributions (names in lower case) with their virtual disk in `parent`, from the registry. Without the
-   * registry, only the distribution `devspaces` can have it there (Devspaces registers no other one): then `wsl.exe
-   * --list` must answer. Undefined when neither tells. Throws an AbortError when the signal aborts.
+   * registry, or when it does not tell the folder of a distribution, only the distribution `devspaces` can have it
+   * there (Devspaces registers no other one): then `wsl.exe --list` must answer. Undefined when neither tells. Throws an
+   * AbortError when the signal aborts.
    */
   private async diskUsers(parent: string, signal?: AbortSignal): Promise<string[] | undefined> {
     const folders = await this.distributionFolders(signal);
-    if (folders !== undefined) return [...folders.entries()].filter(([, diskFolder]) => isWithin(diskFolder, parent)).map(([name]) => name);
+    const entries = folders === undefined ? undefined : [...folders.entries()];
+    if (entries !== undefined && entries.every(([, diskFolder]) => diskFolder !== undefined)) {
+      return entries.filter(([, diskFolder]) => diskFolder !== undefined && isWithin(diskFolder, parent)).map(([name]) => name);
+    }
     try {
       const listed = await this.listed(signal);
       return listed === undefined ? undefined : listed ? [WSL_DISTRIBUTION] : [];
@@ -680,7 +704,7 @@ export class WslSetup {
    * registry (`reg.exe export` into a new temporary folder, removed after the read), or undefined when it cannot be
    * read (logged). Throws an AbortError when the signal aborts.
    */
-  private async distributionFolders(signal?: AbortSignal): Promise<Map<string, string> | undefined> {
+  private async distributionFolders(signal?: AbortSignal): Promise<Map<string, string | undefined> | undefined> {
     let temporary: string | undefined;
     try {
       temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'devspaces-registry-'));

@@ -76,8 +76,8 @@ beforeEach(() => {
       onStep({ kind: 'docker', phase: 'docker' });
       return '29.9.2';
     }),
-    remove: vi.fn(async (_signal?: AbortSignal) => undefined),
-    removeLeftovers: vi.fn(async () => undefined),
+    remove: vi.fn(async (_signal?: AbortSignal) => true),
+    removeLeftovers: vi.fn(async () => true),
     locked: vi.fn(async (task: () => Promise<unknown>) => ({ value: await task() })),
   };
   useHost = vi.fn(async (_host: string) => true);
@@ -265,6 +265,17 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
     expect(forgetHost).toHaveBeenCalledWith(WSL_HOST);
     expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.removed(true));
     expect(WslSetupTexts.removed(true)).toBe('The WSL distribution of Devspaces was removed. Devspaces now uses the local Docker.');
+    // The check before the removal must be sure that the distribution is there or gone.
+    expect(setup.registration.mock.calls.every((call) => call[1] === true)).toBe(true);
+  });
+
+  it('names the folder of the distribution when it stays', async () => {
+    registered('own');
+    setup.remove.mockResolvedValue(false);
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
+    await commands().remove();
+    expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.removed(false, FOLDER));
+    expect(WslSetupTexts.removed(false, FOLDER)).toBe(`The WSL distribution of Devspaces was removed. Its folder stays (the log of Devspaces says why): ${FOLDER}`);
   });
 
   it('does not say "local Docker" after the removal when the local Docker is not supported', async () => {

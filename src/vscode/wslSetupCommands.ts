@@ -83,8 +83,12 @@ export const WslSetupTexts = {
       `The folder of the distribution is removed too:\n${folder}`,
     ].join('\n\n'),
   remove: 'Remove',
-  /** `local`: Devspaces used it, and now uses the local Docker (when that is not supported, its own warning says so). */
-  removed: (nowLocal: boolean) => `The WSL distribution of Devspaces was removed.${nowLocal ? ' Devspaces now uses the local Docker.' : ''}`,
+  /**
+   * `nowLocal`: Devspaces used it, and now uses the local Docker (when that is not supported, its own warning says so).
+   * `keptFolder`: the folder of the distribution, when it stays.
+   */
+  removed: (nowLocal: boolean, keptFolder?: string) =>
+    `The WSL distribution of Devspaces was removed.${nowLocal ? ' Devspaces now uses the local Docker.' : ''}${keptFolder === undefined ? '' : ` Its folder stays (the log of Devspaces says why): ${keptFolder}`}`,
   removedStillListed: `The WSL distribution of Devspaces was removed, but Devspaces could not take "${WSL_HOST}" out of its list of Docker hosts. Take it out with "Remove a Host from the List…".`,
   readyNotUsed: `Docker Engine runs in the WSL distribution of Devspaces, but Devspaces does not use it yet. To use it, choose "${WSL_HOST}" in "Use a Remote Docker Host…".`,
   notInstalled: 'The WSL distribution of Devspaces is not installed.',
@@ -253,10 +257,11 @@ export class WslSetupCommands {
       }
       if (!(await this.confirm(WslSetupTexts.confirmRemove, WslSetupTexts.confirmRemoveDetail(folder), WslSetupTexts.remove))) return;
       // `wsl --unregister` is not cancelled: a half removed distribution would help nobody.
+      let folderGone = true;
       const done = await setup.locked(async () =>
         withNotificationProgress({ title: WslSetupTexts.removing }, async () => {
           if ((await this.removalCheck(setup)) !== 'own') return false;
-          await setup.remove();
+          folderGone = await setup.remove();
           return true;
         }),
       );
@@ -270,7 +275,7 @@ export class WslSetupCommands {
         this.showError(WslSetupTexts.removedStillListed);
         return;
       }
-      this.inform(WslSetupTexts.removed(forgotten === 'local'));
+      this.inform(WslSetupTexts.removed(forgotten === 'local', folderGone ? undefined : folder));
     } catch (error) {
       this.showFailure(error, WslSetupTexts.removeFailedUnknown, 'The removal of the WSL distribution of Devspaces was cancelled.');
     } finally {
@@ -278,10 +283,10 @@ export class WslSetupCommands {
     }
   }
 
-  /** The registration for the removal (WslSetup.registration): `none` without WSL. */
+  /** The registration for the removal (WslSetup.registration, `sure`): `none` without WSL. */
   private async removalCheck(setup: NonNullable<WslSetupCommandsDeps['setup']>, signal?: AbortSignal): Promise<WslRegistration> {
     try {
-      return await setup.registration(signal);
+      return await setup.registration(signal, true);
     } catch (error) {
       if (!isWslSetupError(error) || error.problem !== 'wslMissing') throw error;
       this.deps.logger.info(`WSL is not installed: ${error.message}`);

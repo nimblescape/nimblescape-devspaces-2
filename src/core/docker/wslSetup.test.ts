@@ -306,6 +306,25 @@ describe('WslSetup.registration', () => {
     );
   });
 
+  it('is sure for a removal: it tells neither none nor own when neither the list nor the registry can be read', async () => {
+    const runner = wslRunner(() => failed('Wsl/Service/E_UNEXPECTED'), failed('ERROR: Access is denied.'));
+    await expect(setup({ runner }).registration()).resolves.toBe('none');
+    await expect(setup({ runner }).registration(undefined, true)).rejects.toMatchObject({ problem: 'registryFailed' });
+    // Without any distribution, WSL tells it by its code.
+    const none = wslRunner(() => failed('Error code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND', 4294967295), failed('ERROR: Access is denied.'));
+    await expect(setup({ runner: none }).registration(undefined, true)).resolves.toBe('none');
+  });
+
+  it('is foreign when the registry does not tell the folder of the distribution', async () => {
+    const runner = wslRunner(() => ok('devspaces\r\n'), { devspaces: path.join(folder, 'disk') });
+    const unknownFolder = { ...runner, run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
+      if (file !== REG) return runner.run(file, args, options);
+      fs.writeFileSync(args[2], Buffer.from('[HKEY_CURRENT_USER\\Lxss\\{1}]\r\n"DistributionName"="devspaces"\r\n', 'utf8'));
+      return ok();
+    }) };
+    await expect(setup({ runner: unknownFolder }).registration()).resolves.toBe('foreign');
+  });
+
   it('says that WSL does not answer instead of none when the list ends by its time limit', async () => {
     const runner = wslRunner(() => timedOut);
     await expect(setup({ runner }).registration()).rejects.toMatchObject({ problem: 'wslNotAnswering' });
@@ -323,9 +342,19 @@ describe('the registry of the WSL distributions', () => {
     expect(parseLxssExport(Buffer.from(exported.subarray(2).toString('utf16le'), 'utf8'))).toEqual(expected);
   });
 
-  it('skips a key without a name or a folder', () => {
-    const text = ['[HKEY_CURRENT_USER\\Lxss\\{1}]', '"DistributionName"="docker-desktop"', '', '[HKEY_CURRENT_USER\\Lxss\\{2}]', '"BasePath"="C:\\\\x"'].join('\r\n');
-    expect(parseLxssExport(Buffer.from(text, 'utf8'))).toEqual(new Map());
+  it('skips a key without a name, and gives no folder for a name without a plain one', () => {
+    const text = [
+      '[HKEY_CURRENT_USER\\Lxss\\{1}]',
+      '"DistributionName"="docker-desktop"',
+      '',
+      '[HKEY_CURRENT_USER\\Lxss\\{2}]',
+      '"BasePath"="C:\\\\x"',
+      '',
+      '[HKEY_CURRENT_USER\\Lxss\\{3}]',
+      '"BasePath"=hex(2):43,00,3a,00,00,00',
+      '"DistributionName"="Other"',
+    ].join('\r\n');
+    expect(parseLxssExport(Buffer.from(text, 'utf8'))).toEqual(new Map([['docker-desktop', undefined], ['other', undefined]]));
   });
 });
 
@@ -500,6 +529,12 @@ describe('WslSetup.setUp', () => {
     expect(fs.existsSync(path.join(folder, 'download', 'debian.wsl'))).toBe(false);
   });
 
+  it('keeps the download when the registration ends by its time limit, because WSL may still read it', async () => {
+    const runner = distribution((args) => (args[0] === '--install' ? timedOut : undefined));
+    await expect(setup({ runner, download: writingDownload() }).setUp(image, () => undefined)).rejects.toMatchObject({ problem: 'registerFailed' });
+    expect(fs.existsSync(path.join(folder, 'download', 'debian.wsl'))).toBe(true);
+  });
+
   it('fails with dockerFailed and the lines of the log that the script wrote to standard error', async () => {
     const runner = distribution((args, options) =>
       isScript(args) && options?.input === PROVISION_SCRIPT ? failed('The setup failed. The last lines of /var/log/devspaces-setup.log:\nE: Unable to locate package curl', 1) : undefined,
@@ -661,6 +696,17 @@ describe('WslSetup.removeLeftovers', () => {
     const runner = wslRunner(() => ok('Ubuntu\r\n'), failed('Access is denied.'));
     await setup({ runner }).removeLeftovers();
     expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  it('keeps it when the registry does not tell the folder of a distribution and WSL lists devspaces', async () => {
+    const base = wslRunner(() => ok('devspaces\r\n'));
+    const runner = { ...base, run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
+      if (file !== REG) return base.run(file, args, options);
+      fs.writeFileSync(args[2], Buffer.from('[HKEY_CURRENT_USER\\Lxss\\{1}]\r\n"DistributionName"="devspaces"\r\n"BasePath"=hex(2):43,00\r\n', 'utf8'));
+      return ok();
+    }) };
+    await setup({ runner }).removeLeftovers();
+    expect(fs.readdirSync(path.join(folder, 'disk'))).toEqual(['ext4.vhdx']);
   });
 
   it('removes it without a key in the registry when WSL has no distribution', async () => {
