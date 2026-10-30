@@ -924,7 +924,7 @@ export class Controller implements vscode.Disposable {
     const target = await this.operationTarget();
     if (!docker.canRunOn(target)) return;
     if (await this.restoreRefusedWhileRemoving(target.host, options.user === true)) return;
-    const added = await service.reconcileInWorker({ passive: options.passive });
+    const added = await service.reconcileInWorker({ passive: options.passive, ...(options.user === true ? { byUser: true } : {}) });
     if (added === 0 && options.adopt !== true) return;
     await this.adoptWindowDevspace();
     if (added > 0) await this.deps.sidebar.render();

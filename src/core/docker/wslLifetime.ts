@@ -11,7 +11,7 @@
 // starts it. No `vscode`.
 import { errorMessage } from '../errors';
 import { LABEL_DEVSPACE_ID, LABEL_HELPER } from '../names';
-import type { Logger, ProcessRunner, StartedProcess } from '../ports';
+import type { Logger, ProcessRunner, RunResult, StartedProcess } from '../ports';
 import { LABEL_MONITOR } from '../remoteMonitor/protocol';
 import { sshPromptsAllowed } from '../sshAskpass';
 import { hostAccessOf, parseWslList, wslCommandArgs, wslEnv, wslText } from './dockerHost';
@@ -28,7 +28,8 @@ export const IDLE_CHECK_SECONDS = 60;
 export const IDLE_QUIET_CHECKS = 2;
 /**
  * After an idle session that failed within this long after its start (it could not start, for example for a
- * distribution that is not registered), no new one starts for this long either.
+ * distribution that is not registered), no new one starts for this long either; a use within that time starts one
+ * after it, when the distribution runs then.
  */
 export const IDLE_RETRY_MS = 60_000;
 /**
@@ -95,6 +96,10 @@ export class WslLifetime {
   private readonly sessions = new Map<string, StartedProcess>();
   /** The time of the end of the last idle session that failed, by host. */
   private readonly failedAt = new Map<string, number>();
+  /** The timer of the start after the wait that follows a failed session (retryLater), by host. */
+  private readonly retries = new Map<string, ReturnType<typeof setTimeout>>();
+  /** The `wsl.exe --list --running --quiet` that runs now, which the calls at the same time share. */
+  private listing: Promise<RunResult> | undefined;
   /** The last state that `leavesStopped` logged, by host: true while it leaves the distribution stopped. */
   private readonly saidStopped = new Map<string, boolean>();
   /** The last warning of `running`, by distribution, so that a failure that stays is logged once. */
@@ -114,7 +119,10 @@ export class WslLifetime {
     const wsl = this.deps.wslPath();
     if (wsl === undefined) return undefined;
     try {
-      const result = await this.deps.runner.run(wsl, WSL_RUNNING_ARGS, { env: wslEnv(this.deps.env), timeoutMs: WSL_RUNNING_TIMEOUT_MS });
+      this.listing ??= this.deps.runner.run(wsl, WSL_RUNNING_ARGS, { env: wslEnv(this.deps.env), timeoutMs: WSL_RUNNING_TIMEOUT_MS }).finally(() => {
+        this.listing = undefined;
+      });
+      const result = await this.listing;
       if (result.timedOut) throw new Error(`it did not answer within ${WSL_RUNNING_TIMEOUT_MS / 1000} seconds`);
       if (result.exitCode !== 0) throw new Error(`exit code ${result.exitCode}: ${wslText(result.stderr || result.stdout).trim()}`);
       this.runningWarnings.delete(distribution);
@@ -153,26 +161,43 @@ export class WslLifetime {
 
   /**
    * Devspaces starts a `wsl.exe` for the WSL host `host` now (a shell, a connection of the relay, a connection of a
-   * Docker pipe): this window holds the idle session of the host from now on, unless it holds one already, the last one
-   * failed within the last minute (IDLE_RETRY_MS: it ended with an error within a minute after its start), or `wsl.exe`
-   * cannot be found. Nothing for any other host, and after `dispose`. Never throws.
+   * Docker pipe): this window holds the idle session of the host from now on, unless it holds one already, or `wsl.exe`
+   * cannot be found. Within a minute after the last one failed (IDLE_RETRY_MS: it ended with an error within a minute
+   * after its start), the session starts only after that minute, and only when the distribution runs then
+   * (`retryLater`). Nothing for any other host, and after `dispose`. Never throws.
    */
   use(host: string): void {
     const access = hostAccessOf(host);
-    if (this.disposed || access?.kind !== 'wsl') return;
-    if (this.holds(host)) return;
+    if (this.disposed || access?.kind !== 'wsl' || this.holds(host)) return;
     const failed = this.failedAt.get(host);
-    if (failed !== undefined && Math.abs(this.now() - failed) < this.retryMs()) return;
+    const wait = failed === undefined ? 0 : this.retryMs() - Math.abs(this.now() - failed);
+    if (wait > 0) this.retryLater(host, access.distribution, wait);
+    else this.start(host, access.distribution);
+  }
+
+  /**
+   * A use within the wait after a failed session: the session starts once the wait is over, when the distribution runs
+   * then, because the `wsl.exe` of this use (for example a connection of the relay) may stay the only one for a long
+   * time. One timer per host; `dispose` stops it.
+   */
+  private retryLater(host: string, distribution: string, waitMs: number): void {
+    if (this.retries.has(host)) return;
+    const timer = setTimeout(() => {
+      this.retries.delete(host);
+      void this.running(distribution).then((runs) => {
+        if (runs === true && !this.disposed && !this.holds(host)) this.start(host, distribution);
+      });
+    }, waitMs);
+    timer.unref?.();
+    this.retries.set(host, timer);
+  }
+
+  /** Starts the idle session of `host` (the distribution `distribution`), unless `wsl.exe` cannot be found. */
+  private start(host: string, distribution: string): void {
     const wsl = this.deps.wslPath();
     if (wsl === undefined || this.deps.runner.start === undefined) return;
-    let process: StartedProcess;
-    try {
-      process = this.deps.runner.start(wsl, wslCommandArgs(access.distribution, ['sh', '-c', IDLE_SESSION_SCRIPT]), { env: wslEnv(this.deps.env) });
-    } catch (error) {
-      this.failedAt.set(host, this.now());
-      this.deps.logger.warn(`The idle session of the WSL distribution ${access.distribution} could not start: ${errorMessage(error)}`);
-      return;
-    }
+    // Never throws: a `wsl.exe` that cannot start resolves `exited` with the error, a failed session below.
+    const process = this.deps.runner.start(wsl, wslCommandArgs(distribution, ['sh', '-c', IDLE_SESSION_SCRIPT]), { env: wslEnv(this.deps.env) });
     const startedAt = this.now();
     this.sessions.set(host, process);
     let errorOutput = '';
@@ -180,23 +205,23 @@ export class WslLifetime {
     process.onStderr((text) => {
       errorOutput = (errorOutput + wslText(text)).slice(-MAX_LOGGED_ERROR);
     });
-    this.deps.logger.info(`Devspaces holds an idle session of the WSL distribution ${access.distribution}, so that it runs while this window is open and a container of Devspaces runs there.`);
+    this.deps.logger.info(`Devspaces starts an idle session of the WSL distribution ${distribution}, so that it runs while this window is open and a container of Devspaces runs there.`);
     void process.exited.then(({ exitCode, error }) => {
       if (this.sessions.get(host) === process) this.sessions.delete(host);
       if (this.disposed) return;
       if (exitCode === 0 && error === undefined) {
-        this.deps.logger.info(`The idle session of the WSL distribution ${access.distribution} ended: no container of Devspaces ran there.`);
+        this.deps.logger.info(`The idle session of the WSL distribution ${distribution} ended: no container of Devspaces ran there.`);
         return;
       }
       const reason = error !== undefined ? errorMessage(error) : `exit code ${exitCode}${errorOutput.trim() ? `: ${errorOutput.trim()}` : ''}`;
       // One that ran for a while ended with the distribution (`wsl --terminate`, `wsl --shutdown`, the removal): the
       // next `wsl.exe` starts a new one at once.
       if (Math.abs(this.now() - startedAt) >= this.retryMs()) {
-        this.deps.logger.info(`The idle session of the WSL distribution ${access.distribution} ended (${reason}).`);
+        this.deps.logger.info(`The idle session of the WSL distribution ${distribution} ended (${reason}).`);
         return;
       }
       this.failedAt.set(host, this.now());
-      this.deps.logger.warn(`The idle session of the WSL distribution ${access.distribution} failed (${reason}), so the next one starts in a minute at the earliest.`);
+      this.deps.logger.warn(`The idle session of the WSL distribution ${distribution} failed (${reason}), so the next one starts in a minute at the earliest.`);
     });
   }
 
@@ -211,6 +236,8 @@ export class WslLifetime {
    */
   dispose(): void {
     this.disposed = true;
+    for (const timer of this.retries.values()) clearTimeout(timer);
+    this.retries.clear();
     for (const process of this.sessions.values()) {
       process.end();
       if (process.killNow !== undefined) process.killNow();

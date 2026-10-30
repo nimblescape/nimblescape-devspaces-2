@@ -6,7 +6,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunOptions, RunResult, StartedProcess, StartOptions } from '../ports';
 import { withSshPrompts } from '../sshAskpass';
 import { WSL_HOST, wslCommandArgs } from './dockerHost';
@@ -102,6 +102,14 @@ describe('WslLifetime.running', () => {
     expect(await lifetime({ list: () => ok('devspaces-old\n') }).subject.running('devspaces')).toBe(false);
   });
 
+  it('calls at the same time share one wsl.exe; a later call asks again', async () => {
+    const { subject, runs } = lifetime({ list: () => ok('devspaces\n') });
+    expect(await Promise.all([subject.running('devspaces'), subject.running('DevSpaces'), subject.running('Ubuntu')])).toEqual([true, true, false]);
+    expect(runs).toHaveLength(1);
+    expect(await subject.running('devspaces')).toBe(true);
+    expect(runs).toHaveLength(2);
+  });
+
   it('logs a failure that stays once, and again after it worked', async () => {
     let list: RunResult = { exitCode: 1, stdout: '', stderr: 'broken', timedOut: false };
     const { subject, log } = lifetime({ list: () => list });
@@ -192,7 +200,7 @@ describe('WslLifetime.use', () => {
     expect(started[0]?.args).toEqual(wslCommandArgs('devspaces', ['sh', '-c', IDLE_SESSION_SCRIPT]));
     expect(started[0]?.options).toEqual({ env: { PATH: 'C:\\Windows\\System32', WSL_UTF8: '1' } });
     expect(subject.holds(WSL_HOST)).toBe(true);
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('holds an idle session'));
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining('starts an idle session'));
   });
 
   // Mutation: a rule that blocks the next session after a quiet end (in the background, a connection of a Docker pipe,
@@ -218,7 +226,7 @@ describe('WslLifetime.use', () => {
 
   it('starts no new session within a minute after one failed, with the error output in the warning; then again', async () => {
     let now = 1_000_000;
-    const { subject, started, log } = lifetime({ now: () => now });
+    const { subject, started, log } = lifetime({ now: () => now, list: () => ok('') });
     subject.use(WSL_HOST);
     started[0]?.stderr('There is no distribution with the supplied name.\r\n');
     started[0]?.exit({ exitCode: 4294967295 });
@@ -230,6 +238,58 @@ describe('WslLifetime.use', () => {
     now += 1;
     subject.use(WSL_HOST);
     expect(started).toHaveLength(2);
+    subject.dispose();
+  });
+
+  // Mutation: a use within the wait that is only dropped fails it: a long connection of the relay of a Start in that
+  // minute would then be the only `wsl.exe`, and WSL would stop the devspace 15 seconds after its end.
+  describe('a use within the wait after a failed session', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function failedSession(list: () => RunResult) {
+      const now = 1_000_000;
+      const made = lifetime({ now: () => now, list });
+      made.subject.use(WSL_HOST);
+      made.started[0]?.exit({ exitCode: 1 });
+      await vi.waitFor(() => expect(made.subject.holds(WSL_HOST)).toBe(false));
+      // Two uses within the wait: one timer.
+      made.subject.use(WSL_HOST);
+      made.subject.use(WSL_HOST);
+      expect(made.started).toHaveLength(1);
+      return made;
+    }
+
+    it('starts the session after the wait when the distribution runs then, with one question to WSL', async () => {
+      const { subject, started, runs } = await failedSession(() => ok('devspaces\n'));
+      await vi.advanceTimersByTimeAsync(IDLE_RETRY_MS - 1);
+      expect(runs).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(runs.map((run) => run.args)).toEqual([WSL_RUNNING_ARGS]);
+      expect(started).toHaveLength(2);
+      expect(subject.holds(WSL_HOST)).toBe(true);
+      subject.dispose();
+    });
+
+    it('starts nothing after the wait when the distribution does not run then (it does not start it)', async () => {
+      const { subject, started, runs } = await failedSession(() => ok(''));
+      await vi.advanceTimersByTimeAsync(IDLE_RETRY_MS);
+      expect(runs).toHaveLength(1);
+      expect(started).toHaveLength(1);
+      expect(subject.holds(WSL_HOST)).toBe(false);
+    });
+
+    it('starts nothing after dispose', async () => {
+      const { subject, started, runs } = await failedSession(() => ok('devspaces\n'));
+      subject.dispose();
+      await vi.advanceTimersByTimeAsync(IDLE_RETRY_MS);
+      expect(runs).toHaveLength(0);
+      expect(started).toHaveLength(1);
+    });
   });
 
   it('starts a new session at once after one that ran for a minute or longer ended with an error (the distribution was stopped)', async () => {

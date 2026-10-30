@@ -58,10 +58,12 @@ describe('reconcileInWorker', () => {
     const dockerRunning = vi.fn(async () => true);
     const stopped = harness({ added: 1 }, { dockerTarget: async () => wsl, leavesStopped, dockerRunning });
     expect(await stopped.h.operations.reconcileInWorker({ passive: true })).toBe(0);
+    // Also the restore after the prebuild, which is not passive but runs in the background.
+    expect(await stopped.h.operations.reconcileInWorker({ passive: false })).toBe(0);
     expect(stopped.calls).toEqual([]);
     expect(dockerRunning).not.toHaveBeenCalled();
-    // The Refresh of the user (not passive) starts it, as any flow of the user does.
-    expect(await stopped.h.operations.reconcileInWorker({ passive: false })).toBe(1);
+    // The Refresh of the user starts it, as any flow of the user does.
+    expect(await stopped.h.operations.reconcileInWorker({ passive: false, byUser: true })).toBe(1);
     expect(dockerRunning).toHaveBeenCalledTimes(1);
     // While it may be started (or runs), the rebuild runs as before.
     const runs = harness({ added: 1 }, { dockerTarget: async () => wsl, leavesStopped: async () => false });
