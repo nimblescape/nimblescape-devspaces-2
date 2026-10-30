@@ -127,7 +127,7 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
       '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-i', keys.keyPath, '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
       '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-p', '2222', '-l', 'me', '--', 'box', 'true',
     ]);
-    expect(await state.sshKey('me@box:2222')).toBe('installed');
+    expect(state.sshKeyNow('me@box:2222')).toBe('installed');
     expect(keys.identityFor('me@box:2222')).toBe(keys.keyPath);
     expect(keys.identityFor('other')).toBeUndefined();
   });
@@ -140,16 +140,16 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     expect(fs.readFileSync(keys.keyPath, 'utf8')).toBe(before);
     // The same key once in authorized_keys of the same account.
     expect(authorizedKeys().trim().split('\n')).toHaveLength(1);
-    expect(await state.sshKey('b')).toBe('installed');
+    expect(state.sshKeyNow('b')).toBe('installed');
   });
 
   it('records "Not for This Host", and asks again next time when the question was closed', async () => {
     answer = undefined;
     await offer().afterLogin('box', { passwordAsked: true }, shell);
-    expect(await state.sshKey('box')).toBeUndefined();
+    expect(state.sshKeyNow('box')).toBeUndefined();
     answer = 'never';
     await offer().afterLogin('box', { passwordAsked: true }, shell);
-    expect(await state.sshKey('box')).toBe('declined');
+    expect(state.sshKeyNow('box')).toBe('declined');
     await offer().afterLogin('box', { passwordAsked: true }, shell);
     expect(asked).toHaveLength(2);
     expect(fs.existsSync(path.join(home, '.ssh', 'devspaces_ed25519'))).toBe(false);
@@ -163,8 +163,27 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     // The line that the setup added is gone again; the other lines stay.
     expect(authorizedKeys()).toBe('');
     expect(warnings).toHaveLength(1);
-    expect(await state.sshKey('box')).toBeUndefined();
+    expect(state.sshKeyNow('box')).toBeUndefined();
     expect(keys.identityFor('box')).toBeUndefined();
+  });
+
+  it('removes the line it added when the answer cannot be recorded', async () => {
+    const keys = new SshKeyOffer({
+      home,
+      platform: process.platform,
+      computerName: 'test box',
+      wrapperFolder: path.join(dir, 'wrapper'),
+      runner: new NodeProcessRunner(),
+      sshPath: () => path.join(dir, 'bin', 'ssh'),
+      sshKeygenPath: () => keygen,
+      env: { PATH: process.env.PATH, FAKE_SSH_LOG: path.join(dir, 'ssh-args'), FAKE_SSH_EXIT: '0' },
+      state: { sshKeyNow: () => undefined, setSshKey: () => Promise.reject(new Error('the lock is busy')) },
+      dialogs,
+      logger,
+    });
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked[1]).toBe('failed box: the lock is busy');
+    expect(authorizedKeys()).toBe('');
   });
 
   // For example a jump host that asks for the password: the check login without questions cannot pass it.
@@ -172,7 +191,7 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     sshExit = 255;
     failedAnswer = 'never';
     await offer().afterLogin('box', { passwordAsked: true }, shell);
-    await vi.waitFor(async () => expect(await state.sshKey('box')).toBe('declined'));
+    await vi.waitFor(async () => expect(state.sshKeyNow('box')).toBe('declined'));
     await offer().afterLogin('box', { passwordAsked: true }, shell);
     expect(asked).toHaveLength(2);
   });

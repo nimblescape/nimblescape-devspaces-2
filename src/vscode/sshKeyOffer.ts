@@ -106,6 +106,8 @@ export class SshKeyOffer {
   private preparing: Promise<void> | undefined;
   /** When the last write of the wrapper failed (Date.now()). */
   private wrapperFailedAt: number | undefined;
+  /** The last ensureKey of this window. */
+  private keySteps: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: SshKeyOfferOptions) {
     this.keyPath = devspacesKeyPath(options.home, options.platform);
@@ -172,24 +174,23 @@ export class SshKeyOffer {
       await state.setSshKey(host, 'declined').catch((error: unknown) => logger.warn(`The answer for ${host} could not be recorded: ${errorMessage(error)}`));
       return;
     }
+    const comment = keyComment(this.options.computerName);
+    let added: PublicKey | undefined;
     try {
       const key = await this.ensureKey();
-      const comment = keyComment(this.options.computerName);
-      const added = await shell.run(authorizedKeysCommand(key, comment), { timeoutMs: KEY_STEP_TIMEOUT_MS });
-      if (added.exitCode !== 0) throw new Error(`~/.ssh/authorized_keys on ${host} could not be changed: ${added.stderr.trim() || `exit code ${added.exitCode}`}`);
-      const addedNow = added.stdout.trim() === AUTHORIZED_KEY_ADDED;
-      logger.info(`The public key of Devspaces is in ~/.ssh/authorized_keys of the account on ${host}${addedNow ? ' now' : ' already'}.`);
+      const result = await shell.run(authorizedKeysCommand(key, comment), { timeoutMs: KEY_STEP_TIMEOUT_MS });
+      if (result.exitCode !== 0) throw new Error(`~/.ssh/authorized_keys on ${host} could not be changed: ${result.stderr.trim() || `exit code ${result.exitCode}`}`);
+      if (result.stdout.trim() === AUTHORIZED_KEY_ADDED) added = key;
+      logger.info(`The public key of Devspaces is in ~/.ssh/authorized_keys of the account on ${host}${added ? ' now' : ' already'}.`);
       const detail = await this.checkLogin(host);
-      if (detail !== undefined) {
-        // A key that Devspaces does not use stays on no host: its line goes again when this step added it.
-        if (addedNow) await this.removeKey(host, shell, key, comment);
-        throw new Error(`a login with the key failed: ${detail}`);
-      }
+      if (detail !== undefined) throw new Error(`a login with the key failed: ${detail}`);
       await state.setSshKey(host, 'installed');
       logger.info(`Devspaces logs in to ${host} with its key ${this.keyPath} from now on.`);
       dialogs.installed(host);
     } catch (error) {
       logger.warn(`The key of Devspaces could not be set up for ${host}: ${errorMessage(error)}`);
+      // A key that Devspaces does not use stays on no host: its line goes again when this setup added it.
+      if (added !== undefined) await this.removeKey(host, shell, added, comment);
       // Not awaited: the relay takes the shell over after this step. "Not for This Host" there ends the offer for a host
       // where a key does not help (for example a jump host that asks for the password).
       void dialogs.failed(host, errorMessage(error)).then(async (choice) => {
@@ -231,8 +232,17 @@ export class SshKeyOffer {
     return (this.options.exists ?? fs.existsSync)(file);
   }
 
-  /** The public key of Devspaces: the key file is created with `ssh-keygen` when it is not there yet. */
-  private async ensureKey(): Promise<PublicKey> {
+  /**
+   * The public key of Devspaces: the key file is created with `ssh-keygen` when it is not there yet. One at a time in
+   * this window (two hosts whose offers were answered one after the other).
+   */
+  private ensureKey(): Promise<PublicKey> {
+    const step = this.keySteps.then(() => this.ensureKeyNow());
+    this.keySteps = step.catch(() => undefined);
+    return step;
+  }
+
+  private async ensureKeyNow(): Promise<PublicKey> {
     const { runner, env, logger, computerName } = this.options;
     const keygen = this.options.sshKeygenPath();
     if (keygen === undefined) throw new Error('ssh-keygen was not found on this computer.');

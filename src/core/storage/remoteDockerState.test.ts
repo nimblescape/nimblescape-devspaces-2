@@ -147,9 +147,9 @@ describe('RemoteDockerState: the SSH key of Devspaces', () => {
     await state.setRootlessSocket('a', '/run/user/1000/docker.sock');
     await state.setSshKey('a', 'installed');
     await state.setSshKey('b', 'declined');
-    expect(await state.sshKey('a')).toBe('installed');
-    expect(await state.sshKey('b')).toBe('declined');
-    expect(await state.sshKey('c')).toBeUndefined();
+    expect(state.sshKeyNow('a')).toBe('installed');
+    expect(state.sshKeyNow('b')).toBe('declined');
+    expect(state.sshKeyNow('c')).toBeUndefined();
     expect((await state.read()).hosts).toEqual([
       { host: 'a', rootlessSocket: '/run/user/1000/docker.sock', sshKey: 'installed' },
       { host: 'b', sshKey: 'declined' },
@@ -180,8 +180,8 @@ describe('RemoteDockerState: the SSH key of Devspaces', () => {
     await state.setSshKey('b', 'installed');
     await state.removeHost('a');
     await state.removeHost('b');
-    expect(await state.sshKey('a')).toBeUndefined();
-    expect(await state.sshKey('b')).toBe('installed');
+    expect(state.sshKeyNow('a')).toBeUndefined();
+    expect(state.sshKeyNow('b')).toBe('installed');
     expect((await state.read()).hosts).toEqual([{ host: 'b', sshKey: 'installed' }]);
   });
 

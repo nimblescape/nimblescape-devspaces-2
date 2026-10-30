@@ -108,6 +108,8 @@ describe('the command that adds the key to authorized_keys (run by sh in a home 
     runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'));
     expect(fs.readFileSync(file(), 'utf8')).toBe(others);
     if (process.platform !== 'win32') expect(fs.statSync(file()).mode & 0o777).toBe(0o640);
+    // No copy stays behind.
+    expect(fs.readdirSync(path.join(home, '.ssh'))).toEqual(['authorized_keys']);
     // The only line: an empty file.
     fs.writeFileSync(file(), `ssh-ed25519 ${BLOB} devspaces@box\n`);
     runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'));

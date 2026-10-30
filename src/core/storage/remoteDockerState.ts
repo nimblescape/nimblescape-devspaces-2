@@ -143,16 +143,12 @@ export class RemoteDockerState {
     });
   }
 
-  /** The SSH key of Devspaces on `host` (SshKeyState), or undefined when it was never offered or not answered. */
-  async sshKey(host: string): Promise<SshKeyState | undefined> {
-    return (await this.read()).hosts?.find((record) => record.host === host)?.sshKey;
-  }
-
   /**
-   * sshKey without waiting, for the arguments of an `ssh` that starts now: the file is read again only when it was
-   * replaced (each write renames a new file), or its time of change or its size changed since the last read. A file
-   * that is not there knows nothing; after another error (for example while another window renames its write into
-   * place on Windows), the last read counts.
+   * The SSH key of Devspaces on `host` (SshKeyState), or undefined when it was never offered or not answered. Without
+   * waiting, for the arguments of an `ssh` that starts now: the file is read again only when it was replaced (each
+   * write renames a new file), or its time of change or its size changed since the last read. A file that is not there
+   * knows nothing; after another error (for example while another window renames its write into place on Windows), the
+   * last read counts.
    */
   sshKeyNow(host: string): SshKeyState | undefined {
     try {
