@@ -38,7 +38,7 @@ import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { HostPipes } from '../core/relay/hostPipes';
 import { RemoteShells, type RemoteShellStart } from '../core/relay/remoteShells';
-import { dockerPipeBase } from '../core/relay/pipeAddress';
+import { dockerPipeBase, dockerPipeId, parseDockerPipeHost } from '../core/relay/pipeAddress';
 import { sshPromptSignal, sshPromptsAllowed } from '../core/sshAskpass';
 import { DiscoveryService } from '../core/discovery/discoveryService';
 import { GitHubApi } from '../core/discovery/githubApi';
@@ -1107,6 +1107,18 @@ async function activateExtension(
 
   // The devspace of this window: the container of its folder URI, if the registry knows it.
   const containerName = connection.currentContainerName();
+  // Whether this window reaches its container through its Docker pipe for the Docker host `host` (the ID of the pipe in
+  // its authority, dockerPipeId): its window connects there, so it starts a WSL distribution there anyway, and the
+  // restore of a lost registry for it may start it too. False without an ID of this computer.
+  const windowPipeOn = (host: string): boolean => {
+    const address = parseDockerPipeHost(connection.currentDockerHost() ?? '', platform);
+    if (containerName === undefined || address === undefined) return false;
+    try {
+      return address.id === dockerPipeId(computerId(), host, containerName);
+    } catch {
+      return false;
+    }
+  };
   // Before the first use of Devspaces (no registry.json and no marker of it), the activation asks Docker nothing in the
   // background: no restore of lost devspaces, no prebuild of the helper image. The window of a devspace container does
   // both, so it finds its devspace also after the storage folder was lost (backgroundWorkAtStart).
@@ -1115,7 +1127,7 @@ async function activateExtension(
   // mark, which this computer asks nothing by itself (the check of the worker for a passive read refuses it there too).
   const mayRestore = startWork ? async (): Promise<boolean> => !(await engineRemoved(await targets.current())) : false;
   const currentDevspace = containerName
-    ? await findWindowDevspace(containerName, { registry, needsRestore, docker, current: () => targets.current(), service, logger, mayRestore })
+    ? await findWindowDevspace(containerName, { registry, needsRestore, docker, current: () => targets.current(), service, logger, mayRestore, windowPipeOn })
     : undefined;
   // Nothing was restored from an engine with the removal mark: the labels of the container of this window still give its
   // devspace and its owner (one plain `docker container inspect`, no worker), so that the account rule holds there too.
@@ -1243,7 +1255,7 @@ async function activateExtension(
   const adopt = Boolean(containerName) && currentDevspace === undefined;
   const startEngine = startWork ? backgroundEngineAtStart({ current: () => targets.current(), removed: engineRemoved, logger }) : Promise.resolve(undefined);
   background(
-    startEngine.then((target) => (target === undefined ? undefined : controller.reconcileIfRegistryLost({ passive: true, adopt }))),
+    startEngine.then((target) => (target === undefined ? undefined : controller.reconcileIfRegistryLost({ passive: true, adopt, mayStart: adopt && windowPipeOn(target.host) }))),
     'restore the devspaces from the volumes',
   );
   // When helper.json does not know the current helper tag (after the installation, or an update that changed it; there
@@ -1276,7 +1288,7 @@ async function activateExtension(
       const outcome = await helperPrebuild.start(target);
       // A lost registry is restored again once the helper image was built. A failed restore is logged as such, not as
       // a failed preparation.
-      await restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt })).catch((error: unknown) =>
+      await restoreAfterPrebuild(outcome, () => controller.reconcileIfRegistryLost({ passive: false, adopt, mayStart: adopt && windowPipeOn(target.host) })).catch((error: unknown) =>
         logger.error('Could not restore the devspaces from the volumes after the helper image was prepared.', error),
       );
     }),

@@ -56,10 +56,25 @@ describe('the devspace of the window at its activation', () => {
     expect(await findWindowDevspace('devspaces-acme-api-x', all)).toBe(ENTRY);
     const [options] = all.service.reconcileInWorker.mock.calls[0];
     expect(options.passive).toBe(true);
-    // The window of a devspace starts a WSL distribution that does not run anyway, when it connects.
-    expect(options.mayStart).toBe(true);
+    // Not a window that reaches its container through its Docker pipe on that host: a WSL distribution that does not
+    // run stays stopped.
+    expect(options.mayStart).toBeUndefined();
     expect(options.signal).toBeInstanceOf(AbortSignal);
     expect(WINDOW_RESTORE_TIMEOUT_MS).toBe(30_000);
+  });
+
+  // Mutation: a restore that always may start the distribution (also for a window of a container on another engine)
+  // fails it, and so does one that never may.
+  it('may start a WSL distribution only for a window whose Docker pipe is for the host of the restore', async () => {
+    const wsl = { kind: 'remote' as const, host: 'wsl:devspaces', endpoint: 'wsl://devspaces' } as DockerTarget;
+    const asked: string[] = [];
+    const piped = deps({ found: [undefined as unknown as Devspace, ENTRY], added: 1, target: wsl });
+    await findWindowDevspace('devspaces-acme-api-x', { ...piped.all, windowPipeOn: (host) => (asked.push(host), host === 'wsl:devspaces') });
+    expect(asked).toEqual(['wsl:devspaces']);
+    expect(piped.all.service.reconcileInWorker.mock.calls[0]?.[0].mayStart).toBe(true);
+    const elsewhere = deps({ found: [undefined as unknown as Devspace, ENTRY], added: 1, target: wsl });
+    await findWindowDevspace('devspaces-acme-api-x', { ...elsewhere.all, windowPipeOn: () => false });
+    expect(elsewhere.all.service.reconcileInWorker.mock.calls[0]?.[0].mayStart).toBeUndefined();
   });
 
   it('nothing restored, a valid registry, or no Docker: no devspace', async () => {

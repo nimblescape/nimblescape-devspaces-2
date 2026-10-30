@@ -168,6 +168,19 @@ describe('WslLifetime.leavesStopped', () => {
     expect(runs).toEqual([]);
   });
 
+  it('logs the stop again after a flow of the user or an idle session of this window', async () => {
+    const { subject, started, log } = lifetime({ list: () => ok(''), now: () => 1_000_000 });
+    expect(await subject.leavesStopped(WSL_HOST)).toBe(true);
+    expect(await withSshPrompts(() => subject.leavesStopped(WSL_HOST))).toBe(false);
+    expect(await subject.leavesStopped(WSL_HOST)).toBe(true);
+    subject.use(WSL_HOST);
+    expect(await subject.leavesStopped(WSL_HOST)).toBe(false);
+    started[0]?.exit({ exitCode: 0 });
+    await vi.waitFor(() => expect(subject.holds(WSL_HOST)).toBe(false));
+    expect(await subject.leavesStopped(WSL_HOST)).toBe(true);
+    expect(log.info.mock.calls.filter(([text]) => String(text).includes('does not run. Devspaces does not start it'))).toHaveLength(3);
+  });
+
   it('is false in a flow of the user, which starts the distribution', async () => {
     const { subject, runs } = lifetime({ list: () => ok('') });
     expect(await withSshPrompts(() => subject.leavesStopped(WSL_HOST))).toBe(false);
@@ -397,9 +410,16 @@ describe.skipIf(process.platform === 'win32')('the idle script', () => {
     expect(await exited).toBe(0);
     expect(calls()).toBe(2);
     expect(args()).toContain(
-      'ps --filter status=running --format {{.Label "nimblescape.devspaces.id"}}{{.Label "nimblescape.devspaces.monitor"}}{{.Label "nimblescape.devspaces.worker"}}',
+      'ps --filter status=running --format {{.Label `nimblescape.devspaces.id`}}{{.Label `nimblescape.devspaces.monitor`}}{{.Label `nimblescape.devspaces.worker`}}',
     );
     child.stdin.end();
+  });
+
+  // The command line of `wsl.exe` on Windows: Node.js puts an argument with a space in double quotes and escapes a
+  // double quote in it with backslashes, which `wsl.exe --exec` reads back (CommandLineToArgvW). Without both, nothing
+  // of that applies.
+  it('is one line without a double quote and without a backslash', () => {
+    expect(IDLE_SESSION_SCRIPT).not.toMatch(/["\\\n\r]/);
   });
 
   it('runs on while a devspace, the Monitor or a helper container runs; a running container without these labels counts as quiet', async () => {

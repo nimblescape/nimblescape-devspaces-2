@@ -5197,8 +5197,12 @@ describe('Accounts', () => {
       return 0;
     });
     await h.controller.reconcileIfRegistryLost({ passive: false, adopt: true });
-    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false, mayStart: true });
+    expect(h.service.reconcileInWorker).toHaveBeenCalledWith({ passive: false });
     expect(h.coordinator.setDevspace).toHaveBeenCalledWith(env.id);
+    // A window whose Docker pipe is for that host (extension.ts windowPipeOn) may start a WSL distribution there.
+    fs.rmSync(h.paths.registry, { force: true });
+    await h.controller.reconcileIfRegistryLost({ passive: true, adopt: true, mayStart: true });
+    expect(h.service.reconcileInWorker).toHaveBeenLastCalledWith({ passive: true, mayStart: true });
   });
 
   // One adoption at a time, once per window, never in a window of role A.

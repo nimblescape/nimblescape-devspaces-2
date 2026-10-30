@@ -35,9 +35,10 @@ export const IDLE_RETRY_MS = 60_000;
 /**
  * The output of `docker ps` in the idle session: one line per running container, with the values of its labels of a
  * devspace, of the Monitor and of a helper container (a worker or a relay, which close 10 minutes after their last use;
- * they inherit the label from the helper image), or empty for a container without any of them.
+ * they inherit the label from the helper image), or empty for a container without any of them. The names are raw
+ * strings of Go (in backquotes), so that the script has no double quote (IDLE_SESSION_SCRIPT).
  */
-export const IDLE_PS_FORMAT = `{{.Label "${LABEL_DEVSPACE_ID}"}}{{.Label "${LABEL_MONITOR}"}}{{.Label "${LABEL_HELPER}"}}`;
+export const IDLE_PS_FORMAT = `{{.Label \`${LABEL_DEVSPACE_ID}\`}}{{.Label \`${LABEL_MONITOR}\`}}{{.Label \`${LABEL_HELPER}\`}}`;
 /** The last characters of the error output of an idle session that are logged. */
 const MAX_LOGGED_ERROR = 2000;
 
@@ -48,7 +49,8 @@ const MAX_LOGGED_ERROR = 2000;
  * input ended (the window closed). Every IDLE_CHECK_SECONDS, `docker ps` looks for a running container with
  * one of the labels of IDLE_PS_FORMAT; a check that finds none, also a failed one, counts as quiet. After
  * IDLE_QUIET_CHECKS quiet checks in a row, the session ends with exit code 0. One line, so that the command line of
- * `wsl.exe` has no line break.
+ * `wsl.exe` has no line break, and without a double quote and a backslash, so that the quoting of the command line on
+ * Windows (Node.js) and its parsing by `wsl.exe --exec` (CommandLineToArgvW) cannot change it.
  */
 export const IDLE_SESSION_SCRIPT = [
   'exec 3<&0 >/dev/null 2>&1',
@@ -56,17 +58,17 @@ export const IDLE_SESSION_SCRIPT = [
   'tick=0',
   'quiet=0',
   [
-    'while kill -0 "$input"; do',
+    'while kill -0 $input; do',
     `sleep ${IDLE_INPUT_SECONDS};`,
     'tick=$((tick + 1));',
     `[ $((tick % ${IDLE_CHECK_SECONDS / IDLE_INPUT_SECONDS})) -eq 0 ] || continue;`,
     `if docker ps --filter status=running --format '${IDLE_PS_FORMAT}' | grep -q .;`,
     'then quiet=0;',
-    `else quiet=$((quiet + 1)); [ "$quiet" -lt ${IDLE_QUIET_CHECKS} ] || break;`,
+    `else quiet=$((quiet + 1)); [ $quiet -lt ${IDLE_QUIET_CHECKS} ] || break;`,
     'fi;',
     'done',
   ].join(' '),
-  'kill "$input"',
+  'kill $input',
   'exit 0',
 ].join('; ');
 
@@ -146,7 +148,13 @@ export class WslLifetime {
    */
   async leavesStopped(host: string): Promise<boolean> {
     const access = hostAccessOf(host);
-    if (access?.kind !== 'wsl' || sshPromptsAllowed() || this.holds(host)) return false;
+    if (access?.kind !== 'wsl') return false;
+    if (sshPromptsAllowed() || this.holds(host)) {
+      // A flow of the user starts the distribution, and an idle session of this window holds it: the next time that a
+      // call leaves it stopped is logged again.
+      this.saidStopped.delete(host);
+      return false;
+    }
     const stopped = !(await this.deps.monitorPermanent(host)) && (await this.running(access.distribution)) === false;
     if (stopped !== (this.saidStopped.get(host) ?? false)) {
       this.saidStopped.set(host, stopped);
