@@ -394,16 +394,16 @@ export class WslSetup {
    * list of WSL and the folder of its virtual disk in the registry, `own` only when that folder is in the folder of
    * Devspaces. When `wsl.exe --list` fails otherwise than without any distribution, the registry alone decides, and
    * without the registry it is `none` (a WSL with no distribution may have no key in the registry yet); with `sure`
-   * (a removal, which must not forget a distribution that still exists), it throws WslSetupError `registryFailed`
-   * instead. It throws that too when WSL lists the distribution but the registry cannot be read: Devspaces never
-   * guesses that it set up a distribution.
+   * (a removal, which must not forget a distribution that still exists), it is `none` only when WSL is not installed
+   * (wslInstalled), and else throws WslSetupError `registryFailed`. It throws that too when WSL lists the distribution
+   * but the registry cannot be read: Devspaces never guesses that it set up a distribution.
    */
   async registration(signal?: AbortSignal, sure = false): Promise<WslRegistration> {
     const listed = await this.listed(signal);
     if (listed === false) return 'none';
     const folders = await this.distributionFolders(signal);
     if (folders === undefined) {
-      if (listed === undefined && !sure) return 'none';
+      if (listed === undefined && (!sure || !(await this.wslInstalled(signal)))) return 'none';
       throw new WslSetupError(
         'registryFailed',
         listed
@@ -651,13 +651,24 @@ export class WslSetup {
     const names = await filesOf(first);
     if (names?.length === 0) return first;
     const users = names === undefined ? undefined : await this.diskUsers(first, signal);
+    let removalError: unknown;
     if (names !== undefined && users?.length === 0) {
       this.deps.logger.info(`The folder ${first} has the files of a setup that did not end (${names.join(', ')}); they are removed.`);
-      await fs.promises.rm(first, { recursive: true, force: true });
-      return first;
+      try {
+        await fs.promises.rm(first, { recursive: true, force: true });
+        return first;
+      } catch (error) {
+        // For example a file that WSL still has open.
+        removalError = error;
+      }
     }
     const content = names === undefined ? 'cannot be read' : `has files (${names.join(', ')})`;
-    const why = users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses it' : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
+    const why =
+      removalError !== undefined
+        ? `they could not be removed (${errorMessage(removalError)})`
+        : users === undefined
+          ? 'neither the registry nor WSL tells whether a WSL distribution uses it'
+          : `the WSL distribution ${users.join(', ')} has its virtual disk there`;
     for (let number = 2; number <= MAX_DISK_FOLDERS; number++) {
       const next = path.join(this.deps.folder, `disk-${number}`);
       if ((await filesOf(next))?.length !== 0) continue;
@@ -688,6 +699,15 @@ export class WslSetup {
       this.deps.logger.info(`WSL does not list its distributions: ${errorMessage(error)}`);
       return undefined;
     }
+  }
+
+  /**
+   * Whether WSL is installed: `wsl.exe --version` or, from an older WSL, `wsl.exe --status` ends with exit code 0 (as
+   * in checkWsl). Throws WslSetupError (runShort).
+   */
+  private async wslInstalled(signal?: AbortSignal): Promise<boolean> {
+    if ((await this.runShort(WSL_VERSION_ARGS, signal)).exitCode === 0) return true;
+    return (await this.runShort(WSL_STATUS_ARGS, signal)).exitCode === 0;
   }
 
   /**

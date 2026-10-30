@@ -322,9 +322,13 @@ describe('WslSetup.registration', () => {
   });
 
   it('is sure for a removal: it tells neither none nor own when neither the list nor the registry can be read', async () => {
-    const runner = wslRunner(() => failed('Wsl/Service/E_UNEXPECTED'), failed('ERROR: Access is denied.'));
+    const runner = wslRunner((args) => (args[0] === '--version' ? ok('WSL version: 2.6.1.0') : failed('Wsl/Service/E_UNEXPECTED')), failed('ERROR: Access is denied.'));
     await expect(setup({ runner }).registration()).resolves.toBe('none');
     await expect(setup({ runner }).registration(undefined, true)).rejects.toMatchObject({ problem: 'registryFailed' });
+    // Without WSL (the wsl.exe of Windows that only offers the installation), there is no distribution.
+    const stub = wslRunner(() => failed('The Windows Subsystem for Linux is not installed.'), failed('ERROR: The system was unable to find the specified registry key or value.'));
+    await expect(setup({ runner: stub }).registration(undefined, true)).resolves.toBe('none');
+    expect(stub.calls.filter((call) => call.file === WSL).map((call) => call.args)).toEqual([WSL_LIST_ARGS, ['--version'], ['--status']]);
     // Without any distribution, WSL tells it by its code.
     const none = wslRunner(() => failed('Error code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND', 4294967295), failed('ERROR: Access is denied.'));
     await expect(setup({ runner: none }).registration(undefined, true)).resolves.toBe('none');
@@ -636,6 +640,27 @@ describe('WslSetup.setUp', () => {
     await setup({ runner: plain, download: writingDownload() }).setUp(image, () => undefined);
     expect(installArgs(plain)).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
     expect(fs.readFileSync(disk, 'utf8')).toBe('not a folder');
+  });
+
+  it('registers in another folder when the files of a setup that did not end cannot be removed', async () => {
+    const disk = path.join(folder, 'disk');
+    fs.mkdirSync(disk, { recursive: true });
+    fs.writeFileSync(path.join(disk, 'ext4.vhdx'), 'open');
+    const rm = fs.promises.rm;
+    const spy = vi.spyOn(fs.promises, 'rm').mockImplementation(async (target, options) => {
+      if (target === disk) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+      return rm(target, options);
+    });
+    try {
+      const runner = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
+      const log = logger();
+      await setup({ runner, download: writingDownload(), log }).setUp(image, () => undefined);
+      const file = path.join(folder, 'download', 'debian.wsl');
+      expect(runner.calls.find((call) => call.args[0] === '--install')?.args).toEqual(wslInstallArgs(file, path.join(folder, 'disk-2')));
+      expect(log.info).toHaveBeenCalledWith(expect.stringContaining('and they could not be removed (EBUSY: resource busy or locked)'));
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('removes a download that stayed after a registration when it sets up the distribution again', async () => {
