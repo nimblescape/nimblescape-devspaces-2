@@ -44,22 +44,37 @@ function keyInAuthorizedKeys(key: PublicKey): string {
   return `{ grep -v '^[[:space:]]*#' ${AUTHORIZED_KEYS} 2>/dev/null | grep -qF ${shellWord(`${key.type} ${key.blob}`)}; }`;
 }
 
+/** The output of authorizedKeysCommand when it added the line (and not when the key was there). */
+export const AUTHORIZED_KEY_ADDED = 'added';
+
 /**
  * One line for the shell before the relay that adds `key` to `~/.ssh/authorized_keys` of the account, as `ssh-copy-id`
  * does: in the home folder, with umask 077 (a new folder 0700, a new file 0600), only when the key is not in a line of
  * the file that is no comment, after a line feed when the file does not end with one, and with `restorecon` when the
  * host has it (SELinux). In a subshell, so the folder and the umask of the shell stay as they are for the commands
- * after it and for the relay. Its exit code is 0 when the key is in the file.
+ * after it and for the relay. Its exit code is 0 when the key is in the file; it prints AUTHORIZED_KEY_ADDED when it
+ * added the line `<type> <key> <comment>`.
  */
 export function authorizedKeysCommand(key: PublicKey, comment: string): string {
   const file = AUTHORIZED_KEYS;
   const line = shellWord(`${key.type} ${key.blob} ${comment}`);
   const steps = [
     `cd && umask 077 && mkdir -p .ssh`,
-    `{ ${keyInAuthorizedKeys(key)} || { { [ -z "$(tail -c 1 ${file} 2>/dev/null)" ] || echo >> ${file}; } && printf '%s\\n' ${line} >> ${file}; }; }`,
+    `{ ${keyInAuthorizedKeys(key)} || { { [ -z "$(tail -c 1 ${file} 2>/dev/null)" ] || echo >> ${file}; } && printf '%s\\n' ${line} >> ${file} && echo ${AUTHORIZED_KEY_ADDED}; }; }`,
     `{ ! command -v restorecon >/dev/null 2>&1 || restorecon -F .ssh ${file} >/dev/null 2>&1 || true; }`,
   ];
   return `( ${steps.join(' && ')} )`;
+}
+
+/**
+ * One line for the shell before the relay that removes the line `<type> <key> <comment>` that authorizedKeysCommand
+ * added from `~/.ssh/authorized_keys` again (only lines that are exactly this line). The file is written in place, so
+ * it keeps its mode and owner. Its exit code is 0 when the file was written.
+ */
+export function removeAuthorizedKeyCommand(key: PublicKey, comment: string): string {
+  const file = AUTHORIZED_KEYS;
+  const line = shellWord(`${key.type} ${key.blob} ${comment}`);
+  return `( cd || exit; kept=$(grep -vxF -- ${line} ${file}); [ $? -le 1 ] || exit; { [ -z "$kept" ] || printf '%s\\n' "$kept"; } > ${file} )`;
 }
 
 /** One line for the shell before the relay whose exit code is 0 when `key` is in `~/.ssh/authorized_keys` (no comment). */

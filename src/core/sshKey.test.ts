@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { authorizedKeyPresentCommand, authorizedKeysCommand, devspacesKeyPath, keyComment, parsePublicKey, sshWrapper } from './sshKey';
+import { authorizedKeyPresentCommand, authorizedKeysCommand, devspacesKeyPath, keyComment, parsePublicKey, removeAuthorizedKeyCommand, sshWrapper } from './sshKey';
 
 const BLOB = 'AAAAC3NzaC1lZDI1NTE5AAAAIHgJ3c2oQkQe4m4oY0bJ6qNnV6l0Sx5Jm8m2bq9b3n1d';
 const KEY = { type: 'ssh-ed25519', blob: BLOB };
@@ -45,15 +45,15 @@ describe('the command that adds the key to authorized_keys (run by sh in a home 
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  function runCommand(): void {
-    execFileSync('sh', ['-c', authorizedKeysCommand(KEY, 'devspaces@box')], { env: { HOME: home, PATH: process.env.PATH }, cwd: os.tmpdir() });
+  function runCommand(command = authorizedKeysCommand(KEY, 'devspaces@box')): string {
+    return execFileSync('sh', ['-c', command], { env: { HOME: home, PATH: process.env.PATH }, cwd: os.tmpdir() }).toString();
   }
 
   const file = (): string => path.join(home, '.ssh', 'authorized_keys');
 
   it('creates the folder and the file only for the owner, and adds the key once', () => {
-    runCommand();
-    runCommand();
+    expect(runCommand()).toBe('added\n');
+    expect(runCommand()).toBe('');
     expect(fs.readFileSync(file(), 'utf8')).toBe(`ssh-ed25519 ${BLOB} devspaces@box\n`);
     if (process.platform !== 'win32') {
       expect(fs.statSync(path.join(home, '.ssh')).mode & 0o777).toBe(0o700);
@@ -96,7 +96,26 @@ describe('the command that adds the key to authorized_keys (run by sh in a home 
       env: { HOME: home, PATH: process.env.PATH },
       cwd: os.tmpdir(),
     }).toString();
-    expect(out.trim().split('\n')).toEqual(['0022', fs.realpathSync(os.tmpdir())]);
+    expect(out.trim().split('\n')).toEqual(['added', '0022', fs.realpathSync(os.tmpdir())]);
+  });
+
+  it('removes exactly the line that it added, and keeps the others with the mode of the file', () => {
+    fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
+    const others = `ssh-ed25519 AAAAother ann@desk\n# ssh-ed25519 ${BLOB} devspaces@box\n`;
+    fs.writeFileSync(file(), others, { mode: 0o640 });
+    runCommand();
+    expect(fs.readFileSync(file(), 'utf8')).toBe(`${others}ssh-ed25519 ${BLOB} devspaces@box\n`);
+    runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'));
+    expect(fs.readFileSync(file(), 'utf8')).toBe(others);
+    if (process.platform !== 'win32') expect(fs.statSync(file()).mode & 0o777).toBe(0o640);
+    // The only line: an empty file.
+    fs.writeFileSync(file(), `ssh-ed25519 ${BLOB} devspaces@box\n`);
+    runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'));
+    expect(fs.readFileSync(file(), 'utf8')).toBe('');
+    // No file: it fails and creates none.
+    fs.rmSync(file());
+    expect(() => runCommand(removeAuthorizedKeyCommand(KEY, 'devspaces@box'))).toThrow();
+    expect(fs.existsSync(file())).toBe(false);
   });
 
   it('fails when the file cannot be written', () => {

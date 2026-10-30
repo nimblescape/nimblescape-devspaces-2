@@ -19,6 +19,7 @@ import { errorMessage } from '../core/errors';
 import type { Logger, ProcessRunner, RunResult } from '../core/ports';
 import type { RemoteDockerState } from '../core/storage/remoteDockerState';
 import {
+  AUTHORIZED_KEY_ADDED,
   SSH_WRAPPER_IDENTITY_ENV,
   SSH_WRAPPER_SSH_ENV,
   authorizedKeyPresentCommand,
@@ -26,6 +27,7 @@ import {
   devspacesKeyPath,
   keyComment,
   parsePublicKey,
+  removeAuthorizedKeyCommand,
   sshWrapper,
   type PublicKey,
 } from '../core/sshKey';
@@ -132,9 +134,9 @@ export class SshKeyOffer {
    */
   dockerSshEnv(host: string, env: NodeJS.ProcessEnv): void {
     const identity = this.identityFor(host);
-    if (identity !== undefined && this.wrapper === undefined && this.preparing === undefined) {
+    if (identity !== undefined && this.wrapper === undefined && !this.wrapperWritten() && this.preparing === undefined) {
       const waiting = this.wrapperFailedAt !== undefined && Date.now() - this.wrapperFailedAt < (this.options.wrapperRetryMs ?? WRAPPER_RETRY_MS);
-      if (!waiting && !this.wrapperWritten()) void this.prepare();
+      if (!waiting) void this.prepare();
     }
     const ssh = identity === undefined || this.wrapper === undefined ? undefined : this.options.sshPath();
     if (identity === undefined || ssh === undefined) return;
@@ -171,11 +173,17 @@ export class SshKeyOffer {
     }
     try {
       const key = await this.ensureKey();
-      const added = await shell.run(authorizedKeysCommand(key, keyComment(this.options.computerName)), { timeoutMs: KEY_STEP_TIMEOUT_MS });
+      const comment = keyComment(this.options.computerName);
+      const added = await shell.run(authorizedKeysCommand(key, comment), { timeoutMs: KEY_STEP_TIMEOUT_MS });
       if (added.exitCode !== 0) throw new Error(`~/.ssh/authorized_keys on ${host} could not be changed: ${added.stderr.trim() || `exit code ${added.exitCode}`}`);
-      logger.info(`The public key of Devspaces is in ~/.ssh/authorized_keys of the account on ${host}.`);
+      const addedNow = added.stdout.trim() === AUTHORIZED_KEY_ADDED;
+      logger.info(`The public key of Devspaces is in ~/.ssh/authorized_keys of the account on ${host}${addedNow ? ' now' : ' already'}.`);
       const detail = await this.checkLogin(host);
-      if (detail !== undefined) throw new Error(`the key is in ~/.ssh/authorized_keys on ${host}, but a login with it failed: ${detail}`);
+      if (detail !== undefined) {
+        // A key that Devspaces does not use stays on no host: its line goes again when this step added it.
+        if (addedNow) await this.removeKey(host, shell, key, comment);
+        throw new Error(`a login with the key failed: ${detail}`);
+      }
       await state.setSshKey(host, 'installed');
       logger.info(`Devspaces logs in to ${host} with its key ${this.keyPath} from now on.`);
       dialogs.installed(host);
@@ -188,6 +196,18 @@ export class SshKeyOffer {
         logger.info(`Devspaces does not offer its key for ${host} again.`);
         await state.setSshKey(host, 'declined').catch((failure: unknown) => logger.warn(`The answer for ${host} could not be recorded: ${errorMessage(failure)}`));
       });
+    }
+  }
+
+  /** Removes the line of the key that this setup added from `~/.ssh/authorized_keys` on the host of `shell` (logged). */
+  private async removeKey(host: string, shell: KeyShell, key: PublicKey, comment: string): Promise<void> {
+    const { logger } = this.options;
+    try {
+      const removed = await shell.run(removeAuthorizedKeyCommand(key, comment), { timeoutMs: KEY_STEP_TIMEOUT_MS });
+      if (removed.exitCode !== 0) throw new Error(removed.stderr.trim() || `exit code ${removed.exitCode}`);
+      logger.info(`The public key of Devspaces was removed from ~/.ssh/authorized_keys on ${host} again.`);
+    } catch (error) {
+      logger.warn(`The public key of Devspaces could not be removed from ~/.ssh/authorized_keys on ${host} again (${errorMessage(error)}); remove its line ${comment} there.`);
     }
   }
 

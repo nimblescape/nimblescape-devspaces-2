@@ -155,11 +155,13 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     expect(fs.existsSync(path.join(home, '.ssh', 'devspaces_ed25519'))).toBe(false);
   });
 
-  it('shows why the key could not be set up, and records nothing: a failed check login', async () => {
+  it('shows why the key could not be set up, records nothing, and removes the line it added: a failed check login', async () => {
     sshExit = 255;
     const keys = offer();
     await keys.afterLogin('box', { passwordAsked: true }, shell);
-    expect(asked[1]).toBe('failed box: the key is in ~/.ssh/authorized_keys on box, but a login with it failed: Permission denied (publickey).');
+    expect(asked[1]).toBe('failed box: a login with the key failed: Permission denied (publickey).');
+    // The line that the setup added is gone again; the other lines stay.
+    expect(authorizedKeys()).toBe('');
     expect(warnings).toHaveLength(1);
     expect(await state.sshKey('box')).toBeUndefined();
     expect(keys.identityFor('box')).toBeUndefined();
