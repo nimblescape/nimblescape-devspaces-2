@@ -187,8 +187,10 @@ export class WslSetupCommands {
       });
       if (plan.registration === 'foreign') {
         this.deps.logger.info(`A WSL distribution ${WSL_DISTRIBUTION} exists that Devspaces did not set up; Devspaces does not change it.`);
-        const choice = await showInformationMessage(WslSetupTexts.foreign, WslSetupTexts.useIt);
-        if (choice === WslSetupTexts.useIt) await this.deps.useHost(WSL_HOST);
+        // Not awaited: a message that nobody answers must not block the next setup or removal here.
+        showInformationMessage(WslSetupTexts.foreign, WslSetupTexts.useIt)
+          .then((choice) => (choice === WslSetupTexts.useIt ? this.deps.useHost(WSL_HOST) : undefined))
+          .then(undefined, (error: unknown) => this.deps.logger.error(`${WSL_HOST} could not be used: ${errorMessage(error)}`));
         return;
       }
       const confirmed =

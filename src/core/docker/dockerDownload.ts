@@ -136,13 +136,12 @@ export async function downloadFile(options: DownloadOptions): Promise<void> {
   }
   const hash = crypto.createHash('sha256');
   let received = 0;
-  const source = url;
   // Counts, hashes and limits each piece before it is written.
   const meter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       received += chunk.length;
       if (maxBytes !== undefined && received > maxBytes) {
-        callback(new Error(`The download of ${source} has more than the ${maxBytes} bytes that it may have.`));
+        callback(new Error(`The download of ${url} has more than the ${maxBytes} bytes that it may have.`));
         return;
       }
       hash.update(chunk);

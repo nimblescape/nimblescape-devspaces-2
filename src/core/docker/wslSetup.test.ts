@@ -472,6 +472,20 @@ describe('WslSetup.setUp', () => {
     expect(fs.existsSync(path.join(folder, 'download', 'debian.wsl'))).toBe(false);
   });
 
+  it('ends the registration after a cancel, and then stops before the script', async () => {
+    const abort = new AbortController();
+    const runner = distribution((args) => {
+      if (args[0] !== '--install') return undefined;
+      abort.abort();
+      return ok();
+    });
+    const error = await setup({ runner, download: writingDownload() }).setUp(image, () => undefined, abort.signal).catch((caught: unknown) => caught);
+    expect(isAbortError(error)).toBe(true);
+    expect(runner.calls.map((call) => call.args[0])).toEqual(['--install']);
+    expect(runner.calls[0].options?.signal).toBeUndefined();
+    expect(fs.existsSync(path.join(folder, 'download', 'debian.wsl'))).toBe(false);
+  });
+
   it('fails with registerFailed with the message of WSL, and removes the download', async () => {
     const runner = distribution((args) => (args[0] === '--install' ? failed('W\0S\0L\0_\0E\0_\0D\0I\0S\0T\0R\0O\0_\0E\0X\0I\0S\0T\0S\0') : undefined));
     await expect(setup({ runner, download: writingDownload() }).setUp(image, () => undefined)).rejects.toMatchObject({

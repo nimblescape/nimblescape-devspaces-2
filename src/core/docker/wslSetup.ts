@@ -60,8 +60,9 @@ const REGISTRY_EXPORT_NAME = 'distributions.reg';
 const STEP_PREFIX = 'devspaces-step ';
 /**
  * The lock of the setup for all windows (withLockFolder): its holder refreshes it every 15 seconds, so that a lock
- * older than a minute is of a window that ended; another window waits for it one second. After the computer slept,
- * the holder refreshes it at once, before another window takes it: that window takes it only after a confirmation.
+ * older than a minute is of a window that ended; another window waits for it one second. After the computer slept for
+ * more than a minute, another window can take it before the holder refreshes it; then the script in the distribution
+ * still runs only once at a time (flock), and WSL registers the name only once.
  */
 const LOCK_TIMINGS = { staleMs: 60_000, timeoutMs: 1_000 };
 /** The longest wait for the list of WSL distributions and for the size of the Debian file. */
@@ -453,8 +454,10 @@ export class WslSetup {
    * in a folder `disk` (diskFolderFor), and removes the download; then the script installs Docker Engine (PROVISION_SCRIPT), the
    * distribution restarts, and Docker must answer. Without `image`, only the script, the restart and the check run (a
    * distribution that Devspaces set up before). Returns the version of the engine. Throws WslSetupError, or an
-   * AbortError when the signal aborts. When the script is cancelled or ends by its time limit, the distribution stops,
-   * because the script would go on there after the end of wsl.exe; its next run goes on from there.
+   * AbortError when the signal aborts. The registration itself is not cancelled: the service of WSL would go on with it
+   * after the end of wsl.exe, so a cancel takes effect after it. When the script is cancelled or ends by its time
+   * limit, the distribution stops, because the script would go on there after the end of wsl.exe; its next run goes on
+   * from there.
    */
   async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
     if (image !== undefined) await this.register(image, onStep, signal);
@@ -543,11 +546,14 @@ export class WslSetup {
       onStep({ kind: 'register' });
       const args = wslInstallArgs(file, diskFolder);
       this.deps.logger.info(`wsl.exe ${args.join(' ')}`);
-      const result = await this.runWsl(args, { timeoutMs: REGISTER_MS, signal });
+      // Without the signal (setUp). After the time limit, WSL may still end the registration: the next setup then finds
+      // the distribution of Devspaces and only runs the script.
+      const result = await this.runWsl(args, { timeoutMs: REGISTER_MS });
       if (result.exitCode !== 0) {
         throw new WslSetupError('registerFailed', `wsl.exe --install --from-file failed (${endOf(result, REGISTER_MS)}): ${outputOf(result)}`);
       }
       this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${diskFolder}.`);
+      if (signal?.aborted) throw abortError();
     } finally {
       await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
         this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
@@ -590,12 +596,13 @@ export class WslSetup {
     }
   }
 
-  /** The size of the file at `url` from HEAD requests (HTTPS redirects followed, each within 30 seconds), or undefined (logged). */
+  /** The size of the file at `url` from HEAD requests (HTTPS redirects followed, all within 30 seconds), or undefined (logged). */
   private async sizeOf(url: string, signal?: AbortSignal): Promise<number | undefined> {
     let current = url;
+    const deadline = withTimeout(signal, REQUEST_MS);
     try {
       for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
-        const response = await this.deps.http.request({ method: 'HEAD', url: current }, withTimeout(signal, REQUEST_MS));
+        const response = await this.deps.http.request({ method: 'HEAD', url: current }, deadline);
         const location = response.headers.location;
         if (response.status >= 300 && response.status < 400 && location) {
           current = new URL(location, current).href;

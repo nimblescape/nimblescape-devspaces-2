@@ -187,7 +187,18 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     expect(window.showInformationMessage).toHaveBeenCalledWith(WslSetupTexts.foreign, WslSetupTexts.useIt);
     expect(questions()).toEqual([]);
     expect(setup.setUp).not.toHaveBeenCalled();
-    expect(useHost).toHaveBeenCalledWith(WSL_HOST);
+    await vi.waitFor(() => expect(useHost).toHaveBeenCalledWith(WSL_HOST));
+  });
+
+  it('does not wait for an answer about a distribution devspaces of the user', async () => {
+    registered('foreign');
+    window.showInformationMessage.mockReturnValueOnce(new Promise(() => {}));
+    const instance = commands();
+    await instance.setUp();
+    registered('own');
+    await instance.setUp();
+    expect(window.showInformationMessage).not.toHaveBeenCalledWith(WslSetupTexts.busy);
+    expect(questions()).toHaveLength(1);
   });
 
   it('offers Install WSL 2 when WSL is missing', async () => {
