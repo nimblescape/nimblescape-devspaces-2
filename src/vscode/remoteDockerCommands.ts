@@ -292,7 +292,8 @@ export class RemoteDockerCommands {
    * `host` leaves the list of Devspaces without a choice (the removal of the WSL distribution of Devspaces); when
    * Devspaces used it, the local Docker takes its place and the sidebar follows. Returns `notDockerHost` when Devspaces
    * did not use it; else `local`, or `unsupported` when the local Docker of Devspaces is not supported (its warning is
-   * shown, as for "Use the Local Docker").
+   * shown, as for "Use the Local Docker"). Throws only when the list cannot be changed: the steps after the change
+   * never throw.
    */
   async forgetHost(host: string): Promise<'notDockerHost' | 'local' | 'unsupported'> {
     const { removed, wasDockerHost } = await this.deps.state.removeHost(host);

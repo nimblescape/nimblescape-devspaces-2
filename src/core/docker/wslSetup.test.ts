@@ -585,10 +585,18 @@ describe('WslSetup.setUp', () => {
 describe('WslSetup.remove', () => {
   it('unregisters the distribution and removes the folder of Devspaces', async () => {
     fs.mkdirSync(path.join(folder, 'disk'));
-    const runner = wslRunner((args) => (args.join(' ') === WSL_UNREGISTER_ARGS.join(' ') ? ok() : undefined));
+    const runner = wslRunner((args) => (args.join(' ') === WSL_UNREGISTER_ARGS.join(' ') ? ok() : undefined), { Ubuntu: 'C:\\WSL\\Ubuntu' });
     await setup({ runner }).remove();
-    expect(runner.calls.map((call) => call.args)).toEqual([WSL_UNREGISTER_ARGS]);
+    expect(runner.calls.map((call) => call.args[0])).toEqual([WSL_UNREGISTER_ARGS[0], 'export']);
     expect(fs.existsSync(folder)).toBe(false);
+  });
+
+  it('keeps the folder of Devspaces when another distribution has its virtual disk there', async () => {
+    fs.mkdirSync(path.join(folder, 'disk'));
+    fs.writeFileSync(path.join(folder, 'disk', 'ext4.vhdx'), 'other');
+    const runner = wslRunner((args) => (args.join(' ') === WSL_UNREGISTER_ARGS.join(' ') ? ok() : undefined), { other: path.join(folder, 'disk') });
+    await setup({ runner }).remove();
+    expect(fs.readdirSync(path.join(folder, 'disk'))).toEqual(['ext4.vhdx']);
   });
 
   it('keeps the folder when WSL refuses', async () => {

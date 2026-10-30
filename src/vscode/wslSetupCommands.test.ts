@@ -135,6 +135,23 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     expect(window.showInformationMessage.mock.calls.filter((call: unknown[]) => call[0] === WslSetupTexts.busyElsewhere)).toHaveLength(2);
   });
 
+  it('changes nothing when another window set up or removed the distribution after the check', async () => {
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    setup.registration.mockResolvedValueOnce('none').mockResolvedValueOnce('own');
+    await commands().setUp();
+    expect(setup.setUp).not.toHaveBeenCalled();
+    expect(useHost).not.toHaveBeenCalled();
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
+    setup.registration.mockResolvedValueOnce('own').mockResolvedValueOnce('none');
+    await commands().remove();
+    expect(setup.remove).not.toHaveBeenCalled();
+    setup.registration.mockResolvedValueOnce('none').mockResolvedValueOnce('own');
+    await commands().remove();
+    expect(setup.removeLeftovers).not.toHaveBeenCalled();
+    expect(forgetHost).not.toHaveBeenCalled();
+    expect(window.showInformationMessage.mock.calls).toEqual([[WslSetupTexts.changedElsewhere], [WslSetupTexts.changedElsewhere], [WslSetupTexts.changedElsewhere]]);
+  });
+
   it('says that the setup is done when Devspaces cannot use the distribution yet', async () => {
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
     useHost.mockResolvedValue(false);
@@ -284,6 +301,14 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
     expect(window.showErrorMessage).toHaveBeenCalledWith(WslSetupTexts.removedStillListed, Actions.showDetails);
     expect(window.showErrorMessage).not.toHaveBeenCalledWith(WslSetupTexts.removeFailedUnknown, Actions.showDetails);
     expect(logger.error).toHaveBeenCalledWith(`${WSL_HOST} could not be removed from the list of Devspaces: EBUSY: the file is locked`);
+  });
+
+  it('keeps the host and the files of a setup while another window holds the lock', async () => {
+    setup.locked.mockResolvedValueOnce(undefined);
+    await commands().remove();
+    expect(forgetHost).not.toHaveBeenCalled();
+    expect(setup.removeLeftovers).not.toHaveBeenCalled();
+    expect(window.showInformationMessage.mock.calls).toEqual([[WslSetupTexts.busyElsewhere]]);
   });
 
   it('logs a cancelled check as a cancelled removal', async () => {

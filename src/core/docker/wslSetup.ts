@@ -60,7 +60,8 @@ const REGISTRY_EXPORT_NAME = 'distributions.reg';
 const STEP_PREFIX = 'devspaces-step ';
 /**
  * The lock of the setup for all windows (withLockFolder): its holder refreshes it every 15 seconds, so that a lock
- * older than a minute is of a window that ended; another window waits for it one second.
+ * older than a minute is of a window that ended; another window waits for it one second. After the computer slept,
+ * the holder refreshes it at once, before another window takes it: that window takes it only after a confirmation.
  */
 const LOCK_TIMINGS = { staleMs: 60_000, timeoutMs: 1_000 };
 /** The longest wait for the list of WSL distributions and for the size of the Debian file. */
@@ -500,8 +501,9 @@ export class WslSetup {
   }
 
   /**
-   * `wsl --unregister devspaces`, which deletes the distribution with everything in it, then the folder of Devspaces.
-   * Only for a distribution that Devspaces set up (the caller checks `registration`). Throws WslSetupError `removeFailed`.
+   * `wsl --unregister devspaces`, which deletes the distribution with everything in it, then the folder of Devspaces,
+   * unless another WSL distribution has its virtual disk there (removeLeftovers). Only for a distribution that Devspaces
+   * set up (the caller checks `registration`). Throws WslSetupError `removeFailed`.
    */
   async remove(signal?: AbortSignal): Promise<void> {
     const result = await this.runWsl(WSL_UNREGISTER_ARGS, { timeoutMs: UNREGISTER_MS, signal });
@@ -509,14 +511,12 @@ export class WslSetup {
       throw new WslSetupError('removeFailed', `wsl.exe ${WSL_UNREGISTER_ARGS.join(' ')} failed (${endOf(result, UNREGISTER_MS)}): ${outputOf(result)}`);
     }
     this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was removed.`);
-    await fs.promises.rm(this.deps.folder, { recursive: true, force: true }).catch((error: unknown) => {
-      this.deps.logger.warn(`The folder ${this.deps.folder} could not be removed: ${errorMessage(error)}`);
-    });
+    await this.removeLeftovers();
   }
 
   /**
-   * Removes the folder of Devspaces when no WSL distribution has its virtual disk there (the registry): the files of a
-   * setup that did not end. Never throws (logged).
+   * Removes the folder of Devspaces when no WSL distribution has its virtual disk there (the registry): after the
+   * removal, or the files of a setup that did not end. Never throws (logged).
    */
   async removeLeftovers(): Promise<void> {
     const { folder, logger } = this.deps;
@@ -527,7 +527,7 @@ export class WslSetup {
       return;
     }
     await fs.promises.rm(folder, { recursive: true, force: true }).then(
-      () => logger.info(`The folder ${folder} of an earlier setup was removed.`),
+      () => logger.info(`The folder ${folder} was removed.`),
       (error: unknown) => logger.warn(`The folder ${folder} could not be removed: ${errorMessage(error)}`),
     );
   }
