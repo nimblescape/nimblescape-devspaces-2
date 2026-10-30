@@ -28,7 +28,10 @@ const SHELL_CLOSE_KILL_MS = 5_000;
 /** The end of the error output of the login that is kept for the reason of a failure. */
 const STDERR_TAIL_LENGTH = 8 * 1024;
 
-/** The login of the shell failed; `detail` is the error output of `ssh`, `timedOut` when it did not answer in time. */
+/**
+ * The login of the shell failed; `detail` is the error output of `ssh` (or `wsl.exe`), `timedOut` when it did not answer
+ * in time.
+ */
 export class RemoteShellError extends Error {
   constructor(
     readonly detail: string,
@@ -79,6 +82,8 @@ export interface RemoteShellOptions {
   logger: Logger;
   /** Named in the log lines, for example the host. */
   name: string;
+  /** The program of the transport, named when its login does not answer in time: `ssh` (default) or `wsl.exe`. */
+  program?: 'ssh' | 'wsl.exe';
   loginTimeoutMs?: number;
   idleCloseMs?: number;
   /** Called once when the shell ends or is taken over. */
@@ -183,7 +188,7 @@ export class RemoteShell {
       const fail = (detail: string, timedOut = false) => settle(new RemoteShellError(detail, timedOut));
       const arm = () => {
         clearTimeout(timer);
-        timer = setTimeout(() => fail(`ssh did not answer within ${timeoutMs / 1000} seconds.`, true), timeoutMs);
+        timer = setTimeout(() => fail(`${this.options.program ?? 'ssh'} did not answer within ${timeoutMs / 1000} seconds.`, true), timeoutMs);
       };
       arm();
       // A question in VS Code waits for the user: no time limit while it is open, the full one again after it.
@@ -240,7 +245,8 @@ export class RemoteShell {
    * as its standard input (else none), and resolves with its exit code and output as ProcessRunner.run does. After
    * `timeoutMs`, the shell is stopped and the result has `timedOut`; when `signal` aborts, the shell is stopped and the
    * call rejects with an AbortError. When the shell ends during the command (the connection broke), the result has
-   * the exit code of `ssh` and its error output. Rejects with ShellGoneError when the shell ended or was taken over
+   * the exit code of the transport (`ssh` or `wsl.exe`) and its error output. Rejects with ShellGoneError when the shell
+   * ended or was taken over
    * before the command started, and with an Error for a command or input that the line cannot carry (shellCommandLine).
    */
   run(command: string, options: Pick<RunOptions, 'input' | 'timeoutMs' | 'signal'> = {}): Promise<RunResult> {

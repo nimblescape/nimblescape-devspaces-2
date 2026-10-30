@@ -42,7 +42,7 @@ describeUnix('RemoteShells', () => {
     expect(results.map((result) => (result !== undefined && 'stdout' in result ? result.stdout : result))).toEqual(['one', 'two', { ok: true }, 'three']);
     await expect(registry.run('box', 'printf four')).resolves.toMatchObject({ stdout: 'four' });
     expect(logins.sort()).toEqual(['box', 'other']);
-    expect(lines.filter((line) => line.startsWith('The shell on box'))).toEqual(['The shell on box is open: one SSH login for the checks before the relay.']);
+    expect(lines.filter((line) => line.startsWith('The shell on box'))).toEqual(['The shell on box is open: one login for the checks before the relay.']);
     registry.dispose();
   });
 

@@ -9,7 +9,8 @@
 // process of the computer is killed, or the connection stays silent). `afterAll` fails when a channel container is left
 // over. The channel starts no step container (the end of a batch helper with its worker is tested in
 // src/helperChannel/batch.e2e.test.ts). The probe and the sweep of the worker go over the Engine API of its socket (no
-// Docker CLI of the worker), so their answers are checked against what the Docker CLI of the runner reports.
+// Docker CLI of the worker), so their answers are checked against what the Docker CLI of the runner reports. The
+// transport of the WSL distribution of Devspaces runs here with a fake `wsl.exe`.
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -18,7 +19,8 @@ import { sharedBundleOptions, workerBundleOptions } from '../../scripts/bundleOp
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // The Docker CLI of the extension (BootstrapDocker).
 import { BootstrapDocker } from '../../src/core/docker/bootstrapDocker';
-import { remoteDockerTarget } from '../../src/core/docker/dockerHost';
+import { WSL_HOST, remoteDockerTarget, wslCommandArgs, wslEnv } from '../../src/core/docker/dockerHost';
+import { testRemoteDockerHost } from '../../src/core/docker/remoteDocker';
 import { outsideOperation, runWithDockerTarget } from '../../src/core/docker/dockerTargets';
 import { HelperChannel } from '../../src/core/helperChannel/helperChannel';
 import { channelRunArgs, openHelperChannel } from '../../src/core/helperChannel/helperChannels';
@@ -45,7 +47,8 @@ import { RelayConnections, relayAccess } from '../../src/core/relay/connections'
 import { DockerPipe, relayDockerDial } from '../../src/core/relay/dockerPipe';
 import { HostPipes } from '../../src/core/relay/hostPipes';
 import { dockerPipeAddress } from '../../src/core/relay/pipeAddress';
-import { openRelayConnection } from '../../src/core/relay/transport';
+import { RemoteShells } from '../../src/core/relay/remoteShells';
+import { openRelayConnection, wslHostTransport, type RelayTransport } from '../../src/core/relay/transport';
 import { TEST_RUN_LABEL, removeRunObjects } from './dockerRun';
 import { Timings, dockerTestContext, testHelperImage, testStateVolume, testVscodeVolume } from './harness';
 
@@ -130,12 +133,12 @@ describe('the helper channel with the real Docker engine', () => {
   /**
    * Opens a channel as the extension does; `extraArgs` go before the image (for example `-e`), `process` is kept.
    * `relay`: the worker behind the relay, on the connection of `relay` when it has one, else on a new connection whose
-   * transport is a local `sh -s` (in place of `ssh … sh -s`); `transport` is that process, and `name` the name of its
-   * container.
+   * transport is a local `sh -s` (in place of `ssh … sh -s`), or `relayTransport`; `transport` is that process, and
+   * `name` the name of its container. `host`: the host of the relay (default `runner-engine`).
    */
   async function open(
     extraArgs: string[] = [],
-    options: { relay?: RelayConnections } = {},
+    options: { relay?: RelayConnections; relayTransport?: RelayTransport; host?: string } = {},
   ): Promise<{ channel: HelperChannel; process: StartedProcess; name: string; transport?: StartedByteProcess }> {
     let started: StartedProcess | undefined;
     let transport: StartedByteProcess | undefined;
@@ -155,10 +158,12 @@ describe('the helper channel with the real Docker engine', () => {
         },
         relay: () => {
           if (!options.relay) return undefined;
-          const start = () => ({ process: (transport = byteRunner.startBytes('sh', ['-s'], { env })) });
+          const { file, args, env: transportEnv } = options.relayTransport ?? { file: 'sh', args: ['-s'], env };
+          const start = () => ({ process: (transport = byteRunner.startBytes(file, args, { env: transportEnv })) });
+          const host = options.host ?? 'runner-engine';
           // The Docker CLI of the run, with the environment of the run.
-          return relayAccess(options.relay, 'runner-engine', (command, bundle) =>
-            openRelayConnection(start, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: 'runner-engine' }),
+          return relayAccess(options.relay, host, (command, bundle) =>
+            openRelayConnection(start, [run.dockerPath, ...testArgs(command.slice(1))], bundle, { logger: log, name: host }),
           );
         },
         // The engine identity of the open is compared with one call without the worker.
@@ -380,6 +385,96 @@ describe('the helper channel with the real Docker engine', () => {
       connections.dispose();
       fs.rmSync(folder, { recursive: true, force: true });
       fs.rmSync(context, { recursive: true, force: true });
+    }
+  });
+
+  // The WSL distribution of Devspaces (docs/architecture.md "The WSL distribution of Devspaces"): the transport and the
+  // dial-stdio of `wsl.exe`, here a fake `wsl.exe` that takes exactly the arguments of wslCommandArgs and runs the command
+  // on this computer, so on the engine of the runner. The test of the host on its shell, the worker behind the relay, and
+  // the Docker calls of the extension through its own pipe, which runs each connection with its own dial-stdio.
+  it('reaches the WSL distribution through wsl.exe: the test of the host, the worker behind the relay, and the Docker calls of the extension', async () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'wsl-'));
+    const callsFile = path.join(folder, 'calls');
+    const fakeWsl = path.join(folder, 'wsl');
+    fs.writeFileSync(
+      fakeWsl,
+      [
+        '#!/bin/sh',
+        `printf '%s\\n' "$*" >> '${callsFile}'`,
+        '[ "$1" = -d ] && [ "$3" = -u ] && [ "$4" = root ] && [ "$5" = --cd ] && [ "$6" = / ] && [ "$7" = --exec ] || { echo "fake wsl: unexpected arguments: $*" >&2; exit 2; }',
+        '[ "$WSL_UTF8" = 1 ] || { echo "fake wsl: WSL_UTF8 is not 1" >&2; exit 2; }',
+        'if [ "$2" != devspaces ]; then printf "%s\\n" "There is no distribution with the supplied name." "Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND" >&2; exit 1; fi',
+        'shift 7',
+        'cd / && exec "$@"',
+        '',
+      ].join('\n'),
+      { mode: 0o700 },
+    );
+    const calls = () => fs.readFileSync(callsFile, 'utf8').trim().split('\n');
+    const startShell = (host: string) => {
+      const distribution = host.slice('wsl:'.length);
+      const transport = wslHostTransport(distribution, fakeWsl, env);
+      return { process: byteRunner.startBytes(transport.file, transport.args, { env: transport.env }) };
+    };
+    const shells = new RemoteShells({ logger: log, start: startShell });
+    const connections = new RelayConnections({ logger: log });
+    const pipeFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'wsl-pipe-'));
+    const hostPipes = new HostPipes({
+      logger: log,
+      platform: process.platform,
+      base: () => pipeFolder,
+      relayConnection: (host) => connections.get(host),
+      dialStdio: (host) => byteRunner.startBytes(fakeWsl, wslCommandArgs(host.slice('wsl:'.length), ['docker', 'system', 'dial-stdio']), { env: wslEnv(env) }),
+    });
+    const extensionDocker = new BootstrapDocker(byteRunner, run.dockerPath, env, log, process.platform, {
+      dockerPipe: (pipeTarget) => hostPipes.dockerHost(pipeTarget.host),
+      servePipe: (pipeTarget) => hostPipes.serve(pipeTarget.host),
+    });
+    try {
+      // The test of the host: `docker info` of the distribution on its shell before the relay.
+      const tested = await timings.measure('test of the WSL distribution', () =>
+        testRemoteDockerHost(extensionDocker, WSL_HOST, { runner: byteRunner, sshPath: undefined, env, shells }),
+      );
+      expect(tested).toMatchObject({ ok: true, version: cli.ok(['version', '--format', '{{.Server.Version}}']) });
+      await expect(testRemoteDockerHost(extensionDocker, 'wsl:other', { runner: byteRunner, sshPath: undefined, env, shells })).resolves.toMatchObject({
+        ok: false,
+        problem: 'wslDistributionMissing',
+      });
+      expect(calls()).toEqual(['-d devspaces -u root --cd / --exec sh -s', '-d other -u root --cd / --exec sh -s']);
+      shells.dispose();
+
+      // The worker behind the relay, with the transport of the distribution.
+      const { channel, name, transport } = await timings.measure('open a channel behind the relay through wsl.exe', () =>
+        open([], { relay: connections, relayTransport: wslHostTransport('devspaces', fakeWsl, env), host: WSL_HOST }),
+      );
+      expect(cli.container(name)?.Config.Cmd?.at(-1)).toBe('startRelay');
+      const probe = parseProbeValue(await channel.operation(OP_PROBE, parseProbeParams({}), { timeoutMs: 30_000 }));
+      expect(probe?.engine).toEqual(engineIdentity(cli.ok([...ENGINE_IDENTITY_ARGS])));
+
+      // The Docker calls of the extension in an operation there: through its pipe, each connection with its own
+      // dial-stdio (never through the connection of the relay); the end of standard input of `run -i` reaches `cat`.
+      const opened = connections.get(WSL_HOST)!.streamsOpened;
+      const wslTarget = remoteDockerTarget(WSL_HOST);
+      const version = await runWithDockerTarget(wslTarget, () => extensionDocker.run(['version', '--format', '{{.Server.Version}}']));
+      expect({ exitCode: version.exitCode, stdout: version.stdout.trim() }).toEqual({ exitCode: 0, stdout: cli.ok(['version', '--format', '{{.Server.Version}}']) });
+      const ran = await runWithDockerTarget(wslTarget, () =>
+        extensionDocker.run(['run', '--rm', '-i', ...runLabelArgs, '--entrypoint', 'sh', helperTag, '-c', 'cat; echo " and the end"'], { input: 'the input', timeoutMs: 120_000 }),
+      );
+      expect({ exitCode: ran.exitCode, stdout: ran.stdout }).toEqual({ exitCode: 0, stdout: 'the input and the end\n' });
+      expect(connections.get(WSL_HOST)!.streamsOpened).toBe(opened);
+      expect(calls().filter((line) => line.endsWith('--exec docker system dial-stdio')).length).toBeGreaterThanOrEqual(2);
+      expect(hostPipes.dockerHost(WSL_HOST)).toMatch(/^unix:\/\/.*\/docker\.sock$/);
+
+      channel.close();
+      connections.close(WSL_HOST, 'the test closed it');
+      await transport?.exited;
+      await waitUntil(() => cli.container(name) === undefined, 'the removal of the container');
+    } finally {
+      shells.dispose();
+      hostPipes.dispose();
+      connections.dispose();
+      fs.rmSync(folder, { recursive: true, force: true });
+      fs.rmSync(pipeFolder, { recursive: true, force: true });
     }
   });
 

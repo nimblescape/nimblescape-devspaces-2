@@ -10,7 +10,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { silentLogger, type Logger, type ProcessRunner, type RunOptions, type RunResult, type StartedProcess } from '../ports';
 import { BootstrapDocker, isShellCall } from './bootstrapDocker';
-import { LOCAL_DOCKER_TARGET, remoteDockerTarget, type DockerTarget } from './dockerHost';
+import { LOCAL_DOCKER_TARGET, WSL_HOST, remoteDockerTarget, type DockerTarget } from './dockerHost';
 import { runWithDockerTarget } from './dockerTargets';
 
 const OK: RunResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false };
@@ -145,6 +145,68 @@ describe('BootstrapDocker: the Docker pipe of the extension', () => {
     expect(envs[0].DOCKER_HOST).toBe(SSH);
     expect(envs[0].DOCKER_CONTEXT).toBeUndefined();
     expect(warnings).toEqual(['The Docker pipe of build-box could not be looked up, so the call logs in itself: broken']);
+  });
+});
+
+describe('BootstrapDocker: the Docker pipe of the WSL distribution of Devspaces', () => {
+  const WSL = remoteDockerTarget(WSL_HOST);
+
+  it('serves the pipe before each call of an operation there, and gives every call the pipe, also the checks of a new connection', async () => {
+    const { runner, envs } = recorder();
+    let pipe: string | undefined;
+    const served: string[] = [];
+    const servePipe = vi.fn(async (target: DockerTarget) => {
+      served.push(target.host);
+      pipe = PIPE;
+    });
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin', DOCKER_HOST: 'tcp://x:2375' }, silentLogger, 'win32', {
+      dockerPipe: (target) => (target.host === WSL_HOST ? pipe : undefined),
+      servePipe,
+    });
+    await runWithDockerTarget(WSL, () => docker.run(['container', 'inspect', 'x']));
+    await runWithDockerTarget(WSL, () => docker.runWithoutPipe(['info', '--format', '{{json .ID}}']));
+    expect(envs.map((env) => env.DOCKER_HOST)).toEqual([PIPE, PIPE]);
+    expect(served).toEqual([WSL_HOST, WSL_HOST]);
+    // The hook is asked for every remote engine (extension.ts serves only the WSL distribution), never for the local one.
+    await runWithDockerTarget(REMOTE, () => docker.run(['container', 'inspect', 'x']));
+    await runWithDockerTarget(LOCAL_DOCKER_TARGET, () => docker.run(['container', 'inspect', 'x']));
+    await docker.run(['container', 'inspect', 'x']);
+    expect(served).toEqual([WSL_HOST, WSL_HOST, 'build-box']);
+  });
+
+  it('never logs in with ssh:// there: without the pipe a call that only reads runs on the shell before the relay, any other one fails', async () => {
+    const { runner, envs, starts } = recorder();
+    const remoteShell = vi.fn(async (): Promise<RunResult | undefined> => ({ ...OK, stdout: 'on the shell' }));
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, silentLogger, 'win32', {
+      dockerPipe: () => undefined,
+      servePipe: async () => undefined,
+      remoteShell,
+    });
+    await expect(runWithDockerTarget(WSL, () => docker.run(['container', 'inspect', 'x']))).resolves.toMatchObject({ stdout: 'on the shell' });
+    expect(remoteShell).toHaveBeenCalledWith(WSL, ['container', 'inspect', 'x'], { timeoutMs: undefined, signal: undefined });
+    remoteShell.mockResolvedValue(undefined);
+    await expect(runWithDockerTarget(WSL, () => docker.run(['container', 'inspect', 'x']))).rejects.toMatchObject({
+      code: 'dockerHostUnreachable',
+      message: expect.stringContaining(WSL_HOST),
+    });
+    await expect(runWithDockerTarget(WSL, () => docker.run(['rm', '-f', 'x']))).rejects.toMatchObject({ code: 'dockerHostUnreachable' });
+    // The worker starts there only behind the relay.
+    await expect(runWithDockerTarget(WSL, async () => docker.start(['run', '-i', 'img']))).resolves.toBeUndefined();
+    expect(envs).toEqual([]);
+    expect(starts).toEqual([]);
+  });
+
+  it('logs a servePipe that throws and goes on', async () => {
+    const { runner, envs } = recorder();
+    const warnings: string[] = [];
+    const logger: Logger = { ...silentLogger, warn: (message) => warnings.push(message) };
+    const docker = new BootstrapDocker(runner, '/usr/bin/docker', { PATH: '/usr/bin' }, logger, 'win32', {
+      dockerPipe: () => PIPE,
+      servePipe: () => Promise.reject(new Error('broken')),
+    });
+    await runWithDockerTarget(WSL, () => docker.run(['container', 'inspect', 'x']));
+    expect(envs[0].DOCKER_HOST).toBe(PIPE);
+    expect(warnings).toEqual([`The Docker pipe of ${WSL_HOST} could not be served: broken`]);
   });
 });
 

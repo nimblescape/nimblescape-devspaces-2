@@ -9,6 +9,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WSL_HOST } from '../docker/dockerHost';
 import { NodeProcessRunner } from '../process';
 import { silentLogger, type Logger } from '../ports';
 import type { Devspace } from '../types';
@@ -115,7 +116,7 @@ function roundTrip(socketPath: string, text: string): Promise<string> {
 }
 
 describe('windowDockerHost', () => {
-  const sources = { computerId: () => COMPUTER, platform: 'linux' as const, env: { XDG_RUNTIME_DIR: '/run/user/1000' }, tmpdir: '/tmp', sshFound: () => true, isFolder: () => true };
+  const sources = { computerId: () => COMPUTER, platform: 'linux' as const, env: { XDG_RUNTIME_DIR: '/run/user/1000' }, tmpdir: '/tmp', transportFound: () => true, isFolder: () => true };
 
   it('gives a devspace on an SSH host the pipe of this computer for its container', () => {
     const address = windowDockerHost(devspace('me@build-box:2222'), CONTAINER, sources);
@@ -137,10 +138,24 @@ describe('windowDockerHost', () => {
     expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, current: made, isFolder: (folder) => folder !== '/tmp' })).toBe(fresh);
   });
 
-  it('gives none to a local devspace, to a host that is no SSH host, and without ssh', () => {
+  it('gives a devspace in the WSL distribution of Devspaces the pipe of this computer while wsl.exe is found', () => {
+    const asked: string[] = [];
+    const transportFound = (host: string): boolean => {
+      asked.push(host);
+      return true;
+    };
+    expect(windowDockerHost(devspace(WSL_HOST), CONTAINER, { ...sources, platform: 'win32', transportFound })).toBe(
+      dockerPipeAddress(dockerPipeId(COMPUTER, WSL_HOST, CONTAINER), 'win32', '').dockerHost,
+    );
+    expect(asked).toEqual([WSL_HOST]);
+    expect(windowDockerHost(devspace(WSL_HOST), CONTAINER, { ...sources, platform: 'win32', transportFound: () => false })).toBeUndefined();
+  });
+
+  it('gives none to a local devspace, to a host without a transport, and without the program of the transport', () => {
     expect(windowDockerHost(devspace(), CONTAINER, sources)).toBeUndefined();
     expect(windowDockerHost(devspace('-oProxyCommand=x'), CONTAINER, sources)).toBeUndefined();
-    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, sshFound: () => false })).toBeUndefined();
+    expect(windowDockerHost(devspace('wsl:-x'), CONTAINER, sources)).toBeUndefined();
+    expect(windowDockerHost(devspace('build-box'), CONTAINER, { ...sources, transportFound: () => false })).toBeUndefined();
   });
 });
 
@@ -203,7 +218,7 @@ describe('serveWindowPipe', () => {
     // Without ssh, the connection ends with the reason.
     dialStdio.mockReturnValue(undefined);
     await expect(roundTrip(marked.path, 'x')).resolves.toBe('');
-    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: ssh was not found, or marked-box is no SSH host`);
+    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: the program of its transport (ssh or wsl.exe) was not found, or marked-box has no transport`);
   });
 
   it('waits for one open of the connection of the relay at most a while, and goes without it for one connection that it cannot carry', async () => {

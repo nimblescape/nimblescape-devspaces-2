@@ -12,7 +12,7 @@
 // for, the weekly check of the base image), and its maintaining ensure then also runs the daily cleanup when that is due;
 // the cleanup alone never makes it run.
 import * as fs from 'fs';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, unsupportedTargetReason, type DockerTarget } from '../docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, hostAccessOf, unsupportedTargetReason, type DockerTarget } from '../docker/dockerHost';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS, checkSshLogin, type SshCheckDeps } from '../docker/remoteDocker';
 import { errorMessage } from '../errors';
@@ -51,8 +51,9 @@ export interface HelperPrebuildDeps {
    */
   checkBaseImage: () => boolean;
   /**
-   * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker. Called within the
-   * operation on `target`. Never throws, except an AbortError.
+   * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker (except the WSL
+   * distribution of Devspaces, which `wsl.exe` starts). Called within the operation on `target`. Never throws, except
+   * an AbortError.
    */
   dockerRunning: (target: DockerTarget, signal: AbortSignal) => Promise<boolean>;
   /** resources/helper/Dockerfile of the installed extension: its content gives the current helper tag. */
@@ -81,7 +82,10 @@ export interface DockerEngineAnswersDeps {
  * The local Docker: `docker info`. A remote host: first our own `ssh -o BatchMode=yes` (checkSshLogin, a success of the
  * last minute counts), so no password, passphrase or host key is ever asked, also on Windows where the ssh of the Docker
  * CLI could ask on a hidden console; then `docker info` in the context of the operation with the time limit
- * of a remote host. An endpoint that is neither local nor SSH: false. Never throws, except an AbortError.
+ * of a remote host. The WSL distribution of Devspaces: the start of its shell (checkSshLogin), which starts the
+ * distribution and its Docker engine when it does not run, as every call of Devspaces there does (docs/architecture.md
+ * "The WSL distribution of Devspaces"); then `docker info`. An endpoint that is neither local nor SSH: false. Never
+ * throws, except an AbortError.
  */
 export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngineAnswersDeps, signal: AbortSignal): Promise<boolean> {
   switch (target.kind) {
@@ -92,7 +96,7 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
     case 'remote': {
       const login = await checkSshLogin(target.host, deps.ssh, { signal });
       if (!login.ok) {
-        deps.logger.info(`The Docker host ${target.host} cannot be reached over SSH: ${login.detail}`);
+        deps.logger.info(`The Docker host ${target.host} cannot be reached ${hostAccessOf(target.host)?.kind === 'wsl' ? 'through wsl.exe' : 'over SSH'}: ${login.detail}`);
         return false;
       }
       // A host that our ssh cannot check would be asked by the ssh of the Docker CLI, which may ask a question; nothing
@@ -120,7 +124,7 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  * is not due, so an activation does not wake Docker Desktop from its Resource Saver mode, nor connect to a remote host,
  * for housekeeping. It runs on the Docker engine of the target that `start` gets, local or remote alike (it runs as an
  * operation on it, so the engine key, the state file and every Docker call are those of an open on that engine), and
- * only when that engine answers (Docker is never started for this). The ensure is the maintaining one of
+ * only when that engine answers (Docker is never started for this, except the WSL distribution of Devspaces). The ensure is the maintaining one of
  * HelperImages.prebuildImage (it builds a missing tag, runs the rebuild itself so that the next open does not wait for
  * it, starts the check, and runs the cleanup when that is due too), shared with the preparation of a worker in the same
  * window, so one that needs the missing tag meanwhile never builds a second time, and one before an open joins the

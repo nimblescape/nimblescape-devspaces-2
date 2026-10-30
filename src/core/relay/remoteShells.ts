@@ -2,9 +2,11 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The shells before the relay of this window (docs/architecture.md "The shell before the relay"): at most one per SSH
-// host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
-// it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
+// The shells before the relay of this window (docs/architecture.md "The shell before the relay"): at most one per remote
+// host (an SSH host, or the WSL distribution of Devspaces), opened by the first check or Docker call before a connection
+// of the relay to the host, used by the calls after it, and taken over by the next connection of the relay to the host
+// (takeOver). No `vscode`.
+import { transportProgramOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
 import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
@@ -24,7 +26,10 @@ export interface RemoteShellStart {
 
 export interface RemoteShellsOptions {
   logger: Logger;
-  /** Starts the login `ssh … sh -s` to `host` (sshRelayTransport); undefined when the host has no transport. */
+  /**
+   * Starts the login `ssh … sh -s` to `host` (sshHostTransport), or `wsl.exe … sh -s` for a WSL distribution
+   * (wslHostTransport); undefined when the host has no transport.
+   */
   start(host: string): RemoteShellStart | undefined;
   /** Only for the tests. */
   loginTimeoutMs?: number;
@@ -61,7 +66,7 @@ export class RemoteShells {
   constructor(private readonly options: RemoteShellsOptions) {}
 
   /**
-   * The open shell to `host`, or a new one (one SSH login, RemoteShell.open), which callers at the same time share.
+   * The open shell to `host`, or a new one (one login of its transport, RemoteShell.open), which callers at the same time share.
    * Undefined when the host has no transport, and after `dispose`. Rejects with RemoteShellError when the login failed,
    * and with an AbortError when `signal` aborts (the login goes on for the others). A flow of the user whose login may
    * ask (currentSshPromptFlow) that finds a login of the background or of another flow in progress waits for it, and
@@ -100,7 +105,7 @@ export class RemoteShells {
       if (this.entries.get(host) === entry) this.entries.delete(host);
     };
     const { logger, loginTimeoutMs, idleCloseMs } = this.options;
-    entry.opening = RemoteShell.open(process, { logger, name: host, loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
+    entry.opening = RemoteShell.open(process, { logger, name: host, program: transportProgramOf(host), loginTimeoutMs, idleCloseMs, onEnd: forget, prompts }).then(
       (shell) => {
         entry.shell = shell;
         entry.opening = undefined;
@@ -108,7 +113,7 @@ export class RemoteShells {
           shell.killNow();
           return shell;
         }
-        logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        logger.info(`The shell on ${host} is open: one login for the checks before the relay.`);
         if (afterLogin !== undefined) {
           const step: Promise<void> = shell
             .keepOpenDuring(() => afterLogin(shell))
@@ -131,7 +136,8 @@ export class RemoteShells {
 
   /**
    * The login of the shell to `host` (`open`, also with `fresh`), for the SSH check (RemoteShellAccess.login): undefined
-   * when the host has no transport; a failure with the error output of `ssh`. Rejects only with an AbortError.
+   * when the host has no transport; a failure with the error output of `ssh` or `wsl.exe`. Rejects only with an
+   * AbortError.
    */
   async login(
     host: string,
@@ -149,8 +155,9 @@ export class RemoteShells {
   /**
    * Runs `command` (one line for the shell) on the shell of `host` (`open`): its result as ProcessRunner.run gives it
    * (RemoteShell.run). A shell that was closed or taken over before the command started is replaced by a new one, once.
-   * Undefined when the host has no transport, and after `dispose`. A failed login gives the result of `ssh`: exit code
-   * 255 (none after its time limit) and its error output. Rejects with an AbortError when `options.signal` aborts.
+   * Undefined when the host has no transport, and after `dispose`. A failed login gives the result of `ssh` (or
+   * `wsl.exe`): exit code 255 (none after its time limit) and its error output. Rejects with an AbortError when
+   * `options.signal` aborts.
    */
   async run(host: string, command: string, options: Pick<RunOptions, 'input' | 'timeoutMs' | 'signal'> = {}): Promise<RunResult | undefined> {
     for (let attempt = 0; ; attempt++) {

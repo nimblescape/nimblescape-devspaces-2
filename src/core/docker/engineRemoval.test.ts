@@ -344,5 +344,10 @@ describe('the commands in the log', () => {
       'docker -H ssh://box image prune -a -f --filter label=nimblescape.devspaces.worker',
       'docker -H ssh://box volume rm devspaces-monitor devspaces-worker-cache devspaces-vscode',
     ]);
+    // The WSL distribution of Devspaces: its own Docker CLI, through wsl.
+    expect(manualCommand({ kind: 'volume', name: 'devspaces-vscode' }, 'wsl:devspaces')).toBe('wsl -d devspaces -u root -- docker volume rm devspaces-vscode');
+    expect(uninstallCommands('wsl:devspaces')[0]).toBe(
+      'wsl -d devspaces -u root -- docker rm -f $(wsl -d devspaces -u root -- docker ps -aq --filter label=nimblescape.devspaces.monitor)',
+    );
   });
 });

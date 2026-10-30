@@ -77,7 +77,7 @@ export function workerLocks(
   socketPath: (target: DockerTarget) => Promise<string>,
   /**
    * `network: 'none'` starts the workers without network (the offline scenarios). `relay`: the transport of the
-   * connection of the relay for a target, as extension.ts (sshRelayTransport); without it, every worker starts with the
+   * connection of the relay for a target, as extension.ts (sshHostTransport); without it, every worker starts with the
    * Docker CLI.
    */
   options: { network?: 'none'; relay?: (target: DockerTarget) => RelayTransport | undefined } = {},

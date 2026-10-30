@@ -30,6 +30,21 @@ export function envValue(env: NodeJS.ProcessEnv, name: string, platform: NodeJS.
   return undefined;
 }
 
+/** Removes a variable in every spelling of its name (names are case-insensitive on Windows); `name` in upper case. */
+export function deleteEnv(env: NodeJS.ProcessEnv, name: string): void {
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === name) delete env[key];
+  }
+}
+
+/** A copy of `base` with the variable `name` (in upper case) set to `value`, without its other spellings (deleteEnv). */
+export function withEnvValue(base: NodeJS.ProcessEnv, name: string, value: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  deleteEnv(env, name);
+  env[name] = value;
+  return env;
+}
+
 /**
  * Installation folders of Docker Desktop on Windows. First the folder of an installation for all users, for example
  * `C:\Program Files\Docker\Docker` (in `ProgramW6432` / `ProgramFiles` when set, then in the default folder). Then the

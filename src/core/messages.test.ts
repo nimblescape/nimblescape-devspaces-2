@@ -83,6 +83,26 @@ describe('the messages of a remote Docker host', () => {
     expect(dockerHostReason(problem, 'box')).toContain(text);
   });
 
+  // The WSL distribution of Devspaces has no network and no SSH: never the advice of an SSH host.
+  it.each([
+    ['unreachable', 'WSL did not answer.'],
+    ['closedBeforeLogin', 'WSL could not start a shell in the WSL distribution devspaces.'],
+    ['login', 'WSL could not start a shell in the WSL distribution devspaces.'],
+    ['hostKey', 'WSL could not start a shell in the WSL distribution devspaces.'],
+    ['sshMissing', 'WSL could not start a shell in the WSL distribution devspaces.'],
+    ['dockerMissing', 'Docker is not installed in the WSL distribution devspaces.'],
+    ['dockerNotRunning', 'Docker is not running in the WSL distribution devspaces.'],
+    ['dockerPermission', 'Docker in the WSL distribution devspaces refused the call.'],
+    ['wslMissing', 'WSL (wsl.exe) was not found on this computer.'],
+    ['wslDistributionMissing', 'The WSL distribution devspaces is not installed on this computer.'],
+    ['pipeNotListening', 'The Docker pipe of Devspaces for it cannot listen'],
+    ['unknown', 'The details show why.'],
+  ] as const)('%s for the WSL distribution', (problem, text) => {
+    const reason = dockerHostReason(problem, 'wsl:devspaces');
+    expect(reason).toContain(text);
+    expect(reason).not.toMatch(/SSH|ssh|network|group docker/);
+  });
+
   it('never offers the Docker Desktop start or its installation for a remote host', () => {
     const text = Messages.dockerHostUnreachable('box', dockerHostReason('dockerNotRunning', 'box'));
     expect(text).not.toMatch(/Docker Desktop|install/i);

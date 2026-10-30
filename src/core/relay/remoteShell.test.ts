@@ -121,6 +121,9 @@ describeUnix('RemoteShell', () => {
     await expect(refused).rejects.toMatchObject({ detail: 'user@box: Permission denied (publickey).', timedOut: false });
     const silent = RemoteShell.open(login('sleep 30'), { logger: silentLogger, name: 'box', loginTimeoutMs: 300 });
     await expect(silent).rejects.toMatchObject({ detail: 'ssh did not answer within 0.3 seconds.', timedOut: true });
+    // The WSL distribution of Devspaces: the program of its transport is wsl.exe.
+    const wsl = RemoteShell.open(login('sleep 30'), { logger: silentLogger, name: 'wsl:devspaces', program: 'wsl.exe', loginTimeoutMs: 300 });
+    await expect(wsl).rejects.toMatchObject({ detail: 'wsl.exe did not answer within 0.3 seconds.', timedOut: true });
   });
 
   // A question of the login in VS Code (a password, a host key) waits for the user, longer than the time limit.

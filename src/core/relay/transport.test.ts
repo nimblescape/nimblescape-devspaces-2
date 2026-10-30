@@ -3,22 +3,22 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it, vi } from 'vitest';
-import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../docker/dockerHost';
+import { WSL_HOST } from '../docker/dockerHost';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
 import { RelayConnectionError } from './connection';
-import { RELAY_SHELL_COMMAND, openRelayConnection, sshRelayTransport } from './transport';
+import { RELAY_SHELL_COMMAND, openRelayConnection, sshHostTransport, wslHostTransport, wslProcess } from './transport';
 
-describe('sshRelayTransport', () => {
+describe('sshHostTransport', () => {
   const env = { PATH: '/usr/bin', ssh_askpass_require: 'force' };
 
   it('logs in once without questions and runs sh -s, for an alias and for an address', () => {
-    expect(sshRelayTransport(remoteDockerTarget('build-box'), '/usr/bin/ssh', env)).toEqual({
+    expect(sshHostTransport('build-box', '/usr/bin/ssh', env)).toEqual({
       file: '/usr/bin/ssh',
       args: ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '--', 'build-box', RELAY_SHELL_COMMAND],
       env: { PATH: '/usr/bin', SSH_ASKPASS_REQUIRE: 'never' },
     });
-    expect(sshRelayTransport(remoteDockerTarget('me@[::1]:2222'), '/usr/bin/ssh', env)?.args).toEqual([
+    expect(sshHostTransport('me@[::1]:2222', '/usr/bin/ssh', env)?.args).toEqual([
       '-o',
       'BatchMode=yes',
       '-o',
@@ -37,7 +37,7 @@ describe('sshRelayTransport', () => {
   // A login of a flow of the user: ssh may ask, through the helper of askpassEnv, in VS Code.
   it('leaves out BatchMode and X11 and takes the environment of the questions for a login that may ask', () => {
     const prompts = { env: vi.fn((base: NodeJS.ProcessEnv) => ({ ...base, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' })) };
-    expect(sshRelayTransport(remoteDockerTarget('me@box:2222'), '/usr/bin/ssh', env, { prompts })).toEqual({
+    expect(sshHostTransport('me@box:2222', '/usr/bin/ssh', env, { prompts })).toEqual({
       file: '/usr/bin/ssh',
       args: ['-x', '-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', RELAY_SHELL_COMMAND],
       env: { ...env, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' },
@@ -47,7 +47,7 @@ describe('sshRelayTransport', () => {
 
   // A host with the key of Devspaces (sshKey.ts): every login of Devspaces gives it to ssh.
   it('gives the key of Devspaces with -i, before the destination', () => {
-    expect(sshRelayTransport(remoteDockerTarget('box'), '/usr/bin/ssh', env, { identity: '/home/me/.ssh/devspaces_ed25519' })?.args).toEqual([
+    expect(sshHostTransport('box', '/usr/bin/ssh', env, { identity: '/home/me/.ssh/devspaces_ed25519' })?.args).toEqual([
       '-o',
       'BatchMode=yes',
       '-o',
@@ -61,9 +61,49 @@ describe('sshRelayTransport', () => {
     ]);
   });
 
-  it('has no transport for the local engine and for a host that is no SSH alias or address', () => {
-    expect(sshRelayTransport(LOCAL_DOCKER_TARGET, '/usr/bin/ssh', env)).toBeUndefined();
-    expect(sshRelayTransport({ kind: 'remote', host: 'box/path', endpoint: 'ssh://box/path' }, '/usr/bin/ssh', env)).toBeUndefined();
+  it('has no transport for a host that is no SSH alias or address', () => {
+    expect(sshHostTransport('box/path', '/usr/bin/ssh', env)).toBeUndefined();
+    // The WSL distribution of Devspaces has no SSH transport (wslHostTransport).
+    expect(sshHostTransport(WSL_HOST, '/usr/bin/ssh', env)).toBeUndefined();
+  });
+});
+
+describe('wslHostTransport', () => {
+  it('runs sh -s as root in the distribution with wsl.exe, without a shell of the distribution and without questions', () => {
+    const wsl = 'C:\\Windows\\System32\\wsl.exe';
+    expect(wslHostTransport('devspaces', wsl, { Path: 'C:\\Windows' })).toEqual({
+      file: wsl,
+      args: ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'],
+      env: { Path: 'C:\\Windows', WSL_UTF8: '1' },
+    });
+  });
+});
+
+// An older wsl.exe writes UTF-16 also with WSL_UTF8=1: read as UTF-8, a NUL after each character.
+describe('wslProcess', () => {
+  it('gives the error output of wsl.exe as text, and leaves everything else to the process', () => {
+    const listeners: ((text: string) => void)[] = [];
+    const kill = vi.fn();
+    const process = {
+      write: () => true,
+      onDrain: () => {},
+      end: () => {},
+      kill,
+      onStdout: () => {},
+      pauseStdout: () => {},
+      resumeStdout: () => {},
+      onStderr: (listener: (text: string) => void) => listeners.push(listener),
+      exited: new Promise<{ exitCode: number | null }>(() => {}),
+    };
+    const texts: string[] = [];
+    const wsl = wslProcess(process);
+    wsl.onStderr((text) => texts.push(text));
+    listeners.forEach((listener) => listener(Buffer.from('\uFEFFThere is no distribution', 'utf16le').toString('utf8')));
+    listeners.forEach((listener) => listener('sh: 1: docker: not found\n'));
+    expect(texts).toEqual(['There is no distribution', 'sh: 1: docker: not found\n']);
+    wsl.kill();
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(wsl.exited).toBe(process.exited);
   });
 });
 
@@ -121,7 +161,7 @@ describe('openRelayConnection', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(written).toHaveLength(1);
     expect(written[0]).toMatch(/^printf '%s\\n' devspaces-start-[0-9a-f]{32}; exec 'docker' 'run'\n$/);
-    expect(lines).toEqual(['The connection to build-box starts on the SSH login of the shell before the relay.']);
+    expect(lines).toEqual(['The connection to build-box starts on the login of the shell before the relay.']);
     finish({ exitCode: 255 });
     await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
   });

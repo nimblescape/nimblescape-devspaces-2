@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isBlockingBusyMark, isFreshPending, statusNamesDevspace, type WindowMark } from '../core/busy';
 import { attachDiagnostics } from '../core/docker/attachDiagnostics';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, isOnDockerHost, sshTargetOf, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, dockerHostOf, devspacesOfHost, hostAccessOf, isOnDockerHost, transportProgramOf, unsupportedTargetReason, type DockerTarget } from '../core/docker/dockerHost';
 import { dockerEndpointUnsupported } from '../core/docker/remoteDocker';
 import { engineInventory, inventoryIsEmpty, removalEndedNote, removeEngineInfrastructure, type EngineInventory, type RemovalResult } from '../core/docker/engineRemoval';
 import { operationDockerTarget, outsideOperation, runWithDockerTarget, type DockerTargets } from '../core/docker/dockerTargets';
@@ -4196,14 +4196,16 @@ function uniqueNames(names: readonly string[]): string[] {
 const usesDevspace = statusNamesDevspace;
 
 /**
- * The window of a devspace on the SSH host `host` can get no Docker pipe (windowDockerHost): `ssh` is missing on this
- * computer, or `host` is no SSH address that Devspaces can use.
+ * The window of a devspace on the remote host `host` can get no Docker pipe (windowDockerHost): the program of its
+ * transport is missing on this computer (`ssh`, or `wsl.exe` for the WSL distribution of Devspaces), or `host` has no
+ * transport that Devspaces can use.
  */
 function noWindowPipe(host: string): UserFacingError {
-  const valid = sshTargetOf(host) !== undefined;
+  const access = hostAccessOf(host);
+  const program = transportProgramOf(host);
   return new UserFacingError(
     'dockerHostUnreachable',
-    Messages.dockerHostUnreachable(host, dockerHostReason(valid ? 'sshMissing' : 'unknown', host)),
-    valid ? 'No ssh on this computer, so the window has no Docker pipe.' : `${host} is no SSH address that Devspaces can use, so the window has no Docker pipe.`,
+    Messages.dockerHostUnreachable(host, dockerHostReason(access === undefined ? 'unknown' : access.kind === 'wsl' ? 'wslMissing' : 'sshMissing', host)),
+    access !== undefined ? `No ${program} on this computer, so the window has no Docker pipe.` : `${host} is no SSH address that Devspaces can use, so the window has no Docker pipe.`,
   );
 }

@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // All user-visible texts.
-import { sshCommandLine } from './docker/dockerHost';
+import { sshCommandLine, wslDistributionOf, type DockerHostProblem } from './docker/dockerHost';
 
 export const Steps = {
   startingDocker: 'Starting Docker',
@@ -443,9 +443,34 @@ function describeHost(host: string): string {
 
 /** The plain reason of a failed connection to the remote Docker host `host` (see dockerHostProblem). */
 export function dockerHostReason(
-  problem: 'unreachable' | 'closedBeforeLogin' | 'login' | 'hostKey' | 'dockerMissing' | 'dockerNotRunning' | 'dockerPermission' | 'sshMissing' | 'unknown',
+  problem: DockerHostProblem,
   host: string,
 ): string {
+  const distribution = wslDistributionOf(host);
+  // The WSL distribution of Devspaces is on this computer: no network, no SSH. The patterns of an SSH problem
+  // (dockerHostProblem) can match a message of wsl.exe, so these get a text of WSL too.
+  if (distribution !== undefined) {
+    switch (problem) {
+      case 'unreachable':
+        return 'WSL did not answer. Try again. When it does not help, run "wsl --shutdown" in a terminal, then try again.';
+      case 'closedBeforeLogin':
+      case 'login':
+      case 'hostKey':
+      case 'sshMissing':
+        return `WSL could not start a shell in the WSL distribution ${distribution}. The details show why.`;
+      case 'dockerMissing':
+        return `Docker is not installed in the WSL distribution ${distribution}.`;
+      case 'dockerNotRunning':
+        return `Docker is not running in the WSL distribution ${distribution}.`;
+      case 'dockerPermission':
+        return `Docker in the WSL distribution ${distribution} refused the call. The details show why.`;
+      case 'wslMissing':
+      case 'wslDistributionMissing':
+      case 'pipeNotListening':
+      case 'unknown':
+        break;
+    }
+  }
   switch (problem) {
     case 'unreachable':
       return 'The computer does not answer. Check its name and the network connection.';
@@ -463,6 +488,12 @@ export function dockerHostReason(
       return 'Your user on that computer may not use Docker. Add it to the group docker there.';
     case 'sshMissing':
       return 'The SSH client (ssh) was not found on this computer.';
+    case 'wslMissing':
+      return 'WSL (wsl.exe) was not found on this computer.';
+    case 'wslDistributionMissing':
+      return `The WSL distribution ${distribution ?? host} is not installed on this computer.`;
+    case 'pipeNotListening':
+      return 'The Docker pipe of Devspaces for it cannot listen on this computer. Devspaces tries again in a few seconds; the details show why.';
     case 'unknown':
       return 'The details show why.';
   }
