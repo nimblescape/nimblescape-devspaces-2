@@ -562,7 +562,11 @@ export class WslSetup {
    */
   async removeLeftovers(): Promise<boolean> {
     const { folder, logger } = this.deps;
-    if (!fs.existsSync(folder)) return true;
+    const exists = await fs.promises.access(folder).then(
+      () => true,
+      (error: unknown) => errorCode(error) !== 'ENOENT',
+    );
+    if (!exists) return true;
     const users = await this.diskUsers(folder).catch(() => undefined);
     if (users === undefined || users.length > 0) {
       logger.warn(`The folder ${folder} stays: ${users === undefined ? 'neither the registry nor WSL tells whether a WSL distribution uses it' : `the WSL distribution ${users.join(', ')} has its virtual disk there`}.`);
