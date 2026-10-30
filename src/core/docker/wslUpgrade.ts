@@ -18,13 +18,13 @@ import { WSL_POLICY_INSTALL, WSL_SETUP_LOCK, endOf, outputOf } from './wslSetup'
 export const UPGRADE_STATE_DIR = '/var/lib/devspaces';
 /** The time (seconds since 1970) of the last upgrade that ended well. */
 export const UPGRADE_DONE_FILE = `${UPGRADE_STATE_DIR}/upgraded`;
-/** The time (seconds since 1970) of the last upgrade that began, so that a failure is tried again only after a day. */
-export const UPGRADE_TRIED_FILE = `${UPGRADE_STATE_DIR}/upgrade-tried`;
+/** The time (seconds since 1970) of the last upgrade that failed, so that a failure is tried again only after a day. */
+export const UPGRADE_FAILED_FILE = `${UPGRADE_STATE_DIR}/upgrade-failed`;
 /** The log of the last upgrade in the distribution. */
 export const UPGRADE_LOG = '/var/log/devspaces-upgrade.log';
 /** An upgrade runs when the last one that ended well is this old. */
 export const UPGRADE_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
-/** An upgrade runs when the last one that began is this old. */
+/** An upgrade runs only when the last one that failed is this old. */
 export const UPGRADE_RETRY_SECONDS = 24 * 60 * 60;
 /** The start of the line of the script that tells its result: `busy`, `skipped`, or `done <the summary of apt-get>`. */
 export const UPGRADE_PREFIX = 'devspaces-upgrade ';
@@ -37,12 +37,13 @@ export const UPGRADE_CHECK_MS = 6 * 60 * 60_000;
 
 /**
  * The script of the upgrade (`sh -s`, as root). It runs only with the lock of the setup (another setup or upgrade runs:
- * `busy`), and only when the last upgrade that ended well is a week old and the last one that began is a day old, or
- * when dpkg has packages that an interrupted run left unconfigured (`dpkg --audit`); else `skipped`. A time after now
- * (a clock that went back) counts as none. `dpkg --configure -a` ends an upgrade that the stop of the distribution
- * interrupted. apt waits up to 5 minutes for the lock of dpkg (the timers apt-daily of Debian). `--with-new-pkgs` also
- * installs a new package that an upgrade needs, but removes none. On a failure, standard error gets the last lines of
- * its log.
+ * `busy`), only when the last upgrade that ended well is a week old or dpkg has packages that an interrupted run left
+ * unconfigured (`dpkg --audit`), and never within a day after a failure; else `skipped`. A run that the stop of the
+ * distribution interrupted is no failure, so the next check ends it with `dpkg --configure -a`. A time after now (a
+ * clock that went back) counts as none. `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg
+ * --configure -a` and `apt-get update` fail at once while another program holds a lock of dpkg or apt. `--with-new-pkgs`
+ * also installs a new package that an upgrade needs, but removes none. On a failure, standard error gets the last lines
+ * of its log.
  */
 export const UPGRADE_SCRIPT = `set -eu
 main() {
@@ -55,21 +56,21 @@ fi
 mkdir -p ${UPGRADE_STATE_DIR}
 now=$(date +%s)
 since() { last=$(cat "$1" 2>/dev/null || echo 0); case "$last" in ''|*[!0-9]*) last=0;; esac; [ "$last" -le "$now" ] || last=0; echo $((now - last)); }
-if [ -z "$(dpkg --audit 2>/dev/null)" ] && { [ "$(since ${UPGRADE_DONE_FILE})" -lt ${UPGRADE_INTERVAL_SECONDS} ] || [ "$(since ${UPGRADE_TRIED_FILE})" -lt ${UPGRADE_RETRY_SECONDS} ]; }; then
+if { [ -z "$(dpkg --audit 2>/dev/null)" ] && [ "$(since ${UPGRADE_DONE_FILE})" -lt ${UPGRADE_INTERVAL_SECONDS} ]; } || [ "$(since ${UPGRADE_FAILED_FILE})" -lt ${UPGRADE_RETRY_SECONDS} ]; then
 echo "${UPGRADE_PREFIX}skipped"
 exit 0
 fi
-echo "$now" > ${UPGRADE_TRIED_FILE}
 : > "$log"
-fail() { echo "The upgrade failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
+fail() { echo "$now" > ${UPGRADE_FAILED_FILE}; echo "The upgrade failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
 run() { "$@" >> "$log" 2>&1 || fail; }
 export DEBIAN_FRONTEND=noninteractive
 ${WSL_POLICY_INSTALL}
 run dpkg --configure -a
-run apt-get -o DPkg::Lock::Timeout=300 update
+run apt-get update
 run apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs
 run apt-get clean
 echo "$now" > ${UPGRADE_DONE_FILE}
+rm -f ${UPGRADE_FAILED_FILE}
 echo "${UPGRADE_PREFIX}done $(grep -E '^[0-9]+ upgraded' "$log" | tail -n 1)"
 }
 main < /dev/null
@@ -138,11 +139,16 @@ export class WslUpgrade {
     this.timer = undefined;
   }
 
+  /**
+   * A check counts for UPGRADE_CHECK_MS only when the distribution ran: one that found it stopped lets the next use
+   * schedule a check again.
+   */
   private async runCheck(): Promise<void> {
-    this.checkedAt = this.now();
     try {
       const wsl = this.deps.wslPath();
-      if (wsl === undefined || this.disposed || (await this.deps.runs(WSL_DISTRIBUTION)) !== true || !(await this.deps.own())) return;
+      if (wsl === undefined || this.disposed || (await this.deps.runs(WSL_DISTRIBUTION)) !== true) return;
+      this.checkedAt = this.now();
+      if (!(await this.deps.own())) return;
       const result = await this.deps.runner.run(wsl, wslCommandArgs(WSL_DISTRIBUTION, ['sh', '-s']), {
         input: UPGRADE_SCRIPT,
         timeoutMs: UPGRADE_MS,
@@ -158,15 +164,27 @@ export class WslUpgrade {
     const line = wslText(result.stdout)
       .split(/\r?\n/)
       .find((text) => text.startsWith(UPGRADE_PREFIX));
-    if (result.exitCode !== 0 || result.timedOut || line === undefined) {
+    if (result.timedOut) {
+      this.deps.logger.warn(
+        `The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} did not end within ${UPGRADE_MS / 60_000} minutes; ` +
+          `it may go on in the distribution. Its output is in ${UPGRADE_LOG} there.`,
+      );
+      return;
+    }
+    if (result.exitCode !== 0 || line === undefined) {
       this.deps.logger.warn(`The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} failed (${endOf(result, UPGRADE_MS)}): ${outputOf(result)}`);
       return;
     }
     const answer = line.slice(UPGRADE_PREFIX.length).trim();
     if (!answer.startsWith('done')) return;
     const summary = answer.slice('done'.length).trim();
+    const of = `(apt-get upgrade${summary ? `: ${summary}` : ''})`;
+    if (/^0 upgraded, 0 newly installed\b/.test(summary)) {
+      this.deps.logger.info(`The packages of the WSL distribution ${WSL_DISTRIBUTION} are up to date ${of}.`);
+      return;
+    }
     this.deps.logger.info(
-      `The packages of the WSL distribution ${WSL_DISTRIBUTION} were upgraded (apt-get upgrade${summary ? `: ${summary}` : ''}). ` +
+      `The packages of the WSL distribution ${WSL_DISTRIBUTION} were upgraded ${of}. ` +
         `Docker and other services there run the new versions after the next start of the distribution; running devspaces go on.`,
     );
   }
