@@ -199,9 +199,13 @@ describe('RemoteDockerState: the SSH key of Devspaces', () => {
     // Another window (another object on the same file) changes it.
     await new RemoteDockerState(state.file).setSshKey('a', 'declined');
     expect(state.sshKeyNow('a')).toBe('declined');
-    fs.writeFileSync(state.file, 'not json');
-    expect(state.sshKeyNow('a')).toBeUndefined();
+    // A file that cannot be read for a moment: the last read counts.
     fs.rmSync(state.file);
+    fs.mkdirSync(state.file);
+    expect(state.sshKeyNow('a')).toBe('declined');
+    fs.rmdirSync(state.file);
+    expect(state.sshKeyNow('a')).toBeUndefined();
+    fs.writeFileSync(state.file, 'not json');
     expect(state.sshKeyNow('a')).toBeUndefined();
   });
 

@@ -123,7 +123,7 @@ export class SshKeyOffer {
    */
   dockerSshEnv(host: string, env: NodeJS.ProcessEnv): void {
     const identity = this.identityFor(host);
-    if (identity !== undefined && this.wrapper === undefined) void this.prepare();
+    if (identity !== undefined && this.wrapper === undefined && !this.wrapperWritten()) void this.prepare();
     const ssh = identity === undefined || this.wrapper === undefined ? undefined : this.options.sshPath();
     if (identity === undefined || ssh === undefined) return;
     putFolderFirstInPath(env, this.options.platform, this.options.wrapperFolder);
@@ -173,14 +173,18 @@ export class SshKeyOffer {
     }
   }
 
-  /** True when the key of Devspaces is in `~/.ssh/authorized_keys` on the host of `shell`; also when that is not known. */
+  /**
+   * True when the key of Devspaces is in `~/.ssh/authorized_keys` on the host of `shell`. False when it is not, and when
+   * that cannot be known (for example the key file cannot be read): then the offer comes, and its setup says why it
+   * fails.
+   */
   private async keyOnHost(shell: KeyShell): Promise<boolean> {
     try {
       const present = await shell.run(authorizedKeyPresentCommand(await this.publicKey()), { timeoutMs: KEY_STEP_TIMEOUT_MS });
-      return present.exitCode !== 1;
+      return present.exitCode === 0;
     } catch (error) {
       this.options.logger.warn(`The key of Devspaces on the host could not be looked up: ${errorMessage(error)}`);
-      return true;
+      return false;
     }
   }
 
@@ -232,6 +236,22 @@ export class SshKeyOffer {
     });
     if (result.timedOut) return `ssh did not answer within ${KEY_STEP_TIMEOUT_MS / 1000} seconds.`;
     return result.exitCode === 0 ? undefined : result.stderr.trim() || `ssh failed with exit code ${result.exitCode}.`;
+  }
+
+  /**
+   * True when the wrapper of an earlier activation is there with the text of now (so a Docker call right after the
+   * activation, before prepare wrote it, has it too); it is then used.
+   */
+  private wrapperWritten(): boolean {
+    const wrapper = sshWrapper(this.options.platform);
+    const file = path.join(this.options.wrapperFolder, wrapper.fileName);
+    try {
+      if (fs.readFileSync(file, 'utf8') !== wrapper.text) return false;
+    } catch {
+      return false;
+    }
+    this.wrapper = file;
+    return true;
   }
 
   private async writeWrapper(): Promise<void> {

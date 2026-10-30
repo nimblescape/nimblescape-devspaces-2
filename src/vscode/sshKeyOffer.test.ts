@@ -188,6 +188,15 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     expect(authorizedKeys().trim().split('\n')).toHaveLength(2);
   });
 
+  it('offers the key again when the key file of a host with the key cannot be read, and says why the setup fails', async () => {
+    const keys = offer();
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    fs.writeFileSync(keys.keyPath, 'not a key', { mode: 0o600 });
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked[2]).toBe(`offer box ${keys.keyPath}`);
+    expect(asked[3]).toMatch(new RegExp(`^failed box: the key ${keys.keyPath} could not be read: `));
+  });
+
   it('writes over no public key file that is there without its private key', async () => {
     fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
     const keys = offer();
@@ -221,6 +230,15 @@ describeWithKeygen('SshKeyOffer: the ssh of the Docker CLI', () => {
     keys.dockerSshEnv('box', env);
     expect(env.DEVSPACES_SSH_IDENTITY).toBe(keys.keyPath);
     expect(fs.existsSync(path.join(dir, 'wrapper', 'ssh'))).toBe(true);
+  });
+
+  it('uses the wrapper of an earlier activation before its own write', async () => {
+    const earlier = offer();
+    await earlier.afterLogin('box', { passwordAsked: true }, shell);
+    await earlier.prepare();
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    offer().dockerSshEnv('box', env);
+    expect(env.DEVSPACES_SSH_IDENTITY).toBe(earlier.keyPath);
   });
 
   it('puts the wrapper first in PATH of a call to a host with the key, after it was written, with ssh and the key', async () => {

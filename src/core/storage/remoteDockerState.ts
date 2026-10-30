@@ -91,7 +91,7 @@ export class RemoteDockerState {
   /**
    * Removes `host` from the list; when it is the Docker host of Devspaces, the local Docker takes its place. Its rootless
    * socket, an installed SSH key and the devspaces on it stay; a `declined` SSH key is forgotten (also for a host that
-   * is not in the list, for example after a failed test), so the key is offered again after the host is added again.
+   * is not in the list), so the key is offered again after the host is added again.
    * `removed`: it was in the list; `wasDockerHost`: it was the Docker host of Devspaces (both as found under the lock).
    */
   async removeHost(host: string): Promise<{ removed: boolean; wasDockerHost: boolean }> {
@@ -151,20 +151,19 @@ export class RemoteDockerState {
   /**
    * sshKey without waiting, for the arguments of an `ssh` that starts now: the file is read again only when it was
    * replaced (each write renames a new file), or its time of change or its size changed since the last read. A file
-   * that cannot be read knows nothing.
+   * that is not there knows nothing; after another error (for example while another window renames its write into
+   * place on Windows), the last read counts.
    */
   sshKeyNow(host: string): SshKeyState | undefined {
-    let state: RemoteDockerStateFile = {};
     try {
       const stat = fs.statSync(this.file);
       if (this.lastRead?.ino !== stat.ino || this.lastRead.mtimeMs !== stat.mtimeMs || this.lastRead.size !== stat.size) {
         this.lastRead = { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, state: normalize(parseJson(fs.readFileSync(this.file, 'utf8'))) };
       }
-      state = this.lastRead.state;
-    } catch {
-      this.lastRead = undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') this.lastRead = undefined;
     }
-    return state.hosts?.find((record) => record.host === host)?.sshKey;
+    return this.lastRead?.state.hosts?.find((record) => record.host === host)?.sshKey;
   }
 
   /** Records (or with `undefined` forgets) the SSH key of Devspaces on `host`. Writes only when it changes. */
