@@ -25,9 +25,13 @@ import {
   WslSetup,
   WslSetupError,
   debianImageOf,
+  dockerDesktopIntegrates,
+  dockerDesktopSettingsFiles,
   listsDistribution,
+  parseLxss,
   parseLxssExport,
   parseWslVersion,
+  regDeleteDefaultArgs,
   regExportArgs,
   supportsFromFile,
   wslInstallArgs,
@@ -67,9 +71,9 @@ interface Call {
  * The file of `reg.exe export` with the distributions `folders` (name, then BasePath), in UTF-16 with a BOM, as Windows
  * writes it.
  */
-function lxssExport(folders: Record<string, string>): Buffer {
+function lxssExport(folders: Record<string, string>, defaultIndex: number | 'none' = 1): Buffer {
   const key = LXSS_KEY.replace('HKCU', 'HKEY_CURRENT_USER');
-  const lines = ['Windows Registry Editor Version 5.00', '', `[${key}]`, '"DefaultDistribution"="{1}"', ''];
+  const lines = ['Windows Registry Editor Version 5.00', '', `[${key}]`, ...(defaultIndex === 'none' ? [] : [`"DefaultDistribution"="{${defaultIndex}}"`]), ''];
   Object.entries(folders).forEach(([name, basePath], index) => {
     const escaped = basePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     lines.push(`[${key}\\{${index}}]`, `"BasePath"="${escaped}"`, `"DistributionName"="${name}"`, '"Flags"=dword:0000000f', '');
@@ -368,6 +372,20 @@ describe('WslSetup.registration', () => {
 });
 
 describe('the registry of the WSL distributions', () => {
+  it('gives the distributions in their order with their keys, and the key of the default one', () => {
+    const registry = parseLxss(lxssExport({ Ubuntu: 'C:\\u', devspaces: 'C:\\d' }));
+    expect(registry).toEqual({
+      defaultId: '{1}',
+      distributions: [
+        { id: '{0}', name: 'Ubuntu', basePath: 'C:\\u' },
+        { id: '{1}', name: 'devspaces', basePath: 'C:\\d' },
+      ],
+    });
+    const key = LXSS_KEY.replace('HKCU', 'HKEY_CURRENT_USER');
+    const noDefault = [`[${key}]`, '"DefaultVersion"=dword:00000002', '', `[${key}\\{0ABC}]`, '"DistributionName"="Debian"'].join('\r\n');
+    expect(parseLxss(Buffer.from(noDefault, 'utf8'))).toEqual({ defaultId: undefined, distributions: [{ id: '{0abc}', name: 'Debian', basePath: undefined }] });
+  });
+
   it('gives the folder of each distribution by its name, from UTF-16 or UTF-8', () => {
     const exported = lxssExport({ Ubuntu: 'C:\\Users\\ana\\WSL "x"', Devspaces: 'C:\\Users\\ana\\AppData\\Local\\nimblescape\\devspaces\\wsl\\disk' });
     const expected = new Map([
@@ -391,6 +409,102 @@ describe('the registry of the WSL distributions', () => {
       '"DistributionName"="Other"',
     ].join('\r\n');
     expect(parseLxssExport(Buffer.from(text, 'utf8'))).toEqual(new Map([['docker-desktop', undefined], ['other', undefined]]));
+  });
+});
+
+describe('WslSetup.separate', () => {
+  /** A runner of `wsl.exe` whose `wsl --set-default` ends with `setDefault`. */
+  function registryRunner(setDefault: RunResult = ok()) {
+    return wslRunner((args) => (args[0] === '--set-default' ? setDefault : undefined));
+  }
+
+  /** `runner`, with `reg.exe export` writing `folders` with the default `defaultIndex`, and any other `reg.exe` ending well. */
+  function withRegistry(runner: ReturnType<typeof wslRunner>, folders: Record<string, string>, defaultIndex: number | 'none') {
+    return {
+      ...runner,
+      run: vi.fn(async (file: string, args: readonly string[], options?: RunOptions) => {
+        if (file === REG && args[0] === 'export') {
+          runner.calls.push({ file, args, options });
+          fs.writeFileSync(args[2], lxssExport(folders, defaultIndex));
+          return ok();
+        }
+        if (file === REG) {
+          runner.calls.push({ file, args, options });
+          return ok();
+        }
+        return runner.run(file, args, options);
+      }),
+    };
+  }
+
+  const ours = () => path.join(folder, 'disk');
+
+  // Mutation: a check without the default fails it (`wsl` in a terminal would open the distribution of Devspaces as
+  // root, and Docker Desktop would integrate it); so does a default of Docker Desktop, or a change of a distribution
+  // that Devspaces did not set up.
+  it('makes the first other distribution of the user the default when WSL made the one of Devspaces the default', async () => {
+    const base = registryRunner();
+    const runner = withRegistry(base, { 'docker-desktop': 'C:\\dd', Ubuntu: 'C:\\u', devspaces: ours() }, 2);
+    const log = logger();
+    await expect(setup({ runner, log }).separate()).resolves.toBe(true);
+    expect(base.calls.map((call) => call.args)).toEqual([expect.arrayContaining(['export']), ['--set-default', 'Ubuntu']]);
+    expect(log.info).toHaveBeenCalledWith('The WSL distribution devspaces of Devspaces was the default distribution of WSL; now Ubuntu is.');
+  });
+
+  it('removes the default of WSL when no other distribution of the user is there', async () => {
+    const base = registryRunner();
+    const runner = withRegistry(base, { 'docker-desktop': 'C:\\dd', 'docker-desktop-data': 'C:\\ddd', devspaces: ours() }, 2);
+    await expect(setup({ runner }).separate()).resolves.toBe(true);
+    expect(base.calls.map((call) => call.args)).toEqual([expect.arrayContaining(['export']), regDeleteDefaultArgs()]);
+    expect(regDeleteDefaultArgs()).toEqual(['delete', LXSS_KEY, '/v', 'DefaultDistribution', '/f']);
+  });
+
+  it('changes nothing when another distribution is the default, or for a distribution that Devspaces did not set up', async () => {
+    const base = registryRunner();
+    await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: ours() }, 0) }).separate()).resolves.toBe(true);
+    await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: ours() }, 'none') }).separate()).resolves.toBe(true);
+    await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: 'C:\\WSL\\devspaces' }, 1) }).separate()).resolves.toBe(false);
+    await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u' }, 0) }).separate()).resolves.toBe(false);
+    expect(base.calls.map((call) => call.args[0])).toEqual(['export', 'export', 'export', 'export']);
+  });
+
+  it('runs nothing without the folder of Devspaces, and logs a failure without a throw', async () => {
+    const base = registryRunner(failed('Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND'));
+    const log = logger();
+    await expect(setup({ runner: withRegistry(base, { Ubuntu: 'C:\\u', devspaces: ours() }, 1), log }).separate()).resolves.toBe(true);
+    expect(log.warn).toHaveBeenCalledWith(
+      'The WSL distribution devspaces of Devspaces stays the default distribution of WSL: wsl.exe --set-default Ubuntu ended with exit code 1: Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND',
+    );
+    fs.rmSync(folder, { recursive: true, force: true });
+    const none = registryRunner();
+    await expect(setup({ runner: withRegistry(none, { devspaces: ours() }, 0) }).separate()).resolves.toBe(false);
+    expect(none.calls).toEqual([]);
+  });
+});
+
+describe('dockerDesktopIntegrates', () => {
+  const env = { APPDATA: 'C:\\Users\\ana\\AppData\\Roaming' };
+  const files = (content: Record<string, string>) => async (file: string) => {
+    const text = content[path.win32.basename(file)];
+    if (text === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    return text;
+  };
+
+  it('reads the list of the WSL integration of Docker Desktop, keys and names without case', async () => {
+    expect(dockerDesktopSettingsFiles(env)).toEqual([
+      'C:\\Users\\ana\\AppData\\Roaming\\Docker\\settings-store.json',
+      'C:\\Users\\ana\\AppData\\Roaming\\Docker\\settings.json',
+    ]);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', files({ 'settings-store.json': '{"IntegratedWslDistros":["Ubuntu","Devspaces"]}' }))).toBe(true);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', files({ 'settings.json': '{"integratedWslDistros":["devspaces"]}' }))).toBe(true);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', files({ 'settings-store.json': '{"IntegratedWslDistros":["Ubuntu"],"EnableIntegrationWithDefaultWslDistro":true}' }))).toBe(false);
+  });
+
+  it('is false without a file, with a file that is not JSON or has no list, and without APPDATA', async () => {
+    expect(await dockerDesktopIntegrates(env, 'devspaces', files({}))).toBe(false);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', files({ 'settings-store.json': '{', 'settings.json': '[]' }))).toBe(false);
+    expect(await dockerDesktopIntegrates(env, 'devspaces', files({ 'settings-store.json': '{"IntegratedWslDistros":"devspaces"}' }))).toBe(false);
+    expect(await dockerDesktopIntegrates({}, 'devspaces', files({ 'settings-store.json': '{"IntegratedWslDistros":["devspaces"]}' }))).toBe(false);
   });
 });
 
@@ -476,14 +590,16 @@ describe('WslSetup.setUp', () => {
     expect(download).toHaveBeenCalledWith(
       expect.objectContaining({ url: DEBIAN_URL, host: 'salsa.debian.org', expected: { sha256: SHA }, anyHttpsRedirect: true, target: file }),
     );
-    expect(runner.calls.map((call) => call.args)).toEqual([
+    // After the registration, the registry tells whether WSL made the new distribution its default (WslSetup.separate).
+    expect(runner.calls.map((call) => (call.file === REG ? call.args[0] : call.args))).toEqual([
       wslInstallArgs(file, path.join(folder, 'disk')),
+      'export',
       ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'],
       WSL_TERMINATE_ARGS,
       ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'],
     ]);
     expect(runner.calls[0].args.join(' ')).toContain('--version 2 --no-launch');
-    expect(runner.calls.every((call) => call.options?.env?.WSL_UTF8 === '1')).toBe(true);
+    expect(runner.calls.filter((call) => call.file === WSL).every((call) => call.options?.env?.WSL_UTF8 === '1')).toBe(true);
     expect(steps).toEqual([
       { kind: 'download', received: 0, total: 10 },
       { kind: 'download', received: 10, total: 10 },
@@ -609,7 +725,7 @@ describe('WslSetup.setUp', () => {
     const log = logger();
     const runner = distribution(undefined, { Ubuntu: 'C:\\WSL\\Ubuntu' });
     await expect(setup({ runner, download: writingDownload(), log }).setUp(image, () => undefined)).resolves.toBe('29.9.2');
-    expect(runner.calls.map((call) => call.file)).toEqual([REG, WSL, WSL, WSL, WSL]);
+    expect(runner.calls.map((call) => call.file)).toEqual([REG, WSL, REG, WSL, WSL, WSL]);
     expect(fs.readdirSync(disk)).toEqual([]);
     expect(log.info).toHaveBeenCalledWith(`The folder ${disk} has the files of a setup that did not end (ext4.vhdx); they are removed.`);
   });

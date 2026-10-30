@@ -95,6 +95,7 @@ export const WslSetupTexts = {
   foreign: `A WSL distribution with the name "${WSL_DISTRIBUTION}" exists, but Devspaces did not set it up, so Devspaces does not change it. Use it as it is?`,
   foreignRemove: `The WSL distribution "${WSL_DISTRIBUTION}" was not set up by Devspaces, so Devspaces does not remove it. If you do not need it, remove it in a terminal with "wsl --unregister ${WSL_DISTRIBUTION}".`,
   useIt: 'Use It',
+  dockerDesktopIntegrates: `Docker Desktop has its WSL integration turned on for the WSL distribution "${WSL_DISTRIBUTION}" of Devspaces. Docker warns that Docker Desktop and a Docker Engine in the same WSL distribution can conflict. Turn it off in Docker Desktop: Settings > Resources > WSL integration.`,
   installWsl: 'Install WSL 2',
   failed: 'The WSL distribution of Devspaces could not be set up.',
   removeFailedUnknown: 'The WSL distribution of Devspaces could not be removed.',
@@ -146,7 +147,7 @@ export const WslSetupTexts = {
 
 export interface WslSetupCommandsDeps {
   /** The setup of this computer; undefined where there is none (not Windows, or no LOCALAPPDATA). */
-  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked'> | undefined;
+  setup: Pick<WslSetup, 'checkWsl' | 'registration' | 'image' | 'setUp' | 'remove' | 'removeLeftovers' | 'locked' | 'separate'> | undefined;
   /** The folder of the distribution (wslSetupFolder), for the questions. */
   folder: string | undefined;
   /** For the message without `setup`. */
@@ -166,13 +167,31 @@ export interface WslSetupCommandsDeps {
    * (WslKeeper.removeStartEntry). Never rejects.
    */
   forgetDistribution?: () => Promise<void>;
+  /** Whether Docker Desktop has its WSL integration on for the distribution (dockerDesktopIntegrates). Never rejects. */
+  dockerDesktopIntegrates?: () => Promise<boolean>;
 }
 
 export class WslSetupCommands {
   /** A setup or a removal runs in this window. */
   private running = false;
+  /** This window warned that Docker Desktop integrates the distribution. */
+  private dockerDesktopWarned = false;
 
   constructor(private readonly deps: WslSetupCommandsDeps) {}
+
+  /**
+   * At the start of a window: the WSL distribution of Devspaces is not the default distribution of WSL
+   * (WslSetup.separate; also after the user removed the default distribution, when WSL made this one the default), and
+   * a warning, once in the window, while Docker Desktop has its WSL integration on for it. Only for a distribution that
+   * Devspaces set up. Never throws (logged).
+   */
+  async checkSeparation(): Promise<void> {
+    try {
+      if (await this.deps.setup?.separate()) await this.warnDockerDesktop();
+    } catch (error) {
+      this.deps.logger.error('The WSL distribution of Devspaces could not be checked.', error);
+    }
+  }
 
   /**
    * "Set Up Docker for Devspaces in WSL…": checks WSL, asks once with the downloads and the folder, sets up the distribution
@@ -219,6 +238,7 @@ export class WslSetupCommands {
           await setup.setUp(plan.image, (step) => report(step), signal);
           return true;
         });
+        if (ready) await this.warnDockerDesktop();
         // useHost shows its own problem.
         return ready && { used: await this.deps.useHost(WSL_HOST) };
       });
@@ -389,6 +409,14 @@ export class WslSetupCommands {
       },
       (error: unknown) => this.deps.logger.error('Could not show the message.', error),
     );
+  }
+
+  /** The warning while Docker Desktop has its WSL integration on for the distribution, once in the window (logged). */
+  private async warnDockerDesktop(): Promise<void> {
+    if (this.dockerDesktopWarned || !(await this.deps.dockerDesktopIntegrates?.())) return;
+    this.dockerDesktopWarned = true;
+    this.deps.logger.warn(WslSetupTexts.dockerDesktopIntegrates);
+    showWarningMessage(WslSetupTexts.dockerDesktopIntegrates).then(undefined, (error: unknown) => this.deps.logger.error('Could not show the message.', error));
   }
 
   private inform(message: string): void {

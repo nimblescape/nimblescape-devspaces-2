@@ -79,6 +79,7 @@ beforeEach(() => {
     remove: vi.fn(async (_signal?: AbortSignal) => true),
     removeLeftovers: vi.fn(async () => true),
     locked: vi.fn(async (task: () => Promise<unknown>) => ({ value: await task() })),
+    separate: vi.fn(async (_signal?: AbortSignal) => true),
   };
   useHost = vi.fn(async (_host: string) => true);
   forgetHost = vi.fn(async (_host: string): Promise<'notDockerHost' | 'local' | 'unsupported'> => 'notDockerHost');
@@ -89,6 +90,35 @@ beforeEach(() => {
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
     ),
   );
+});
+
+describe('the check at the start of a window', () => {
+  // Mutation: a check that does not call separate fails it (WSL makes the distribution the default after the removal of
+  // the default of the user); so does a warning for a distribution that Devspaces did not set up, or at each check.
+  it('keeps the distribution off the default of WSL, and warns once while Docker Desktop integrates it', async () => {
+    const dockerDesktopIntegrates = vi.fn(async () => true);
+    const subject = commands({ dockerDesktopIntegrates });
+    await subject.checkSeparation();
+    await subject.checkSeparation();
+    expect(setup.separate).toHaveBeenCalledTimes(2);
+    expect(window.showWarningMessage.mock.calls).toEqual([[WslSetupTexts.dockerDesktopIntegrates]]);
+    expect(logger.warn).toHaveBeenCalledWith(WslSetupTexts.dockerDesktopIntegrates);
+    // Not for a distribution that Devspaces did not set up, or that is not there.
+    setup.separate.mockResolvedValue(false);
+    const other = commands({ dockerDesktopIntegrates });
+    await other.checkSeparation();
+    expect(window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(dockerDesktopIntegrates).toHaveBeenCalledTimes(1);
+  });
+
+  it('never throws (logged), and warns after a setup while Docker Desktop integrates the distribution', async () => {
+    setup.separate.mockRejectedValueOnce(new Error('EPERM'));
+    await commands().checkSeparation();
+    expect(logger.error).toHaveBeenCalledWith('The WSL distribution of Devspaces could not be checked.', expect.any(Error));
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    await commands({ dockerDesktopIntegrates: async () => true }).setUp();
+    expect(window.showWarningMessage).toHaveBeenLastCalledWith(WslSetupTexts.dockerDesktopIntegrates);
+  });
 });
 
 describe('Set Up Docker for Devspaces in WSL…', () => {

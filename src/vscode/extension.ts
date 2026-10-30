@@ -13,7 +13,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
-import { WslSetup, endOf, listsDistribution, outputOf, wslSetupFolder } from '../core/docker/wslSetup';
+import { WslSetup, dockerDesktopIntegrates, endOf, listsDistribution, outputOf, wslSetupFolder } from '../core/docker/wslSetup';
 import { WslKeeper } from '../core/docker/wslKeeper';
 import { WslLifetime } from '../core/docker/wslLifetime';
 import {
@@ -1010,6 +1010,7 @@ async function activateExtension(
         ? undefined
         : new WslSetup({ runner, wslPath, env, arch: process.arch, folder: wslFolder, logger, http: nodeHttpsTransport }),
     folder: wslFolder,
+    dockerDesktopIntegrates: () => dockerDesktopIntegrates(env, WSL_DISTRIBUTION),
     isWindows: platform === 'win32',
     logger,
     showLog: () => logger.show(),
@@ -1136,6 +1137,9 @@ async function activateExtension(
     background(keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION), 'update the start entry of the WSL distribution of Devspaces');
   };
   updateStartEntry(WSL_HOST);
+  // The distribution of Devspaces is never the default distribution of WSL, and Docker Desktop does not integrate it
+  // (only with its folder; WslSetupCommands.checkSeparation).
+  if (wslPath() !== undefined) background(wslSetup.checkSeparation(), 'check the WSL distribution of Devspaces');
 
   // The Docker CLI of Devspaces that this window needs and does not have yet: downloaded now, with a progress notification
   // (its link Show details needs the commands above), before the window looks up its devspace and serves its pipe, and
