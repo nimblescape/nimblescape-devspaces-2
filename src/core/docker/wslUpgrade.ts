@@ -20,6 +20,8 @@ export const UPGRADE_STATE_DIR = '/var/lib/devspaces';
 export const UPGRADE_DONE_FILE = `${UPGRADE_STATE_DIR}/upgraded`;
 /** The time (seconds since 1970) of the last upgrade that failed, so that a failure is tried again only after a day. */
 export const UPGRADE_FAILED_FILE = `${UPGRADE_STATE_DIR}/upgrade-failed`;
+/** There while an upgrade runs: still there at the start of a run, the last one was interrupted (the stop of the distribution). */
+export const UPGRADE_RUNNING_FILE = `${UPGRADE_STATE_DIR}/upgrade-running`;
 /** The log of the last upgrade in the distribution. */
 export const UPGRADE_LOG = '/var/log/devspaces-upgrade.log';
 /** An upgrade runs when the last one that ended well is this old. */
@@ -37,10 +39,10 @@ export const UPGRADE_CHECK_MS = 6 * 60 * 60_000;
 
 /**
  * The script of the upgrade (`sh -s`, as root). It runs only with the lock of the setup (another setup or upgrade runs:
- * `busy`), only when the last upgrade that ended well is a week old or dpkg has packages that an interrupted run left
- * unconfigured (`dpkg --audit`), and never within a day after a failure; else `skipped`. A run that the stop of the
- * distribution interrupted is no failure, so the next check ends it with `dpkg --configure -a`. A time after now (a
- * clock that went back) counts as none. `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg
+ * `busy`), and only when the last upgrade that ended well is a week old and the last one that failed is a day old;
+ * else `skipped`. A run that the stop of the distribution interrupted (UPGRADE_RUNNING_FILE is still there) is no
+ * failure: the next check runs again, and `dpkg --configure -a` ends the interrupted one. A time after now (a clock
+ * that went back) counts as none. `apt-get upgrade` waits up to 5 minutes for the lock of dpkg; `dpkg
  * --configure -a` and `apt-get update` fail at once while another program holds a lock of dpkg or apt. `--with-new-pkgs`
  * also installs a new package that an upgrade needs, but removes none. On a failure, standard error gets the last lines
  * of its log.
@@ -56,12 +58,13 @@ fi
 mkdir -p ${UPGRADE_STATE_DIR}
 now=$(date +%s)
 since() { last=$(cat "$1" 2>/dev/null || echo 0); case "$last" in ''|*[!0-9]*) last=0;; esac; [ "$last" -le "$now" ] || last=0; echo $((now - last)); }
-if { [ -z "$(dpkg --audit 2>/dev/null)" ] && [ "$(since ${UPGRADE_DONE_FILE})" -lt ${UPGRADE_INTERVAL_SECONDS} ]; } || [ "$(since ${UPGRADE_FAILED_FILE})" -lt ${UPGRADE_RETRY_SECONDS} ]; then
+if [ ! -e ${UPGRADE_RUNNING_FILE} ] && { [ "$(since ${UPGRADE_DONE_FILE})" -lt ${UPGRADE_INTERVAL_SECONDS} ] || [ "$(since ${UPGRADE_FAILED_FILE})" -lt ${UPGRADE_RETRY_SECONDS} ]; }; then
 echo "${UPGRADE_PREFIX}skipped"
 exit 0
 fi
+: > ${UPGRADE_RUNNING_FILE}
 : > "$log"
-fail() { echo "$now" > ${UPGRADE_FAILED_FILE}; echo "The upgrade failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
+fail() { echo "$now" > ${UPGRADE_FAILED_FILE}; rm -f ${UPGRADE_RUNNING_FILE}; echo "The upgrade failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
 run() { "$@" >> "$log" 2>&1 || fail; }
 export DEBIAN_FRONTEND=noninteractive
 ${WSL_POLICY_INSTALL}
@@ -70,7 +73,7 @@ run apt-get update
 run apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs
 run apt-get clean
 echo "$now" > ${UPGRADE_DONE_FILE}
-rm -f ${UPGRADE_FAILED_FILE}
+rm -f ${UPGRADE_FAILED_FILE} ${UPGRADE_RUNNING_FILE}
 echo "${UPGRADE_PREFIX}done $(grep -E '^[0-9]+ upgraded' "$log" | tail -n 1)"
 }
 main < /dev/null
@@ -140,15 +143,20 @@ export class WslUpgrade {
   }
 
   /**
-   * A check counts for UPGRADE_CHECK_MS only when the distribution ran: one that found it stopped lets the next use
-   * schedule a check again.
+   * A check counts for UPGRADE_CHECK_MS unless it found the distribution stopped: then the next use schedules a check
+   * again. The state of the distribution is read last, right before the run, so that the run starts no distribution
+   * that stopped during the check of the owner.
    */
   private async runCheck(): Promise<void> {
+    let counts = true;
     try {
       const wsl = this.deps.wslPath();
-      if (wsl === undefined || this.disposed || (await this.deps.runs(WSL_DISTRIBUTION)) !== true) return;
-      this.checkedAt = this.now();
-      if (!(await this.deps.own())) return;
+      if (wsl === undefined || this.disposed || !(await this.deps.own()) || this.disposed) return;
+      if ((await this.deps.runs(WSL_DISTRIBUTION)) !== true) {
+        counts = false;
+        return;
+      }
+      if (this.disposed) return;
       const result = await this.deps.runner.run(wsl, wslCommandArgs(WSL_DISTRIBUTION, ['sh', '-s']), {
         input: UPGRADE_SCRIPT,
         timeoutMs: UPGRADE_MS,
@@ -157,6 +165,8 @@ export class WslUpgrade {
       this.report(result);
     } catch (error) {
       this.deps.logger.warn(`The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} could not run: ${errorMessage(error)}`);
+    } finally {
+      if (counts) this.checkedAt = this.now();
     }
   }
 
@@ -179,14 +189,21 @@ export class WslUpgrade {
     if (!answer.startsWith('done')) return;
     const summary = answer.slice('done'.length).trim();
     const of = `(apt-get upgrade${summary ? `: ${summary}` : ''})`;
-    if (/^0 upgraded, 0 newly installed\b/.test(summary)) {
+    const kept = Number(/\b(\d+) not upgraded\b/.exec(summary)?.[1] ?? 0);
+    if (!/^0 upgraded, 0 newly installed\b/.test(summary)) {
+      this.deps.logger.info(
+        `The packages of the WSL distribution ${WSL_DISTRIBUTION} were upgraded ${of}. ` +
+          `Docker and other services there run the new versions after the next start of the distribution; running devspaces go on.`,
+      );
+    } else if (kept === 0) {
       this.deps.logger.info(`The packages of the WSL distribution ${WSL_DISTRIBUTION} are up to date ${of}.`);
-      return;
     }
-    this.deps.logger.info(
-      `The packages of the WSL distribution ${WSL_DISTRIBUTION} were upgraded ${of}. ` +
-        `Docker and other services there run the new versions after the next start of the distribution; running devspaces go on.`,
-    );
+    if (kept > 0) {
+      this.deps.logger.warn(
+        `The weekly upgrade kept ${kept} package(s) of the WSL distribution ${WSL_DISTRIBUTION} back: their new versions need the removal of ` +
+          `other packages, which it never does ${of}. To upgrade them, run "wsl -d ${WSL_DISTRIBUTION} -u root -- apt-get full-upgrade" in a terminal.`,
+      );
+    }
   }
 
   private now(): number {

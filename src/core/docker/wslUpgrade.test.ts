@@ -19,6 +19,7 @@ import {
   UPGRADE_LOG,
   UPGRADE_MS,
   UPGRADE_RETRY_SECONDS,
+  UPGRADE_RUNNING_FILE,
   UPGRADE_SCRIPT,
   UPGRADE_STATE_DIR,
   WslUpgrade,
@@ -99,14 +100,15 @@ describe('WslUpgrade', () => {
 
   // Mutation: a check without the check of the state fails it: work in the background starts no distribution that WSL
   // stopped (only a flow of the user, or a Monitor that runs permanently).
-  // Mutation: a check that counts without a running distribution waits 6 hours after a short use of the distribution.
+  // Mutation: a check that counts without a running distribution waits 6 hours after a short use of the distribution;
+  // one that reads the state before the owner leaves more time for the distribution to stop before the run.
   it('starts no distribution that does not run, or whose state is not known, and checks again at the next use', async () => {
     for (const runs of [false, null]) {
       const { subject, calls, runsCheck, ownCheck } = upgrade(undefined, true, runs);
       subject.schedule('devspaces');
       await vi.advanceTimersByTimeAsync(UPGRADE_DELAY_MS);
       expect(runsCheck).toHaveBeenCalledWith('devspaces');
-      expect(ownCheck).not.toHaveBeenCalled();
+      expect(ownCheck.mock.invocationCallOrder[0]).toBeLessThan(runsCheck.mock.invocationCallOrder[0]);
       expect(calls).toEqual([]);
       subject.schedule('devspaces');
       await vi.advanceTimersByTimeAsync(UPGRADE_DELAY_MS);
@@ -144,10 +146,32 @@ describe('WslUpgrade', () => {
     expect(thrown.log.warn).toHaveBeenCalledWith('The weekly upgrade of the packages of the WSL distribution devspaces could not run: spawn EACCES');
   });
 
-  it('shares a check that runs, and stops one that waits at dispose', async () => {
+  it('warns of packages that the upgrade kept back', async () => {
+    const kept = upgrade(result(0, 'devspaces-upgrade done 0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n'));
+    await kept.subject.check();
+    expect(kept.log.info).not.toHaveBeenCalled();
+    expect(kept.log.warn).toHaveBeenCalledWith(
+      'The weekly upgrade kept 2 package(s) of the WSL distribution devspaces back: their new versions need the removal of other packages, which it ' +
+        'never does (apt-get upgrade: 0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.). ' +
+        'To upgrade them, run "wsl -d devspaces -u root -- apt-get full-upgrade" in a terminal.',
+    );
+    const both = upgrade(result(0, 'devspaces-upgrade done 3 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n'));
+    await both.subject.check();
+    expect(both.log.info).toHaveBeenCalledWith(expect.stringMatching(/^The packages of the WSL distribution devspaces were upgraded/));
+    expect(both.log.warn).toHaveBeenCalledWith(expect.stringMatching(/^The weekly upgrade kept 1 package\(s\)/));
+  });
+
+  // Mutation: a check that does not look at `disposed` after its waits starts an upgrade of 30 minutes from a window
+  // that closed.
+  it('shares a check that runs, stops one that waits at dispose, and starts no run after dispose', async () => {
     const { subject, calls } = upgrade();
     await Promise.all([subject.check(), subject.check()]);
     expect(calls).toHaveLength(1);
+    const closing = upgrade();
+    const checked = closing.subject.check();
+    closing.subject.dispose();
+    await checked;
+    expect(closing.calls).toEqual([]);
     const other = upgrade();
     other.subject.schedule('devspaces');
     other.subject.dispose();
@@ -174,10 +198,9 @@ describe('the script of the upgrade', () => {
 
   /**
    * Runs the script with the real `sh`, `flock` and `date`, its paths in the temporary folder, and stubs of `dpkg` and
-   * `apt-get` that write their arguments (and whether the policy-rc.d is there) to the file `calls`. `dpkg --audit`
-   * prints `audit` and writes nothing.
+   * `apt-get` that write their arguments (and whether the policy-rc.d is there) to the file `calls`.
    */
-  function runScript(options: { failUpdate?: boolean; audit?: string } = {}) {
+  function runScript(options: { failUpdate?: boolean } = {}) {
     const bin = file('bin');
     fs.mkdirSync(bin, { recursive: true });
     const stub = (name: string, first: string[], extra: string[] = []) =>
@@ -186,7 +209,7 @@ describe('the script of the upgrade', () => {
         ['#!/bin/sh', ...first, `echo "${name} $* policy=$([ -e '${file('policy-rc.d')}' ] && echo yes || echo no)" >> '${file('calls')}'`, ...extra].join('\n'),
         { mode: 0o755 },
       );
-    stub('dpkg', [`[ "$1" = --audit ] && { printf '%s' '${options.audit ?? ''}'; exit 0; }`]);
+    stub('dpkg', []);
     stub('apt-get', [], [
       options.failUpdate ? 'case "$*" in update) echo "E: Could not resolve deb.debian.org"; exit 100;; esac' : ':',
       'case "$*" in *upgrade*) echo "3 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.";; esac',
@@ -224,11 +247,12 @@ describe('the script of the upgrade', () => {
     const written = Number(fs.readFileSync(stamp(UPGRADE_DONE_FILE), 'utf8').trim());
     expect(Math.abs(written - seconds())).toBeLessThan(60);
     expect(fs.existsSync(stamp(UPGRADE_FAILED_FILE))).toBe(false);
+    expect(fs.existsSync(stamp(UPGRADE_RUNNING_FILE))).toBe(false);
   });
 
   // Mutation: a script without the check of the times upgrades at each window start; one that tries a failure again at
-  // once runs `apt-get update` at each window start while the network is down; one that skips packages that `dpkg
-  // --audit` names leaves an interrupted upgrade for a week.
+  // once runs `apt-get update` at each window start while the network is down; one without the mark of a run that
+  // runs leaves an interrupted upgrade for a week.
   it('skips the upgrade within a week after the last one and within a day after a failure, and ends an interrupted one', () => {
     fs.mkdirSync(state(), { recursive: true });
     const write = (name: string, ago: number) => fs.writeFileSync(stamp(name), `${seconds() - ago}\n`);
@@ -237,14 +261,15 @@ describe('the script of the upgrade', () => {
     write(UPGRADE_DONE_FILE, UPGRADE_INTERVAL_SECONDS + 60);
     write(UPGRADE_FAILED_FILE, UPGRADE_RETRY_SECONDS - 60);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
-    // Within a day after a failure, also with packages that `dpkg --audit` names (a package that never configures).
-    expect(runScript({ audit: 'The following packages are only half configured' }).stdout.trim()).toBe('devspaces-upgrade skipped');
     expect(calls()).toEqual([]);
-    // An upgrade that the stop of the distribution interrupted (no failure written) is ended within the week.
-    fs.rmSync(stamp(UPGRADE_FAILED_FILE));
+    // An upgrade that the stop of the distribution interrupted (its mark is still there) runs again within the week.
     write(UPGRADE_DONE_FILE, 60);
-    expect(runScript({ audit: 'The following packages are only half configured' }).stdout.trim()).toMatch(/^devspaces-upgrade done /);
+    fs.writeFileSync(stamp(UPGRADE_RUNNING_FILE), '');
+    expect(runScript().stdout.trim()).toMatch(/^devspaces-upgrade done /);
     expect(calls()[0]).toBe('dpkg --configure -a policy=yes');
+    expect(fs.existsSync(stamp(UPGRADE_RUNNING_FILE))).toBe(false);
+    expect(fs.existsSync(stamp(UPGRADE_FAILED_FILE))).toBe(false);
+    expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
     fs.rmSync(file('calls'));
     write(UPGRADE_DONE_FILE, UPGRADE_INTERVAL_SECONDS + 60);
     write(UPGRADE_FAILED_FILE, UPGRADE_RETRY_SECONDS + 60);
@@ -266,6 +291,7 @@ describe('the script of the upgrade', () => {
     expect(run.stderr).toContain(`The upgrade failed. The last lines of ${file('upgrade.log')}:\nE: Could not resolve deb.debian.org`);
     expect(fs.existsSync(stamp(UPGRADE_DONE_FILE))).toBe(false);
     expect(Math.abs(Number(fs.readFileSync(stamp(UPGRADE_FAILED_FILE), 'utf8').trim()) - seconds())).toBeLessThan(60);
+    expect(fs.existsSync(stamp(UPGRADE_RUNNING_FILE))).toBe(false);
     expect(fs.existsSync(file('policy-rc.d'))).toBe(false);
     expect(runScript().stdout.trim()).toBe('devspaces-upgrade skipped');
   });
