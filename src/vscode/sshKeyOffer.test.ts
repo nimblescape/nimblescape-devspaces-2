@@ -30,6 +30,7 @@ let state: RemoteDockerState;
 let asked: string[];
 let warnings: string[];
 let answer: 'use' | 'never' | undefined;
+let failedAnswer: 'never' | undefined;
 let sshExit: number;
 
 const dialogs: SshKeyDialogs = {
@@ -38,7 +39,10 @@ const dialogs: SshKeyDialogs = {
     return answer;
   },
   installed: (host) => asked.push(`installed ${host}`),
-  failed: (host, detail) => asked.push(`failed ${host}: ${detail}`),
+  failed: async (host, detail) => {
+    asked.push(`failed ${host}: ${detail}`);
+    return failedAnswer;
+  },
 };
 
 const logger: Logger = { ...silentLogger, warn: (line) => warnings.push(line) };
@@ -53,7 +57,7 @@ const shell = {
     ),
 };
 
-function offer(options: { ssh?: string | undefined; keygen?: string | undefined } = {}): SshKeyOffer {
+function offer(options: { ssh?: string | undefined; keygen?: string | undefined; wrapperRetryMs?: number } = {}): SshKeyOffer {
   return new SshKeyOffer({
     home,
     platform: process.platform,
@@ -66,6 +70,7 @@ function offer(options: { ssh?: string | undefined; keygen?: string | undefined 
     state,
     dialogs,
     logger,
+    wrapperRetryMs: options.wrapperRetryMs,
   });
 }
 
@@ -88,6 +93,7 @@ beforeEach(() => {
   asked = [];
   warnings = [];
   answer = 'use';
+  failedAnswer = undefined;
   sshExit = 0;
 });
 
@@ -119,7 +125,7 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     // The check: no question, only this key, the address of the host.
     expect(fs.readFileSync(path.join(dir, 'ssh-args'), 'utf8').trim().split('\n')).toEqual([
       '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-i', keys.keyPath, '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
-      '-p', '2222', '-l', 'me', '--', 'box', 'true',
+      '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-p', '2222', '-l', 'me', '--', 'box', 'true',
     ]);
     expect(await state.sshKey('me@box:2222')).toBe('installed');
     expect(keys.identityFor('me@box:2222')).toBe(keys.keyPath);
@@ -157,6 +163,16 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
     expect(warnings).toHaveLength(1);
     expect(await state.sshKey('box')).toBeUndefined();
     expect(keys.identityFor('box')).toBeUndefined();
+  });
+
+  // For example a jump host that asks for the password: the check login without questions cannot pass it.
+  it('records "Not for This Host" chosen in the warning of a failed setup', async () => {
+    sshExit = 255;
+    failedAnswer = 'never';
+    await offer().afterLogin('box', { passwordAsked: true }, shell);
+    await vi.waitFor(async () => expect(await state.sshKey('box')).toBe('declined'));
+    await offer().afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked).toHaveLength(2);
   });
 
   it('shows why the key could not be set up: authorized_keys that cannot be written, and no ssh-keygen', async () => {
@@ -216,8 +232,8 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
 });
 
 describeWithKeygen('SshKeyOffer: the ssh of the Docker CLI', () => {
-  it('writes the wrapper again at the next call after a failure', async () => {
-    const keys = offer();
+  it('writes the wrapper again at a call after a failure, once the wait after the failure ended', async () => {
+    const keys = offer({ wrapperRetryMs: 100 });
     await keys.afterLogin('box', { passwordAsked: true }, shell);
     // A file where the folder of the wrapper belongs: the write fails.
     fs.writeFileSync(path.join(dir, 'wrapper'), '');
@@ -225,6 +241,10 @@ describeWithKeygen('SshKeyOffer: the ssh of the Docker CLI', () => {
     expect(warnings).toHaveLength(1);
     fs.rmSync(path.join(dir, 'wrapper'));
     const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    // Within the wait: no new write.
+    keys.dockerSshEnv('box', env);
+    expect(fs.existsSync(path.join(dir, 'wrapper'))).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 150));
     keys.dockerSshEnv('box', env);
     await keys.prepare();
     keys.dockerSshEnv('box', env);

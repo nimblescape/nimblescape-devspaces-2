@@ -330,7 +330,7 @@ After a login with your password, Devspaces asks once: "Log in to `<host>` witho
 - **Not for This Host**: Devspaces keeps asking for the password on that host and does not offer the key again, until you remove the host from the list and add it again.
 - When you close the dialog, Devspaces asks again after the next login with your password.
 - The key has no passphrase, so every program of your user on this computer can use it (see [Security](security.md#remote-and-shared-engines)). One key serves all hosts. To remove it from a host, delete the line that ends with `devspaces@<name of your computer>` from `~/.ssh/authorized_keys` there.
-- When the key cannot be set up, a warning says why, for example when the SSH server of the host allows no keys. Devspaces then asks again after the next login with your password.
+- When the key cannot be set up, a warning says why, for example when the SSH server of the host allows no keys. Devspaces then asks again after the next login with your password, unless you choose **Not for This Host** in the warning.
 
 ### What to know
 

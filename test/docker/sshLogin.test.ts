@@ -205,9 +205,10 @@ describe('the login without setup: password and host key in VS Code', () => {
         offered.push(`installed ${host}`);
         offerEnded();
       },
-      failed: (host, detail) => {
+      failed: async (host, detail) => {
         offered.push(`failed ${host}: ${detail}`);
         offerEnded();
+        return undefined;
       },
     };
     const keys = new SshKeyOffer({

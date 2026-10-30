@@ -34,6 +34,8 @@ import { writeIfChanged } from './sshLoginPrompts';
 
 /** The longest time of `ssh-keygen`, of the command on the host, and of the check login. */
 const KEY_STEP_TIMEOUT_MS = 30_000;
+/** After a failed write of the wrapper, a Docker call tries it again only after this time. */
+const WRAPPER_RETRY_MS = 60_000;
 
 export const SshKeyTexts = {
   offer: (host: string): string => `Log in to ${host} without a password next time?`,
@@ -50,7 +52,8 @@ export interface SshKeyDialogs {
   /** The answer to the offer: `use`, `never` (Not for This Host), or undefined (closed: ask again next time). */
   offer(host: string, keyPath: string): Promise<'use' | 'never' | undefined>;
   installed(host: string): void;
-  failed(host: string, detail: string): void;
+  /** The warning after a failed setup, with **Not for This Host**: `never` when it was chosen. */
+  failed(host: string, detail: string): Promise<'never' | undefined>;
 }
 
 export function vscodeSshKeyDialogs(): SshKeyDialogs {
@@ -60,7 +63,7 @@ export function vscodeSshKeyDialogs(): SshKeyDialogs {
       return choice === SshKeyTexts.use ? 'use' : choice === SshKeyTexts.never ? 'never' : undefined;
     },
     installed: (host) => void showInformationMessage(SshKeyTexts.installed(host)),
-    failed: (host, detail) => void showWarningMessage(SshKeyTexts.failed(host, detail)),
+    failed: async (host, detail) => ((await showWarningMessage(SshKeyTexts.failed(host, detail), SshKeyTexts.never)) === SshKeyTexts.never ? 'never' : undefined),
   };
 }
 
@@ -82,6 +85,8 @@ export interface SshKeyOfferOptions {
   logger: Logger;
   /** Only for the tests. */
   exists?: (file: string) => boolean;
+  /** Only for the tests. Default: WRAPPER_RETRY_MS. */
+  wrapperRetryMs?: number;
 }
 
 /** The shell before the relay, for the commands of the key offer. */
@@ -97,6 +102,8 @@ export class SshKeyOffer {
   readonly keyPath: string;
   private wrapper: string | undefined;
   private preparing: Promise<void> | undefined;
+  /** When the last write of the wrapper failed (Date.now()). */
+  private wrapperFailedAt: number | undefined;
 
   constructor(private readonly options: SshKeyOfferOptions) {
     this.keyPath = devspacesKeyPath(options.home, options.platform);
@@ -106,6 +113,7 @@ export class SshKeyOffer {
   prepare(): Promise<void> {
     this.preparing ??= this.writeWrapper().catch((error: unknown) => {
       this.options.logger.warn(`The ssh wrapper of the Docker CLI for the key of Devspaces could not be written: ${errorMessage(error)}`);
+      this.wrapperFailedAt = Date.now();
       this.preparing = undefined;
     });
     return this.preparing;
@@ -119,11 +127,15 @@ export class SshKeyOffer {
   /**
    * Changes the environment of a Docker call with `ssh://<host>` (BootstrapDocker sshEnv): for a host with the key, the
    * folder of the wrapper `ssh` comes first in PATH, with the `ssh` of this computer and the key in its variables.
-   * Nothing for another host, without `ssh`, or before the wrapper was written (which this tries again after a failure).
+   * Nothing for another host, without `ssh`, or before the wrapper was written (which this tries again, at most once a
+   * minute, after a failure).
    */
   dockerSshEnv(host: string, env: NodeJS.ProcessEnv): void {
     const identity = this.identityFor(host);
-    if (identity !== undefined && this.wrapper === undefined && !this.wrapperWritten()) void this.prepare();
+    if (identity !== undefined && this.wrapper === undefined && this.preparing === undefined) {
+      const waiting = this.wrapperFailedAt !== undefined && Date.now() - this.wrapperFailedAt < (this.options.wrapperRetryMs ?? WRAPPER_RETRY_MS);
+      if (!waiting && !this.wrapperWritten()) void this.prepare();
+    }
     const ssh = identity === undefined || this.wrapper === undefined ? undefined : this.options.sshPath();
     if (identity === undefined || ssh === undefined) return;
     putFolderFirstInPath(env, this.options.platform, this.options.wrapperFolder);
@@ -169,7 +181,13 @@ export class SshKeyOffer {
       dialogs.installed(host);
     } catch (error) {
       logger.warn(`The key of Devspaces could not be set up for ${host}: ${errorMessage(error)}`);
-      dialogs.failed(host, errorMessage(error));
+      // Not awaited: the relay takes the shell over after this step. "Not for This Host" there ends the offer for a host
+      // where a key does not help (for example a jump host that asks for the password).
+      void dialogs.failed(host, errorMessage(error)).then(async (choice) => {
+        if (choice !== 'never') return;
+        logger.info(`Devspaces does not offer its key for ${host} again.`);
+        await state.setSshKey(host, 'declined').catch((failure: unknown) => logger.warn(`The answer for ${host} could not be recorded: ${errorMessage(failure)}`));
+      });
     }
   }
 

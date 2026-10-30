@@ -215,7 +215,8 @@ describe('SSH aliases and the ssh command line', () => {
     ]);
     expect(sshCommandArgs({ host: 'box' }, 'sh -s', 15, { prompts: true, identity: key })).toEqual(['-x', '-o', 'ConnectTimeout=15', '-T', '-i', key, '--', 'box', 'sh -s']);
     expect(sshCommandArgs({ host: 'box' }, 'true', 15, { identity: key, identityOnly: true })).toEqual([
-      '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-i', key, '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey', '--', 'box', 'true',
+      '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-i', key, '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
+      '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '--', 'box', 'true',
     ]);
     // Without a key, identityOnly changes nothing.
     expect(sshCommandArgs({ host: 'box' }, 'true', 15, { identityOnly: true })).toEqual(sshCommandArgs({ host: 'box' }, 'true'));
