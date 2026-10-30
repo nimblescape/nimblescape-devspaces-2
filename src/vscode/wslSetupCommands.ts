@@ -74,7 +74,7 @@ export const WslSetupTexts = {
       'The distribution grows with your devspaces, their images and their volumes. Devspaces runs its commands there as root with wsl.exe.',
     ].join('\n\n'),
   confirmRepair: 'Set up Docker in the WSL distribution of Devspaces again?',
-  confirmRepairDetail: `The WSL distribution "${WSL_DISTRIBUTION}" of Devspaces exists. Devspaces installs Docker Engine there again from download.docker.com, or updates it, and then restarts the distribution: devspaces that run there stop, and their windows lose the connection. Your devspaces stay.`,
+  confirmRepairDetail: `The WSL distribution "${WSL_DISTRIBUTION}" of Devspaces exists. Devspaces installs Docker Engine there again from download.docker.com, or updates it, and then restarts the distribution: devspaces that run there stop, and their windows lose the connection. Your devspaces stay. Then Devspaces uses Docker there.`,
   setUp: 'Set Up',
   confirmRemove: 'Remove the WSL distribution of Devspaces?',
   confirmRemoveDetail: (folder: string) =>

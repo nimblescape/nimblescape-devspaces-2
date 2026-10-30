@@ -260,6 +260,10 @@ describe('WslSetup.registration', () => {
     await expect(setup({ runner: empty }).registration()).resolves.toBe('none');
     expect(empty.calls[0].args).toEqual(WSL_LIST_ARGS);
     await expect(setup({ runner: wslRunner(noList, { Ubuntu: 'C:\\WSL\\Ubuntu' }) }).registration()).resolves.toBe('none');
+    // The code of WSL without any distribution needs no registry, in any language.
+    const none = wslRunner(() => failed('Das Windows-Subsystem für Linux verfügt über keine installierten Distributionen.\r\nFehlercode: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND', 4294967295));
+    await expect(setup({ runner: none }).registration()).resolves.toBe('none');
+    expect(none.calls).toHaveLength(1);
     // A list without it needs no registry.
     const others = wslRunner(() => ok('Ubuntu\r\ndocker-desktop\r\n'));
     await expect(setup({ runner: others }).registration()).resolves.toBe('none');
@@ -659,6 +663,13 @@ describe('WslSetup.removeLeftovers', () => {
     expect(fs.existsSync(folder)).toBe(false);
   });
 
+  it('removes it without a key in the registry when WSL has no distribution', async () => {
+    const noDistribution = failed('Windows Subsystem for Linux has no installed distributions.\r\nError code: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND', 4294967295);
+    const runner = wslRunner(() => noDistribution, failed('ERROR: The system was unable to find the specified registry key or value.'));
+    await setup({ runner }).removeLeftovers();
+    expect(fs.existsSync(folder)).toBe(false);
+  });
+
   it('keeps it when a distribution has its disk there, when the registry does not tell, and does nothing without it', async () => {
     await setup({ runner: wslRunner(() => undefined, { other: path.join(folder, 'disk', 'other') }) }).removeLeftovers();
     await setup({ runner: wslRunner(() => undefined, failed('Access is denied.')) }).removeLeftovers();
@@ -693,6 +704,8 @@ describe('the scripts in the distribution', () => {
   it('run one at a time, end an interrupted installation first, and know their own policy-rc.d', () => {
     expect(PROVISION_SCRIPT).toContain('exec 9> /run/devspaces-setup.lock\nif ! flock -n 9; then');
     expect(PROVISION_SCRIPT.indexOf('run dpkg --configure -a')).toBeLessThan(PROVISION_SCRIPT.indexOf('run apt-get update'));
+    // systemd is on only after its installation.
+    expect(PROVISION_SCRIPT.indexOf('systemd systemd-sysv')).toBeLessThan(PROVISION_SCRIPT.indexOf('cat > /etc/wsl.conf'));
     expect(PROVISION_SCRIPT).toContain(`grep -qxF '${WSL_POLICY_MARK}' /usr/sbin/policy-rc.d`);
     expect(PROVISION_SCRIPT).toContain(`printf '#!/bin/sh\\n${WSL_POLICY_MARK}\\nexit 101\\n' > /usr/sbin/policy-rc.d`);
   });

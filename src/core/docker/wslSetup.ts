@@ -38,6 +38,8 @@ export const WSL_POLICY_MARK = '# Written by the setup of Devspaces.';
 /** The key of the registry with the WSL distributions of the Windows user: one subkey for each, with its name and folder. */
 export const LXSS_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss';
 
+/** The code in the answer of `wsl.exe --list` without any distribution (its text is in the language of Windows). */
+const NO_DISTRIBUTIONS = /WSL_E_DEFAULT_DISTRO_NOT_FOUND/;
 /** The largest list that is read. */
 const MAX_LIST_BYTES = 1024 * 1024;
 const MAX_REDIRECTS = 5;
@@ -231,12 +233,12 @@ trap 'rm -f /usr/sbin/policy-rc.d' EXIT
 trap 'exit 1' HUP INT TERM
 fi
 step packages
-cat > /etc/wsl.conf <<'WSLCONF'
-${WSL_CONF}
-WSLCONF
 run dpkg --configure -a
 run apt-get update
 run apt-get install -y ca-certificates curl systemd systemd-sysv
+cat > /etc/wsl.conf <<'WSLCONF'
+${WSL_CONF}
+WSLCONF
 step repository
 . /etc/os-release
 if [ "\${ID:-}" != debian ] || [ -z "\${VERSION_CODENAME:-}" ]; then
@@ -389,8 +391,8 @@ export class WslSetup {
   /**
    * Whether the distribution `devspaces` is registered, and whether Devspaces set it up (WslRegistration): from the
    * list of WSL and the folder of its virtual disk in the registry, `own` only when that folder is in the folder of
-   * Devspaces. When `wsl.exe --list` fails (it also does without any distribution), the registry alone decides, and
-   * without the registry it is `none`. Throws WslSetupError `registryFailed` when WSL lists the distribution but the
+   * Devspaces. When `wsl.exe --list` fails otherwise than without any distribution, the registry alone decides, and
+   * without the registry it is `none` (a WSL with no distribution may have no key in the registry yet). Throws WslSetupError `registryFailed` when WSL lists the distribution but the
    * registry cannot be read: Devspaces never guesses that it set up a distribution.
    */
   async registration(signal?: AbortSignal): Promise<WslRegistration> {
@@ -663,13 +665,13 @@ export class WslSetup {
   }
 
   /**
-   * Whether `wsl.exe --list` names the distribution `devspaces` (WSL compares the names without case); undefined when
-   * the list ends with an exit code that is not 0, which it also does without any distribution. Throws WslSetupError
-   * (runShort).
+   * Whether `wsl.exe --list` names the distribution `devspaces` (WSL compares the names without case): false also when
+   * WSL has no distribution (NO_DISTRIBUTIONS); undefined when the list ends with another exit code that is not 0.
+   * Throws WslSetupError (runShort).
    */
   private async listed(signal?: AbortSignal): Promise<boolean | undefined> {
     const result = await this.runShort(WSL_LIST_ARGS, signal);
-    if (result.exitCode !== 0) return undefined;
+    if (result.exitCode !== 0) return NO_DISTRIBUTIONS.test(wslText(`${result.stdout}\n${result.stderr}`)) ? false : undefined;
     return parseWslList(result.stdout).some((name) => name.toLowerCase() === WSL_DISTRIBUTION);
   }
 

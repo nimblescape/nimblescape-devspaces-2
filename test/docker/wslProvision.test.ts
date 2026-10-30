@@ -57,7 +57,8 @@ describe('the setup script of the WSL distribution', () => {
     expect(result.code).toBe(1);
     expect(result.out).toBe('devspaces-step packages');
     expect(result.err).toMatch(new RegExp(`^The setup failed\\. The last lines of ${WSL_SETUP_LOG}:\\n== packages\\n`));
-    expect(shell(container, 'cat /etc/wsl.conf')).toBe(WSL_CONF);
+    // systemd is not turned on without its installation.
+    expect(shell(container, 'test -e /etc/wsl.conf && echo present || echo absent')).toBe('absent');
     // Its guard against the start of services is gone again, also after the failure.
     expect(shell(container, 'test -e /usr/sbin/policy-rc.d && echo present || echo absent')).toBe('absent');
   });
