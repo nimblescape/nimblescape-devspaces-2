@@ -200,8 +200,12 @@ export class WslKeeper {
     });
   }
 
-  /** Removes the start entry of the WSL distribution `distribution` (its removal). Never rejects. */
+  /**
+   * Removes the start entry of the WSL distribution `distribution` (its removal). An update that waits before it does
+   * not cover a later call of updateStartEntry, which then runs after this removal. Never rejects.
+   */
   removeStartEntry(distribution: string): Promise<void> {
+    this.updatesWaiting.delete(distribution);
     return this.enqueue(() => this.writeStartEntry(distribution, undefined));
   }
 
@@ -262,9 +266,13 @@ export class WslKeeper {
     try {
       const query = await run(regQueryArgs(name), 'query');
       const present = query.exitCode === 0;
-      const permanent = host === undefined ? false : await this.deps.monitorPermanent(host);
-      // A distribution that was removed by hand (`wsl --unregister`) gets no entry: WSL would fail at each logon.
-      const wanted = permanent === true ? await this.deps.registered(distribution) : permanent;
+      let wanted = host === undefined ? false : await this.deps.monitorPermanent(host);
+      if (wanted === true && host !== undefined) {
+        // A distribution that was removed by hand (`wsl --unregister`) gets no entry: WSL would fail at each logon. The
+        // state of the Monitor is read again after the list of WSL, which can take seconds.
+        const listed = await this.deps.registered(distribution);
+        wanted = listed === true ? await this.deps.monitorPermanent(host) : listed;
+      }
       if (wanted === undefined) return;
       const command = wanted ? this.startCommand(distribution) : undefined;
       if (command === undefined) {

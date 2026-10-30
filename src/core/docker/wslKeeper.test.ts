@@ -314,6 +314,33 @@ describe('the start entry of the WSL distribution', () => {
     expect(reads).toEqual(['query', 'query']);
   });
 
+  // Mutation: an update that joins one that waits before a removal fails it: the removal would run last.
+  it('an update after a removal runs after it, also while an update waits before the removal', async () => {
+    const { subject, state, runs } = keeper({ permanent: true, entry: true });
+    // The first two wait together (one update); then the removal; then a new update.
+    const updates = [subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION), subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION)];
+    const removal = subject.removeStartEntry(WSL_DISTRIBUTION);
+    const after = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    await Promise.all([...updates, removal, after]);
+    expect(runs.map((run) => run.args[0])).toEqual(['query', 'query', 'delete', 'query', 'add']);
+    expect(state.entry).toBe(true);
+  });
+
+  // Mutation: a state of the Monitor that is not read again after the list of WSL fails it: an answer that another
+  // window forgot during that list would be undone.
+  it('reads the state of the Monitor again after the list of WSL', async () => {
+    let permanent = true;
+    const { subject, state } = keeper({
+      monitorPermanent: async () => permanent,
+      registered: async () => {
+        permanent = false;
+        return true;
+      },
+    });
+    await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(state.entry).toBe(false);
+  });
+
   // Mutation: a keeper whose start writes the registry fails it (one read per minute and window for nothing).
   it('is not read or written by the start of the keeper', async () => {
     const { subject, runs, launches } = keeper({ permanent: true });

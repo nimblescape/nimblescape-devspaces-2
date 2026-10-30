@@ -57,7 +57,7 @@ import { Messages } from '../core/messages';
 import { nodeHttpsTransport, takeUserAgentVersion } from '../core/http';
 import { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
-import { isoTime, systemClock, type StartedByteProcess } from '../core/ports';
+import { isoTime, systemClock, type RunResult, type StartedByteProcess } from '../core/ports';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
 import { monitorSettingsOf } from './monitorSettings';
 import { REMOTE_MONITOR_VOLUME } from '../core/remoteMonitor/protocol';
@@ -311,18 +311,10 @@ async function activateExtension(
   // `wsl.exe` for the WSL distribution of Devspaces (docs/architecture.md "The WSL distribution of Devspaces"); only on
   // Windows.
   const wslPath = (): string | undefined => (platform === 'win32' ? findExecutable('wsl', env, platform) : undefined);
-  // The WSL distributions of this Windows user. Without WSL, or without a distribution, `wsl.exe` says so with an exit
-  // code that is not 0: then there is none. Throws when `wsl.exe` does not answer.
-  const wslDistributions = async (): Promise<string[]> => {
+  /** `wsl.exe --list --quiet` (WSL_LIST_ARGS): the WSL distributions of this Windows user; undefined without `wsl.exe`. */
+  const runWslList = async (): Promise<RunResult | undefined> => {
     const wsl = wslPath();
-    if (wsl === undefined) return [];
-    const result = await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS });
-    if (result.timedOut) throw new Error(`wsl.exe ${WSL_LIST_ARGS.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
-    if (result.exitCode !== 0) {
-      logger.info(`wsl.exe ${WSL_LIST_ARGS.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
-      return [];
-    }
-    return parseWslList(result.stdout);
+    return wsl === undefined ? undefined : runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS });
   };
   /** Whether the program of the transport of the remote host `host` is found (`ssh`, or `wsl.exe` for WSL). */
   const transportFound = (host: string): boolean => {
@@ -685,8 +677,7 @@ async function activateExtension(
     launch: (file, args, onExit) => launchDetachedProcess(file, args, onExit, { windowsHide: true }),
     // Only WSL_E_DEFAULT_DISTRO_NOT_FOUND counts as a list without it; another failure tells nothing.
     registered: async (distribution) => {
-      const wsl = wslPath();
-      const result = wsl === undefined ? undefined : await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS }).catch(() => undefined);
+      const result = await runWslList().catch(() => undefined);
       const listed = result === undefined || result.timedOut ? undefined : listsDistribution(result, distribution);
       if (listed === undefined) logger.warn(`WSL did not tell whether it lists the distribution ${distribution}, so its start entry stays as it is${result === undefined ? '' : ` (${endOf(result, WSL_LIST_TIMEOUT_MS)}: ${outputOf(result)})`}.`);
       return listed;
@@ -983,8 +974,18 @@ async function activateExtension(
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
     sshEnv: (host, callEnv) => sshKeys.dockerSshEnv(host, callEnv),
-    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host.
-    wslDistributions,
+    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host. Without
+    // WSL, or without a distribution, `wsl.exe` says so with an exit code that is not 0: then there is none.
+    wslDistributions: async () => {
+      const result = await runWslList();
+      if (result === undefined) return [];
+      if (result.timedOut) throw new Error(`wsl.exe ${WSL_LIST_ARGS.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
+      if (result.exitCode !== 0) {
+        logger.info(`wsl.exe ${WSL_LIST_ARGS.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
+        return [];
+      }
+      return parseWslList(result.stdout);
+    },
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();
@@ -1127,7 +1128,15 @@ async function activateExtension(
     if (host !== WSL_HOST || wslPath() === undefined) return;
     background(keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION), 'update the start entry of the WSL distribution of Devspaces');
   };
-  updateStartEntry(WSL_HOST);
+  // At the start of the window only when the records of this VS Code know the engine there: another VS Code (for
+  // example VS Code Insiders, with its own storage and no answer there) does not remove the entry, and a window that
+  // never used the distribution starts no reg.exe.
+  if (wslPath() !== undefined) {
+    background(
+      engineRecords.record(WSL_HOST).then((record) => (record === undefined ? undefined : updateStartEntry(WSL_HOST))),
+      'read the records of the Docker engines',
+    );
+  }
 
   // The Docker CLI of Devspaces that this window needs and does not have yet: downloaded now, with a progress notification
   // (its link Show details needs the commands above), before the window looks up its devspace and serves its pipe, and
