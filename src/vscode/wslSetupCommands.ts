@@ -9,6 +9,7 @@
 // devspaces that Devspaces did not set up is never changed or removed. The work is in src/core/docker/wslSetup.ts.
 import * as vscode from 'vscode';
 import { WSL_DISTRIBUTION, WSL_HOST } from '../core/docker/dockerHost';
+import { WSL_INSTALL_COMMAND } from '../core/docker/dockerSetup';
 import {
   WSL_DISTRIBUTION_LIST_URL,
   WSL_FROM_FILE_VERSION,
@@ -121,7 +122,7 @@ export const WslSetupTexts = {
   problem: (problem: WslSetupProblem): string => {
     switch (problem) {
       case 'wslMissing':
-        return 'WSL is not installed on this computer. Install WSL 2 first: Windows asks for administrator permission, and you restart the computer afterwards.';
+        return `WSL is not installed on this computer. Install WSL 2 first: Windows asks for administrator permission (without it, ask an administrator of this computer to run "${WSL_INSTALL_COMMAND}"), and you restart the computer afterwards.`;
       case 'wslTooOld':
         return `The WSL of this computer is too old: Devspaces needs WSL ${WSL_FROM_FILE_VERSION.join('.')} or later. Run "wsl --update" in a terminal, then try again.`;
       case 'wslNotAnswering':

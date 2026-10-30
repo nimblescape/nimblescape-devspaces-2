@@ -953,8 +953,9 @@ describe('DockerSetup: WSL 2 (sidebar button Install WSL 2, Windows)', () => {
     confirmWith(DockerSetupTexts.install);
     await dockerSetup.installWsl();
     expect(modalCalls()[0][0]).toBe(DockerSetupTexts.confirmWsl);
-    expect(modalCalls()[0][1].detail).toBe(`${DockerSetupTexts.confirmCommands}\n\nwsl --install\n\n${DockerSetupTexts.wslRestart}`);
-    expect(fakeVscode.terminals[0].lines).toEqual(['wsl --install']);
+    // Without the Ubuntu that `wsl --install` adds by default.
+    expect(modalCalls()[0][1].detail).toBe(`${DockerSetupTexts.confirmCommands}\n\nwsl --install --no-distribution\n\n${DockerSetupTexts.wslRestart}`);
+    expect(fakeVscode.terminals[0].lines).toEqual(['wsl --install --no-distribution']);
     // The first check, before the confirmation (no check ran before the click).
     expect(runner.run).toHaveBeenCalledTimes(1);
     exitCode = 0;
