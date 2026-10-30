@@ -906,13 +906,14 @@ export class Controller implements vscode.Disposable {
    * whose container the registry did not know at activation (no open pipeline runs for it): it takes its devspace
    * also when the registry was restored already (by an earlier restore of this window whose answer came too late, or by
    * another window). Not while Devspaces is being removed from the engine (restoreRefusedWhileRemoving); `user`, a
-   * Refresh of the user, is told then.
+   * Refresh of the user, is told then. `user` and `mayStart` (a window of a container on that Docker host, which starts
+   * it anyway) may start a WSL distribution that does not run (reconcileInWorker).
    */
-  async reconcileIfRegistryLost(options: { passive: boolean; adopt?: boolean; user?: boolean } = { passive: true }): Promise<void> {
+  async reconcileIfRegistryLost(options: { passive: boolean; adopt?: boolean; user?: boolean; mayStart?: boolean } = { passive: true }): Promise<void> {
     await this.withDockerTarget(() => this.reconcileIfRegistryLostNow(options));
   }
 
-  private async reconcileIfRegistryLostNow(options: { passive: boolean; adopt?: boolean; user?: boolean }): Promise<void> {
+  private async reconcileIfRegistryLostNow(options: { passive: boolean; adopt?: boolean; user?: boolean; mayStart?: boolean }): Promise<void> {
     const { docker, service } = this.deps;
     // Also when registry.json exists but its content is lost (not valid, or invalid entries), not only when it is missing.
     if (!(await this.deps.registryNeedsRestore())) {
@@ -924,7 +925,10 @@ export class Controller implements vscode.Disposable {
     const target = await this.operationTarget();
     if (!docker.canRunOn(target)) return;
     if (await this.restoreRefusedWhileRemoving(target.host, options.user === true)) return;
-    const added = await service.reconcileInWorker({ passive: options.passive });
+    // The Refresh of the user, and the window of a devspace on that host (`mayStart`), may start a WSL distribution that
+    // does not run.
+    const mayStart = options.user === true || options.mayStart === true;
+    const added = await service.reconcileInWorker({ passive: options.passive, ...(mayStart ? { mayStart } : {}) });
     if (added === 0 && options.adopt !== true) return;
     await this.adoptWindowDevspace();
     if (added > 0) await this.deps.sidebar.render();

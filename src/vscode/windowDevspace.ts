@@ -90,6 +90,11 @@ export async function findWindowDevspace(
     logger: Logger;
     /** Whether a lost registry may be restored here, or the check of it; true when not given. */
     mayRestore?: boolean | (() => Promise<boolean>);
+    /**
+     * Whether this window reaches its container through its Docker pipe on the Docker host `host` (its window starts a
+     * WSL distribution there anyway when it connects, so the restore may start it too); false when not given.
+     */
+    windowPipeOn?: (host: string) => boolean;
   },
 ): Promise<Devspace | undefined> {
   const { registry, needsRestore, docker, service, logger } = deps;
@@ -100,11 +105,13 @@ export async function findWindowDevspace(
     // reconcileInWorker checks the Docker target first (never an endpoint that is neither local nor SSH), then whether
     // Docker runs; the worker of the Docker host restores, in the background (passive). On a computer without Docker, the
     // Docker CLI of Devspaces runs the calls on a remote host (BootstrapDocker.canRunOn).
-    if (!docker.canRunOn(await deps.current())) return undefined;
+    const target = await deps.current();
+    if (!docker.canRunOn(target)) return undefined;
     // The activation waits at most WINDOW_RESTORE_TIMEOUT_MS for it; the restore in the background of the activation,
     // and the one after the build of the helper image, adopt the window later (reconcileIfRegistryLost with `adopt`).
     try {
-      await service.reconcileInWorker({ passive: true, signal: AbortSignal.timeout(WINDOW_RESTORE_TIMEOUT_MS) });
+      const mayStart = deps.windowPipeOn?.(target.host) === true;
+      await service.reconcileInWorker({ passive: true, ...(mayStart ? { mayStart } : {}), signal: AbortSignal.timeout(WINDOW_RESTORE_TIMEOUT_MS) });
     } catch (error) {
       logger.warn(`The devspaces could not be restored from the volumes while this window started: ${errorMessage(error)}`);
     }

@@ -51,9 +51,9 @@ export interface HelperPrebuildDeps {
    */
   checkBaseImage: () => boolean;
   /**
-   * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker (except the WSL
-   * distribution of Devspaces, which `wsl.exe` starts). Called within the operation on `target`. Never throws, except
-   * an AbortError.
+   * Whether the Docker engine of `target` answers (dockerEngineAnswers); it never starts Docker (a WSL distribution
+   * only while its Monitor runs permanently, because `wsl.exe` starts it). Called within the operation on `target`.
+   * Never throws, except an AbortError.
    */
   dockerRunning: (target: DockerTarget, signal: AbortSignal) => Promise<boolean>;
   /** resources/helper/Dockerfile of the installed extension: its content gives the current helper tag. */
@@ -74,6 +74,11 @@ export interface DockerEngineAnswersDeps {
   daemonStatus: (signal: AbortSignal, timeoutMs?: number) => Promise<{ running: boolean }>;
   /** For the SSH check before a remote host (checkSshLogin). */
   ssh: SshCheckDeps;
+  /**
+   * Whether a call on the engine of the Docker host `host` must not run now, because it would start a WSL distribution
+   * that does not run (WslLifetime.leavesStopped). False when not given.
+   */
+  leavesStopped?: (host: string) => Promise<boolean>;
   logger: Logger;
 }
 
@@ -82,10 +87,10 @@ export interface DockerEngineAnswersDeps {
  * The local Docker: `docker info`. A remote host: first our own `ssh -o BatchMode=yes` (checkSshLogin, a success of the
  * last minute counts), so no password, passphrase or host key is ever asked, also on Windows where the ssh of the Docker
  * CLI could ask on a hidden console; then `docker info` in the context of the operation with the time limit
- * of a remote host. The WSL distribution of Devspaces: the start of its shell (checkSshLogin), which starts the
- * distribution and its Docker engine when it does not run, as every call of Devspaces there does (docs/architecture.md
- * "The WSL distribution of Devspaces"); then `docker info`. An endpoint that is neither local nor SSH: false. Never
- * throws, except an AbortError.
+ * of a remote host. A WSL distribution: false while a call must leave it stopped (`leavesStopped`: it does not run, its
+ * Monitor does not run permanently, and no flow of the user runs); else the start of its shell (checkSshLogin), which
+ * starts the distribution and its Docker engine when it does not run (docs/architecture.md "The WSL distribution of
+ * Devspaces"); then `docker info`. An endpoint that is neither local nor SSH: false. Never throws, except an AbortError.
  */
 export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngineAnswersDeps, signal: AbortSignal): Promise<boolean> {
   switch (target.kind) {
@@ -94,6 +99,7 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
     case 'unsupported':
       return false;
     case 'remote': {
+      if (await deps.leavesStopped?.(target.host)) return false;
       const login = await checkSshLogin(target.host, deps.ssh, { signal });
       if (!login.ok) {
         deps.logger.info(`The Docker host ${target.host} cannot be reached ${hostAccessOf(target.host)?.kind === 'wsl' ? 'through wsl.exe' : 'over SSH'}: ${login.detail}`);
@@ -124,11 +130,11 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
  * is not due, so an activation does not wake Docker Desktop from its Resource Saver mode, nor connect to a remote host,
  * for housekeeping. It runs on the Docker engine of the target that `start` gets, local or remote alike (it runs as an
  * operation on it, so the engine key, the state file and every Docker call are those of an open on that engine), and
- * only when that engine answers (Docker is never started for this, except the WSL distribution of Devspaces). The ensure is the maintaining one of
- * HelperImages.prebuildImage (it builds a missing tag, runs the rebuild itself so that the next open does not wait for
- * it, starts the check, and runs the cleanup when that is due too), shared with the preparation of a worker in the same
- * window, so one that needs the missing tag meanwhile never builds a second time, and one before an open joins the
- * rebuild. There is no lock across windows (a lock left behind by a window that closed during the prebuild would block
+ * only when that engine answers (Docker is never started for this; a WSL distribution only while its Monitor runs
+ * permanently). The ensure is the maintaining one of HelperImages.prebuildImage (it builds a missing tag, runs the
+ * rebuild itself so that the next open does not wait for it, starts the check, and runs the cleanup when that is due
+ * too), shared with the preparation of a worker in the same window, so one that needs the missing tag meanwhile never
+ * builds a second time, and one before an open joins the rebuild. There is no lock across windows (a lock left behind by a window that closed during the prebuild would block
  * the prebuild of every window). Windows that start at the same time
  * may each build the tag, or run the rebuild, once (BuildKit shares the layer cache; the extra images stay dangling
  * until the daily cleanup removes them); windows that start later find the record and no refresh due, and do nothing.

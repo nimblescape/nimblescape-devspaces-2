@@ -4240,6 +4240,28 @@ describe('refreshStates', () => {
     expect(workerRefresh).toHaveBeenCalledTimes(1);
   });
 
+  // A WSL distribution that does not run, which a call in the background must leave stopped: no `docker info` there
+  // (it would start the distribution), and the states are known: nothing runs. Mutation: the check after dockerRunning,
+  // or without the host of the devspaces, fails it.
+  it('a WSL distribution that a call must leave stopped: neither Docker nor the worker is asked, and the answer says that it does not run', async () => {
+    const workerRefresh = vi.fn(async (): Promise<DevspaceStates> => ({ runtime: new Map(), branches: new Map() }));
+    const dockerRunning = vi.fn(async () => true);
+    const leavesStopped = vi.fn(async (host: string) => host === 'wsl:devspaces');
+    const wsl = async () => ({ kind: 'remote' as const, host: 'wsl:devspaces', endpoint: 'wsl://devspaces' });
+    h = recreate({ workerRefresh, dockerRunning, leavesStopped, dockerTarget: wsl });
+    await seedDevspace(h, { extra: { dockerHost: 'wsl:devspaces' } });
+    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: undefined, branches: new Map(), dockerStopped: true, distributionStopped: true });
+    expect(leavesStopped).toHaveBeenCalledWith('wsl:devspaces');
+    expect(dockerRunning).not.toHaveBeenCalled();
+    expect(workerRefresh).not.toHaveBeenCalled();
+    // While it runs (or may be started), the refresh asks as before.
+    h = recreate({ workerRefresh, dockerRunning, leavesStopped: async () => false, dockerTarget: wsl });
+    await seedDevspace(h, { extra: { dockerHost: 'wsl:devspaces' } });
+    expect(await h.operations.refreshStates(new Set([ENV_ID]))).toEqual({ runtime: new Map(), branches: new Map() });
+    expect(dockerRunning).toHaveBeenCalledTimes(1);
+    expect(workerRefresh).toHaveBeenCalledTimes(1);
+  });
+
   it('does not ask the worker when Docker does not run', async () => {
     const workerRefresh = vi.fn(async (): Promise<DevspaceStates> => ({ runtime: new Map(), branches: new Map() }));
     h = recreate({ workerRefresh });

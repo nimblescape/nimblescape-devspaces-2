@@ -947,6 +947,22 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild)', 
       expect(runner.run).not.toHaveBeenCalled();
       expect(daemonStatus).toHaveBeenCalledWith(expect.any(AbortSignal), REMOTE_INFO_TIMEOUT_MS);
     });
+
+    // The shell of the check would start a WSL distribution that does not run (WslLifetime.leavesStopped).
+    it('answers false without the shell and without docker info while a call must leave the WSL distribution stopped', async () => {
+      const runner = sshRunner({});
+      const daemonStatus = vi.fn(async () => ({ running: true }));
+      const shells = { login: vi.fn(async () => ({ ok: true }) as const), run: vi.fn(async () => undefined) };
+      const leavesStopped = vi.fn(async (host: string) => host === WSL_HOST);
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {}, shells }, leavesStopped, logger };
+      expect(await dockerEngineAnswers(WSL_TARGET, deps, new AbortController().signal)).toBe(false);
+      expect(leavesStopped).toHaveBeenCalledWith(WSL_HOST);
+      expect(shells.login).not.toHaveBeenCalled();
+      expect(daemonStatus).not.toHaveBeenCalled();
+      // An SSH host is checked as before.
+      expect(await dockerEngineAnswers(REMOTE_TARGET, deps, new AbortController().signal)).toBe(true);
+      expect(leavesStopped).toHaveBeenCalledWith(REMOTE_TARGET.host);
+    });
   });
 
   // helper.json alone decides whether the prebuild is due; there is no extension version to remember. A caller whose

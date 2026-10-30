@@ -495,6 +495,28 @@ describe('Sidebar', () => {
     expect(rowOf('acme/web').description).toContain(StateTexts.stopped);
   });
 
+  // A WSL distribution that does not run, which the background work leaves stopped: nothing runs there, so the rows
+  // are Stopped with Start, never unknown, and Docker is not asked (it would start the distribution). Mutation: the
+  // condition without distributionStopped fails it.
+  it('a WSL distribution that does not run: Stopped with Start, not unknown, and Docker is not asked', async () => {
+    h.dockerHost.value = 'wsl:devspaces';
+    await h.registry.add(devspace(API, 'acme/api', { dockerHost: 'wsl:devspaces' }));
+    await signedIn();
+    h.docker.isRunning.mockClear();
+    h.service.refreshStates.mockResolvedValue({ runtime: undefined, branches: new Map(), dockerStopped: true, distributionStopped: true });
+    await h.sidebar.refreshStates();
+    expect(h.docker.isRunning).not.toHaveBeenCalled();
+    expect(rowOf('acme/api').stateUnknown).toBeUndefined();
+    expect(rowOf('acme/api').state).toBe('stopped');
+    expect(rowOf('acme/api').description).toContain(StateTexts.stopped);
+    expect(rowOf('acme/api').contextValue).toContain('canStart');
+    // When it does not answer otherwise, its containers may run: unknown, as for an SSH host.
+    h.service.refreshStates.mockResolvedValue({ runtime: undefined, branches: new Map(), dockerStopped: true });
+    await h.sidebar.refreshStates();
+    expect(rowOf('acme/api').stateUnknown).toBe(true);
+    expect(rowOf('acme/api').description).toContain(StateTexts.unknown);
+  });
+
   it('reads the branch of running containers when it refreshes the states', async () => {
     await h.registry.add(devspace(API, 'acme/api', { gitSummary: { branch: 'main', uncommittedFiles: 0, unpushedCommits: 0, stashes: 0, recordedAt: iso(NOW) } }));
     await signedIn();

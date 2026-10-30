@@ -638,9 +638,9 @@ export class Sidebar implements vscode.Disposable {
       if (!running) runtime = dockerStoppedRuntime(await registry.list());
       // The states that could not be read are shown as unknown, with the reason: an engine that answers but whose
       // worker could not read them, or a remote engine that does not answer (its containers may run). Only the local
-      // Docker that does not run is known: nothing runs. The registry is not changed; the runtime above still gives the
-      // actions (Start stays offered).
-      if (running || dockerHost !== '') unread = { dockerHost, reachable: running };
+      // Docker that does not run, and a WSL distribution that does not run (`distributionStopped`), are known: nothing
+      // runs. The registry is not changed; the runtime above still gives the actions (Start stays offered).
+      if (running || (dockerHost !== '' && states.distributionStopped !== true)) unread = { dockerHost, reachable: running };
     }
     this.runtime = runtime;
     this.statesUnread = unread;
