@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
 import { WSL_HOST } from '../core/docker/dockerHost';
-import { WslSetupError, type WslImage, type WslRegistration, type WslSetupStep } from '../core/docker/wslSetup';
+import { WslSetupError, type WslImage, type WslRegistration, type WslSeparation, type WslSetupStep } from '../core/docker/wslSetup';
 import { Actions } from '../core/messages';
 import { abortError } from '../core/ports';
 import { Commands } from './commands';
@@ -74,11 +74,12 @@ beforeEach(() => {
       onStep({ kind: 'download', received: IMAGE.size, total: IMAGE.size });
       onStep({ kind: 'register' });
       onStep({ kind: 'docker', phase: 'docker' });
-      return '29.9.2';
+      return { version: '29.9.2', separation: { state: 'separate', dockerDesktop: true } as WslSeparation };
     }),
     remove: vi.fn(async (_signal?: AbortSignal) => true),
     removeLeftovers: vi.fn(async () => true),
     locked: vi.fn(async (task: () => Promise<unknown>) => ({ value: await task() })),
+    separate: vi.fn(async (): Promise<WslSeparation> => ({ state: 'separate', dockerDesktop: true })),
   };
   useHost = vi.fn(async (_host: string) => true);
   forgetHost = vi.fn(async (_host: string): Promise<'notDockerHost' | 'local' | 'unsupported'> => 'notDockerHost');
@@ -89,6 +90,62 @@ beforeEach(() => {
       { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
     ),
   );
+});
+
+describe('the check at the start of a window', () => {
+  // Mutation: a check that does not call separate fails it (WSL makes the distribution the default after the removal of
+  // the default of the user); so does a warning for a distribution that Devspaces did not set up, or at each check.
+  it('keeps the distribution off the default of WSL, and warns once while Docker Desktop integrates it', async () => {
+    const dockerDesktopIntegrates = vi.fn(async (_isDefault: boolean) => true);
+    const subject = commands({ dockerDesktopIntegrates });
+    await subject.checkSeparation();
+    await subject.checkSeparation();
+    expect(setup.separate).toHaveBeenCalledTimes(2);
+    expect(window.showWarningMessage.mock.calls).toEqual([[WslSetupTexts.dockerDesktopIntegrates]]);
+    expect(logger.warn).toHaveBeenCalledWith(WslSetupTexts.dockerDesktopIntegrates);
+    expect(dockerDesktopIntegrates.mock.calls).toEqual([[false]]);
+    // Not for a distribution that Devspaces did not set up, or that is not there.
+    setup.separate.mockResolvedValue({ state: 'none', dockerDesktop: true });
+    const other = commands({ dockerDesktopIntegrates });
+    await other.checkSeparation();
+    expect(window.showWarningMessage).toHaveBeenCalledTimes(1);
+    expect(dockerDesktopIntegrates).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutation: a check of the settings without the distribution of Docker Desktop fails it (the settings files can stay
+  // after its removal); so does a check flag that is set only before the read (two checks would both warn).
+  it('warns only while WSL has the distribution of Docker Desktop, and once also for two checks at the same time', async () => {
+    const dockerDesktopIntegrates = vi.fn(async (_isDefault: boolean) => true);
+    setup.separate.mockResolvedValueOnce({ state: 'separate', dockerDesktop: false });
+    const subject = commands({ dockerDesktopIntegrates });
+    await subject.checkSeparation();
+    expect(dockerDesktopIntegrates).not.toHaveBeenCalled();
+    await Promise.all([subject.checkSeparation(), subject.checkSeparation()]);
+    expect(dockerDesktopIntegrates).toHaveBeenCalledTimes(2);
+    expect(window.showWarningMessage).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutation: a check without the default integration while the distribution stays the default fails it; so does a
+  // check when the registry cannot be read (nothing tells that Devspaces set up the distribution).
+  it('counts the default integration of Docker Desktop while the distribution stays the default of WSL', async () => {
+    const dockerDesktopIntegrates = vi.fn(async (_isDefault: boolean) => false);
+    setup.separate.mockResolvedValueOnce({ state: 'default', dockerDesktop: true }).mockResolvedValueOnce({ state: 'unknown', dockerDesktop: undefined });
+    await commands({ dockerDesktopIntegrates }).checkSeparation();
+    await commands({ dockerDesktopIntegrates }).checkSeparation();
+    expect(dockerDesktopIntegrates.mock.calls).toEqual([[true]]);
+  });
+
+  it('never throws (logged), and warns after a setup while Docker Desktop integrates the distribution', async () => {
+    setup.separate.mockRejectedValueOnce(new Error('EPERM'));
+    await commands().checkSeparation();
+    expect(logger.error).toHaveBeenCalledWith('The WSL distribution of Devspaces could not be checked.', expect.any(Error));
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    setup.separate.mockClear();
+    await commands({ dockerDesktopIntegrates: async () => true }).setUp();
+    expect(window.showWarningMessage).toHaveBeenLastCalledWith(WslSetupTexts.dockerDesktopIntegrates);
+    // With what the check of the setup found, without another one.
+    expect(setup.separate).not.toHaveBeenCalled();
+  });
 });
 
 describe('Set Up Docker for Devspaces in WSL…', () => {
@@ -173,7 +230,7 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
   it('forgets the old distribution before a new one is set up, and not for a repair', async () => {
     const order: string[] = [];
     const forgetDistribution = vi.fn(async () => void order.push('forget'));
-    setup.setUp.mockImplementation(async () => (order.push('set up'), '29.9.2'));
+    setup.setUp.mockImplementation(async () => (order.push('set up'), { version: '29.9.2', separation: { state: 'separate', dockerDesktop: true } }));
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
     await commands({ forgetDistribution }).setUp();
     expect(order).toEqual(['forget', 'set up']);

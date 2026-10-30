@@ -164,31 +164,154 @@ export function regExportArgs(file: string): string[] {
   return ['export', LXSS_KEY, file, '/y'];
 }
 
+/** The value of LXSS_KEY that names the default distribution of WSL by its key (DistributionRegistration.cpp of WSL). */
+export const LXSS_DEFAULT_VALUE = 'DefaultDistribution';
+
+/** The arguments of `reg.exe` that delete the default distribution of WSL (LXSS_DEFAULT_VALUE): then WSL has none. */
+export function regDeleteDefaultArgs(): string[] {
+  return ['delete', LXSS_KEY, '/v', LXSS_DEFAULT_VALUE, '/f'];
+}
+
+/** The arguments of `wsl.exe` that make the distribution `name` the default distribution of WSL. */
+export function wslSetDefaultArgs(name: string): string[] {
+  return ['--set-default', name];
+}
+
+/** A WSL distribution in the registry (LXSS_KEY). */
+export interface LxssDistribution {
+  /** Its key, a GUID in braces, in lower case. */
+  id: string;
+  /** DistributionName. */
+  name: string;
+  /** BasePath, the folder of its virtual disk; undefined when it is missing or not a plain string. */
+  basePath: string | undefined;
+  /** Whether its State is LxssDistributionStateInstalled (1, wslservice.idl of WSL); undefined without a State. */
+  installed: boolean | undefined;
+}
+
+/** The WSL distributions of the registry, in its order, and the key of the default one (lower case), when it has one. */
+export interface LxssRegistry {
+  defaultId: string | undefined;
+  distributions: LxssDistribution[];
+}
+
 /**
- * The folders of the WSL distributions (the value BasePath: the folder of the virtual disk) by their name in lower case
- * (DistributionName), from the file of `reg.exe export` (UTF-16 with a BOM, else UTF-8). Undefined for a distribution
- * whose BasePath is missing or not a plain string: its folder is not known.
+ * The WSL distributions and the default one, from the file of `reg.exe export` of LXSS_KEY (UTF-16 with a BOM, else
+ * UTF-8). A key without DistributionName is no distribution.
  */
-export function parseLxssExport(content: Buffer): Map<string, string | undefined> {
+export function parseLxss(content: Buffer): LxssRegistry {
   const text = content[0] === 0xff && content[1] === 0xfe ? content.subarray(2).toString('utf16le') : content.toString('utf8');
-  const folders = new Map<string, string | undefined>();
+  const registry: LxssRegistry = { defaultId: undefined, distributions: [] };
+  let key = '';
   let values = new Map<string, string>();
+  let state: number | undefined;
   const close = (): void => {
     const name = values.get('distributionname');
-    if (name !== undefined) folders.set(name.toLowerCase(), values.get('basepath'));
+    if (/\\lxss$/i.test(key)) registry.defaultId = values.get(LXSS_DEFAULT_VALUE.toLowerCase())?.toLowerCase();
+    else if (name !== undefined) {
+      const id = key.slice(key.lastIndexOf('\\') + 1).toLowerCase();
+      registry.distributions.push({ id, name, basePath: values.get('basepath'), installed: state === undefined ? undefined : state === 1 });
+    }
   };
   for (const line of text.split(/\r?\n/)) {
     if (line.startsWith('[')) {
       close();
+      key = line.trim().replace(/^\[|\]$/g, '');
       values = new Map();
+      state = undefined;
       continue;
     }
     // A string value: "Name"="Value", with \\ and \" inside.
     const match = /^"((?:[^"\\]|\\.)*)"="((?:[^"\\]|\\.)*)"$/.exec(line.trim());
     if (match) values.set(unescapeRegistry(match[1]).toLowerCase(), unescapeRegistry(match[2]));
+    const dword = /^"State"=dword:([0-9a-f]{8})$/i.exec(line.trim());
+    if (dword) state = parseInt(dword[1], 16);
   }
   close();
-  return folders;
+  return registry;
+}
+
+/**
+ * The folders of the WSL distributions of `registry` (the value BasePath: the folder of the virtual disk) by their name
+ * in lower case (DistributionName). Undefined for a distribution whose BasePath is missing or not a plain string: its
+ * folder is not known.
+ */
+export function distributionFoldersOf(registry: LxssRegistry): Map<string, string | undefined> {
+  return new Map(registry.distributions.map((distribution) => [distribution.name.toLowerCase(), distribution.basePath]));
+}
+
+/** What WslSetup.separate found. */
+export interface WslSeparation {
+  /**
+   * `none`, no distribution of Devspaces (or no folder of Devspaces); `unknown`, the registry cannot be read; `default`,
+   * the distribution of Devspaces stays the default of WSL (its change failed); `separate`, it is not the default.
+   */
+  state: 'none' | 'unknown' | 'default' | 'separate';
+  /**
+   * Whether the registry has a distribution of Docker Desktop, which its WSL 2 engine and so its WSL integration need;
+   * undefined when the registry cannot be read.
+   */
+  dockerDesktop: boolean | undefined;
+}
+
+/** The distributions of Docker Desktop (`docker-desktop`, and `docker-desktop-data` of older versions). */
+function isDockerDesktopDistribution(name: string): boolean {
+  return /^docker-desktop(-data)?$/i.test(name);
+}
+
+/**
+ * The distributions that tools run as their machine, which must not be the default distribution of WSL in place of
+ * the one of Devspaces: Docker Desktop, Rancher Desktop (`rancher-desktop`, `rancher-desktop-data`) and Podman
+ * (`podman-machine-<name>`).
+ */
+function isToolDistribution(name: string): boolean {
+  return isDockerDesktopDistribution(name) || /^rancher-desktop(-data)?$/i.test(name) || /^podman-machine-/i.test(name);
+}
+
+/**
+ * The settings files of Docker Desktop on Windows: `settings-store.json`, and `settings.json` of older versions, in
+ * `%APPDATA%\Docker` (docs.docker.com, "Change your Docker Desktop settings"). Empty without APPDATA.
+ */
+export function dockerDesktopSettingsFiles(env: NodeJS.ProcessEnv): string[] {
+  const appData = envValue(env, 'APPDATA', 'win32');
+  return appData ? ['settings-store.json', 'settings.json'].map((name) => path.win32.join(appData, 'Docker', name)) : [];
+}
+
+/**
+ * Whether Docker Desktop has its WSL integration on for `distribution`: it is in the list IntegratedWslDistros, or it
+ * is the default distribution of WSL (`isDefault`) while EnableIntegrationWithDefaultWslDistro is not false (on by
+ * default); never while WslEngineEnabled is false (the engine of Hyper-V has no WSL integration). Keys and names
+ * without case. The first settings file that can be read decides (the file of an older version may stay after the
+ * move to settings-store.json); false when it is no JSON object, or when none can be read. Never rejects.
+ */
+export async function dockerDesktopIntegrates(
+  env: NodeJS.ProcessEnv,
+  distribution: string,
+  isDefault: boolean,
+  readFile: (file: string) => Promise<string> = (file) => fs.promises.readFile(file, 'utf8'),
+): Promise<boolean> {
+  for (const file of dockerDesktopSettingsFiles(env)) {
+    let text: string;
+    try {
+      text = await readFile(file);
+    } catch {
+      continue;
+    }
+    let settings: unknown;
+    try {
+      settings = JSON.parse(text);
+    } catch {
+      // Docker Desktop may be writing it; the file of an older version would tell old settings.
+      return false;
+    }
+    if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) return false;
+    const value = (name: string): unknown => Object.entries(settings).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+    if (value('WslEngineEnabled') === false) return false;
+    const list = value('IntegratedWslDistros');
+    if (Array.isArray(list) && list.some((name) => typeof name === 'string' && name.toLowerCase() === distribution.toLowerCase())) return true;
+    return isDefault && value('EnableIntegrationWithDefaultWslDistro') !== false;
+  }
+  return false;
 }
 
 function unescapeRegistry(text: string): string {
@@ -501,19 +624,22 @@ export class WslSetup {
    * Sets up the distribution: with `image`, downloads it into the folder `download`, registers it with its virtual disk
    * in a folder `disk` (diskFolderFor), and removes the download; then the script installs Docker Engine (PROVISION_SCRIPT), the
    * distribution restarts, and Docker must answer. Without `image`, only the script, the restart and the check run (a
-   * distribution that Devspaces set up before). Returns the version of the engine. Throws WslSetupError, or an
+   * distribution that Devspaces set up before). Returns the version of the engine, and what WslSetup.separate found
+   * after the registration (or before the script). Throws WslSetupError, or an
    * AbortError when the signal aborts. The registration itself is not cancelled: the service of WSL would go on with it
    * after the end of wsl.exe, so a cancel takes effect after it. When the script is cancelled or ends by its time
    * limit, the distribution stops, because the script would go on there after the end of wsl.exe; its next run goes on
    * from there.
    */
-  async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<string> {
+  async setUp(image: WslImage | undefined, onStep: (step: WslSetupStep) => void, signal?: AbortSignal): Promise<{ version: string; separation: WslSeparation }> {
     if (image !== undefined) {
       await this.register(image, onStep, signal);
     } else {
       // A download that could not be removed after the registration (WSL still had it open).
       await fs.promises.rm(this.downloadFolder, { recursive: true, force: true }).catch(() => undefined);
     }
+    // WSL makes a new distribution the default when it has none.
+    const separation = await this.separate();
     let pending = '';
     let provision: RunResult;
     try {
@@ -553,7 +679,7 @@ export class WslSetup {
     }
     const version = wslText(wait.stdout).trim();
     this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} runs Docker Engine ${version}.`);
-    return version;
+    return { version, separation };
   }
 
   /**
@@ -617,7 +743,11 @@ export class WslSetup {
         throw new WslSetupError('registerFailed', `wsl.exe --install --from-file failed (${endOf(result, REGISTER_MS)}): ${outputOf(result)}`);
       }
       this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} was registered with its virtual disk in ${diskFolder}.`);
-      if (signal?.aborted) throw abortError();
+      if (signal?.aborted) {
+        // The cancel takes effect after the registration, which WSL may have made its default.
+        await this.separate();
+        throw abortError();
+      }
     } finally {
       await fs.promises.rm(file, { force: true }).catch((error: unknown) => {
         this.deps.logger.warn(`The download ${file} could not be removed: ${errorMessage(error)}`);
@@ -758,6 +888,71 @@ export class WslSetup {
   }
 
   /**
+   * Keeps the WSL distribution of Devspaces from being the default distribution of WSL, which `wsl` without `-d` opens
+   * (as root there) and which Docker Desktop integrates by default. WSL makes a new distribution the default when it
+   * has none, and the first one that is left after the removal of the default (LxssUserSession.cpp of WSL). Then the
+   * first other installed distribution of the registry that takes it becomes the default (`wsl.exe --set-default`, as
+   * WSL would choose without the one of Devspaces; never the machine of a tool, isToolDistribution), or, when WSL
+   * refuses all, WSL has no default (the value DefaultDistribution goes; `wsl --list` still lists the distributions,
+   * and WSL makes the next new distribution the default). After a call that WSL does not answer, nothing more is tried
+   * until the next check. Only for a distribution that Devspaces set up (the folder of its virtual disk is in the
+   * folder of Devspaces); without the folder of Devspaces, nothing runs. Not cancelled: a cancel would leave the
+   * distribution the default. A failure is logged; never throws.
+   */
+  async separate(): Promise<WslSeparation> {
+    if (!(await fs.promises.access(this.deps.folder).then(() => true, () => false))) return { state: 'none', dockerDesktop: undefined };
+    const registry = await this.readRegistry();
+    if (registry === undefined) return { state: 'unknown', dockerDesktop: undefined };
+    const dockerDesktop = registry.distributions.some((distribution) => isDockerDesktopDistribution(distribution.name));
+    const result = (state: WslSeparation['state']): WslSeparation => ({ state, dockerDesktop });
+    const ours = registry.distributions.find((distribution) => distribution.name.toLowerCase() === WSL_DISTRIBUTION);
+    if (ours?.basePath === undefined || !(await isWithinResolved(ours.basePath, this.deps.folder))) return result('none');
+    if (registry.defaultId !== ours.id) return result('separate');
+    const others = registry.distributions.filter(
+      (distribution) => distribution !== ours && distribution.installed !== false && !isToolDistribution(distribution.name),
+    );
+    const failures: string[] = [];
+    const stays = (): WslSeparation => {
+      this.deps.logger.warn(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces stays the default distribution of WSL: ${failures.join('; ')}`);
+      return result('default');
+    };
+    /** True when `run` ended well; false after a failure; undefined when WSL did not answer or start (WslSetupError). */
+    const attempt = async (what: string, run: () => Promise<RunResult>, done: string): Promise<boolean | undefined> => {
+      try {
+        const ended = await run();
+        if (ended.exitCode === 0 && !ended.timedOut) {
+          this.deps.logger.info(`The WSL distribution ${WSL_DISTRIBUTION} of Devspaces was the default distribution of WSL; ${done}.`);
+          return true;
+        }
+        failures.push(`${what} ended with ${endOf(ended, SHORT_CALL_MS)}: ${outputOf(ended)}`);
+        return false;
+      } catch (error) {
+        failures.push(`${what}: ${errorMessage(error)}`);
+        return error instanceof WslSetupError ? undefined : false;
+      }
+    };
+    for (const other of others) {
+      const args = wslSetDefaultArgs(other.name);
+      const done = await attempt(`wsl.exe ${args.join(' ')}`, () => this.runShort(args), `now ${other.name} is`);
+      if (done) return result('separate');
+      // WSL may only be slow (just after the logon, or busy with a setup in another window): the next window start
+      // tries again, and the user keeps a default.
+      if (done === undefined) return stays();
+    }
+    // Only while the default is still the one of Devspaces: the user, or a removal in another window, may have changed
+    // it meanwhile, and that default stays.
+    const now = await this.readRegistry();
+    if (now === undefined) return stays();
+    if (now.defaultId !== ours.id) return result('separate');
+    const removed = await attempt(
+      'reg.exe delete',
+      () => this.deps.runner.run(this.regPath, regDeleteDefaultArgs(), { timeoutMs: SHORT_CALL_MS }),
+      'now WSL has no default, so "wsl" without "-d" does not open it',
+    );
+    return removed ? result('separate') : stays();
+  }
+
+  /**
    * Whether `wsl.exe --list` names the distribution `devspaces` (WSL compares the names without case): false also when
    * WSL has no distribution (NO_DISTRIBUTIONS); undefined when the list ends with another exit code that is not 0.
    * Throws WslSetupError (runShort).
@@ -767,18 +962,26 @@ export class WslSetup {
   }
 
   /**
-   * The folders of the virtual disks of the WSL distributions of the Windows user by name in lower case, from the
-   * registry (`reg.exe export` into a new temporary folder, removed after the read), or undefined when it cannot be
-   * read (logged). Throws an AbortError when the signal aborts.
+   * The folders of the virtual disks of the WSL distributions of the Windows user by name in lower case
+   * (readRegistry), or undefined when the registry cannot be read (logged). Throws an AbortError when the signal aborts.
    */
   private async distributionFolders(signal?: AbortSignal): Promise<Map<string, string | undefined> | undefined> {
+    const registry = await this.readRegistry(signal);
+    return registry && distributionFoldersOf(registry);
+  }
+
+  /**
+   * The WSL distributions of the Windows user in the registry (`reg.exe export` into a new temporary folder, removed
+   * after the read), or undefined when it cannot be read (logged). Throws an AbortError when the signal aborts.
+   */
+  private async readRegistry(signal?: AbortSignal): Promise<LxssRegistry | undefined> {
     let temporary: string | undefined;
     try {
       temporary = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'devspaces-registry-'));
       const file = path.join(temporary, REGISTRY_EXPORT_NAME);
       const result = await this.deps.runner.run(this.regPath, regExportArgs(file), { timeoutMs: SHORT_CALL_MS, signal });
       if (result.exitCode !== 0) throw new Error(`reg.exe export ended with ${endOf(result, SHORT_CALL_MS)}: ${outputOf(result)}`);
-      return parseLxssExport(await fs.promises.readFile(file));
+      return parseLxss(await fs.promises.readFile(file));
     } catch (error) {
       if (signal?.aborted) throw abortError();
       this.deps.logger.warn(`The WSL distributions could not be read from the registry (${LXSS_KEY}): ${errorMessage(error)}`);
