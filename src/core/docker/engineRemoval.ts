@@ -17,7 +17,7 @@ import { isAbortError, type Logger, type RunOptions, type RunResult } from '../p
 import { LABEL_MONITOR, LABEL_MONITOR_OWNER, REMOTE_MONITOR_VOLUME } from '../remoteMonitor/protocol';
 import { isRecord } from '../valueChecks';
 import { IMAGE_IN_USE_PATTERN, commandText, parseJsonLines, type BootstrapDocker } from './bootstrapDocker';
-import { describeDockerHost, sshEndpoint } from './dockerHost';
+import { describeDockerHost, sshEndpoint, wslDistributionOf } from './dockerHost';
 import { DOCKER_QUERY_TIMEOUT_MS } from './dockerTimeouts';
 
 /**
@@ -168,13 +168,18 @@ export async function engineInventory(
   };
 }
 
-/** `docker` with `-H ssh://<host>` for a remote engine, so that a command of the log reaches the same engine. */
+/**
+ * `docker` with `-H ssh://<host>` for a remote engine, or behind `wsl -d <distribution> -u root --` for the WSL
+ * distribution of Devspaces, so that a command of the log reaches the same engine.
+ */
 function dockerWord(remoteHost: string | undefined): string {
-  return remoteHost === undefined ? 'docker' : `docker -H ${sshEndpoint(remoteHost)}`;
+  if (remoteHost === undefined) return 'docker';
+  const distribution = wslDistributionOf(remoteHost);
+  return distribution === undefined ? `docker -H ${sshEndpoint(remoteHost)}` : `wsl -d ${distribution} -u root -- docker`;
 }
 
 /**
- * The command that removes an item that is left (`remoteHost`: the SSH host of a remote engine). For the containers
+ * The command that removes an item that is left (`remoteHost`: the host of a remote engine). For the containers
  * or images of a label that could not be listed (`label=<key>`), the command removes all of them; for the images with
  * `docker image prune`, which removes an image with all its tags and leaves an image that a container uses.
  */

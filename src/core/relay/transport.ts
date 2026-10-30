@@ -5,8 +5,9 @@
 // The transports of the connection of the relay (docs/architecture.md "The connection of the relay"): the program on
 // this computer whose standard input and output reach a POSIX shell on the computer of the Docker engine. That shell
 // reads the start script (startScript.ts), which starts the relay. SSH for a remote host: one login, which asks only in
-// a flow of the user (sshAskpass.ts). No `vscode`.
-import { sshCommandArgs, sshTargetOf, type DockerTarget } from '../docker/dockerHost';
+// a flow of the user (sshAskpass.ts). `wsl.exe` for the WSL distribution of Devspaces: no login and no question. No
+// `vscode`.
+import { sshCommandArgs, sshTargetOf, wslCommandArgs, wslEnv, type DockerTarget } from '../docker/dockerHost';
 import { noPromptEnv } from '../docker/remoteDocker';
 import { bundleLine } from '../loader/pipeLoader';
 import type { Logger, StartedByteProcess } from '../ports';
@@ -23,6 +24,15 @@ export interface RelayTransport {
 
 /** The command of the transport on the other computer: a POSIX shell that reads its script from its input. */
 export const RELAY_SHELL_COMMAND = 'sh -s';
+
+/**
+ * The `wsl.exe` transport to the engine in the WSL distribution `distribution`: `wsl.exe -d <distribution> -u root --cd /
+ * --exec sh -s` (wslCommandArgs), with WSL_UTF8=1 (wslEnv). It starts the distribution when it does not run, and asks
+ * nothing: the Windows user owns the distribution, and its root user runs the Docker engine.
+ */
+export function wslHostTransport(distribution: string, wslPath: string, env: NodeJS.ProcessEnv): RelayTransport {
+  return { file: wslPath, args: wslCommandArgs(distribution, RELAY_SHELL_COMMAND.split(' ')), env: wslEnv(env) };
+}
 
 /**
  * The SSH transport to the engine of `target`: `ssh -o BatchMode=yes -o ConnectTimeout=15 -T [-i key] [-p port] [-l
@@ -76,7 +86,7 @@ export async function openRelayConnection(
   const marker = startMarker();
   const startScript = relayStartScript(marker, command);
   const shell = takeOver === undefined ? undefined : await takeOver();
-  if (shell !== undefined) options.logger.info(`The connection to ${options.name} starts on the SSH login of the shell before the relay.`);
+  if (shell !== undefined) options.logger.info(`The connection to ${options.name} starts on the login of the shell before the relay.`);
   const { process, prompts } = shell === undefined ? start() : { process: shell, prompts: undefined };
   return RelayConnection.open(process, { ...connectionOptions, prompts, marker, startScript, bundleLine: line });
 }

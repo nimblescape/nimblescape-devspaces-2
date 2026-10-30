@@ -2,15 +2,18 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The Docker pipes of the Docker calls of Devspaces itself (docs/architecture.md "The Docker pipe"): one pipe per SSH
-// host in this extension host, at a random address (pipeAddress.ts), served from the first time that a connection of
-// the relay to the host passed its checks (RelayConnections.use) until the window closes. While a connection of the
-// relay to the host is open, the Docker CLI of Devspaces gets the pipe as DOCKER_HOST (BootstrapDocker), so its calls
-// need no SSH login of their own. Each connection of the pipe becomes a Docker stream of that connection
-// (relayDockerDial); when it ended meanwhile, the connection runs its own `ssh … docker system dial-stdio`. No `vscode`.
+// The Docker pipes of the Docker calls of Devspaces itself (docs/architecture.md "The Docker pipe"): one pipe per remote
+// host in this extension host, at a random address (pipeAddress.ts), served until the window closes. For an SSH host,
+// from the first time that a connection of the relay to the host passed its checks (RelayConnections.use); while a
+// connection of the relay to the host is open, the Docker CLI of Devspaces gets the pipe as DOCKER_HOST
+// (BootstrapDocker), so its calls need no SSH login of their own. Each connection of the pipe becomes a Docker stream of
+// that connection (relayDockerDial); when it ended meanwhile, the connection runs its own `ssh … docker system
+// dial-stdio`. For the WSL distribution of Devspaces, from the first Docker call of an operation there (BootstrapDocker,
+// servePipe), and every Docker call of the extension there uses it: each connection runs its own `wsl.exe …
+// docker system dial-stdio`, which needs no login, so the pipe never depends on a connection of the relay. No `vscode`.
 import { randomBytes } from 'crypto';
 import type * as net from 'net';
-import { sshTargetOf } from '../docker/dockerHost';
+import { hostAccessOf } from '../docker/dockerHost';
 import { errorMessage } from '../errors';
 import type { Logger, StartedByteProcess } from '../ports';
 import type { RelayConnection } from './connection';
@@ -24,7 +27,10 @@ export interface HostPipesDeps {
   base(): string;
   /** The open connection of the relay to `host` for a Docker stream (RelayConnections.get), or undefined. */
   relayConnection(host: string): RelayConnection | undefined;
-  /** `ssh … docker system dial-stdio` on `host`; undefined without `ssh` or for a host that is no SSH alias or address. */
+  /**
+   * `ssh … docker system dial-stdio` on `host`, or `wsl.exe … docker system dial-stdio` for a WSL distribution;
+   * undefined without the program of the transport or for a host that has none (hostAccessOf).
+   */
   dialStdio(host: string): StartedByteProcess | undefined;
   /** Only for the tests: the id of the next pipe (16 hexadecimal digits). */
   randomId?: () => string;
@@ -32,8 +38,8 @@ export interface HostPipesDeps {
 
 /** The Docker pipes of this extension host for the Docker calls of Devspaces, by the Docker host (DockerTarget.host). */
 export class HostPipes {
-  /** The pipe of each host that is served, or that is starting to listen (`pipe` undefined). */
-  private readonly pipes = new Map<string, { pipe?: DockerPipe }>();
+  /** The pipe of each host that is served, or that is starting to listen (`pipe` undefined, until `listening` ends). */
+  private readonly pipes = new Map<string, { pipe?: DockerPipe; listening?: Promise<void> }>();
   private disposed = false;
 
   constructor(private readonly deps: HostPipesDeps) {}
@@ -41,47 +47,52 @@ export class HostPipes {
   /**
    * DOCKER_HOST for a Docker call of Devspaces to the engine on `host`: the address of the pipe of the host while it
    * serves its address (DockerPipe.isServing: a socket that a cleanup of temporary folders removed, until the pipe
-   * listens again at its next refresh, or that another file replaced, does not) and a connection of the relay to the
-   * host is open; undefined otherwise (the call uses the Docker context, as before). Never throws.
+   * listens again at its next refresh, or that another file replaced, does not) and, for an SSH host, a connection of
+   * the relay to the host is open; undefined otherwise (the call logs in itself, as before). Never throws.
    */
   dockerHost(host: string): string | undefined {
     const pipe = this.pipes.get(host)?.pipe;
-    if (pipe === undefined || this.deps.relayConnection(host) === undefined || !pipe.isServing()) return undefined;
+    if (pipe === undefined || !pipe.isServing()) return undefined;
+    if (hostAccessOf(host)?.kind !== 'wsl' && this.deps.relayConnection(host) === undefined) return undefined;
     return pipe.address.dockerHost;
   }
 
   /**
-   * Serves the pipe of `host` (an SSH host) when it does not listen yet: a connection of the relay to it passed its
-   * checks. A pipe that does not serve its address anymore (DockerPipe.isServing) is closed, and a new one at a new
-   * address takes its place. A pipe that cannot listen is logged; the next connection that passes its checks tries
-   * again. Resolves when the pipe listens or could not; never rejects.
+   * Serves the pipe of `host` (a host with a transport, hostAccessOf) when it does not listen yet: for an SSH host, a
+   * connection of the relay to it passed its checks; for a WSL distribution, a Docker call of an operation there comes.
+   * A pipe that does not serve its address anymore (DockerPipe.isServing) is closed, and a new one at a new address
+   * takes its place. A pipe that cannot listen is logged; the next call of `serve` tries again. Resolves when the pipe
+   * listens or could not, also for a call while another one starts it; never rejects.
    */
   async serve(host: string): Promise<void> {
-    if (this.disposed || sshTargetOf(host) === undefined) return;
+    const access = hostAccessOf(host);
+    if (this.disposed || access === undefined) return;
     const { logger, platform } = this.deps;
     const name = `the extension on ${host}`;
     const served = this.pipes.get(host);
     if (served !== undefined) {
-      // Listens, or starts to listen.
-      if (served.pipe === undefined || served.pipe.isServing()) return;
+      // Starts to listen (this call waits for the same start), or listens.
+      if (served.pipe === undefined) return served.listening;
+      if (served.pipe.isServing()) return;
       logger.info(`The Docker pipe of ${name} does not serve ${served.pipe.address.dockerHost} anymore, so a new pipe takes its place.`);
       served.pipe.close();
       this.pipes.delete(host);
     }
-    const entry: { pipe?: DockerPipe } = {};
+    const entry: { pipe?: DockerPipe; listening?: Promise<void> } = {};
     this.pipes.set(host, entry);
     const direct = processDockerDial(
       () => {
         const process = this.deps.dialStdio(host);
-        // Only an SSH host gets a pipe (see serve).
-        if (process === undefined) throw new Error('ssh was not found');
+        // Only a host with a transport gets a pipe (see serve).
+        if (process === undefined) throw new Error(`${access.kind === 'wsl' ? 'wsl.exe' : 'ssh'} was not found`);
         return process;
       },
       logger,
       host,
     );
     const connect = async (socket: net.Socket): Promise<void> => {
-      const connection = this.deps.relayConnection(host);
+      // The WSL distribution: always its own `dial-stdio`, so that the calls never depend on a connection of the relay.
+      const connection = access.kind === 'wsl' ? undefined : this.deps.relayConnection(host);
       if (connection !== undefined) {
         try {
           relayDockerDial(connection, socket);
@@ -93,16 +104,24 @@ export class HostPipes {
       }
       return direct(socket);
     };
-    try {
-      // A new random address for each pipe: no other window and no other user knows it beforehand.
-      const address = dockerPipeAddress((this.deps.randomId ?? (() => randomBytes(8).toString('hex')))(), platform, platform === 'win32' ? '' : this.deps.base());
-      const pipe = await DockerPipe.listen({ address, connect, logger, name, platform, inUseWaitMs: 0 });
-      if (this.disposed) pipe.close();
-      else entry.pipe = pipe;
-    } catch (error) {
-      if (this.pipes.get(host) === entry) this.pipes.delete(host);
-      logger.warn(`The Docker pipe of ${name} cannot listen, so the Docker calls of the extension log in to ${host} each time: ${errorMessage(error)}`);
-    }
+    const listen = async (): Promise<void> => {
+      try {
+        // A new random address for each pipe: no other window and no other user knows it beforehand.
+        const address = dockerPipeAddress((this.deps.randomId ?? (() => randomBytes(8).toString('hex')))(), platform, platform === 'win32' ? '' : this.deps.base());
+        const pipe = await DockerPipe.listen({ address, connect, logger, name, platform, inUseWaitMs: 0 });
+        if (this.disposed) pipe.close();
+        else entry.pipe = pipe;
+      } catch (error) {
+        if (this.pipes.get(host) === entry) this.pipes.delete(host);
+        logger.warn(
+          access.kind === 'wsl'
+            ? `The Docker pipe of ${name} cannot listen, so the Docker calls of the extension cannot reach ${host}: ${errorMessage(error)}`
+            : `The Docker pipe of ${name} cannot listen, so the Docker calls of the extension log in to ${host} each time: ${errorMessage(error)}`,
+        );
+      }
+    };
+    entry.listening = listen();
+    return entry.listening;
   }
 
   /** Closes every pipe; their sockets and folders are removed (the window closes). */

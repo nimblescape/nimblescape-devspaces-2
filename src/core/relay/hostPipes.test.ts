@@ -2,13 +2,15 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The Docker pipes of the extension: one pipe per SSH host at a random address, DOCKER_HOST only while a connection of
-// the relay to the host is open, and the way of each connection (the relay, or `docker system dial-stdio`; here `cat`).
+// The Docker pipes of the extension: one pipe per remote host at a random address, DOCKER_HOST for an SSH host only while
+// a connection of the relay to the host is open, and the way of each connection (the relay, or `docker system
+// dial-stdio`; here `cat`). The pipe of the WSL distribution of Devspaces never uses the relay.
 import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WSL_HOST } from '../docker/dockerHost';
 import { NodeProcessRunner } from '../process';
 import { silentLogger, type Logger } from '../ports';
 import type { RelayConnection } from './connection';
@@ -128,11 +130,12 @@ describe('HostPipes', () => {
     expect(fs.existsSync(address.folder as string)).toBe(false);
   });
 
-  it('serves no pipe for a host that is no SSH alias or address', async () => {
+  it('serves no pipe for a host that has no transport', async () => {
     const folder = base();
     const hostPipes = pipes({ base: () => folder, relayConnection: () => echoRelay() });
     await hostPipes.serve('-oProxyCommand=x');
     await hostPipes.serve('me@box/path');
+    await hostPipes.serve('wsl:-x');
     expect(hostPipes.dockerHost('-oProxyCommand=x')).toBeUndefined();
     expect(fs.readdirSync(folder)).toEqual([]);
   });
@@ -214,6 +217,47 @@ describe('HostPipes', () => {
     await serving;
     expect(hostPipes.dockerHost('build-box')).toBeUndefined();
     expect(fs.existsSync(address.folder as string)).toBe(false);
+  });
+
+  it('names the pipe of the WSL distribution as DOCKER_HOST while it listens, and carries each connection through its own dial-stdio', async () => {
+    const runner = new NodeProcessRunner();
+    const folder = base();
+    const address = dockerPipeAddress(ID, 'linux', folder);
+    // An open connection of the relay to the distribution is never used by this pipe.
+    const relayConnection = vi.fn(() => echoRelay());
+    const dialStdio = vi.fn<HostPipesDeps['dialStdio']>(() => runner.startBytes('cat', []));
+    const log = logger();
+    const hostPipes = pipes({ base: () => folder, logger: log, relayConnection, dialStdio });
+    expect(hostPipes.dockerHost(WSL_HOST)).toBeUndefined();
+    await hostPipes.serve(WSL_HOST);
+    expect(hostPipes.dockerHost(WSL_HOST)).toBe(address.dockerHost);
+    await expect(roundTrip(address.path, 'GET /_ping HTTP/1.1\r\n\r\n')).resolves.toBe('GET /_ping HTTP/1.1\r\n\r\n');
+    expect(dialStdio).toHaveBeenCalledWith(WSL_HOST);
+    expect(relayConnection).not.toHaveBeenCalled();
+    // Without wsl.exe, the connection is closed, and the log says why.
+    dialStdio.mockReturnValue(undefined);
+    await expect(roundTrip(address.path, 'y')).resolves.toBe('');
+    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of the extension on ${WSL_HOST} could not reach the Docker engine: wsl.exe was not found`);
+  });
+
+  it('lets every serve that comes while the pipe starts to listen wait for it', async () => {
+    const folder = base();
+    const hostPipes = pipes({ base: () => folder });
+    const calls = [hostPipes.serve(WSL_HOST), hostPipes.serve(WSL_HOST), hostPipes.serve(WSL_HOST)];
+    const seen: Array<string | undefined> = [];
+    await Promise.all(calls.map((call) => call.then(() => seen.push(hostPipes.dockerHost(WSL_HOST)))));
+    expect(seen).toEqual(Array(3).fill(dockerPipeAddress(ID, 'linux', folder).dockerHost));
+  });
+
+  it('logs a pipe of the WSL distribution that cannot listen: its calls have no other way', async () => {
+    const folder = base();
+    const blocked = path.join(folder, 'file');
+    fs.writeFileSync(blocked, '');
+    const log = logger();
+    const hostPipes = pipes({ base: () => blocked, logger: log });
+    await hostPipes.serve(WSL_HOST);
+    expect(hostPipes.dockerHost(WSL_HOST)).toBeUndefined();
+    expect(log.lines[0]).toMatch(new RegExp(`^warn The Docker pipe of the extension on ${WSL_HOST} cannot listen, so the Docker calls of the extension cannot reach ${WSL_HOST}: `));
   });
 
   it('gives each pipe a new random address', async () => {

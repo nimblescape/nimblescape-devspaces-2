@@ -9,10 +9,10 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 
 vi.mock('vscode', async () => (await import('./testing/fakeVscode')).fakeVscode);
 
-import { dockerTargetOf, remoteDockerTarget, LOCAL_DOCKER_TARGET } from '../core/docker/dockerHost';
+import { dockerTargetOf, remoteDockerTarget, LOCAL_DOCKER_TARGET, WSL_HOST } from '../core/docker/dockerHost';
 import { DockerTargets, runWithDockerTarget, operationDockerTarget } from '../core/docker/dockerTargets';
 import { ENGINE_INFO_FORMAT } from '../core/docker/remoteDocker';
-import { Messages, dockerHostReason } from '../core/messages';
+import { Actions, Messages, dockerHostReason } from '../core/messages';
 import type { RunOptions, RunResult } from '../core/ports';
 import { RemoteDockerState } from '../core/storage/remoteDockerState';
 import { RemoteDockerCommands, RemoteDockerTexts, describeEntry, type RemoteDockerDeps } from './remoteDockerCommands';
@@ -173,6 +173,55 @@ describe('Use a Remote Docker Host…', () => {
       [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
       [RemoteDockerTexts.removeHost, undefined],
     ]);
+  });
+
+  it('offers the WSL distribution of Devspaces when it is registered and not in the list', async () => {
+    const wslDistributions = vi.fn(async () => ['Ubuntu', 'Devspaces']);
+    commands = create({ wslDistributions });
+    await commands.useRemoteHost();
+    expect(shown().slice(-4)).toEqual([
+      [RemoteDockerTexts.wslGroup, undefined],
+      [WSL_HOST, RemoteDockerTexts.wslDistribution('devspaces')],
+      ['', undefined],
+      [RemoteDockerTexts.enterAddress, RemoteDockerTexts.enterAddressDetail],
+    ]);
+    // In the list, it shows there; another distribution is never offered, and a failed list offers none (logged).
+    await listed([WSL_HOST]);
+    await commands.useRemoteHost();
+    expect(shown(1).slice(0, 2)).toEqual([
+      [RemoteDockerTexts.listGroup, undefined],
+      [WSL_HOST, RemoteDockerTexts.wslDistribution('devspaces')],
+    ]);
+    expect(shown(1).filter(([label]) => label === RemoteDockerTexts.wslGroup)).toEqual([]);
+    await state.removeHost(WSL_HOST);
+    wslDistributions.mockResolvedValueOnce(['Ubuntu']);
+    await commands.useRemoteHost();
+    wslDistributions.mockRejectedValueOnce(new Error('wsl.exe --list --quiet failed: exit code 1'));
+    await commands.useRemoteHost();
+    expect([shown(2), shown(3)].flat().some(([label]) => label === WSL_HOST)).toBe(false);
+    expect(logger.warn).toHaveBeenCalledWith('The WSL distributions could not be listed: wsl.exe --list --quiet failed: exit code 1');
+  });
+
+  it('tests the WSL distribution on its shell (wsl.exe) and uses it, without ssh and without docker -H', async () => {
+    const shells = {
+      login: vi.fn(async () => ({ ok: true as const })),
+      run: vi.fn(async () => engineInfo()),
+    };
+    commands = create({ wslDistributions: async () => ['devspaces'], shells });
+    pick(WSL_HOST);
+    await commands.useRemoteHost();
+    expect(shells.login).toHaveBeenCalledWith(WSL_HOST, expect.any(AbortSignal), { fresh: true });
+    expect(await state.dockerHost()).toBe(WSL_HOST);
+    expect(cli.calls.filter((call) => call.args[0] === '-H')).toEqual([]);
+    expect(runner.run).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(`Devspaces uses ${WSL_HOST} (wsl://devspaces). No Docker context was changed.`);
+    // Without wsl.exe (no shell), the plain reason, and nothing changes.
+    await state.setDockerHost(undefined);
+    commands = create({ wslDistributions: async () => ['devspaces'], shells: { login: vi.fn(async () => undefined), run: vi.fn(async () => undefined) } });
+    pick(WSL_HOST);
+    await commands.useRemoteHost();
+    expect(window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerHostUnreachable(WSL_HOST, dockerHostReason('wslMissing', WSL_HOST)), Actions.showDetails);
+    expect(await state.dockerHost()).toBeUndefined();
   });
 
   it('tests the host without questions and makes it the Docker host of Devspaces; no Docker context is changed', async () => {

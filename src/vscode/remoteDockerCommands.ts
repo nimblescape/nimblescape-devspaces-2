@@ -10,10 +10,14 @@
 // docker command in the terminals of the user keeps its target. One Docker host at a time, for every window of
 // Devspaces on this computer. A Docker context or DOCKER_HOST of the user that reaches a host over SSH is offered once
 // for the list (offerDockerContextHost). A computer without a Docker CLI gets the Docker CLI of Devspaces for the remote
-// host first (ensureRemoteCli), so no Docker needs to be installed on it.
+// host first (ensureRemoteCli), so no Docker needs to be installed on it. On Windows, the WSL distribution of Devspaces
+// is offered as a host when it is registered (wslHosts): Devspaces reaches it with `wsl.exe`, without SSH.
 import * as vscode from 'vscode';
 import {
+  WSL_DISTRIBUTION,
+  WSL_HOST,
   describeDockerHost,
+  hostEndpoint,
   isDockerContextHostTarget,
   parseSshAddress,
   sshTargetOf,
@@ -47,6 +51,9 @@ export const RemoteDockerTexts = {
   listGroup: 'Hosts of Devspaces',
   sshConfigGroup: 'SSH config',
   contextGroup: 'Docker contexts',
+  wslGroup: 'WSL',
+  /** The description of the WSL distribution of Devspaces in the choice. */
+  wslDistribution: (name: string) => `WSL distribution ${name} of Devspaces`,
   enterAddress: 'Enter an SSH address…',
   enterAddressDetail: 'user@host or user@host:port',
   addressPrompt: 'The SSH address of the computer with Docker, for example me@build-box or me@192.0.2.10:2222',
@@ -127,6 +134,11 @@ export interface RemoteDockerDeps {
   identityFor?(host: string): string | undefined;
   /** The environment of a Docker call with `ssh://<host>` with that key (SshCheckDeps.sshEnv). */
   sshEnv?(host: string, env: NodeJS.ProcessEnv): void;
+  /**
+   * The names of the WSL distributions of this Windows user (`wsl.exe --list --quiet`); none elsewhere, without WSL, or
+   * when they cannot be listed. Without it, the WSL distribution of Devspaces is not offered.
+   */
+  wslDistributions?: () => Promise<string[]>;
   /** The number of devspaces of this computer on `host` (its registry), for the message of a removed host. */
   devspaceCount?: (host: string) => Promise<number>;
   /** After a change of the Docker host of Devspaces: the sidebar shows the devspaces of the new host. */
@@ -322,7 +334,7 @@ export class RemoteDockerCommands {
     }
     this.deps.logger.info(`The Docker host ${host} answers: Docker engine ${check.version}${check.rootless ? ' (rootless)' : ''}.`);
     await this.deps.state.setDockerHost(host);
-    this.deps.logger.info(`Devspaces uses ${host} (ssh://${host}). No Docker context was changed.`);
+    this.deps.logger.info(`Devspaces uses ${host} (${hostEndpoint(host)}). No Docker context was changed.`);
     await this.deps.targets.resolve();
     this.inform(RemoteDockerTexts.nowRemote(host, check.rootless));
     await this.afterSwitch();
@@ -406,7 +418,8 @@ export class RemoteDockerCommands {
 
   /**
    * A host or a typed SSH address: the hosts of the list of Devspaces, then the other hosts of the SSH config, then the
-   * SSH hosts of the Docker contexts of the user (each host once); `currentHost` is marked. "Remove a Host from the
+   * SSH hosts of the Docker contexts of the user, then the WSL distribution of Devspaces when it is registered and not in
+   * the list (each host once); `currentHost` is marked. "Remove a Host from the
    * List…" when the list has a host. With `offerLocal` (the choice of the first row of the sidebar), the local Docker is
    * the last entry (LOCAL_CHOICE), marked when no host is current and `localSupported` is not false.
    */
@@ -419,7 +432,7 @@ export class RemoteDockerCommands {
     } catch (error) {
       this.deps.logger.warn(`The SSH config could not be read: ${errorMessage(error)}`);
     }
-    const [listed, contextHosts] = await Promise.all([this.deps.state.remoteHosts(), this.contextHosts()]);
+    const [listed, contextHosts, wslHosts] = await Promise.all([this.deps.state.remoteHosts(), this.contextHosts(), this.wslHosts()]);
     const shown = new Set<string>();
     const item = (host: string, description: string | undefined): HostItem => {
       shown.add(host);
@@ -427,6 +440,7 @@ export class RemoteDockerCommands {
       return { label: `$(check) ${host}`, description: description ? `${description} · ${RemoteDockerTexts.current}` : RemoteDockerTexts.current, host };
     };
     const describe = (host: string): string | undefined => {
+      if (host === WSL_HOST) return RemoteDockerTexts.wslDistribution(WSL_DISTRIBUTION);
       const entry = entries.find((candidate) => candidate.alias === host);
       return entry === undefined ? undefined : describeEntry(entry);
     };
@@ -437,6 +451,7 @@ export class RemoteDockerCommands {
         label: RemoteDockerTexts.contextGroup,
         items: contextHosts.filter((entry) => !shown.has(entry.host)).map((entry) => item(entry.host, RemoteDockerTexts.dockerContext(entry.context))),
       },
+      { label: RemoteDockerTexts.wslGroup, items: wslHosts.filter((host) => !shown.has(host)).map((host) => item(host, describe(host))) },
     ];
     const items: HostItem[] = [];
     for (const group of groups) {
@@ -490,6 +505,20 @@ export class RemoteDockerCommands {
       return await sshHostsOfContexts(this.deps.docker);
     } catch (error) {
       this.deps.logger.warn(`The Docker contexts could not be listed: ${errorMessage(error)}`);
+      return [];
+    }
+  }
+
+  /**
+   * The WSL distribution of Devspaces as a host (WSL_HOST) when it is registered (WSL compares the names without case);
+   * none when the distributions cannot be listed (logged).
+   */
+  private async wslHosts(): Promise<string[]> {
+    if (this.deps.wslDistributions === undefined) return [];
+    try {
+      return (await this.deps.wslDistributions()).some((name) => name.toLowerCase() === WSL_DISTRIBUTION) ? [WSL_HOST] : [];
+    } catch (error) {
+      this.deps.logger.warn(`The WSL distributions could not be listed: ${errorMessage(error)}`);
       return [];
     }
   }

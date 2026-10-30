@@ -3,10 +3,11 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // Docker on another computer: Devspaces keeps its own list of SSH hosts (RemoteDockerState) and reaches each with its
-// own `ssh`; it creates and changes no Docker context. Its local Docker is the current Docker context of the Docker CLI
-// (or DOCKER_HOST), as for Docker, Docker Compose, and the Dev Containers extension. This module holds the pure rules:
-// which endpoint counts as local, remote (ssh://), or not supported; the Docker host of a devspace; the check of an SSH
-// address; the plain reasons of a failed connection. No `vscode`.
+// own `ssh`; it creates and changes no Docker context. On Windows, the WSL distribution of Devspaces is such a host too,
+// reached with `wsl.exe` instead of `ssh` (hostAccessOf). Its local Docker is the current Docker context of the Docker
+// CLI (or DOCKER_HOST), as for Docker, Docker Compose, and the Dev Containers extension. This module holds the pure
+// rules: which endpoint counts as local, remote (ssh://), or not supported; the Docker host of a devspace; the check of
+// an SSH address; how a host of the list is reached; the plain reasons of a failed connection. No `vscode`.
 import type { Devspace } from '../types';
 import { isRecord } from '../valueChecks';
 
@@ -17,7 +18,8 @@ export const DEFAULT_CONTEXT_NAME = 'default';
  * Where Docker runs:
  * - `local`: the Docker of this computer, as the current Docker context (or DOCKER_HOST) says (Docker Desktop, the
  *   default Unix socket, a named pipe, a rootless socket of this user, or TCP to this computer's loopback).
- * - `remote`: a host of the list of Devspaces (remoteDockerTarget), the Docker of another computer, reached through SSH.
+ * - `remote`: a host of the list of Devspaces (remoteDockerTarget): the Docker of another computer, reached through SSH,
+ *   or of the WSL distribution of Devspaces, reached through `wsl.exe` (hostAccessOf).
  * - `unsupported`: any other endpoint of the current context (TCP to another computer, an unknown scheme, or an SSH
  *   host, isDockerContextHostTarget), a current context that could not be read (isUnreadableDockerTarget), or a docker
  *   command that is Podman (isPodmanDockerTarget): refused with a message.
@@ -28,13 +30,14 @@ export interface DockerTarget {
   kind: DockerTargetKind;
   /**
    * The Docker host that devspaces record (`Devspace.dockerHost`): empty for `local`; for `remote` the part after
-   * `ssh://` (an alias of the SSH config or `user@host[:port]`); for `unsupported` the endpoint, or a text for a
+   * `ssh://` (an alias of the SSH config or `user@host[:port]`), or `wsl:<distribution>` (WSL_HOST); for `unsupported` the endpoint, or a text for a
    * context that could not be read or for Podman (never recorded, and no devspace has it).
    */
   host: string;
   /**
-   * The endpoint of the context, for example `unix:///var/run/docker.sock` or `ssh://build-box`. Empty when unknown
-   * (without a Docker CLI, for a context that could not be read, or for Podman).
+   * The endpoint of the context, for example `unix:///var/run/docker.sock` or `ssh://build-box`; `wsl://<distribution>`
+   * for the WSL distribution of Devspaces (hostEndpoint; no endpoint of the Docker CLI). Empty when unknown (without a
+   * Docker CLI, for a context that could not be read, or for Podman).
    */
   endpoint: string;
   /**
@@ -150,9 +153,9 @@ export function dockerTargetOf(endpoint: string, context: string | undefined): D
   return { kind, host, endpoint, ...named };
 }
 
-/** The target of the host `host` of the list of Devspaces: its Docker over SSH, `ssh://<host>`. */
+/** The target of the host `host` of the list of Devspaces: its Docker over SSH (`ssh://<host>`) or through `wsl.exe`. */
 export function remoteDockerTarget(host: string): DockerTarget {
-  return { kind: 'remote', host, endpoint: sshEndpoint(host) };
+  return { kind: 'remote', host, endpoint: hostEndpoint(host) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -295,6 +298,16 @@ export function sshEndpoint(host: string): string {
 }
 
 /**
+ * The endpoint of the target of a host of the list (DockerTarget.endpoint): `wsl://<distribution>` for a WSL
+ * distribution, which names it in the log only (the Docker CLI reaches it through a Docker pipe of Devspaces), else
+ * sshEndpoint.
+ */
+export function hostEndpoint(host: string): string {
+  const distribution = wslDistributionOf(host);
+  return distribution === undefined ? sshEndpoint(host) : `wsl://${distribution}`;
+}
+
+/**
  * The arguments of `ssh` that run `remoteCommand` (one string that the remote shell runs) on `target` without any
  * question: BatchMode (no password or passphrase prompt, no host key question: an unknown key fails), a time limit for
  * the connection, no terminal. With `prompts`, without BatchMode: a login of a flow of the user, whose questions
@@ -321,6 +334,81 @@ export function sshCommandArgs(
   args.push('--', target.host, remoteCommand);
   return args;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The WSL distribution of Devspaces
+
+/** The name of the WSL distribution of Devspaces on Windows (docs/architecture.md "The WSL distribution of Devspaces"). */
+export const WSL_DISTRIBUTION = 'devspaces';
+
+/** The start of the Docker host of a WSL distribution: `wsl:<distribution>`, which is never an SSH alias or address. */
+export const WSL_HOST_PREFIX = 'wsl:';
+
+/** The Docker host of the WSL distribution of Devspaces, as the devspaces and the list of Devspaces record it. */
+export const WSL_HOST = `${WSL_HOST_PREFIX}${WSL_DISTRIBUTION}`;
+
+/** A name of a WSL distribution that `wsl.exe` takes after `-d` as it is (never an option). */
+const WSL_DISTRIBUTION_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** The WSL distribution of the Docker host `host` (`wsl:<distribution>`), or undefined for any other host. */
+export function wslDistributionOf(host: string): string | undefined {
+  if (!host.startsWith(WSL_HOST_PREFIX)) return undefined;
+  const distribution = host.slice(WSL_HOST_PREFIX.length);
+  return WSL_DISTRIBUTION_NAME.test(distribution) ? distribution : undefined;
+}
+
+/**
+ * How Devspaces reaches the Docker engine of a host of its list: `ssh` for an SSH alias or address (sshTargetOf), `wsl`
+ * for a WSL distribution (wslDistributionOf); undefined for any other host, which has no transport.
+ */
+export type HostAccess = { kind: 'ssh'; address: SshAddress } | { kind: 'wsl'; distribution: string };
+
+/** HostAccess of `host`. */
+export function hostAccessOf(host: string): HostAccess | undefined {
+  const distribution = wslDistributionOf(host);
+  if (distribution !== undefined) return { kind: 'wsl', distribution };
+  const address = sshTargetOf(host);
+  return address === undefined ? undefined : { kind: 'ssh', address };
+}
+
+/**
+ * The arguments of `wsl.exe` that run `command` in the WSL distribution `distribution` as root, without a shell of the
+ * distribution in between (`--exec`), in the root folder: `-d <distribution> -u root --cd / --exec <command…>`. The
+ * distribution starts when it does not run. No login and no question: the Windows user owns the distribution.
+ */
+export function wslCommandArgs(distribution: string, command: readonly string[]): string[] {
+  return ['-d', distribution, '-u', 'root', '--cd', '/', '--exec', ...command];
+}
+
+/**
+ * The environment of `wsl.exe`: WSL_UTF8=1, so that its own messages (for example a distribution that is not
+ * registered) are UTF-8, not UTF-16, when its output is a pipe.
+ */
+export function wslEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const key of Object.keys(env)) if (key.toUpperCase() === 'WSL_UTF8') delete env[key];
+  env.WSL_UTF8 = '1';
+  return env;
+}
+
+/** The arguments of `wsl.exe` that list the names of the WSL distributions of this Windows user, one per line. */
+export const WSL_LIST_ARGS: readonly string[] = ['--list', '--quiet'];
+
+/**
+ * The names in the output of `wsl.exe --list --quiet` (WSL_LIST_ARGS): one per line. An older `wsl.exe` writes UTF-16
+ * also with WSL_UTF8=1; read as UTF-8, its text has a NUL byte after each character, and a byte order mark becomes
+ * replacement characters. Both are dropped here (no name of a distribution has them).
+ */
+export function parseWslList(stdout: string): string[] {
+  return stdout
+    .replace(/[\u0000\uFEFF\uFFFD]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Rootless engines
 
 /** The remote command that prints the folder of the user's runtime files (XDG_RUNTIME_DIR), for a rootless engine. */
 export const RUNTIME_DIR_COMMAND = 'printf %s "$XDG_RUNTIME_DIR"';
@@ -381,11 +469,17 @@ export type DockerHostProblem =
   | 'dockerNotRunning'
   | 'dockerPermission'
   | 'sshMissing'
+  | 'wslMissing'
+  | 'wslDistributionMissing'
   | 'unknown';
 
-/** Maps the error text of `docker -H ssh://… info` (or of `ssh`) to a DockerHostProblem. */
+/** The message of `wsl.exe` for a distribution that is not registered (WSL_E_DISTRO_NOT_FOUND). */
+const WSL_DISTRIBUTION_MISSING = /WSL_E_DISTRO_NOT_FOUND|There is no distribution with the supplied name/i;
+
+/** Maps the error text of `docker -H ssh://… info` (or of `ssh`, or of `wsl.exe`) to a DockerHostProblem. */
 export function dockerHostProblem(detail: string): DockerHostProblem {
   const text = detail;
+  if (WSL_DISTRIBUTION_MISSING.test(text)) return 'wslDistributionMissing';
   if (/executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
     return 'sshMissing';
   }

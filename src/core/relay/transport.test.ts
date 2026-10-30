@@ -3,11 +3,11 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 import { describe, expect, it, vi } from 'vitest';
-import { LOCAL_DOCKER_TARGET, remoteDockerTarget } from '../docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, WSL_HOST, remoteDockerTarget } from '../docker/dockerHost';
 import { MAX_BUNDLE_LINE_LENGTH } from '../loader/pipeLoader';
 import { silentLogger, type StartOptions, type StartedByteProcess } from '../ports';
 import { RelayConnectionError } from './connection';
-import { RELAY_SHELL_COMMAND, openRelayConnection, sshRelayTransport } from './transport';
+import { RELAY_SHELL_COMMAND, openRelayConnection, sshRelayTransport, wslHostTransport } from './transport';
 
 describe('sshRelayTransport', () => {
   const env = { PATH: '/usr/bin', ssh_askpass_require: 'force' };
@@ -64,6 +64,19 @@ describe('sshRelayTransport', () => {
   it('has no transport for the local engine and for a host that is no SSH alias or address', () => {
     expect(sshRelayTransport(LOCAL_DOCKER_TARGET, '/usr/bin/ssh', env)).toBeUndefined();
     expect(sshRelayTransport({ kind: 'remote', host: 'box/path', endpoint: 'ssh://box/path' }, '/usr/bin/ssh', env)).toBeUndefined();
+    // The WSL distribution of Devspaces has no SSH transport (wslHostTransport).
+    expect(sshRelayTransport(remoteDockerTarget(WSL_HOST), '/usr/bin/ssh', env)).toBeUndefined();
+  });
+});
+
+describe('wslHostTransport', () => {
+  it('runs sh -s as root in the distribution with wsl.exe, without a shell of the distribution and without questions', () => {
+    const wsl = 'C:\\Windows\\System32\\wsl.exe';
+    expect(wslHostTransport('devspaces', wsl, { Path: 'C:\\Windows' })).toEqual({
+      file: wsl,
+      args: ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s'],
+      env: { Path: 'C:\\Windows', WSL_UTF8: '1' },
+    });
   });
 });
 
@@ -121,7 +134,7 @@ describe('openRelayConnection', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(written).toHaveLength(1);
     expect(written[0]).toMatch(/^printf '%s\\n' devspaces-start-[0-9a-f]{32}; exec 'docker' 'run'\n$/);
-    expect(lines).toEqual(['The connection to build-box starts on the SSH login of the shell before the relay.']);
+    expect(lines).toEqual(['The connection to build-box starts on the login of the shell before the relay.']);
     finish({ exitCode: 255 });
     await expect(opening).rejects.toBeInstanceOf(RelayConnectionError);
   });

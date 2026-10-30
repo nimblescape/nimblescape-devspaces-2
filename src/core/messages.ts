@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
 // All user-visible texts.
-import { sshCommandLine } from './docker/dockerHost';
+import { sshCommandLine, wslDistributionOf, type DockerHostProblem } from './docker/dockerHost';
 
 export const Steps = {
   startingDocker: 'Starting Docker',
@@ -443,7 +443,7 @@ function describeHost(host: string): string {
 
 /** The plain reason of a failed connection to the remote Docker host `host` (see dockerHostProblem). */
 export function dockerHostReason(
-  problem: 'unreachable' | 'closedBeforeLogin' | 'login' | 'hostKey' | 'dockerMissing' | 'dockerNotRunning' | 'dockerPermission' | 'sshMissing' | 'unknown',
+  problem: DockerHostProblem,
   host: string,
 ): string {
   switch (problem) {
@@ -463,6 +463,10 @@ export function dockerHostReason(
       return 'Your user on that computer may not use Docker. Add it to the group docker there.';
     case 'sshMissing':
       return 'The SSH client (ssh) was not found on this computer.';
+    case 'wslMissing':
+      return 'WSL (wsl.exe) was not found on this computer.';
+    case 'wslDistributionMissing':
+      return `The WSL distribution ${wslDistributionOf(host) ?? host} is not installed on this computer.`;
     case 'unknown':
       return 'The details show why.';
   }

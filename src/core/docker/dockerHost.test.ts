@@ -26,6 +26,13 @@ import {
   sshTargetOf,
   unsupportedTargetReason,
   RUNTIME_DIR_COMMAND,
+  WSL_HOST,
+  hostAccessOf,
+  hostEndpoint,
+  parseWslList,
+  wslCommandArgs,
+  wslDistributionOf,
+  wslEnv,
 } from './dockerHost';
 
 describe('classifyDockerEndpoint (SSH only for another computer)', () => {
@@ -249,6 +256,46 @@ describe('rootless Docker on the remote computer', () => {
   });
 });
 
+describe('the WSL distribution of Devspaces as a host', () => {
+  it('names the distribution in its host, which is never an SSH alias or address', () => {
+    expect(WSL_HOST).toBe('wsl:devspaces');
+    expect(wslDistributionOf(WSL_HOST)).toBe('devspaces');
+    expect(wslDistributionOf('wsl:Ubuntu-24.04')).toBe('Ubuntu-24.04');
+    for (const host of ['wsl:', 'wsl:-d', 'wsl:a b', 'wsl:x/y', 'wsl:x;y', `wsl:${'a'.repeat(65)}`, 'devspaces', 'ssh://wsl:devspaces', 'WSL:devspaces']) {
+      expect(wslDistributionOf(host), host).toBeUndefined();
+    }
+    expect(sshTargetOf(WSL_HOST)).toBeUndefined();
+    expect(parseSshAddress(WSL_HOST).ok).toBe(false);
+  });
+
+  it('reaches an SSH host over SSH and the distribution through wsl.exe; any other host has no transport', () => {
+    expect(hostAccessOf(WSL_HOST)).toEqual({ kind: 'wsl', distribution: 'devspaces' });
+    expect(hostAccessOf('me@box:2222')).toEqual({ kind: 'ssh', address: { user: 'me', host: 'box', port: 2222 } });
+    expect(hostAccessOf('build-box')).toEqual({ kind: 'ssh', address: { host: 'build-box' } });
+    expect(hostAccessOf('box/path')).toBeUndefined();
+    expect(hostAccessOf('wsl:-x')).toBeUndefined();
+  });
+
+  it('gives its target the endpoint wsl://<distribution>, and an SSH host ssh://<host>', () => {
+    expect(remoteDockerTarget(WSL_HOST)).toEqual({ kind: 'remote', host: WSL_HOST, endpoint: 'wsl://devspaces' });
+    expect(hostEndpoint('build-box')).toBe('ssh://build-box');
+  });
+
+  it('runs a command as root in the root folder without a shell of the distribution, with the messages of wsl.exe in UTF-8', () => {
+    expect(wslCommandArgs('devspaces', ['sh', '-s'])).toEqual(['-d', 'devspaces', '-u', 'root', '--cd', '/', '--exec', 'sh', '-s']);
+    const base = { PATH: 'C:\\Windows\\System32', wsl_utf8: '0' };
+    expect(wslEnv(base)).toEqual({ PATH: 'C:\\Windows\\System32', WSL_UTF8: '1' });
+    expect(base).toEqual({ PATH: 'C:\\Windows\\System32', wsl_utf8: '0' });
+  });
+
+  it('reads the names of `wsl.exe --list --quiet`, also as UTF-16 of an older wsl.exe', () => {
+    expect(parseWslList('Ubuntu\r\ndevspaces\r\n\r\n')).toEqual(['Ubuntu', 'devspaces']);
+    const utf16 = Buffer.from('\uFEFFUbuntu\r\ndevspaces\r\n', 'utf16le').toString('utf8');
+    expect(parseWslList(utf16)).toEqual(['Ubuntu', 'devspaces']);
+    expect(parseWslList('')).toEqual([]);
+  });
+});
+
 describe('dockerHostProblem (plain reasons of a failed connection)', () => {
   it.each([
     ['error during connect: ssh: Could not resolve hostname build-box: Name or service not known', 'unreachable'],
@@ -274,6 +321,9 @@ describe('dockerHostProblem (plain reasons of a failed connection)', () => {
     ],
     ['kex_exchange_identification: Connection closed by remote host\r\nConnection closed by 192.0.2.10 port 22', 'closedBeforeLogin'],
     ['kex_exchange_identification: read: Connection reset by peer\r\nConnection reset by 192.0.2.10 port 22', 'closedBeforeLogin'],
+    // wsl.exe for a distribution that is not registered (WSL 2.x, and the older text).
+    ['There is no distribution with the supplied name.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND', 'wslDistributionMissing'],
+    ['There is no distribution with the supplied name.', 'wslDistributionMissing'],
     ['something else', 'unknown'],
   ])('%s → %s', (detail, problem) => {
     expect(dockerHostProblem(detail)).toBe(problem);

@@ -13,13 +13,24 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
-import { describeDockerHost, devspacesOfHost, dockerHostOf, sshCommandArgs, sshTargetOf, type DockerTarget } from '../core/docker/dockerHost';
+import {
+  WSL_LIST_ARGS,
+  describeDockerHost,
+  devspacesOfHost,
+  dockerHostOf,
+  hostAccessOf,
+  parseWslList,
+  sshCommandArgs,
+  wslCommandArgs,
+  wslEnv,
+  type DockerTarget,
+} from '../core/docker/dockerHost';
 import { RemovedEngineError, removedEngineImageNote, removedEngineNote } from '../core/docker/engineRemoval';
 import { ensureDockerRunning } from '../core/docker/dockerStart';
 import { DockerTargets, operationDockerTarget, outsideOperation, runWithDockerTarget } from '../core/docker/dockerTargets';
 import { SshLoginCache, noPromptEnv, sshHostsOfContexts, startDockerFor, type RemoteReachabilityDeps } from '../core/docker/remoteDocker';
 import { RelayConnectionError } from '../core/relay/connection';
-import { openRelayConnection, sshHostTransport, sshRelayTransport } from '../core/relay/transport';
+import { openRelayConnection, sshHostTransport, wslHostTransport } from '../core/relay/transport';
 import { RelayConnections, relayAccess } from '../core/relay/connections';
 import { serveWindowPipe, windowDockerHost } from '../core/relay/windowPipe';
 import { HostPipes } from '../core/relay/hostPipes';
@@ -107,6 +118,9 @@ import { REPOSITORIES_VIEW_ID, RepositoriesTreeProvider, expandAll, revealRow, t
 
 /** A window that gets the focus refreshes the sidebar at most this often. */
 const FOCUS_REFRESH_INTERVAL_MS = 15_000;
+
+/** Time limit of `wsl.exe --list --quiet`, which may start the WSL service; the choice of the host waits for it. */
+const WSL_LIST_TIMEOUT_MS = 10_000;
 
 /** Kept for deactivate(). */
 let coordinator: SessionCoordinator | undefined;
@@ -232,17 +246,22 @@ async function activateExtension(
   let backgroundPrebuild: HelperPrebuild | undefined;
   let daemonRunning = false;
   const adapterOptions = dockerAdapterOptions(() => dockerSetup);
-  // The Docker pipes of the extension, one per SSH host, and the shells before the relay; both set below.
+  // The Docker pipes of the extension, one per remote host, and the shells before the relay; both set below.
   let hostPipes: HostPipes | undefined;
   let remoteShells: RemoteShells | undefined;
   // The key of Devspaces for its SSH logins (the key offer), set below; the `ssh` of the Docker CLI uses it too.
   let keyOffer: SshKeyOffer | undefined;
   // Docker Desktop installed, updated, uninstalled or moved while VS Code runs is found or lost without a reload. The
   // Docker CLI of the extension is only the bootstrap's (BootstrapDocker). Its calls of an operation on an SSH host go
-  // through the Docker pipe of the extension for the host while a connection of the relay to it is open.
+  // through the Docker pipe of the extension for the host while a connection of the relay to it is open; on the WSL
+  // distribution of Devspaces always through its pipe.
   const docker = new BootstrapDocker(runner, dockerPath, env, logger, platform, {
     ...adapterOptions,
     dockerPipe: (target) => hostPipes?.dockerHost(target.host),
+    // The pipe of the WSL distribution listens from the first Docker call of an operation there.
+    servePipe: async (target) => {
+      if (hostAccessOf(target.host)?.kind === 'wsl') await hostPipes?.serve(target.host);
+    },
     // A call of an operation that only reads, while the host has no pipe: on the shell before the relay of the host.
     remoteShell: (target, args, options) => remoteShells?.docker(target.host, args, options) ?? Promise.resolve(undefined),
     // A call with `ssh://<host>`: the `ssh` of the Docker CLI with the key of Devspaces when the host has it.
@@ -276,6 +295,15 @@ async function activateExtension(
     }
   };
   const sshPath = (): string | undefined => findExecutable('ssh', env, platform);
+  // `wsl.exe` for the WSL distribution of Devspaces (docs/architecture.md "The WSL distribution of Devspaces"); only on
+  // Windows.
+  const wslPath = (): string | undefined => (platform === 'win32' ? findExecutable('wsl', env, platform) : undefined);
+  /** Whether the program of the transport of the remote host `host` is found (`ssh`, or `wsl.exe` for WSL). */
+  const transportFound = (host: string): boolean => {
+    const access = hostAccessOf(host);
+    if (access === undefined) return false;
+    return (access.kind === 'wsl' ? wslPath() : sshPath()) !== undefined;
+  };
   // After a login with a password in a flow of the user, Devspaces offers once per host to log in with its own key
   // (~/.ssh/devspaces_ed25519) next time; every later login of Devspaces to a host with the key uses it.
   const sshKeys = new SshKeyOffer({
@@ -293,14 +321,21 @@ async function activateExtension(
   });
   keyOffer = sshKeys;
   void sshKeys.prepare();
-  // `ssh … docker system dial-stdio` on an SSH host, for a connection of a Docker pipe without the relay. ssh is found
-  // once: a window that works without the relay makes many short Docker connections.
+  // `ssh … docker system dial-stdio` on an SSH host, or `wsl.exe … docker system dial-stdio` in the WSL distribution,
+  // for a connection of a Docker pipe without the relay. The program is found once: a window that works without the
+  // relay makes many short Docker connections.
   let dialSsh: string | undefined;
+  let dialWsl: string | undefined;
   const dialStdio = (host: string): StartedByteProcess | undefined => {
+    const access = hostAccessOf(host);
+    if (access?.kind === 'wsl') {
+      dialWsl ??= wslPath();
+      if (dialWsl === undefined) return undefined;
+      return runner.startBytes(dialWsl, wslCommandArgs(access.distribution, ['docker', 'system', 'dial-stdio']), { env: wslEnv(env) });
+    }
     dialSsh ??= sshPath();
-    const address = sshTargetOf(host);
-    if (dialSsh === undefined || address === undefined) return undefined;
-    return runner.startBytes(dialSsh, sshCommandArgs(address, 'docker system dial-stdio', undefined, { identity: sshKeys.identityFor(host) }), {
+    if (dialSsh === undefined || access === undefined) return undefined;
+    return runner.startBytes(dialSsh, sshCommandArgs(access.address, 'docker system dial-stdio', undefined, { identity: sshKeys.identityFor(host) }), {
       env: noPromptEnv(env),
     });
   };
@@ -331,10 +366,18 @@ async function activateExtension(
    * A new login `ssh … sh -s` to `host` (sshHostTransport), for a shell before the relay or a connection of the relay.
    * Within a flow of the user (withSshPrompts), it may ask in VS Code until the Cancel of the flow; its questions end
    * with its process. With the key of Devspaces when the host has it; after a login that asked for the password, the key
-   * offer runs on the shell (SshKeyOffer.afterLogin). Undefined without `ssh` and for a host that is no SSH alias or
-   * address.
+   * offer runs on the shell (SshKeyOffer.afterLogin). For the WSL distribution of Devspaces `wsl.exe … sh -s`
+   * (wslHostTransport), which asks nothing. Undefined without the program of the transport and for a host that has
+   * none (hostAccessOf).
    */
   const startLogin = (host: string): RemoteShellStart | undefined => {
+    const access = hostAccessOf(host);
+    if (access?.kind === 'wsl') {
+      const wsl = wslPath();
+      if (wsl === undefined) return undefined;
+      const transport = wslHostTransport(access.distribution, wsl, env);
+      return { process: runner.startBytes(transport.file, transport.args, { env: transport.env }) };
+    }
     const ssh = sshPath();
     if (ssh === undefined) return undefined;
     const login: SshLogin | undefined = sshPromptsAllowed() ? askpass.login(host, sshPromptSignal()) : undefined;
@@ -347,8 +390,8 @@ async function activateExtension(
     if (login !== undefined) void process.exited.then(() => login.dispose());
     return { process, prompts: login, afterLogin: login === undefined ? undefined : (shell) => sshKeys.afterLogin(host, login, shell) };
   };
-  // The shells before the relay, one per SSH host: the checks before a connection of the relay run on one login, which
-  // the connection then takes over (`ssh … sh -s`, as its transport).
+  // The shells before the relay, one per remote host: the checks before a connection of the relay run on one login,
+  // which the connection then takes over (`ssh … sh -s` or `wsl.exe … sh -s`, as its transport).
   remoteShells = new RemoteShells({ logger, start: startLogin });
   const shells = remoteShells;
   // The SSH check before the Docker calls to a remote host: the login of its shell before the relay. A success counts
@@ -517,16 +560,17 @@ async function activateExtension(
       openHelperChannel(
         {
           start: (args) => docker.start(args),
-          // A remote engine: the worker behind the relay, on the open connection of the host, or with one SSH login
-          // (`ssh … sh -s`).
+          // A remote engine: the worker behind the relay, on the open connection of the host, or with one login
+          // (`ssh … sh -s`, or `wsl.exe … sh -s` for the WSL distribution).
           relay: (target) => {
-            const ssh = sshPath();
-            if (ssh === undefined || sshRelayTransport(target, ssh, env) === undefined) return undefined;
+            if (target.kind !== 'remote' || !transportFound(target.host)) return undefined;
             // The login of the shell before the relay, when its checks left one open; else a new one, which may ask
             // within a flow of the user.
             const start = () => {
               const started = startLogin(target.host);
-              if (started === undefined) throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ssh was not found, or it is no SSH alias or address.`);
+              if (started === undefined) {
+                throw new RelayConnectionError(`The connection to ${target.host} could not be opened: the program of its transport (ssh or wsl.exe) was not found, or it has no transport.`);
+              }
               return started;
             };
             return relayAccess(relayConnections, target.host, (command, bundle) =>
@@ -863,6 +907,19 @@ async function activateExtension(
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
     sshEnv: (host, callEnv) => sshKeys.dockerSshEnv(host, callEnv),
+    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host. Without
+    // WSL, or without a distribution, `wsl.exe` says so with an exit code that is not 0: then there is none.
+    wslDistributions: async () => {
+      const wsl = wslPath();
+      if (wsl === undefined) return [];
+      const result = await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS });
+      if (result.timedOut) throw new Error(`wsl.exe ${WSL_LIST_ARGS.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
+      if (result.exitCode !== 0) {
+        logger.info(`wsl.exe ${WSL_LIST_ARGS.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
+        return [];
+      }
+      return parseWslList(result.stdout);
+    },
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();
@@ -904,14 +961,14 @@ async function activateExtension(
     revealRow: (rowId) => revealRow(view, tree, rowId),
     development: context.extensionMode === vscode.ExtensionMode.Development,
     dockerTargets: targets,
-    // The Docker pipe of the window of a devspace on an SSH host (docs/architecture.md "The Docker pipe").
+    // The Docker pipe of the window of a devspace on a remote host (docs/architecture.md "The Docker pipe").
     windowDockerHost: (devspace, shownContainer) =>
       windowDockerHost(devspace, shownContainer, {
         computerId,
         platform,
         env,
         tmpdir: os.tmpdir(),
-        sshFound: () => sshPath() !== undefined,
+        transportFound,
         current: connection.currentDockerHost(),
       }),
     remoteDocker,

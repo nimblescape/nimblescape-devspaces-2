@@ -2,9 +2,10 @@
 // © 2026 Hannes Stauss (scalarion@nimblescape.com)
 // Licensed under the MIT License. See LICENSE in the repository root for details.
 
-// The shells before the relay of this window (docs/architecture.md "The shell before the relay"): at most one per SSH
-// host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
-// it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
+// The shells before the relay of this window (docs/architecture.md "The shell before the relay"): at most one per remote
+// host (an SSH host, or the WSL distribution of Devspaces), opened by the first check or Docker call before a connection
+// of the relay to the host, used by the calls after it, and taken over by the next connection of the relay to the host
+// (takeOver). No `vscode`.
 import { errorMessage } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
 import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
@@ -24,7 +25,10 @@ export interface RemoteShellStart {
 
 export interface RemoteShellsOptions {
   logger: Logger;
-  /** Starts the login `ssh … sh -s` to `host` (sshRelayTransport); undefined when the host has no transport. */
+  /**
+   * Starts the login `ssh … sh -s` to `host` (sshHostTransport), or `wsl.exe … sh -s` for a WSL distribution
+   * (wslHostTransport); undefined when the host has no transport.
+   */
   start(host: string): RemoteShellStart | undefined;
   /** Only for the tests. */
   loginTimeoutMs?: number;

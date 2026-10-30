@@ -332,6 +332,16 @@ After a login with your password, Devspaces asks once: "Log in to `<host>` witho
 - The key has no passphrase, so every program of your user on this computer can use it (see [Security](security.md#remote-and-shared-engines)). One key serves all hosts. To remove it from a host, delete the line that ends with `devspaces@<name of your computer>` from `~/.ssh/authorized_keys` there.
 - When the key cannot be set up, a warning says why, for example when the SSH server of the host allows no keys. When the test login with the key failed, Devspaces removes the line of the key from `authorized_keys` again. Devspaces then asks again after the next login with your password, unless you choose **Not for This Host** in the warning.
 
+### The WSL distribution of Devspaces (Windows)
+
+On Windows, Devspaces can use Docker Engine in a WSL distribution of its own, named `devspaces`, as a host of its list: without Docker Desktop and without SSH.
+
+- **Use it**: when the distribution `devspaces` exists on your computer, **Devspaces: Use a Remote Docker Host…** lists it as `wsl:devspaces` in the group **WSL**. Devspaces tests it with `docker info` in the distribution and then uses it as any other host of its list: the same view, the same windows, and the same Docker CLI of Devspaces.
+- **No login**: Devspaces starts `wsl.exe` as your Windows user and runs its commands as root of the distribution. WSL starts the distribution when it does not run. There is no password, no key, and no question.
+- **For now**: this version does not create the distribution. It uses a distribution with the name `devspaces` in which Docker Engine runs, so that `docker info` works there as root. The setup of the distribution by Devspaces comes in a later version.
+- When the distribution is not installed, the message says so. A devspace in the distribution opens only on this computer: on another computer, its window does not open, and the message says that WSL is missing.
+- **Remove by hand**: the Docker commands of [Remove by hand](#remove-by-hand) work with `wsl -d devspaces -u root -- docker` in place of `docker`.
+
 ### What to know
 
 - The view and the switcher show only the devspaces of the current Docker engine, and the commands of the Command Palette act only on them. Each devspace belongs to the engine where it was created, and a repository gets its own devspace on each engine. Two names of the same computer (an SSH alias and `user@address`) count as two hosts. A window of a devspace that opens again, for example from **Open Recent**, always runs on the engine of its devspace, without a question. So do **Close and Keep Running** and **Reconnect** in the status bar of that window, also while another engine is current.

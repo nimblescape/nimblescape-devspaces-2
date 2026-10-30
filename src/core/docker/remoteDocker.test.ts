@@ -10,7 +10,7 @@ import { UserFacingError } from '../errors';
 import { Messages, dockerHostReason } from '../messages';
 import type { RunOptions, RunResult } from '../ports';
 import { RemoteDockerState } from '../storage/remoteDockerState';
-import { remoteDockerTarget } from './dockerHost';
+import { WSL_HOST, remoteDockerTarget } from './dockerHost';
 import { UNREADABLE_DOCKER_TARGET, operationDockerTarget } from './dockerTargets';
 import {
   CONTEXT_COMMAND_TIMEOUT_MS,
@@ -310,6 +310,83 @@ describe('the ssh check before the Docker calls', () => {
       message: Messages.dockerHostUnreachable('me@box:2222', dockerHostReason('hostKey', 'me@box:2222')),
     });
     expect(docker.calls).toHaveLength(2);
+  });
+});
+
+describe('the WSL distribution of Devspaces: no SSH', () => {
+  type Login = { ok: true } | { ok: false; detail: string; timedOut: boolean } | undefined;
+  // `null`: the window has no shell for the distribution (no wsl.exe).
+  const wslShells = (login: Login | null = { ok: true }, answer: RunResult | null = info()) => ({
+    login: vi.fn(async (_host: string, _signal?: AbortSignal, _options?: { fresh?: boolean }): Promise<Login> => login ?? undefined),
+    run: vi.fn(async (_host: string, _command: string, _options?: Pick<RunOptions, 'timeoutMs' | 'signal'>): Promise<RunResult | undefined> => answer ?? undefined),
+  });
+  const missing = { ok: false, detail: 'There is no distribution with the supplied name.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND', timedOut: false } as const;
+
+  it('tests the distribution on a new shell before the relay (wsl.exe), never with ssh or docker -H', async () => {
+    const docker = fakeDocker(() => info());
+    const runner = sshRunner();
+    const shells = wslShells();
+    const sshLogins = new SshLoginCache();
+    await expect(testRemoteDockerHost(docker, WSL_HOST, { runner, sshPath: undefined, env: {}, shells, sshLogins })).resolves.toEqual({ ok: true, version: '28.1.0', rootless: false });
+    expect(shells.login).toHaveBeenCalledWith(WSL_HOST, undefined, { fresh: true });
+    expect(shells.run.mock.calls.map((call) => call[1])).toEqual([`'docker' 'info' '--format' '${ENGINE_INFO_FORMAT}'`]);
+    expect(sshLogins.isFresh(WSL_HOST)).toBe(true);
+    expect(docker.calls).toEqual([]);
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('names a distribution that is not registered, a missing wsl.exe, and a missing Docker in it', async () => {
+    const docker = fakeDocker(() => info());
+    const deps = { runner: sshRunner(), sshPath: '/usr/bin/ssh', env: {} };
+    await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(missing) })).resolves.toMatchObject({ ok: false, problem: 'wslDistributionMissing' });
+    await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(null) })).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    await expect(testRemoteDockerHost(docker, WSL_HOST, deps)).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, fail('sh: 1: docker: not found', 127)) })).resolves.toMatchObject({
+      ok: false,
+      problem: 'dockerMissing',
+    });
+    expect(docker.calls).toEqual([]);
+    expect(deps.runner.run).not.toHaveBeenCalled();
+    expect(dockerHostReason('wslDistributionMissing', WSL_HOST)).toBe('The WSL distribution devspaces is not installed on this computer.');
+    expect(dockerHostReason('wslMissing', WSL_HOST)).toBe('WSL (wsl.exe) was not found on this computer.');
+  });
+
+  it('checks the distribution with the start of its shell before an operation, also while its Docker pipe listens', async () => {
+    const runner = sshRunner();
+    const sshLogins = new SshLoginCache();
+    const shells = wslShells();
+    const deps = { runner, sshPath: '/usr/bin/ssh', env: {}, sshLogins, shells, viaDockerPipe: () => true };
+    await expect(checkSshLogin(WSL_HOST, deps)).resolves.toEqual({ ok: true });
+    // A success of the last minute counts.
+    await expect(checkSshLogin(WSL_HOST, deps)).resolves.toEqual({ ok: true, skipped: 'cached' });
+    expect(shells.login).toHaveBeenCalledTimes(1);
+    sshLogins.forget(WSL_HOST);
+    shells.login.mockResolvedValueOnce(missing);
+    await expect(checkSshLogin(WSL_HOST, deps)).resolves.toMatchObject({ ok: false, problem: 'wslDistributionMissing' });
+    expect(sshLogins.isFresh(WSL_HOST)).toBe(false);
+    await expect(checkSshLogin(WSL_HOST, { ...deps, shells: undefined })).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('reaches the engine of an operation there after the check, and says why it cannot', async () => {
+    const docker = fakeDocker(() => info());
+    const runner = sshRunner();
+    const shells = wslShells();
+    await ensureDockerHostReachable(remoteDockerTarget(WSL_HOST), { docker, runner, state, logger, sshPath: undefined, env: {}, shells });
+    expect(docker.calls.map((call) => call.args)).toEqual([['info', '--format', ENGINE_INFO_FORMAT]]);
+    const error = await ensureDockerHostReachable(remoteDockerTarget(WSL_HOST), { docker, runner, state, logger, sshPath: undefined, env: {}, shells: wslShells(missing) }).catch(
+      (caught: unknown) => caught,
+    );
+    expect((error as UserFacingError).message).toBe(Messages.dockerHostUnreachable(WSL_HOST, dockerHostReason('wslDistributionMissing', WSL_HOST)));
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('reads the runtime folder of a rootless engine only on its shell', async () => {
+    const runner = { run: vi.fn(async () => ok('/run/user/9')) };
+    await expect(readRootlessSocket(runner, undefined, WSL_HOST, {}, undefined, wslShells({ ok: true }, ok('/run/user/0')))).resolves.toEqual({ ok: true, socket: '/run/user/0/docker.sock' });
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {}, undefined, wslShells({ ok: true }, null))).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {})).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    expect(runner.run).not.toHaveBeenCalled();
   });
 });
 
