@@ -289,6 +289,31 @@ describe('the start entry of the WSL distribution', () => {
     expect(state.entry).toBe(true);
   });
 
+  // Mutation: an update per call fails it (an answer runs it twice: the change of the setting and the answer); so does
+  // one that is skipped while another one already began (it may have read the state before the change).
+  it('one update that waits and has not begun yet covers a second call', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const reads: string[] = [];
+    const { subject } = keeper({
+      runner: {
+        run: async (_file, args) => {
+          reads.push(String(args[0]));
+          if (reads.length === 1) await gate;
+          return result(1);
+        },
+      },
+    });
+    const first = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    await vi.waitFor(() => expect(reads).toEqual(['query']));
+    // The first began: a second one waits, and a third joins it.
+    const second = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    const third = subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    release();
+    await Promise.all([first, second, third]);
+    expect(reads).toEqual(['query', 'query']);
+  });
+
   // Mutation: a keeper whose start writes the registry fails it (one read per minute and window for nothing).
   it('is not read or written by the start of the keeper', async () => {
     const { subject, runs, launches } = keeper({ permanent: true });

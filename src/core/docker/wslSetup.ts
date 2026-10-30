@@ -143,6 +143,16 @@ export function supportsFromFile(version: readonly [number, number, number]): bo
   return true;
 }
 
+/**
+ * Whether the result of `wsl.exe --list --quiet` (WSL_LIST_ARGS) names the distribution `distribution` (without case):
+ * false also when WSL has no distribution (NO_DISTRIBUTIONS); undefined when the list ends with another exit code
+ * that is not 0.
+ */
+export function listsDistribution(result: RunResult, distribution: string): boolean | undefined {
+  if (result.exitCode !== 0) return NO_DISTRIBUTIONS.test(wslText(`${result.stdout}\n${result.stderr}`)) ? false : undefined;
+  return parseWslList(result.stdout).some((name) => name.toLowerCase() === distribution.toLowerCase());
+}
+
 /** `reg.exe` in System32 of SystemRoot, not from PATH. */
 export function regExePath(env: NodeJS.ProcessEnv): string {
   const systemRoot = envValue(env, 'SystemRoot', 'win32') ?? 'C:\\Windows';
@@ -753,9 +763,7 @@ export class WslSetup {
    * Throws WslSetupError (runShort).
    */
   private async listed(signal?: AbortSignal): Promise<boolean | undefined> {
-    const result = await this.runShort(WSL_LIST_ARGS, signal);
-    if (result.exitCode !== 0) return NO_DISTRIBUTIONS.test(wslText(`${result.stdout}\n${result.stderr}`)) ? false : undefined;
-    return parseWslList(result.stdout).some((name) => name.toLowerCase() === WSL_DISTRIBUTION);
+    return listsDistribution(await this.runShort(WSL_LIST_ARGS, signal), WSL_DISTRIBUTION);
   }
 
   /**

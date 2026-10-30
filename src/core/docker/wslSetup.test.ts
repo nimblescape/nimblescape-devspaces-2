@@ -25,6 +25,7 @@ import {
   WslSetup,
   WslSetupError,
   debianImageOf,
+  listsDistribution,
   parseLxssExport,
   parseWslVersion,
   regExportArgs,
@@ -266,6 +267,18 @@ describe('WslSetup.checkWsl', () => {
   it('says that WSL does not answer when a short call ends by its time limit', async () => {
     const runner = wslRunner(() => timedOut);
     await expect(setup({ runner }).checkWsl()).rejects.toMatchObject({ problem: 'wslNotAnswering', message: 'wsl.exe --version did not answer within 15 seconds.' });
+  });
+});
+
+// Mutation: a list that fails for another reason and counts as one without the distribution fails it (the start entry
+// of the distribution would go after a moment of a broken WSL).
+describe('listsDistribution', () => {
+  const run = (exitCode: number, stdout: string, stderr = ''): RunResult => ({ exitCode, stdout, stderr, timedOut: false });
+  it('names the distribution without case; false without it, and when WSL has no distribution; undefined for another failure', () => {
+    expect(listsDistribution(run(0, 'Ubuntu\r\nDevspaces\r\n'), 'devspaces')).toBe(true);
+    expect(listsDistribution(run(0, 'Ubuntu\r\n'), 'devspaces')).toBe(false);
+    expect(listsDistribution(run(1, 'Fehlercode: Wsl/WSL_E_DEFAULT_DISTRO_NOT_FOUND'), 'devspaces')).toBe(false);
+    expect(listsDistribution(run(1, '', 'Error code: Wsl/Service/E_UNEXPECTED'), 'devspaces')).toBeUndefined();
   });
 });
 

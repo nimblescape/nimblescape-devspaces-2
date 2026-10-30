@@ -168,6 +168,20 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     expect(useHost).not.toHaveBeenCalled();
   });
 
+  // Mutation: a new distribution that keeps the answer about the Monitor of one that was removed by hand fails it: it
+  // would get a permanent Monitor and a start entry without the question; so does a repair that forgets the answer.
+  it('forgets the old distribution before a new one is set up, and not for a repair', async () => {
+    const order: string[] = [];
+    const forgetDistribution = vi.fn(async () => void order.push('forget'));
+    setup.setUp.mockImplementation(async () => (order.push('set up'), '29.9.2'));
+    window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
+    await commands({ forgetDistribution }).setUp();
+    expect(order).toEqual(['forget', 'set up']);
+    registered('own');
+    await commands({ forgetDistribution }).setUp();
+    expect(order).toEqual(['forget', 'set up', 'set up']);
+  });
+
   it('sets up a distribution of Devspaces again without a download', async () => {
     registered('own');
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.setUp);
@@ -272,23 +286,23 @@ describe('Remove the WSL Distribution of Devspaces…', () => {
   // Mutation: a start entry that stays after the removal fails it: Windows would run wslg.exe for a distribution that is
   // gone at each logon; so does an answer about its Monitor that stays (the next window would add the entry again).
   it('forgets the distribution (its Monitor answer and its start entry) with its removal, and with the files of one that is gone', async () => {
-    const distributionGone = vi.fn(async () => undefined);
+    const forgetDistribution = vi.fn(async () => undefined);
     registered('own');
     window.showWarningMessage.mockResolvedValue(WslSetupTexts.remove);
-    await commands({ distributionGone }).remove();
+    await commands({ forgetDistribution }).remove();
     expect(setup.remove).toHaveBeenCalledTimes(1);
-    expect(distributionGone).toHaveBeenCalledTimes(1);
+    expect(forgetDistribution).toHaveBeenCalledTimes(1);
     registered('none');
-    await commands({ distributionGone }).remove();
+    await commands({ forgetDistribution }).remove();
     expect(setup.removeLeftovers).toHaveBeenCalledTimes(1);
-    expect(distributionGone).toHaveBeenCalledTimes(2);
+    expect(forgetDistribution).toHaveBeenCalledTimes(2);
     // Nothing without the answer Remove, and nothing for a distribution that Devspaces did not set up.
     window.showWarningMessage.mockResolvedValue(undefined);
     registered('own');
-    await commands({ distributionGone }).remove();
+    await commands({ forgetDistribution }).remove();
     registered('foreign');
-    await commands({ distributionGone }).remove();
-    expect(distributionGone).toHaveBeenCalledTimes(2);
+    await commands({ forgetDistribution }).remove();
+    expect(forgetDistribution).toHaveBeenCalledTimes(2);
   });
 
   it('names the folder of the distribution when it stays', async () => {

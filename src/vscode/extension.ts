@@ -13,7 +13,7 @@ import { attachDiagnostics } from '../core/docker/attachDiagnostics';
 import { BootstrapDocker } from '../core/docker/bootstrapDocker';
 import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable, putFolderFirstInPath } from '../core/docker/dockerCli';
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
-import { WslSetup, wslSetupFolder } from '../core/docker/wslSetup';
+import { WslSetup, endOf, listsDistribution, outputOf, wslSetupFolder } from '../core/docker/wslSetup';
 import { WslKeeper } from '../core/docker/wslKeeper';
 import { WslLifetime } from '../core/docker/wslLifetime';
 import {
@@ -683,13 +683,13 @@ async function activateExtension(
     wslPath,
     env,
     launch: (file, args, onExit) => launchDetachedProcess(file, args, onExit, { windowsHide: true }),
+    // Only WSL_E_DEFAULT_DISTRO_NOT_FOUND counts as a list without it; another failure tells nothing.
     registered: async (distribution) => {
-      try {
-        return (await wslDistributions()).some((name) => name.toLowerCase() === distribution.toLowerCase());
-      } catch (error) {
-        logger.warn(`The WSL distributions could not be listed, so the start entry of ${distribution} stays as it is: ${errorMessage(error)}`);
-        return undefined;
-      }
+      const wsl = wslPath();
+      const result = wsl === undefined ? undefined : await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS }).catch(() => undefined);
+      const listed = result === undefined || result.timedOut ? undefined : listsDistribution(result, distribution);
+      if (listed === undefined) logger.warn(`WSL did not tell whether it lists the distribution ${distribution}, so its start entry stays as it is${result === undefined ? '' : ` (${endOf(result, WSL_LIST_TIMEOUT_MS)}: ${outputOf(result)})`}.`);
+      return listed;
     },
     monitorPermanent: (host) => monitorSettings.permanentIfKnown(host),
     logger,
@@ -1010,7 +1010,7 @@ async function activateExtension(
     useHost: (host) => remoteDocker.useHost(host),
     forgetHost: (host) => remoteDocker.forgetHost(host),
     // A new distribution is a new engine: the question about its Monitor comes again, and the start entry goes.
-    distributionGone: async () => {
+    forgetDistribution: async () => {
       await engineRecords.forgetMonitorAnswer(WSL_HOST).catch((error: unknown) => logger.warn(`The answer about the Monitor on ${describeDockerHost(WSL_HOST)} could not be forgotten: ${errorMessage(error)}`));
       await keeper.removeStartEntry(WSL_DISTRIBUTION);
     },
