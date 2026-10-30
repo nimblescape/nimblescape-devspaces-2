@@ -237,7 +237,7 @@ describe('WslLifetime.use', () => {
     const { subject } = lifetime({ keeper: { keep } });
     subject.use(WSL_HOST);
     expect(keep).toHaveBeenCalledTimes(1);
-    expect(keep).toHaveBeenCalledWith(WSL_HOST, 'devspaces');
+    expect(keep).toHaveBeenCalledWith('devspaces');
     subject.use(WSL_HOST);
     expect(keep).toHaveBeenCalledTimes(2);
     subject.use('');

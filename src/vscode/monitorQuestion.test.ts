@@ -106,6 +106,10 @@ describe('the question about the Monitor of an engine', () => {
     expect(options.detail).toBe(ControllerTexts.monitorQuestionDetail(true));
     expect(options.detail).toContain('Devspaces adds a start entry of your Windows user, so that WSL starts the distribution when you log on to Windows.');
     expect(ControllerTexts.monitorQuestionDetail(false)).not.toContain('start entry');
+    // Another WSL distribution gets no start entry.
+    fakeVscode.window.showInformationMessage.mockResolvedValueOnce(undefined);
+    await question().askIfNeeded('wsl:Ubuntu');
+    expect((modals()[3] as [string, { detail: string }])[1].detail).toBe(ControllerTexts.monitorQuestionDetail(false));
   });
 
   it('the detail says that only Stop When Idle applies to all engines, and names the build of the next image', () => {

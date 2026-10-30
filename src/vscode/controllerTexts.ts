@@ -37,7 +37,7 @@ export const ControllerTexts = {
    * that would keep running (`engine`: describeDockerHost). "Keep Running" is the first and default button.
    */
   monitorQuestion: (engine: string) => `Keep the Devspaces background container running on ${engine}?`,
-  /** `wsl`: the engine is a WSL distribution, which Windows starts at the logon for a Monitor that keeps running (WslKeeper). */
+  /** `wsl`: the engine is the WSL distribution of Devspaces, which Windows starts at the logon for a Monitor that keeps running (WslKeeper). */
   monitorQuestionDetail: (wsl: boolean): string =>
     'The container devspaces-monitor updates the images of your devspaces, the VS Code Server and your extensions, by default once a day. ' +
     'When the base image or the Features of a devspace changed, it also builds the next image of that devspace, so that the update at the next start is fast. ' +

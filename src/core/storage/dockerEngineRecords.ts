@@ -114,6 +114,19 @@ export class DockerEngineRecords {
     return outcome;
   }
 
+  /**
+   * Forgets the answer about the Monitor of the engine `host`, because that engine is gone (the removal of the WSL
+   * distribution of Devspaces): a new engine there is asked again. The rest of its record stays.
+   */
+  async forgetMonitorAnswer(host: string): Promise<void> {
+    await this.change(host, (record) => {
+      if (record.monitorAnsweredAt === undefined) return undefined;
+      const rest = { ...record };
+      delete rest.monitorAnsweredAt;
+      return rest;
+    });
+  }
+
   /** True while the engine `host` has the removal mark. */
   async removed(host: string): Promise<boolean> {
     return (await this.read()).some((record) => record.host === host && record.removedAt !== undefined);

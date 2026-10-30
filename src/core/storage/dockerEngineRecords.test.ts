@@ -54,6 +54,19 @@ describe('DockerEngineRecords: the answer to the question about the Monitor', ()
     expect(JSON.parse(fs.readFileSync(records.file, 'utf8'))).toEqual({ engines: await records.read() });
   });
 
+  // Mutation: a forget that removes the record of another engine, or the removal mark of the engine, fails it.
+  it('forgets the answer of one engine (its engine is gone), and keeps the rest of the records', async () => {
+    fs.writeFileSync(records.file, JSON.stringify({ engines: [{ host: 'wsl:devspaces', monitorAnsweredAt: NOW, removedAt: NOW }, { host: '', monitorAnsweredAt: NOW }] }));
+    await records.forgetMonitorAnswer('wsl:devspaces');
+    expect(await records.read()).toEqual([
+      { host: '', monitorAnsweredAt: NOW },
+      { host: 'wsl:devspaces', removedAt: NOW },
+    ]);
+    await records.forgetMonitorAnswer('');
+    await records.forgetMonitorAnswer('build-box');
+    expect(await records.read()).toEqual([{ host: 'wsl:devspaces', removedAt: NOW }]);
+  });
+
   it('a file that is not valid, or entries that are not, count as no answer', async () => {
     fs.writeFileSync(records.file, '{ not json');
     expect(await records.monitorAnswered('')).toBe(false);

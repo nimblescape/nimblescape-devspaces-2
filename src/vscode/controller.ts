@@ -217,6 +217,11 @@ export interface ControllerDeps {
   engineRecords?: Pick<DockerEngineRecords, 'setRemoved' | 'record' | 'removing' | 'startRemoval' | 'endRemoval' | 'clearRemoved'>;
   /** "Remove Devspaces from This Docker Engine…" (removeFromDockerEngine). Without it, the command does nothing. */
   engineRemoval?: EngineRemovalDeps;
+  /**
+   * "Remove Devspaces from This Docker Engine…" ended on the engine `host`, with or without a change of its removal
+   * mark (the start entry of the WSL distribution of Devspaces follows it). Never throws.
+   */
+  engineRemovalEnded?: (host: string) => void;
   /** The VS Code setting `workbench.list.openMode` (double-click on a row, rowActivation.ts). Default: `readListOpenMode`. */
   listOpenMode?: () => ListOpenMode;
   /** True in an Extension Development Host (a debug run of this extension): the reopen rule is relaxed. */
@@ -1440,6 +1445,7 @@ export class Controller implements vscode.Disposable {
       await this.removeFromCheckedEngine(removal, target, known, here);
     } finally {
       this.removingFrom = undefined;
+      this.deps.engineRemovalEnded?.(target.host);
     }
   }
 

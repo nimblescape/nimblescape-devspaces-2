@@ -1000,7 +1000,11 @@ async function activateExtension(
     showLog: () => logger.show(),
     useHost: (host) => remoteDocker.useHost(host),
     forgetHost: (host) => remoteDocker.forgetHost(host),
-    removeStartEntry: () => keeper.removeStartEntry(WSL_DISTRIBUTION),
+    // A new distribution is a new engine: the question about its Monitor comes again, and the start entry goes.
+    distributionGone: async () => {
+      await engineRecords.forgetMonitorAnswer(WSL_HOST).catch((error: unknown) => logger.warn(`The answer about the Monitor on ${describeDockerHost(WSL_HOST)} could not be forgotten: ${errorMessage(error)}`));
+      await keeper.removeStartEntry(WSL_DISTRIBUTION);
+    },
   });
   // A Docker context or DOCKER_HOST of the user that reaches a host over SSH while Devspaces uses the local Docker: its
   // host is offered once for the list (in the background; the read that found it goes on).
@@ -1063,6 +1067,7 @@ async function activateExtension(
     monitorQuestion: new MonitorQuestion({ records: engineRecords, settings: getSettings, logger, showLog: () => logger.show(), answered: (host) => updateStartEntry(host) }),
     // The removal mark of the engines, which a Start, a Rebuild and "Update All Images Now" of the user clear there.
     engineRecords,
+    engineRemovalEnded: (host) => updateStartEntry(host),
     // "Remove Devspaces from This Docker Engine…": whether the engine answers (as for the background builds: Docker is
     // never started, a remote host gets the SSH check without questions first), the Docker CLI of the extension for the
     // inventory and the removal, the end of this window's worker there, and the ID of this computer.
@@ -1106,14 +1111,12 @@ async function activateExtension(
   const background = (promise: Promise<unknown>, what: string): void => {
     promise.catch((error: unknown) => logger.error(`Could not ${what}.`, error));
   };
-  // The start entry of a WSL distribution follows the mode of its Monitor (WslKeeper.updateStartEntry): with each start
-  // of its keeper, after an answer to the question about its Monitor, after a change of stopMonitorWhenIdle, and at the
-  // start of the window for the distribution of Devspaces, also while no window uses it (for example after "Remove
-  // Devspaces from This Docker Engine…" there): one read of the registry per window and state.
+  // The start entry of the WSL distribution of Devspaces (only that one) follows the mode of its Monitor
+  // (WslKeeper.updateStartEntry): at the start of the window, after an answer to the question about its Monitor, after a
+  // change of stopMonitorWhenIdle, and after "Remove Devspaces from This Docker Engine…" there. Each reads the registry.
   const updateStartEntry = (host: string): void => {
-    const access = hostAccessOf(host);
-    if (access?.kind !== 'wsl' || wslPath() === undefined) return;
-    background(keeper.updateStartEntry(host, access.distribution), `update the start entry of the WSL distribution ${access.distribution}`);
+    if (host !== WSL_HOST || wslPath() === undefined) return;
+    background(keeper.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION), 'update the start entry of the WSL distribution of Devspaces');
   };
   updateStartEntry(WSL_HOST);
 

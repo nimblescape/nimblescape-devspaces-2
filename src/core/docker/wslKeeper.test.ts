@@ -12,6 +12,7 @@ import { WSL_DISTRIBUTION, WSL_HOST, wslCommandArgs } from './dockerHost';
 import {
   KEEPER_LAUNCH_MS,
   KEEPER_LOCK,
+  KEEPER_LOCK_WAIT_SECONDS,
   KEEPER_SCRIPT,
   MAX_START_ENTRY,
   START_ENTRY_KEY,
@@ -72,7 +73,7 @@ function keeper(over: Partial<WslKeeperDeps> & { permanent?: boolean; removed?: 
 describe('the keeper of the WSL distribution', () => {
   it('starts with wslg.exe (no console window): sh -c with the script as root, from the root folder', async () => {
     const { subject, launches, log } = keeper();
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     await vi.waitFor(() => expect(launches).toHaveLength(1));
     expect(launches[0]).toEqual({ file: WSLG, args: ['-d', 'devspaces', '-u', 'root', '--cd', '/', '--shell-type', 'none', 'sh', '-c', KEEPER_SCRIPT] });
     expect(launches[0]?.args).toEqual(keeperWslgArgs(WSL_DISTRIBUTION));
@@ -81,10 +82,10 @@ describe('the keeper of the WSL distribution', () => {
 
   it('starts with wsl.exe --exec without wslg.exe, and not at all without either', async () => {
     const plain = keeper({ wslg: false });
-    plain.subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    plain.subject.keep(WSL_DISTRIBUTION);
     await vi.waitFor(() => expect(plain.launches).toEqual([{ file: WSL, args: wslCommandArgs(WSL_DISTRIBUTION, ['sh', '-c', KEEPER_SCRIPT]) }]));
     const none = keeper({ wslg: false, wslPath: () => undefined });
-    none.subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    none.subject.keep(WSL_DISTRIBUTION);
     await new Promise((resolve) => setImmediate(resolve));
     expect(none.launches).toEqual([]);
   });
@@ -93,18 +94,18 @@ describe('the keeper of the WSL distribution', () => {
   it('starts at most once a minute in a window, and not after dispose', async () => {
     let now = 1_000_000;
     const { subject, launches } = keeper({ now: () => now });
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     now += KEEPER_LAUNCH_MS - 1;
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     await new Promise((resolve) => setImmediate(resolve));
     expect(launches).toHaveLength(1);
     now += 1;
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     await vi.waitFor(() => expect(launches).toHaveLength(2));
     now += KEEPER_LAUNCH_MS;
     subject.dispose();
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     await new Promise((resolve) => setImmediate(resolve));
     expect(launches).toHaveLength(2);
   });
@@ -112,9 +113,9 @@ describe('the keeper of the WSL distribution', () => {
   it('logs a start that fails once while it stays the same', async () => {
     let now = 1_000_000;
     const { subject, log } = keeper({ now: () => now, launch: async () => Promise.reject(new Error('spawn EPERM')) });
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     now += KEEPER_LAUNCH_MS;
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
+    subject.keep(WSL_DISTRIBUTION);
     await vi.waitFor(() => expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('could not start, so WSL stops the distribution 15 seconds after VS Code closed: spawn EPERM')));
     await new Promise((resolve) => setImmediate(resolve));
     expect(log.warn.mock.calls.filter(([text]) => String(text).includes('could not start'))).toHaveLength(1);
@@ -142,9 +143,26 @@ describe('the start entry of the WSL distribution', () => {
     expect(regAddArgs(NAME, 'x')).toEqual(['add', START_ENTRY_KEY, '/v', NAME, '/t', 'REG_SZ', '/d', 'x', '/f']);
     expect(state.entry).toBe(true);
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('added the start entry "nimblescape Devspaces WSL devspaces"'));
-    // Found or written once per window: no second read.
+  });
+
+  // Mutation: a state of the Monitor read before the registry fails it: an answer that another window records between
+  // the two reads, after this window read the state, would be undone here.
+  it('reads the registry first and the state of the Monitor after it', async () => {
+    const order: string[] = [];
+    const { subject } = keeper({
+      runner: {
+        run: async (_file, args) => {
+          order.push(String(args[0]));
+          return result(1);
+        },
+      },
+      monitorPermanent: async () => {
+        order.push('monitor');
+        return false;
+      },
+    });
     await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
-    expect(runs).toHaveLength(2);
+    expect(order).toEqual(['query', 'monitor']);
   });
 
   it('is kept as it is when it exists (one read)', async () => {
@@ -177,7 +195,8 @@ describe('the start entry of the WSL distribution', () => {
     expect(absent.runs.map((run) => run.args[0])).toEqual(['query']);
   });
 
-  it('follows a change of the Monitor mode in the same window', async () => {
+  // Mutation: a window that remembers the state that it wrote fails it: another window may have changed the entry.
+  it('follows a change of the Monitor mode in the same window, and reads the registry each time', async () => {
     let permanent = true;
     const { subject, state } = keeper({ monitorPermanent: async () => permanent });
     await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
@@ -185,15 +204,25 @@ describe('the start entry of the WSL distribution', () => {
     permanent = false;
     await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     expect(state.entry).toBe(false);
+    // Another window (or the user) removed the entry while the Monitor runs permanently again: it is added again.
+    permanent = true;
+    await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    state.entry = false;
+    await subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(state.entry).toBe(true);
   });
 
-  it('is updated with the start of the keeper', async () => {
-    const { subject, state } = keeper({ permanent: true });
-    subject.keep(WSL_HOST, WSL_DISTRIBUTION);
-    await vi.waitFor(() => expect(state.entry).toBe(true));
+  // Mutation: a keeper whose start writes the registry fails it (one read per minute and window for nothing).
+  it('is not read or written by the start of the keeper', async () => {
+    const { subject, runs, launches } = keeper({ permanent: true });
+    subject.keep(WSL_DISTRIBUTION);
+    await vi.waitFor(() => expect(launches).toHaveLength(1));
+    expect(runs).toEqual([]);
   });
 
-  it('is not added without wslg.exe or when it would be too long (logged), and a failure of reg.exe is tried again', async () => {
+  // Mutation: an entry that stays when it cannot be written as it should fails it: Windows would run a program that is
+  // gone, or an older script, at each logon.
+  it('is not added without wslg.exe or when it would be too long (logged), and one that is there is removed then', async () => {
     const noWslg = keeper({ permanent: true, wslg: false });
     await noWslg.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     expect(noWslg.state.entry).toBe(false);
@@ -203,6 +232,13 @@ describe('the start entry of the WSL distribution', () => {
     await tooLong.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     expect(tooLong.state.entry).toBe(false);
     expect(tooLong.log.warn).toHaveBeenCalledWith(expect.stringContaining(`longer than ${MAX_START_ENTRY} characters`));
+    const gone = keeper({ permanent: true, wslg: false, entry: true });
+    await gone.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(gone.runs.map((run) => run.args[0])).toEqual(['query', 'delete']);
+    expect(gone.state.entry).toBe(false);
+  });
+
+  it('logs a failure of reg.exe, and the next update tries again', async () => {
     let fail = true;
     const failing = keeper({
       permanent: true,
@@ -231,10 +267,15 @@ describe.skipIf(process.platform === 'win32')('the keeper script', () => {
     folder = undefined;
   });
 
-  /** Starts the script: `docker ps -q` prints the next line of `answers` (the last one stays); `none`: nothing. */
-  function startScript(answers: readonly string[], options: { slowSleep?: boolean } = {}) {
+  /**
+   * Starts the script in its own folder `name`, with the lock of the test: `docker ps -q` prints the next line of
+   * `answers` (the last one stays); `none`: nothing. `lockWait`: the wait for the lock in seconds, in place of
+   * KEEPER_LOCK_WAIT_SECONDS.
+   */
+  function startScript(answers: readonly string[], options: { slowSleep?: boolean; name?: string; lockWait?: number } = {}) {
     folder ??= fs.mkdtempSync(path.join(os.tmpdir(), 'devspaces-keeper-'));
-    const dir = folder;
+    const lock = path.join(folder, 'lock');
+    const dir = path.join(folder, options.name ?? 'first');
     const bin = path.join(dir, 'bin');
     fs.mkdirSync(bin, { recursive: true });
     fs.writeFileSync(path.join(dir, 'answers'), answers.join('\n') + '\n');
@@ -254,10 +295,11 @@ describe.skipIf(process.platform === 'win32')('the keeper script', () => {
       ].join('\n'),
       { mode: 0o755 },
     );
-    const script = KEEPER_SCRIPT.replace(KEEPER_LOCK, path.join(dir, 'lock'));
+    const script = KEEPER_SCRIPT.replace(KEEPER_LOCK, lock).replace(`-w ${KEEPER_LOCK_WAIT_SECONDS} `, `-w ${options.lockWait ?? KEEPER_LOCK_WAIT_SECONDS} `);
+    expect(script).not.toBe(KEEPER_SCRIPT);
     const child = spawn('sh', ['-c', script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` }, stdio: 'ignore' });
     const exited = new Promise<number | null>((resolve) => child.on('exit', (code) => resolve(code)));
-    const calls = () => Number(fs.readFileSync(path.join(dir, 'calls'), 'utf8').trim() || '0');
+    const calls = () => (fs.existsSync(path.join(dir, 'calls')) ? Number(fs.readFileSync(path.join(dir, 'calls'), 'utf8').trim()) : 0);
     return { child, exited, calls, args: () => fs.readFileSync(path.join(dir, 'args'), 'utf8') };
   }
 
@@ -278,13 +320,32 @@ describe.skipIf(process.platform === 'win32')('the keeper script', () => {
     expect(calls()).toBe(4);
   });
 
-  // Mutation: a script without the lock lets every window start one more keeper.
-  it('ends at once while another keeper holds the lock', async () => {
+  // Mutation: a script without the lock lets every window start one more keeper; one that ends at once while another
+  // holds the lock leaves no keeper when that one ends right after (it was on its last check).
+  it('waits for the lock while another keeper holds it, and takes over when that one ends', async () => {
     const first = startScript(['abc123'], { slowSleep: true });
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const second = startScript(['abc123']);
+    await vi.waitFor(() => expect(fs.existsSync(path.join(folder as string, 'lock'))).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const second = startScript(['none'], { name: 'second' });
+    let secondEnded = false;
+    void second.exited.then(() => (secondEnded = true));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(secondEnded).toBe(false);
+    expect(second.calls()).toBe(0);
+    // The end of the first one frees the lock at once, also while its `sleep` runs on (it does not hold the lock).
+    first.child.kill();
+    await first.exited;
+    expect(await second.exited).toBe(0);
+    expect(second.calls()).toBe(2);
+  });
+
+  it('ends after its wait for the lock while another keeper holds it', async () => {
+    const first = startScript(['abc123'], { slowSleep: true });
+    await vi.waitFor(() => expect(fs.existsSync(path.join(folder as string, 'lock'))).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const second = startScript(['abc123'], { name: 'second', lockWait: 1 });
     expect(await second.exited).not.toBe(0);
-    expect(fs.existsSync(path.join(folder as string, 'calls'))).toBe(false);
+    expect(second.calls()).toBe(0);
     first.child.kill();
     await first.exited;
   });

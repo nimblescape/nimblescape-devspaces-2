@@ -192,7 +192,7 @@ export class WslLifetime {
     const access = hostAccessOf(host);
     if (this.disposed || access?.kind !== 'wsl') return;
     if (this.holds(host)) {
-      this.deps.keeper?.keep(host, access.distribution);
+      this.deps.keeper?.keep(access.distribution);
       return;
     }
     const failed = this.failedAt.get(host);
@@ -233,7 +233,7 @@ export class WslLifetime {
       errorOutput = (errorOutput + wslText(text)).slice(-MAX_LOGGED_ERROR);
     });
     this.deps.logger.info(`Devspaces starts an idle session of the WSL distribution ${distribution}, so that it runs while this window is open and a container of Devspaces runs there.`);
-    this.deps.keeper?.keep(host, distribution);
+    this.deps.keeper?.keep(distribution);
     void process.exited.then(({ exitCode, error }) => {
       if (this.sessions.get(host) === process) this.sessions.delete(host);
       if (this.disposed) return;
