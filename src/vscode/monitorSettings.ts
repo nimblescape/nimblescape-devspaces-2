@@ -58,9 +58,11 @@ export async function monitorPermanentFor(deps: MonitorSettingsDeps, host: strin
 
 /**
  * As monitorPermanentFor, but undefined when the answer cannot be read (logged): for the start entry of the WSL
- * distribution of Devspaces, which a failed read must not remove. Never rejects.
+ * distribution of Devspaces, which a failed read must not remove. With stopMonitorWhenIdle on, false without a read of
+ * the answer. Never rejects.
  */
 export async function monitorPermanentIfKnown(deps: MonitorSettingsDeps, host: string): Promise<boolean | undefined> {
+  if (deps.settings().stopMonitorWhenIdle === true) return false;
   let answered: boolean;
   try {
     answered = await deps.answered(host);

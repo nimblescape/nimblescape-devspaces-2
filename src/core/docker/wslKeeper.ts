@@ -196,11 +196,11 @@ export class WslKeeper {
 
   /**
    * Adds the start entry of the WSL distribution `distribution` while the Monitor of its host `host` runs permanently and
-   * WSL lists the distribution, and removes it otherwise; an entry with another command is replaced. Without
-   * `wslg.exe`, or with a command line longer than MAX_START_ENTRY, there is no entry (logged). While the answer about
-   * the Monitor cannot be read, or WSL does not tell whether it lists the distribution, the entry stays as it is. The
-   * caller calls it when that state may have changed; an update that waits and has not begun yet covers a second call
-   * (it reads the state when it begins). Never rejects.
+   * WSL lists the distribution, and removes it otherwise; an entry with another command is replaced. With a command
+   * line longer than MAX_START_ENTRY, there is no entry (logged). Without `wslg.exe` (logged), while the answer about
+   * the Monitor cannot be read, or while WSL does not tell whether it lists the distribution, the entry stays as it
+   * is. The caller calls it when that state may have changed; an update that waits and has not begun yet covers a
+   * later call (it reads the state when it begins). Never rejects.
    */
   updateStartEntry(host: string, distribution: string): Promise<void> {
     const waiting = this.updatesWaiting.get(distribution);
@@ -264,7 +264,7 @@ export class WslKeeper {
 
   /** Logs `problem` of the keeper once while it stays. */
   private warnLaunch(problem: string): void {
-    const warning = `${problem}. So WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.`;
+    const warning = `${problem}. Without a keeper, WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.`;
     if (warning !== this.launchWarning) this.deps.logger.warn(warning);
     this.launchWarning = warning;
   }
@@ -303,7 +303,19 @@ export class WslKeeper {
         wanted = listed === true ? await this.deps.monitorPermanent(host) : listed;
       }
       if (wanted === undefined) return;
-      const command = wanted ? this.startCommand(distribution) : undefined;
+      let command: string | undefined;
+      if (wanted) {
+        // Without wslg.exe, no entry is added (`wsl.exe` would open a console window at each logon), and an entry that
+        // is there stays as it is: wslg.exe may be missing only while an update of WSL replaces it.
+        const wslg = this.wslg();
+        if (wslg === undefined) {
+          this.entryProblem(
+            `There is no ${wslgPathOf(this.deps.env)}, so Devspaces does not add or change the start entry "${name}"; without the entry, WSL does not start the distribution ${distribution} when you log on to Windows, and its Monitor runs again at the next start of Devspaces there.`,
+          );
+          return;
+        }
+        command = this.startCommand(wslg, distribution);
+      }
       if (command === undefined) {
         if (!present) return;
         action = 'removed';
@@ -326,21 +338,22 @@ export class WslKeeper {
     }
   }
 
-  /**
-   * The command of the start entry of `distribution` with `wslg.exe`; undefined, logged, without `wslg.exe` (`wsl.exe`
-   * would open a console window at each logon) or when it would be longer than MAX_START_ENTRY.
-   */
-  private startCommand(distribution: string): string | undefined {
-    const wslg = this.wslg();
-    const command = startEntryCommand(wslg ?? wslgPathOf(this.deps.env), distribution);
-    const warning = wslg === undefined
-      ? `There is no ${wslgPathOf(this.deps.env)}, so WSL does not start the distribution ${distribution} when you log on to Windows; its Monitor runs again at the next start of Devspaces there.`
-      : command.length > MAX_START_ENTRY
+  /** The command of the start entry of `distribution` with `wslg`; undefined, logged, when it would be longer than MAX_START_ENTRY. */
+  private startCommand(wslg: string, distribution: string): string | undefined {
+    const command = startEntryCommand(wslg, distribution);
+    const tooLong = command.length > MAX_START_ENTRY;
+    this.entryProblem(
+      tooLong
         ? `The start entry for the WSL distribution ${distribution} would be longer than ${MAX_START_ENTRY} characters, so WSL does not start it when you log on to Windows.`
-        : undefined;
+        : undefined,
+    );
+    return tooLong ? undefined : command;
+  }
+
+  /** Logs `warning` about the start entry once while it stays; undefined: no problem now. */
+  private entryProblem(warning: string | undefined): void {
     if (warning !== undefined && warning !== this.entryWarning) this.deps.logger.warn(warning);
     this.entryWarning = warning;
-    return warning === undefined ? command : undefined;
   }
 
   /** The path of `wslg.exe` (wslgPathOf) when it exists. */

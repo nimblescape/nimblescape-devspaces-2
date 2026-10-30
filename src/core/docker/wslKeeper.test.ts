@@ -138,7 +138,7 @@ describe('the keeper of the WSL distribution', () => {
     subject.keep(WSL_DISTRIBUTION);
     await vi.waitFor(() =>
       expect(log.warn).toHaveBeenCalledWith(
-        'The keeper of the WSL distribution devspaces could not start: spawn EPERM. So WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.',
+        'The keeper of the WSL distribution devspaces could not start: spawn EPERM. Without a keeper, WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.',
       ),
     );
     await new Promise((resolve) => setImmediate(resolve));
@@ -161,7 +161,7 @@ describe('the keeper of the WSL distribution', () => {
     now += KEEPER_EARLY_END_MS - 1;
     launches[0]?.exit(1);
     expect(log.warn).toHaveBeenCalledWith(
-      'The keeper of the WSL distribution devspaces ended at once (exit code 1). So WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.',
+      'The keeper of the WSL distribution devspaces ended at once (exit code 1). Without a keeper, WSL stops the distribution 15 seconds after VS Code closed, also while a container runs there.',
     );
     await start(2);
     launches[1]?.exit(1);
@@ -434,22 +434,29 @@ describe('the start entry of the WSL distribution', () => {
 
   // Mutation: an entry that stays when it cannot be written as it should fails it: Windows would run a program that is
   // gone, or an older script, at each logon.
-  it('is not added without wslg.exe or when it would be too long (logged), and one that is there is removed then', async () => {
+  // Mutation: an entry that is removed without wslg.exe fails it (a WSL update that replaces wslg.exe at that moment
+  // would remove the entry of the user); so does a too long entry that stays.
+  it('is not added without wslg.exe (logged) and one that is there stays then; one that would be too long is removed', async () => {
     const noWslg = keeper({ permanent: true, wslg: false });
     await noWslg.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     await noWslg.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
     expect(noWslg.state.entry).toBe(false);
     // Once while it stays.
-    expect(noWslg.log.warn.mock.calls).toEqual([[expect.stringContaining(`There is no ${WSLG}`)]]);
+    expect(noWslg.log.warn.mock.calls).toEqual([[expect.stringContaining(`There is no ${WSLG}, so Devspaces does not add or change the start entry "${NAME}"`)]]);
+    const stays = keeper({ permanent: true, wslg: false, entry: true });
+    await stays.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(stays.runs.map((run) => run.args[0])).toEqual(['query']);
+    expect(stays.state.entry).toBe(true);
+    // An entry that is not wanted goes also without wslg.exe.
+    const unwanted = keeper({ permanent: false, wslg: false, entry: true });
+    await unwanted.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(unwanted.state.entry).toBe(false);
     const long = 'C:\\' + 'x'.repeat(100);
-    const tooLong = keeper({ permanent: true, env: { ProgramFiles: long }, exists: () => true });
+    const tooLong = keeper({ permanent: true, env: { ProgramFiles: long }, exists: () => true, entry: true });
     await tooLong.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
+    expect(tooLong.runs.map((run) => run.args[0])).toEqual(['query', 'delete']);
     expect(tooLong.state.entry).toBe(false);
     expect(tooLong.log.warn).toHaveBeenCalledWith(expect.stringContaining(`longer than ${MAX_START_ENTRY} characters`));
-    const gone = keeper({ permanent: true, wslg: false, entry: true });
-    await gone.subject.updateStartEntry(WSL_HOST, WSL_DISTRIBUTION);
-    expect(gone.runs.map((run) => run.args[0])).toEqual(['query', 'delete']);
-    expect(gone.state.entry).toBe(false);
   });
 
   it('logs a failure of reg.exe, and the next update tries again', async () => {

@@ -98,6 +98,10 @@ describe('the monitor settings of extension.ts', () => {
     const failing = monitorSettingsOf({ ...deps({}), answered: async () => Promise.reject(new Error('EBUSY')), logger: { warn: (message) => warnings.push(message) } });
     expect(await failing.permanentIfKnown('wsl:devspaces')).toBeUndefined();
     expect(warnings).toEqual(['The answer about the Monitor on wsl:devspaces could not be read, so its start entry stays as it is: EBUSY']);
+    // With stopMonitorWhenIdle on, the answer does not count: no read, and false also while it cannot be read.
+    const idle = monitorSettingsOf({ ...deps({ stopMonitorWhenIdle: true }), answered: async () => Promise.reject(new Error('EBUSY')), logger: { warn: (message) => warnings.push(message) } });
+    expect(await idle.permanentIfKnown('wsl:devspaces')).toBe(false);
+    expect(warnings).toHaveLength(1);
   });
 
   // The ensure then replaces a permanent Monitor of this computer with one that stops when idle; the log says why.
