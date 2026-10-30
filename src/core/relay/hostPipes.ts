@@ -20,6 +20,12 @@ import type { RelayConnection } from './connection';
 import { DockerPipe, processDockerDial, relayDockerDial } from './dockerPipe';
 import { dockerPipeAddress } from './pipeAddress';
 
+/**
+ * The wait before the pipe of the WSL distribution of Devspaces tries to listen again after it could not: every Docker
+ * call of an operation there asks for it (BootstrapDocker), and each try would log the same warning.
+ */
+export const WSL_PIPE_RETRY_MS = 60_000;
+
 export interface HostPipesDeps {
   logger: Logger;
   platform: NodeJS.Platform;
@@ -34,12 +40,16 @@ export interface HostPipesDeps {
   dialStdio(host: string): StartedByteProcess | undefined;
   /** Only for the tests: the id of the next pipe (16 hexadecimal digits). */
   randomId?: () => string;
+  /** Only for the tests: the clock of WSL_PIPE_RETRY_MS (default Date.now). */
+  now?: () => number;
 }
 
 /** The Docker pipes of this extension host for the Docker calls of Devspaces, by the Docker host (DockerTarget.host). */
 export class HostPipes {
   /** The pipe of each host that is served, or that is starting to listen (`pipe` undefined, until `listening` ends). */
   private readonly pipes = new Map<string, { pipe?: DockerPipe; listening?: Promise<void> }>();
+  /** When the pipe of a WSL distribution could not listen the last time (WSL_PIPE_RETRY_MS). */
+  private readonly wslFailedAt = new Map<string, number>();
   private disposed = false;
 
   constructor(private readonly deps: HostPipesDeps) {}
@@ -61,13 +71,17 @@ export class HostPipes {
    * Serves the pipe of `host` (a host with a transport, hostAccessOf) when it does not listen yet: for an SSH host, a
    * connection of the relay to it passed its checks; for a WSL distribution, a Docker call of an operation there comes.
    * A pipe that does not serve its address anymore (DockerPipe.isServing) is closed, and a new one at a new address
-   * takes its place. A pipe that cannot listen is logged; the next call of `serve` tries again. Resolves when the pipe
-   * listens or could not, also for a call while another one starts it; never rejects.
+   * takes its place. A pipe that cannot listen is logged; the next call of `serve` tries again, for a WSL distribution
+   * only after WSL_PIPE_RETRY_MS. Resolves when the pipe listens or could not, also for a call while another one starts
+   * it; never rejects.
    */
   async serve(host: string): Promise<void> {
     const access = hostAccessOf(host);
     if (this.disposed || access === undefined) return;
     const { logger, platform } = this.deps;
+    const now = this.deps.now ?? Date.now;
+    const failedAt = this.wslFailedAt.get(host);
+    if (failedAt !== undefined && Math.abs(now() - failedAt) < WSL_PIPE_RETRY_MS) return;
     const name = `the extension on ${host}`;
     const served = this.pipes.get(host);
     if (served !== undefined) {
@@ -109,13 +123,15 @@ export class HostPipes {
         // A new random address for each pipe: no other window and no other user knows it beforehand.
         const address = dockerPipeAddress((this.deps.randomId ?? (() => randomBytes(8).toString('hex')))(), platform, platform === 'win32' ? '' : this.deps.base());
         const pipe = await DockerPipe.listen({ address, connect, logger, name, platform, inUseWaitMs: 0 });
+        this.wslFailedAt.delete(host);
         if (this.disposed) pipe.close();
         else entry.pipe = pipe;
       } catch (error) {
         if (this.pipes.get(host) === entry) this.pipes.delete(host);
+        if (access.kind === 'wsl') this.wslFailedAt.set(host, now());
         logger.warn(
           access.kind === 'wsl'
-            ? `The Docker pipe of ${name} cannot listen, so the Docker calls of the extension cannot reach ${host}: ${errorMessage(error)}`
+            ? `The Docker pipe of ${name} cannot listen, so the Docker calls of the extension cannot reach ${host}; it tries again in ${WSL_PIPE_RETRY_MS / 1000} seconds: ${errorMessage(error)}`
             : `The Docker pipe of ${name} cannot listen, so the Docker calls of the extension log in to ${host} each time: ${errorMessage(error)}`,
         );
       }

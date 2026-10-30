@@ -341,7 +341,10 @@ export function sshCommandArgs(
 /** The name of the WSL distribution of Devspaces on Windows (docs/architecture.md "The WSL distribution of Devspaces"). */
 export const WSL_DISTRIBUTION = 'devspaces';
 
-/** The start of the Docker host of a WSL distribution: `wsl:<distribution>`, which is never an SSH alias or address. */
+/**
+ * The start of the Docker host of a WSL distribution: `wsl:<distribution>`. A host that is an SSH address is no WSL host
+ * (`wsl:2222` is the SSH host `wsl` with the port 2222).
+ */
 export const WSL_HOST_PREFIX = 'wsl:';
 
 /** The Docker host of the WSL distribution of Devspaces, as the devspaces and the list of Devspaces record it. */
@@ -350,9 +353,12 @@ export const WSL_HOST = `${WSL_HOST_PREFIX}${WSL_DISTRIBUTION}`;
 /** A name of a WSL distribution that `wsl.exe` takes after `-d` as it is (never an option). */
 const WSL_DISTRIBUTION_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-/** The WSL distribution of the Docker host `host` (`wsl:<distribution>`), or undefined for any other host. */
+/**
+ * The WSL distribution of the Docker host `host` (`wsl:<distribution>`), or undefined for any other host, also for one
+ * that is an SSH alias or address (sshTargetOf), which stays an SSH host.
+ */
 export function wslDistributionOf(host: string): string | undefined {
-  if (!host.startsWith(WSL_HOST_PREFIX)) return undefined;
+  if (!host.startsWith(WSL_HOST_PREFIX) || sshTargetOf(host) !== undefined) return undefined;
   const distribution = host.slice(WSL_HOST_PREFIX.length);
   return WSL_DISTRIBUTION_NAME.test(distribution) ? distribution : undefined;
 }
@@ -385,9 +391,17 @@ export function wslCommandArgs(distribution: string, command: readonly string[])
  * registered) are UTF-8, not UTF-16, when its output is a pipe.
  */
 export function wslEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return withEnvValue(base, 'WSL_UTF8', '1');
+}
+
+/**
+ * A copy of `base` with the variable `name` (in upper case) set to `value`, without its other spellings (names are
+ * case-insensitive on Windows).
+ */
+export function withEnvValue(base: NodeJS.ProcessEnv, name: string, value: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
-  for (const key of Object.keys(env)) if (key.toUpperCase() === 'WSL_UTF8') delete env[key];
-  env.WSL_UTF8 = '1';
+  for (const key of Object.keys(env)) if (key.toUpperCase() === name) delete env[key];
+  env[name] = value;
   return env;
 }
 
@@ -479,7 +493,8 @@ const WSL_DISTRIBUTION_MISSING = /WSL_E_DISTRO_NOT_FOUND|There is no distributio
 /** Maps the error text of `docker -H ssh://… info` (or of `ssh`, or of `wsl.exe`) to a DockerHostProblem. */
 export function dockerHostProblem(detail: string): DockerHostProblem {
   const text = detail;
-  if (WSL_DISTRIBUTION_MISSING.test(text)) return 'wslDistributionMissing';
+  // An older wsl.exe writes UTF-16 also with WSL_UTF8=1 (parseWslList): its text has a NUL after each character.
+  if (WSL_DISTRIBUTION_MISSING.test(text.replace(/\u0000/g, ''))) return 'wslDistributionMissing';
   if (/executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
     return 'sshMissing';
   }

@@ -152,7 +152,7 @@ describeUnix('the connection of the relay through sh -s', () => {
     expect(started.length - startsBefore).toBe(1);
     expect(logLines).toEqual([
       'The login on fake-host printed 20 bytes before the shell answered; they are ignored.',
-      'The shell on fake-host is open: one SSH login for the checks before the relay.',
+      'The shell on fake-host is open: one login for the checks before the relay.',
       'The connection to fake-host starts on the login of the shell before the relay.',
       'The connection to fake-host is open.',
     ]);

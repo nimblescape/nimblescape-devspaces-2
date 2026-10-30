@@ -339,6 +339,13 @@ describe('the WSL distribution of Devspaces: no SSH', () => {
     const docker = fakeDocker(() => info());
     const deps = { runner: sshRunner(), sshPath: '/usr/bin/ssh', env: {} };
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(missing) })).resolves.toMatchObject({ ok: false, problem: 'wslDistributionMissing' });
+    // The UTF-16 text of an older wsl.exe: its NUL bytes are dropped from the detail.
+    const utf16 = { ...missing, detail: Buffer.from('There is no distribution with the supplied name.', 'utf16le').toString('utf8') };
+    await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(utf16) })).resolves.toEqual({
+      ok: false,
+      problem: 'wslDistributionMissing',
+      detail: 'There is no distribution with the supplied name.',
+    });
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(null) })).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     await expect(testRemoteDockerHost(docker, WSL_HOST, deps)).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, fail('sh: 1: docker: not found', 127)) })).resolves.toMatchObject({

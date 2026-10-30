@@ -120,7 +120,7 @@ import { REPOSITORIES_VIEW_ID, RepositoriesTreeProvider, expandAll, revealRow, t
 const FOCUS_REFRESH_INTERVAL_MS = 15_000;
 
 /** Time limit of `wsl.exe --list --quiet`, which may start the WSL service; the choice of the host waits for it. */
-const WSL_LIST_TIMEOUT_MS = 10_000;
+const WSL_LIST_TIMEOUT_MS = 5_000;
 
 /** Kept for deactivate(). */
 let coordinator: SessionCoordinator | undefined;
@@ -563,13 +563,18 @@ async function activateExtension(
           // A remote engine: the worker behind the relay, on the open connection of the host, or with one login
           // (`ssh … sh -s`, or `wsl.exe … sh -s` for the WSL distribution).
           relay: (target) => {
-            if (target.kind !== 'remote' || !transportFound(target.host)) return undefined;
+            if (target.kind !== 'remote') return undefined;
+            // An SSH host without `ssh` starts its worker with the Docker CLI (`ssh://`); the WSL distribution only
+            // behind the relay, whose open then says that wsl.exe is missing.
+            const access = hostAccessOf(target.host);
+            if (access === undefined || (access.kind === 'ssh' && sshPath() === undefined)) return undefined;
             // The login of the shell before the relay, when its checks left one open; else a new one, which may ask
             // within a flow of the user.
             const start = () => {
               const started = startLogin(target.host);
               if (started === undefined) {
-                throw new RelayConnectionError(`The connection to ${target.host} could not be opened: the program of its transport (ssh or wsl.exe) was not found, or it has no transport.`);
+                const reason = access.kind === 'wsl' ? 'wsl.exe was not found' : 'ssh was not found';
+                throw new RelayConnectionError(`The connection to ${target.host} could not be opened: ${reason}.`);
               }
               return started;
             };

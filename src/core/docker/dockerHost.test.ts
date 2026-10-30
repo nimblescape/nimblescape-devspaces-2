@@ -274,6 +274,9 @@ describe('the WSL distribution of Devspaces as a host', () => {
     expect(hostAccessOf('build-box')).toEqual({ kind: 'ssh', address: { host: 'build-box' } });
     expect(hostAccessOf('box/path')).toBeUndefined();
     expect(hostAccessOf('wsl:-x')).toBeUndefined();
+    // An SSH address stays an SSH host: the host `wsl` with the port 2222.
+    expect(wslDistributionOf('wsl:2222')).toBeUndefined();
+    expect(hostAccessOf('wsl:2222')).toEqual({ kind: 'ssh', address: { host: 'wsl', port: 2222 } });
   });
 
   it('gives its target the endpoint wsl://<distribution>, and an SSH host ssh://<host>', () => {
@@ -324,6 +327,8 @@ describe('dockerHostProblem (plain reasons of a failed connection)', () => {
     // wsl.exe for a distribution that is not registered (WSL 2.x, and the older text).
     ['There is no distribution with the supplied name.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND', 'wslDistributionMissing'],
     ['There is no distribution with the supplied name.', 'wslDistributionMissing'],
+    // The UTF-16 text of an older wsl.exe, read as UTF-8.
+    [Buffer.from('There is no distribution with the supplied name.', 'utf16le').toString('utf8'), 'wslDistributionMissing'],
     ['something else', 'unknown'],
   ])('%s → %s', (detail, problem) => {
     expect(dockerHostProblem(detail)).toBe(problem);

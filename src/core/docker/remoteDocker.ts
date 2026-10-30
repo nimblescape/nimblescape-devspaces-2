@@ -52,6 +52,7 @@ import {
   sshEndpoint,
   sshTargetOf,
   unsupportedTargetReason,
+  withEnvValue,
   type DockerHostProblem,
   type DockerTarget,
 } from './dockerHost';
@@ -100,10 +101,7 @@ export function parseEngineInfo(stdout: string): { version: string; rootless: bo
 
 /** The environment of a Docker call that must never ask a question: SSH_ASKPASS_REQUIRE=never (see the module comment). */
 export function noPromptEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base };
-  for (const key of Object.keys(env)) if (key.toUpperCase() === 'SSH_ASKPASS_REQUIRE') delete env[key];
-  env.SSH_ASKPASS_REQUIRE = 'never';
-  return env;
+  return withEnvValue(base, 'SSH_ASKPASS_REQUIRE', 'never');
 }
 
 function engineCheckOf(result: RunResult, timeoutMs: number): EngineCheck {
@@ -148,13 +146,9 @@ export async function testRemoteDockerHost(
   if (hostAccessOf(host)?.kind === 'wsl') return testWslHost(host, ssh, options.signal, timeoutMs);
   if (ssh.shells !== undefined && ssh.sshPath !== undefined && sshTargetOf(host) !== undefined) {
     // Always a new login, as checkSshLogin without its cache: the test sees the SSH configuration and the host of now.
-    const shell = await ssh.shells.login(host, options.signal, { fresh: true });
+    const shell = await shellLoginCheck(host, ssh, options.signal, { fresh: true });
     if (shell !== undefined) {
-      if (!shell.ok) {
-        ssh.sshLogins?.forget(host);
-        return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
-      }
-      ssh.sshLogins?.remember(host);
+      if (!shell.ok) return shell;
       const result = await ssh.shells.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal: options.signal });
       if (result !== undefined) return engineCheckOf(result, timeoutMs);
     }
@@ -186,23 +180,38 @@ async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal 
 }
 
 /**
- * The start of the shell before the relay of the WSL distribution `host` (RemoteShellAccess.login), as the check of the
- * host: `wslMissing` without a shell (no `wsl.exe` on this computer). Rejects only with an AbortError.
+ * The login of the shell before the relay of `host` as a check (RemoteShellAccess.login; with `options` as given): a
+ * success is kept in `sshLogins`, a failure forgets the last one and names its reason (a NUL of the UTF-16 messages of an
+ * older wsl.exe is dropped). Undefined when the host has no shell (no transport). Rejects only with an AbortError.
+ */
+async function shellLoginCheck(
+  host: string,
+  deps: Pick<SshCheckDeps, 'shells' | 'sshLogins'>,
+  signal: AbortSignal | undefined,
+  options?: { fresh?: boolean },
+): Promise<{ ok: true } | { ok: false; problem: DockerHostProblem; detail: string } | undefined> {
+  const shell = options === undefined ? await deps.shells?.login(host, signal) : await deps.shells?.login(host, signal, options);
+  if (shell === undefined) return undefined;
+  if (!shell.ok) {
+    deps.sshLogins?.forget(host);
+    const detail = shell.detail.replace(/\u0000/g, '');
+    return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(detail), detail };
+  }
+  deps.sshLogins?.remember(host);
+  return { ok: true };
+}
+
+/**
+ * The start of the shell before the relay of the WSL distribution `host` as the check of the host (shellLoginCheck):
+ * `wslMissing` without a shell (no `wsl.exe` on this computer). Rejects only with an AbortError.
  */
 async function wslShellLogin(
   host: string,
   deps: Pick<SshCheckDeps, 'shells' | 'sshLogins'>,
   signal: AbortSignal | undefined,
-  options: { fresh?: boolean } = {},
+  options?: { fresh?: boolean },
 ): Promise<{ ok: true } | { ok: false; problem: DockerHostProblem; detail: string }> {
-  const shell = await deps.shells?.login(host, signal, options);
-  if (shell === undefined) return { ok: false, problem: 'wslMissing', detail: 'wsl.exe was not found.' };
-  if (!shell.ok) {
-    deps.sshLogins?.forget(host);
-    return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
-  }
-  deps.sshLogins?.remember(host);
-  return { ok: true };
+  return (await shellLoginCheck(host, deps, signal, options)) ?? { ok: false, problem: 'wslMissing', detail: 'wsl.exe was not found.' };
 }
 
 /** `docker info` of the Docker host of the operation. */
@@ -249,9 +258,10 @@ export async function readRootlessSocket(
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
   if (result === undefined) return { ok: false, problem: 'wslMissing', detail: 'wsl.exe was not found.' };
-  if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `ssh did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
+  const program = access.kind === 'wsl' ? 'wsl.exe' : 'ssh';
+  if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `${program} did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
   if (result.exitCode !== 0) {
-    const detail = result.stderr.trim() || `ssh failed with exit code ${result.exitCode}.`;
+    const detail = result.stderr.trim() || `${program} failed with exit code ${result.exitCode}.`;
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
   const socket = rootlessSocketPath(result.stdout);
@@ -365,15 +375,8 @@ export async function checkSshLogin(
   if (!target) return { ok: true, skipped: 'notAnSshTarget' };
   if (deps.sshPath === undefined) return { ok: false, problem: 'sshMissing', detail: 'The SSH client (ssh) was not found.' };
   // The login of the shell before the relay is the check (not for the test before a switch, which always logs in anew).
-  const shell = options.useCache === false ? undefined : await deps.shells?.login(host, options.signal);
-  if (shell !== undefined) {
-    if (shell.ok) {
-      deps.sshLogins?.remember(host);
-      return { ok: true };
-    }
-    deps.sshLogins?.forget(host);
-    return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
-  }
+  const shell = options.useCache === false ? undefined : await shellLoginCheck(host, deps, options.signal);
+  if (shell !== undefined) return shell;
   let result: RunResult;
   try {
     result = await deps.runner.run(deps.sshPath, sshCommandArgs(target, 'true', undefined, { identity: deps.identityFor?.(host) }), {

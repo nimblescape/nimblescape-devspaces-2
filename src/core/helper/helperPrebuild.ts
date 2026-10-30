@@ -12,7 +12,7 @@
 // for, the weekly check of the base image), and its maintaining ensure then also runs the daily cleanup when that is due;
 // the cleanup alone never makes it run.
 import * as fs from 'fs';
-import { LOCAL_DOCKER_TARGET, describeDockerHost, unsupportedTargetReason, type DockerTarget } from '../docker/dockerHost';
+import { LOCAL_DOCKER_TARGET, describeDockerHost, hostAccessOf, unsupportedTargetReason, type DockerTarget } from '../docker/dockerHost';
 import { runWithDockerTarget } from '../docker/dockerTargets';
 import { REMOTE_INFO_TIMEOUT_MS, checkSshLogin, type SshCheckDeps } from '../docker/remoteDocker';
 import { errorMessage } from '../errors';
@@ -92,7 +92,7 @@ export async function dockerEngineAnswers(target: DockerTarget, deps: DockerEngi
     case 'remote': {
       const login = await checkSshLogin(target.host, deps.ssh, { signal });
       if (!login.ok) {
-        deps.logger.info(`The Docker host ${target.host} cannot be reached over SSH: ${login.detail}`);
+        deps.logger.info(`The Docker host ${target.host} cannot be reached ${hostAccessOf(target.host)?.kind === 'wsl' ? 'through wsl.exe' : 'over SSH'}: ${login.detail}`);
         return false;
       }
       // A host that our ssh cannot check would be asked by the ssh of the Docker CLI, which may ask a question; nothing

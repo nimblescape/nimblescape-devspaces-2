@@ -33,17 +33,20 @@ export interface WindowPipeDeps {
   /** The ID of this computer (computer.id). */
   computerId(): string;
   /**
-   * The SSH hosts that this computer knows (of the list of Devspaces and of the Docker contexts), to find the host of a pipe
+   * The remote hosts that this computer knows (of the list of Devspaces and of the Docker contexts), to find the host of a pipe
    * whose devspace is not known (the registry lost it): the one for which this computer made the address.
    */
   knownHosts(): Promise<string[]>;
-  /** True while the engine on the SSH host `host` has the removal mark ("Remove Devspaces from This Docker Engine…"). */
+  /** True while the engine on the remote host `host` has the removal mark ("Remove Devspaces from This Docker Engine…"). */
   engineRemoved(host: string): Promise<boolean>;
   /** The open connection of the relay to `host`, or undefined; asks nothing. */
   openRelayConnection(host: string): RelayConnection | undefined;
   /** The open connection of the relay to `host`, or a new one (the worker of the engine opens it). */
   relayConnection(host: string): Promise<RelayConnection>;
-  /** `ssh … docker system dial-stdio` on `host`; undefined without `ssh` or for a host it cannot reach. */
+  /**
+   * `ssh … docker system dial-stdio` on `host`, or `wsl.exe … docker system dial-stdio` for a WSL distribution;
+   * undefined without the program of the transport or for a host it cannot reach.
+   */
   dialStdio(host: string): StartedByteProcess | undefined;
   /** Only for the tests (DockerPipeOptions.inUseWaitMs, RELAY_RETRY_AFTER_MS, RELAY_WAIT_MS). */
   inUseWaitMs?: number;
@@ -118,7 +121,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
       }
     } else {
       const known = await deps.knownHosts().catch((error: unknown) => {
-        logger.warn(`The known SSH hosts could not be read for the Docker pipe ${dockerHost}: ${errorMessage(error)}`);
+        logger.warn(`The known remote hosts could not be read for the Docker pipe ${dockerHost}: ${errorMessage(error)}`);
         return [];
       });
       const found = known.find((candidate) => address.id === dockerPipeId(deps.computerId(), candidate, containerName));
@@ -129,7 +132,7 @@ export async function serveWindowPipe(dockerHost: string, containerName: string,
     const direct = processDockerDial(
       () => {
         const process = deps.dialStdio(host);
-        if (process === undefined) throw new Error(`ssh was not found, or ${host} is no SSH host`);
+        if (process === undefined) throw new Error(`the program of its transport (ssh or wsl.exe) was not found, or ${host} has no transport`);
         return process;
       },
       logger,

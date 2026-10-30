@@ -14,7 +14,7 @@ import { WSL_HOST } from '../docker/dockerHost';
 import { NodeProcessRunner } from '../process';
 import { silentLogger, type Logger } from '../ports';
 import type { RelayConnection } from './connection';
-import { HostPipes, type HostPipesDeps } from './hostPipes';
+import { HostPipes, WSL_PIPE_RETRY_MS, type HostPipesDeps } from './hostPipes';
 import { MemoryPipe } from './memoryPipe.testkit';
 import { Mux } from './mux';
 import { dockerPipeAddress } from './pipeAddress';
@@ -249,15 +249,29 @@ describe('HostPipes', () => {
     expect(seen).toEqual(Array(3).fill(dockerPipeAddress(ID, 'linux', folder).dockerHost));
   });
 
-  it('logs a pipe of the WSL distribution that cannot listen: its calls have no other way', async () => {
+  it('logs a pipe of the WSL distribution that cannot listen once, and tries again only after a minute', async () => {
     const folder = base();
     const blocked = path.join(folder, 'file');
     fs.writeFileSync(blocked, '');
+    let where = blocked;
+    let now = 1_000_000;
     const log = logger();
-    const hostPipes = pipes({ base: () => blocked, logger: log });
+    const hostPipes = pipes({ base: () => where, logger: log, now: () => now });
     await hostPipes.serve(WSL_HOST);
     expect(hostPipes.dockerHost(WSL_HOST)).toBeUndefined();
-    expect(log.lines[0]).toMatch(new RegExp(`^warn The Docker pipe of the extension on ${WSL_HOST} cannot listen, so the Docker calls of the extension cannot reach ${WSL_HOST}: `));
+    expect(log.lines).toHaveLength(1);
+    expect(log.lines[0]).toMatch(
+      new RegExp(`^warn The Docker pipe of the extension on ${WSL_HOST} cannot listen, so the Docker calls of the extension cannot reach ${WSL_HOST}; it tries again in 60 seconds: `),
+    );
+    // Every call within the minute: no new try, no new warning.
+    where = folder;
+    now += WSL_PIPE_RETRY_MS - 1;
+    await hostPipes.serve(WSL_HOST);
+    expect(hostPipes.dockerHost(WSL_HOST)).toBeUndefined();
+    expect(log.lines).toHaveLength(1);
+    now += 1;
+    await hostPipes.serve(WSL_HOST);
+    expect(hostPipes.dockerHost(WSL_HOST)).toBe(dockerPipeAddress(ID, 'linux', folder).dockerHost);
   });
 
   it('gives each pipe a new random address', async () => {

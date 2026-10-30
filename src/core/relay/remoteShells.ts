@@ -65,7 +65,7 @@ export class RemoteShells {
   constructor(private readonly options: RemoteShellsOptions) {}
 
   /**
-   * The open shell to `host`, or a new one (one SSH login, RemoteShell.open), which callers at the same time share.
+   * The open shell to `host`, or a new one (one login of its transport, RemoteShell.open), which callers at the same time share.
    * Undefined when the host has no transport, and after `dispose`. Rejects with RemoteShellError when the login failed,
    * and with an AbortError when `signal` aborts (the login goes on for the others). A flow of the user whose login may
    * ask (currentSshPromptFlow) that finds a login of the background or of another flow in progress waits for it, and
@@ -112,7 +112,7 @@ export class RemoteShells {
           shell.killNow();
           return shell;
         }
-        logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        logger.info(`The shell on ${host} is open: one login for the checks before the relay.`);
         if (afterLogin !== undefined) {
           const step: Promise<void> = shell
             .keepOpenDuring(() => afterLogin(shell))

@@ -218,7 +218,7 @@ describe('serveWindowPipe', () => {
     // Without ssh, the connection ends with the reason.
     dialStdio.mockReturnValue(undefined);
     await expect(roundTrip(marked.path, 'x')).resolves.toBe('');
-    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: ssh was not found, or marked-box is no SSH host`);
+    expect(log.lines.at(-1)).toBe(`warn The Docker pipe of ${CONTAINER} could not reach the Docker engine: the program of its transport (ssh or wsl.exe) was not found, or marked-box has no transport`);
   });
 
   it('waits for one open of the connection of the relay at most a while, and goes without it for one connection that it cannot carry', async () => {
