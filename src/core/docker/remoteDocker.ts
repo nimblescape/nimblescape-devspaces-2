@@ -52,7 +52,6 @@ import {
   sshEndpoint,
   sshTargetOf,
   unsupportedTargetReason,
-  wslText,
   type DockerHostProblem,
   type DockerTarget,
 } from './dockerHost';
@@ -150,8 +149,8 @@ export async function testRemoteDockerHost(
     const shell = await shellLoginCheck(host, ssh, options.signal, { fresh: true });
     if (shell !== undefined) {
       if (!shell.ok) return shell;
-      const result = await ssh.shells.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal: options.signal });
-      if (result !== undefined) return engineCheckOf(result, timeoutMs);
+      const check = await engineInfoOnShell(ssh.shells, host, timeoutMs, options.signal);
+      if (check !== undefined) return check;
     }
   }
   // Our own ssh without questions first; it always connects (no cached success).
@@ -175,16 +174,29 @@ export async function testRemoteDockerHost(
 async function testWslHost(host: string, ssh: SshCheckDeps, signal: AbortSignal | undefined, timeoutMs: number): Promise<EngineCheck> {
   const shell = await wslShellLogin(host, ssh, signal, { fresh: true });
   if (!shell.ok) return shell;
-  const result = await ssh.shells?.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal });
-  if (result === undefined) return WSL_NOT_FOUND;
-  // The error output can be the one of wsl.exe (its shell could not start again).
-  return engineCheckOf({ ...result, stderr: wslText(result.stderr) }, timeoutMs);
+  return (ssh.shells === undefined ? undefined : await engineInfoOnShell(ssh.shells, host, timeoutMs, signal)) ?? WSL_NOT_FOUND;
+}
+
+/**
+ * `docker info` (ENGINE_INFO_COMMAND) on the shell before the relay of `host`, as an EngineCheck; undefined when the
+ * host has no shell. A shell that ended twice before the command (RemoteShells.run) gives its reason. Rejects only with an
+ * AbortError.
+ */
+async function engineInfoOnShell(shells: RemoteShellAccess, host: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<EngineCheck | undefined> {
+  try {
+    const result = await shells.run(host, ENGINE_INFO_COMMAND, { timeoutMs, signal });
+    return result === undefined ? undefined : engineCheckOf(result, timeoutMs);
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    const detail = errorMessage(error);
+    return { ok: false, problem: dockerHostProblem(detail), detail };
+  }
 }
 
 /**
  * The login of the shell before the relay of `host` as a check (RemoteShellAccess.login): a
- * success is kept in `sshLogins`, a failure forgets the last one and names its reason (the UTF-16 of an older wsl.exe
- * as text, wslText). Undefined when the host has no shell (no transport). Rejects only with an AbortError.
+ * success is kept in `sshLogins`, a failure forgets the last one and names its reason. Undefined when the host has no
+ * shell (no transport). Rejects only with an AbortError.
  */
 async function shellLoginCheck(
   host: string,
@@ -196,8 +208,7 @@ async function shellLoginCheck(
   if (shell === undefined) return undefined;
   if (!shell.ok) {
     deps.sshLogins?.forget(host);
-    const detail = wslText(shell.detail);
-    return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(detail), detail };
+    return { ok: false, problem: shell.timedOut ? 'unreachable' : dockerHostProblem(shell.detail), detail: shell.detail };
   }
   deps.sshLogins?.remember(host);
   return { ok: true };
@@ -269,7 +280,7 @@ export async function readRootlessSocket(
   const program = access.kind === 'wsl' ? 'wsl.exe' : 'ssh';
   if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `${program} did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
   if (result.exitCode !== 0) {
-    const detail = (access.kind === 'wsl' ? wslText(result.stderr) : result.stderr).trim() || `${program} failed with exit code ${result.exitCode}.`;
+    const detail = result.stderr.trim() || `${program} failed with exit code ${result.exitCode}.`;
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
   const socket = rootlessSocketPath(result.stdout);

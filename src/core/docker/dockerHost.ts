@@ -491,9 +491,7 @@ export function dockerHostProblem(detail: string): DockerHostProblem {
   // The UTF-16 of an older wsl.exe (wslText).
   const text = wslText(detail);
   if (WSL_DISTRIBUTION_MISSING.test(text)) return 'wslDistributionMissing';
-  // The program that was not found is docker, not ssh.
-  if (/exec: "?docker"?: executable/i.test(text)) return 'dockerMissing';
-  if (/executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
+  if (/exec: "?ssh(?:\.exe)?"?: executable file not found|ssh: (?:command )?not found|No such file or directory.*\bssh\b|\bssh\b.*ENOENT/i.test(text)) {
     return 'sshMissing';
   }
   if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|host key .*(?:not known|is unknown|mismatch)|No \S+ host key is known/i.test(text)) {
@@ -503,7 +501,7 @@ export function dockerHostProblem(detail: string): DockerHostProblem {
   if (/Permission denied \(|Permission denied, please try again|Too many authentication failures|Authentication failed|no supported authentication methods/i.test(text)) {
     return 'login';
   }
-  if (/docker: (?:command )?not found|command not found: docker|docker: No such file or directory/i.test(text)) {
+  if (/docker: (?:command )?not found|command not found: docker|docker: No such file or directory|exec: "?docker"?: executable/i.test(text)) {
     return 'dockerMissing';
   }
   if (/Cannot connect to the Docker daemon|Is the docker daemon running|dial unix [^\s]*docker\.sock: connect: (?:no such file|connection refused)/i.test(text)) {
