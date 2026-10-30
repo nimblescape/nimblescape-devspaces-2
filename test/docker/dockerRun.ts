@@ -253,8 +253,8 @@ export function unexpectedChanges(baseline: DockerSnapshot, current: DockerSnaps
 
 /**
  * Removes the objects of a test run: the containers with the label devspaces-test.run=<runId> and the containers that use a
- * volume of the run (helper runs), then the images and the volumes with the label. Images are removed with force: they
- * are images of the run only. Returns a description of each removed object.
+ * volume of the run (helper runs), then the images (children before their parents) and the volumes with the label.
+ * Images are removed with force: they are images of the run only. Returns a description of each removed object.
  */
 export function removeRunObjects(docker: DockerCli, runId: string): string[] {
   const filter = `label=${TEST_RUN_LABEL}=${runId}`;
@@ -268,11 +268,20 @@ export function removeRunObjects(docker: DockerCli, runId: string): string[] {
     docker.ok(['rm', '-f', id]);
     removed.push(`container ${id.slice(0, 12)}`);
   }
-  for (const id of new Set(docker.lines(['image', 'ls', '-a', '-q', '--no-trunc', '--filter', filter]))) {
-    // An image that a removal before this one took with it (a parent) is gone already.
-    const result = docker.run(['image', 'rm', '-f', id]);
-    if (result.code !== 0 && !/no such image/i.test(result.err)) throw new Error(`docker image rm -f ${id} failed: ${result.err}`);
-    removed.push(`image ${id.slice(7, 19)}`);
+  // A parent goes only after its children (a commit, for example labelImage, makes a child of an image of the run, with
+  // its labels), whatever the order of the list: an image that cannot be removed yet is tried again after the others,
+  // until a pass removes none.
+  let images = [...new Set(docker.lines(['image', 'ls', '-a', '-q', '--no-trunc', '--filter', filter]))];
+  while (images.length > 0) {
+    const left: Array<{ id: string; err: string }> = [];
+    for (const id of images) {
+      // An image that a removal before this one took with it (a parent) is gone already.
+      const result = docker.run(['image', 'rm', '-f', id]);
+      if (result.code === 0 || /no such image/i.test(result.err)) removed.push(`image ${id.slice(7, 19)}`);
+      else left.push({ id, err: result.err });
+    }
+    if (left.length === images.length) throw new Error(`docker image rm -f ${left[0].id} failed: ${left[0].err}`);
+    images = left.map((entry) => entry.id);
   }
   for (const volume of volumes) {
     docker.ok(['volume', 'rm', volume]);
