@@ -52,6 +52,8 @@ const ALLOWED_MODULES: Record<string, readonly string[]> = {
     'engineRemoval.ts',
     'ownDockerCli.ts',
     'remoteDocker.ts',
+    // The idle session of a WSL distribution, and the rule for the work in the background there.
+    'wslLifetime.ts',
     // The setup and the removal of the WSL distribution of Devspaces on Windows.
     'wslSetup.ts',
   ],

@@ -6,7 +6,7 @@
 // (`reconcile`).
 import type { DevspaceOperationsDeps } from './devspaceOperations';
 import type { OperationFlow } from './devspaceOperations';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OP_RECONCILE } from '../helperChannel/protocol';
 import { type DevspaceServiceDeps } from './devspacePorts';
 import { RECONCILE_FLOW_TIMEOUT_MS } from './operationBase';
@@ -49,6 +49,20 @@ describe('reconcileInWorker', () => {
     expect(await stopped.h.operations.reconcileInWorker({ passive: false })).toBe(0);
     expect(stopped.calls).toEqual([]);
     expect(stopped.h.dockerStarts).toBe(0);
+  });
+
+  // A WSL distribution that does not run stays stopped: no `docker info` there, which would start it.
+  it('not on a WSL distribution that a call must leave stopped (leavesStopped), with neither Docker nor the worker asked', async () => {
+    const wsl = { kind: 'remote' as const, host: 'wsl:devspaces', endpoint: 'wsl://devspaces' };
+    const leavesStopped = async (host: string) => host === 'wsl:devspaces';
+    const dockerRunning = vi.fn(async () => true);
+    const stopped = harness({ added: 1 }, { dockerTarget: async () => wsl, leavesStopped, dockerRunning });
+    expect(await stopped.h.operations.reconcileInWorker({ passive: true })).toBe(0);
+    expect(stopped.calls).toEqual([]);
+    expect(dockerRunning).not.toHaveBeenCalled();
+    // While it may be started (or runs), the rebuild runs as before.
+    const runs = harness({ added: 1 }, { dockerTarget: async () => wsl, leavesStopped: async () => false });
+    expect(await runs.h.operations.reconcileInWorker({ passive: true })).toBe(1);
   });
 
   it('an answer that is not a number of entries, and a failed flow, are failures', async () => {

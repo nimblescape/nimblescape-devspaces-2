@@ -139,6 +139,12 @@ export interface DevspaceOperationsDeps extends OperationBaseDeps {
    */
   engineRemoved?: (host: string) => Promise<boolean>;
   /**
+   * Whether a Docker call on the engine of the Docker host `host` must not run now, because it would start a WSL
+   * distribution that does not run (WslLifetime.leavesStopped): then no container runs there, and the refresh of the
+   * states and the rebuild of a lost registry ask Docker nothing. False when not given.
+   */
+  leavesStopped?: (host: string) => Promise<boolean>;
+  /**
    * readDevspaceStates in the worker of the Docker target (HelperChannels.refresh); it makes the worker ready first,
    * and rejects when it cannot.
    */
@@ -621,11 +627,19 @@ export class DevspaceOperations extends OperationBase {
    * without a worker. On an engine with the removal mark (`engineRemoved`), Docker is not asked either (no `docker
    * info`, no worker): `runtime` is `undefined`, with `engineRemoved`, so that the caller asks Docker nothing too. When
    * Docker did not answer (`docker info`), `runtime` is `undefined` with `dockerStopped`, so that the caller does not ask
-   * it again (on a remote host that does not answer, each `docker info` waits for its time limit).
+   * it again (on a remote host that does not answer, each `docker info` waits for its time limit). On a WSL distribution
+   * that does not run and that a call now must leave stopped (`leavesStopped`), Docker is not asked either: `runtime` is
+   * `undefined` with `dockerStopped` and `distributionStopped`, because no container runs there.
    */
   async refreshStates(
     branchIds: ReadonlySet<string>,
-  ): Promise<{ runtime: Map<string, DevspaceRuntimeState> | undefined; branches: Map<string, string>; engineRemoved?: true; dockerStopped?: true }> {
+  ): Promise<{
+    runtime: Map<string, DevspaceRuntimeState> | undefined;
+    branches: Map<string, string>;
+    engineRemoved?: true;
+    dockerStopped?: true;
+    distributionStopped?: true;
+  }> {
     try {
       const readable = await this.readableDockerHost();
       if (readable === undefined) return { runtime: new Map(), branches: new Map() };
@@ -642,6 +656,7 @@ export class DevspaceOperations extends OperationBase {
       if (devspaces.length === 0) return { runtime: new Map(), branches: new Map() };
       // Nor on an engine with the removal mark, until a flow of the user there clears it (below: said once).
       if (await this.deps.engineRemoved?.(readable)) throw new RemovedEngineError(readable);
+      if (await this.deps.leavesStopped?.(readable)) return { runtime: undefined, branches: new Map(), dockerStopped: true, distributionStopped: true };
       if (!(await this.deps.dockerRunning())) return { runtime: undefined, branches: new Map(), dockerStopped: true };
       // A failure of the worker refresh fails the refresh (below); only through the worker.
       const states = await this.deps.workerRefresh(devspaces);
@@ -710,14 +725,15 @@ export class DevspaceOperations extends OperationBase {
   /**
    * The rebuild of a lost registry by the worker of the Docker host of the operation (`reconcile`, where
    * reconcileFromVolumes runs; the entries come back as `record restore`, which this computer adds under its registry
-   * lock). Returns the number of added entries. Does not start Docker: 0 when it does not run, and on an endpoint that
-   * is neither local nor SSH. `passive`: a call in the background; the worker is made ready as for the refresh (the
-   * helper image only checked, the wait after a failed open kept). Throws when the worker could not be reached or
-   * failed (nothing is added then).
+   * lock). Returns the number of added entries. Does not start Docker: 0 when it does not run, on a WSL distribution
+   * that a call now must leave stopped (`leavesStopped`), and on an endpoint that is neither local nor SSH. `passive`: a
+   * call in the background; the worker is made ready as for the refresh (the helper image only checked, the wait after
+   * a failed open kept). Throws when the worker could not be reached or failed (nothing is added then).
    */
   async reconcileInWorker(options: { passive: boolean; signal?: AbortSignal }): Promise<number> {
     const readable = await this.readableDockerHost();
     if (readable === undefined) return 0;
+    if (await this.deps.leavesStopped?.(readable)) return 0;
     if (!(await this.deps.dockerRunning())) return 0;
     const params = parseReconcileParams({ dockerHost: readable, owner: this.deps.owner });
     if (params === undefined) throw new Error('The rebuild of the registry cannot be sent to the worker.');

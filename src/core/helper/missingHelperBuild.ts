@@ -9,8 +9,9 @@
 // Stop or Delete still builds it at once; a build of the helper image ends that wait). The build is the one of
 // Start, Stop and Delete (`build`: HelperChannelsOptions.prepare without the maintenance of an open, so the same
 // Dockerfile, tag and privileges, and the window's shared build of HelperImages, which a Start at the same time joins);
-// it runs only when the engine answers (`engineAnswers`, as for the background prebuild: Docker is never started, except
-// the WSL distribution of Devspaces, and a remote host gets the SSH check without questions first). After a build, `onBuilt` (the refresh of the sidebar).
+// it runs only when the engine answers (`engineAnswers`, as for the background prebuild: Docker is never started, a WSL
+// distribution only while its Monitor runs permanently, and a remote host gets the SSH check without questions first).
+// After a build, `onBuilt` (the refresh of the sidebar).
 // "Remove Devspaces from This Docker Engine…" stops the build on its engine (`stop`). No `vscode`.
 import { engineKey } from '../session/windowHeartbeats';
 import type { DockerTarget } from '../docker/dockerHost';
@@ -37,9 +38,9 @@ export type MissingHelperStatus = 'building' | 'failed';
 
 export interface MissingHelperBuildDeps {
   /**
-   * Whether the Docker engine of `target` answers (dockerEngineAnswers: Docker is never started, except the WSL
-   * distribution of Devspaces; a remote host first gets the SSH check without questions). Never throws, except an
-   * AbortError.
+   * Whether the Docker engine of `target` answers (dockerEngineAnswers: Docker is never started, a WSL distribution
+   * only while its Monitor runs permanently; a remote host first gets the SSH check without questions). Never throws,
+   * except an AbortError.
    */
   engineAnswers: (target: DockerTarget, signal: AbortSignal) => Promise<boolean>;
   /** The build of Start, Stop and Delete on `target` (HelperChannelsOptions.prepare without maintenance). */
