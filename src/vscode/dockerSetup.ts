@@ -379,7 +379,7 @@ export class DockerSetup implements vscode.Disposable {
     void showInformationMessage(DockerSetupUiTexts.dockerRunning).then(undefined, () => undefined);
   }
 
-  /** Command devspaces.dockerSetup.installWsl (sidebar button "Install WSL 2", Windows): `wsl --install` in the terminal. */
+  /** Command devspaces.dockerSetup.installWsl (sidebar button "Install WSL 2", Windows): WSL_INSTALL_COMMAND in the terminal. */
   async installWsl(): Promise<void> {
     if (this.refuseInRemoteWindow()) return;
     // The button shows until a check finds WSL ready, so a click before the first check ended waits for one.

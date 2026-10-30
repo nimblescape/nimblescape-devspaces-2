@@ -280,6 +280,8 @@ describe('Set Up Docker for Devspaces in WSL…', () => {
     await vi.waitFor(() => expect(fakeVscode.commands.executeCommand).toHaveBeenCalledWith(Commands.dockerSetupInstallWsl));
     expect(setup.image).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalledWith(`${WslSetupTexts.problem('wslMissing')} wsl.exe was not found.`);
+    // A user without administrator permission learns the command for an administrator.
+    expect(WslSetupTexts.problem('wslMissing')).toContain('"wsl --install --no-distribution"');
   });
 
   it('names the problem of a failed step, with Show details, and uses nothing', async () => {

@@ -43,8 +43,12 @@ export const DOCKER_DOWNLOAD_HOST = 'desktop.docker.com';
 export const DOCKER_ENGINE_INSTALL_URL = 'https://docs.docker.com/engine/install/';
 /** Docker Desktop, for a platform or architecture without a download link. */
 export const DOCKER_DESKTOP_DOCS_URL = 'https://docs.docker.com/desktop/';
-/** Docker Desktop on Windows needs WSL 2. */
-export const WSL_INSTALL_COMMAND = 'wsl --install';
+/**
+ * Docker Desktop on Windows needs WSL 2, and so does the WSL distribution of Devspaces. Without a distribution
+ * (`--no-distribution`, basic-commands.md of MicrosoftDocs/WSL): both bring their own, and the Ubuntu that
+ * `wsl --install` adds by default would ask for a Linux user after the restart.
+ */
+export const WSL_INSTALL_COMMAND = 'wsl --install --no-distribution';
 /** Docker Engine on Linux: starts the service now and with the computer. */
 export const LINUX_ENGINE_START_COMMAND = 'sudo systemctl enable --now docker';
 /** Homebrew cask of Docker Desktop (the former cask `docker` was renamed to `docker-desktop`). */
@@ -93,7 +97,7 @@ export const DockerSetupTexts = {
   downloadWindows:
     'Then it starts. The installer is signed by Docker; the file is marked as downloaded, so that Windows checks it. Windows may ask for an administrator password or for your permission.',
   confirmWsl: 'Install WSL 2?',
-  wslRestart: 'Windows asks for administrator permission. Restart the computer afterwards.',
+  wslRestart: 'Windows asks for administrator permission; without it, ask an administrator of this computer to run this command. Restart the computer afterwards.',
   confirmStartEngine: 'Start the Docker service?',
   install: 'Install',
   download: 'Download',

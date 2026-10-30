@@ -336,7 +336,7 @@ After a login with your password, Devspaces asks once: "Log in to `<host>` witho
 
 On Windows, Devspaces can use Docker Engine in a WSL distribution of its own, named `devspaces`, as a host of its list: without Docker Desktop and without SSH.
 
-- **Set it up**: click **Set Up Docker for Devspaces** in the Docker setup of the view, or run **Devspaces: Set Up Docker for Devspaces in WSL…**. It needs WSL 2.4.4 or later; without WSL, the message offers **Install WSL 2** (Windows asks for administrator permission, and you restart the computer afterwards). One question shows what Devspaces downloads and the folder. Then Devspaces:
+- **Set it up**: click **Set Up Docker for Devspaces** in the Docker setup of the view, or run **Devspaces: Set Up Docker for Devspaces in WSL…**. It needs WSL 2.4.4 or later; without WSL, the message offers **Install WSL 2** (`wsl --install --no-distribution`; Windows asks for administrator permission, without it an administrator of the computer runs this command, and you restart the computer afterwards). One question shows what Devspaces downloads and the folder. Then Devspaces:
   1. downloads the Debian file for WSL from the list of WSL distributions of Microsoft, the list that `wsl --install` uses, and checks it against the SHA-256 in that list;
   2. creates the distribution `devspaces` of WSL 2 for your Windows user with `wsl --install --from-file`, with its virtual disk in `%LOCALAPPDATA%\nimblescape\devspaces\wsl\disk`; this needs no administrator permission;
   3. installs Docker Engine there as root from the package repository of Docker (`download.docker.com`), and turns on systemd, which starts Docker;
@@ -388,7 +388,7 @@ The engine has one Monitor for all computers, and each computer asks the questio
 
 When Docker is not installed, the view shows the steps to set it up instead of the repositories, each with its button:
 
-1. On Windows: **Install WSL 2** (`wsl --install`; restart the computer afterwards). Once WSL 2 is ready, the view shows "✓ WSL 2 is installed."
+1. On Windows: **Install WSL 2** (`wsl --install --no-distribution`: WSL 2 without a Linux distribution, because Docker Desktop and the WSL distribution of Devspaces bring their own; restart the computer afterwards). Windows asks for administrator permission; without it, ask an administrator of the computer to run this command. Once WSL 2 is ready, the view shows "✓ WSL 2 is installed."
 2. On Windows: **Set Up Docker for Devspaces** creates the WSL distribution of Devspaces with Docker Engine, without Docker Desktop and without administrator permission (see [The WSL distribution of Devspaces](#the-wsl-distribution-of-devspaces-windows)). Or install Docker Desktop with **Install Docker** below.
 3. **Install Docker**:
    - macOS: with Homebrew, `brew install --cask docker-desktop`. If the terminal shows "Operation not permitted" from `xattr`, allow VS Code in System Settings › Privacy & Security › App Management and install again. Without Homebrew, `Docker.dmg` is downloaded from Docker and opens; drag Docker to Applications.
