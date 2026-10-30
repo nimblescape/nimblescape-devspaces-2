@@ -627,6 +627,68 @@ describe('the offer of the SSH host of a Docker context of the user', () => {
   });
 });
 
+describe('useHost and forgetHost (the WSL distribution of Devspaces after its setup and its removal)', () => {
+  const wslShells = (answers = true) => ({
+    login: vi.fn(async () => (answers ? { ok: true as const } : undefined)),
+    run: vi.fn(async () => (answers ? engineInfo() : undefined)),
+  });
+
+  it('useHost tests the host and uses it without a choice', async () => {
+    commands = create({ shells: wslShells() });
+    await expect(commands.useHost(WSL_HOST)).resolves.toBe(true);
+    expect(window.showQuickPick).not.toHaveBeenCalled();
+    expect(await state.dockerHost()).toBe(WSL_HOST);
+    expect(window.showInformationMessage).toHaveBeenCalledWith(RemoteDockerTexts.nowRemote(WSL_HOST, false));
+    expect(onDidSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  it('useHost gives false and shows the reason when the host does not answer', async () => {
+    commands = create({ shells: wslShells(false) });
+    await expect(commands.useHost(WSL_HOST)).resolves.toBe(false);
+    expect(window.showErrorMessage).toHaveBeenCalledWith(Messages.dockerHostUnreachable(WSL_HOST, dockerHostReason('wslMissing', WSL_HOST)), Actions.showDetails);
+    expect(await state.dockerHost()).toBeUndefined();
+  });
+
+  it('useHost downloads the Docker CLI of Devspaces first on a computer without a Docker CLI, and gives false when that fails', async () => {
+    cli.isInstalled = () => false;
+    const installOwnCli = vi.fn(async () => undefined);
+    commands = create({ shells: wslShells(), installOwnCli });
+    await expect(commands.useHost(WSL_HOST)).resolves.toBe(false);
+    expect(installOwnCli).toHaveBeenCalledTimes(1);
+    expect(await state.dockerHost()).toBeUndefined();
+  });
+
+  it('forgetHost removes the host from the list without a message; when it was current, the local Docker takes its place', async () => {
+    await state.setDockerHost(WSL_HOST);
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('local');
+    expect(await state.dockerHost()).toBeUndefined();
+    expect(await state.remoteHosts()).toEqual([]);
+    expect(onDidSwitch).toHaveBeenCalledTimes(1);
+    expect(window.showInformationMessage).not.toHaveBeenCalled();
+    // Not in the list (anymore): nothing changes.
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('notDockerHost');
+    expect(onDidSwitch).toHaveBeenCalledTimes(1);
+  });
+
+  it('forgetHost says why the local Docker that takes the place of the host is not supported', async () => {
+    await state.setDockerHost(WSL_HOST);
+    cli.contexts.set('tcp', 'tcp://192.0.2.10:2376');
+    cli.current = 'tcp';
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('unsupported');
+    expect(window.showWarningMessage).toHaveBeenCalledWith(Messages.dockerEndpointUnsupported('tcp://192.0.2.10:2376'), 'Show details');
+    expect(window.showInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it('forgetHost keeps the current host when it removes another one', async () => {
+    await state.setDockerHost(WSL_HOST);
+    await state.setDockerHost('build-box');
+    await expect(commands.forgetHost(WSL_HOST)).resolves.toBe('notDockerHost');
+    expect(await state.dockerHost()).toBe('build-box');
+    expect(await state.remoteHosts()).toEqual(['build-box']);
+    expect(onDidSwitch).not.toHaveBeenCalled();
+  });
+});
+
 describe('describeEntry', () => {
   it('shows User, HostName and Port where set', () => {
     expect(describeEntry({ alias: 'a' })).toBeUndefined();

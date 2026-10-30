@@ -54,7 +54,8 @@ export const DOCKER_APP_PATH = '/Applications/Docker.app';
 export const WINGET_INSTALL_COMMAND =
   'winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements';
 
-const DOCKER_ENGINE_PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
+/** The packages of Docker Engine from download.docker.com (apt and dnf). */
+export const DOCKER_ENGINE_PACKAGES = 'docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin';
 /** An absolute path that the shell reads as one word, without quotes (otherwise: no Homebrew, the download instead). */
 const SAFE_PATH_PATTERN = /^\/[A-Za-z0-9_./+-]+$/;
 /** A user name that `usermod` accepts and that the shell reads as one word, without quotes. */
@@ -182,9 +183,14 @@ export function dockerDesktopDownloadUrl(platform: NodeJS.Platform, arch: string
  * URLs, also the target of a redirect.
  */
 export function isHttpsUrlOf(url: string, host: string): boolean {
+  return isHttpsUrl(url) && new URL(url).hostname === host;
+}
+
+/** True for an HTTPS URL on the default port, of any host (a download that a SHA-256 checks). */
+export function isHttpsUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return parsed.protocol === 'https:' && parsed.hostname === host && parsed.port === '';
+    return parsed.protocol === 'https:' && parsed.port === '';
   } catch {
     return false;
   }

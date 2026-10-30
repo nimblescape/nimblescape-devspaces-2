@@ -694,12 +694,21 @@ describe('Controller commands', () => {
     };
     const declared = manifest.contributes.commands.map((command) => command.command).sort();
     expect([...h.commands.keys()].sort()).toEqual(declared);
-    // 38 commands, among them hidden ones: Show Docker Setup (the action Install Docker… of an error: it looks for the
+    // 40 commands, among them hidden ones: Show Docker Setup (the action Install Docker… of an error: it looks for the
     // CLI, then shows the view), the command of a repository row (a double-click runs Start), Enter on a row (Enter
     // runs Start), and the choice of the Docker host (the command of the first row of the view). The last two that were
-    // added: "Start with Account…" and "Add GitHub Account…".
-    expect(declared).toHaveLength(38);
-    expect(declared).toEqual(expect.arrayContaining([Commands.removeFromDockerEngine, Commands.rowEnter, Commands.startWithAccount, Commands.addAccount]));
+    // added: the setup and the removal of the WSL distribution of Devspaces.
+    expect(declared).toHaveLength(40);
+    expect(declared).toEqual(
+      expect.arrayContaining([
+        Commands.removeFromDockerEngine,
+        Commands.rowEnter,
+        Commands.startWithAccount,
+        Commands.addAccount,
+        Commands.setUpWslDistribution,
+        Commands.removeWslDistribution,
+      ]),
+    );
   });
 
   it('uses the settings and the context keys of package.json', () => {
@@ -772,12 +781,15 @@ describe('Controller commands', () => {
     const githubEnterprise =
       'Your VS Code is set up for GitHub Enterprise Server or GHE.com. Devspaces cannot use an account there. Sign in with an account on github.com.';
     const installWsl =
-      '1. Install WSL 2, which Docker Desktop needs. Windows asks for administrator permission; restart afterwards.\n[Install WSL 2](command:devspaces.dockerSetup.installWsl)';
+      '1. Install WSL 2, which Docker needs on Windows. Windows asks for administrator permission; restart afterwards.\n[Install WSL 2](command:devspaces.dockerSetup.installWsl)';
     const wslInstalled = '1. ✓ WSL 2 is installed.';
     const installMac =
       'Install Docker Desktop with Homebrew or Docker\'s installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)';
+    // The WSL distribution of Devspaces, without Docker Desktop.
+    const setUpWsl =
+      '2. Set up Docker for Devspaces: Devspaces creates its own WSL distribution with Docker Engine, without Docker Desktop and without administrator permission. You see the downloads and the folder before anything runs.\n[Set Up Docker for Devspaces](command:devspaces.setUpWslDistribution)';
     const installWindows =
-      '2. Install Docker Desktop with winget or Docker\'s installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)';
+      'Or install Docker Desktop with winget or Docker\'s installer. You see the commands before anything runs. Docker Desktop is free for personal use, education, non-commercial open source, and small businesses; larger companies need a [paid subscription](https://www.docker.com/legal/docker-subscription-service-agreement/).\n[Install Docker](command:devspaces.dockerSetup.install)';
     const installLinux =
       'Install Docker Engine from Docker\'s package repository. You see the commands before anything runs.\n[Install Docker](command:devspaces.dockerSetup.install)';
     // The last step on every platform: Docker on another computer, without Docker on this one.
@@ -789,10 +801,11 @@ describe('Controller commands', () => {
     });
 
     it('shows the steps of Windows with WSL 2 first, and a check mark instead of its button once WSL 2 is ready', () => {
-      expect(shownWelcome({ ...setup, isWindows: true })).toEqual([intro, installWsl, installWindows, after, remote, signIn]);
+      expect(shownWelcome({ ...setup, isWindows: true })).toEqual([intro, installWsl, setUpWsl, installWindows, after, remote, signIn]);
       expect(shownWelcome({ ...setup, isWindows: true, [DockerContextKeys.wslReady]: true })).toEqual([
         intro,
         wslInstalled,
+        setUpWsl,
         installWindows,
         after,
         remote,
@@ -814,7 +827,7 @@ describe('Controller commands', () => {
       expect(shownWelcome({ ...enterprise, ...setup, isMac: true, [SIGNED_IN_CONTEXT_KEY]: true })).toEqual([intro, installMac, after, remote]);
     });
 
-    // Numbers only where there is more than one step (Windows: WSL 2, then Docker Desktop).
+    // Numbers only where there is more than one step (Windows: WSL 2, then Docker for Devspaces in WSL).
     it('numbers the steps 1, 2, … only on the platform with two steps', () => {
       const cases = <Array<[Record<string, boolean>, number]>>[
         [{ isMac: true }, 0],
