@@ -134,7 +134,7 @@ describe('WslUpgrade', () => {
 
   // Mutation: a check that counts without a running distribution waits 6 hours after a short use of the distribution;
   // one that reads the state before the owner leaves more time for the distribution to stop before the run.
-  it('starts no distribution that does not run, or whose state is not known, and checks again at the next use', async () => {
+  it('starts no distribution that does not run, or whose state is not known, and checks a stopped one again at the next use', async () => {
     for (const runs of [false, null]) {
       const { subject, calls, runsCheck, ownCheck } = upgrade(undefined, true, runs);
       subject.schedule('devspaces');
@@ -144,7 +144,8 @@ describe('WslUpgrade', () => {
       expect(calls).toEqual([]);
       subject.schedule('devspaces');
       await vi.advanceTimersByTimeAsync(UPGRADE_DELAY_MS);
-      expect(runsCheck).toHaveBeenCalledTimes(2);
+      // A state that is not known counts for 6 hours, so that a `wsl.exe` that fails gets no check at each use.
+      expect(runsCheck).toHaveBeenCalledTimes(runs === false ? 2 : 1);
     }
   });
 
@@ -170,8 +171,8 @@ describe('WslUpgrade', () => {
     const timedOut = upgrade(result(null, '', '', true));
     await timedOut.subject.check();
     expect(timedOut.log.warn).toHaveBeenCalledWith(
-      'The weekly upgrade of the packages of the WSL distribution devspaces did not end within 30 minutes; it may go on in the distribution. ' +
-        'Its output is in /var/log/devspaces-upgrade.log there.',
+      'The weekly upgrade of the packages of the WSL distribution devspaces did not end within 30 minutes; it goes on in the distribution while the ' +
+        'distribution runs, and a run that the stop of the distribution ended is tried again after a day. Its output is in /var/log/devspaces-upgrade.log there.',
     );
     const thrown = upgrade(new Error('spawn EACCES'));
     await expect(thrown.subject.check()).resolves.toBeUndefined();

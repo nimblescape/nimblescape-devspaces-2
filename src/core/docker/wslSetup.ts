@@ -392,7 +392,7 @@ main() {
 log=${WSL_SETUP_LOG}
 exec 9> ${WSL_SETUP_LOCK}
 if ! flock -n 9; then
-echo "Another setup of Docker, or the weekly upgrade of the packages (up to 30 minutes), runs in the distribution. Try again after it." >&2
+echo "Another setup of Docker, or the weekly upgrade of the packages, runs in the distribution. Try again after it." >&2
 exit 1
 fi
 : > "$log"

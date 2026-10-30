@@ -155,8 +155,8 @@ export class WslUpgrade {
   }
 
   /**
-   * A check counts for UPGRADE_CHECK_MS unless it found the distribution stopped: then the next use schedules a check
-   * again. The state of the distribution is read last, under the lock and right before the run, so that the run starts
+   * A check counts for UPGRADE_CHECK_MS unless it found the distribution stopped (a state that is not known counts):
+   * then the next use schedules a check again. The state of the distribution is read last, under the lock and right before the run, so that the run starts
    * no distribution that stopped meanwhile. A lock that another window holds skips the check.
    */
   private async runCheck(): Promise<void> {
@@ -167,8 +167,10 @@ export class WslUpgrade {
       await this.deps.locked(async () => {
         // Again under the lock: a removal in another window may have come before it.
         if (this.disposed || !(await this.deps.own()) || this.disposed) return;
-        if ((await this.deps.runs(WSL_DISTRIBUTION)) !== true) {
-          counts = false;
+        const runs = await this.deps.runs(WSL_DISTRIBUTION);
+        if (runs !== true) {
+          // A state that is not known counts, so that a `wsl.exe` that fails does not get a check at each use.
+          counts = runs === undefined;
           return;
         }
         if (this.disposed) return;
@@ -193,7 +195,8 @@ export class WslUpgrade {
     if (result.timedOut) {
       this.deps.logger.warn(
         `The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} did not end within ${duration(UPGRADE_MS)}; ` +
-          `it may go on in the distribution. Its output is in ${UPGRADE_LOG} there.`,
+          `it goes on in the distribution while the distribution runs, and a run that the stop of the distribution ended is tried again after a day. ` +
+          `Its output is in ${UPGRADE_LOG} there.`,
       );
       return;
     }
