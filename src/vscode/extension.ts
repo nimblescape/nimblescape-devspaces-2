@@ -1010,7 +1010,7 @@ async function activateExtension(
         ? undefined
         : new WslSetup({ runner, wslPath, env, arch: process.arch, folder: wslFolder, logger, http: nodeHttpsTransport }),
     folder: wslFolder,
-    dockerDesktopIntegrates: () => dockerDesktopIntegrates(env, WSL_DISTRIBUTION),
+    dockerDesktopIntegrates: (isDefault) => dockerDesktopIntegrates(env, WSL_DISTRIBUTION, isDefault),
     isWindows: platform === 'win32',
     logger,
     showLog: () => logger.show(),
