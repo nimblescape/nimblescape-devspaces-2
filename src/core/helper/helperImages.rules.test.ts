@@ -895,7 +895,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild)', 
     it('asks the local Docker with docker info only, and never starts it', async () => {
       const runner = sshRunner({});
       const daemonStatus = vi.fn(async () => ({ running: false }));
-      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, wslRunning: vi.fn(async () => false), logger };
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
       expect(await dockerEngineAnswers(LOCAL_DOCKER_TARGET, deps, new AbortController().signal)).toBe(false);
       expect(daemonStatus).toHaveBeenCalledTimes(1);
       expect(runner.run).not.toHaveBeenCalled();
@@ -904,7 +904,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild)', 
     it('checks a remote host with ssh -o BatchMode=yes first, so no question is ever asked; then docker info with the remote time limit', async () => {
       const runner = sshRunner({});
       const daemonStatus = vi.fn(async (_signal: AbortSignal, _timeoutMs?: number) => ({ running: true }));
-      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, wslRunning: vi.fn(async () => false), logger };
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
       expect(await dockerEngineAnswers(REMOTE_TARGET, deps, new AbortController().signal)).toBe(true);
       expect(runner.run).toHaveBeenCalledTimes(1);
       const [file, args, options] = runner.run.mock.calls[0];
@@ -917,7 +917,7 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild)', 
     it('answers false without docker info when the SSH check of a remote host fails, and false for an unsupported endpoint', async () => {
       const runner = sshRunner({ exitCode: 255, stderr: 'build-box: Permission denied (publickey).' });
       const daemonStatus = vi.fn(async () => ({ running: true }));
-      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, wslRunning: vi.fn(async () => false), logger };
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
       expect(await dockerEngineAnswers(REMOTE_TARGET, deps, new AbortController().signal)).toBe(false);
       expect(daemonStatus).not.toHaveBeenCalled();
       expect(logger.lines.join('\n')).toContain('cannot be reached over SSH');
@@ -930,32 +930,18 @@ describe('HelperImages.prebuildImage and HelperPrebuild (background prebuild)', 
     it('answers false without docker info for a remote host that our ssh cannot check (no unattended question)', async () => {
       const runner = sshRunner({});
       const daemonStatus = vi.fn(async () => ({ running: true }));
-      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, wslRunning: vi.fn(async () => false), logger };
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {} }, logger };
       const odd: DockerTarget = { kind: 'remote', host: 'me@corp.example@build-box', endpoint: 'ssh://me@corp.example@build-box', context: 'odd' };
       expect(await dockerEngineAnswers(odd, deps, new AbortController().signal)).toBe(false);
       expect(runner.run).not.toHaveBeenCalled();
       expect(daemonStatus).not.toHaveBeenCalled();
     });
 
-    // wsl.exe would start the distribution, and its Docker engine with it.
-    it('answers false for the WSL distribution while it does not run, and starts nothing', async () => {
-      const runner = sshRunner({});
-      const daemonStatus = vi.fn(async () => ({ running: true }));
-      const shells = { login: vi.fn(async () => ({ ok: true }) as const), run: vi.fn(async () => undefined) };
-      const wslRunning = vi.fn(async () => false);
-      const deps = { daemonStatus, ssh: { runner, sshPath: undefined, env: {}, shells }, wslRunning, logger };
-      expect(await dockerEngineAnswers(WSL_TARGET, deps, new AbortController().signal)).toBe(false);
-      expect(wslRunning).toHaveBeenCalledWith('devspaces', expect.any(AbortSignal));
-      expect(shells.login).not.toHaveBeenCalled();
-      expect(daemonStatus).not.toHaveBeenCalled();
-      expect(logger.lines.join('\n')).toContain('The WSL distribution devspaces does not run, so it is not started for this.');
-    });
-
-    it('checks the WSL distribution that runs with the start of its shell, then docker info with the remote time limit', async () => {
+    it('checks the WSL distribution with the start of its shell, never with ssh, then docker info with the remote time limit', async () => {
       const runner = sshRunner({});
       const daemonStatus = vi.fn(async (_signal: AbortSignal, _timeoutMs?: number) => ({ running: true }));
       const shells = { login: vi.fn(async () => ({ ok: true }) as const), run: vi.fn(async () => undefined) };
-      const deps = { daemonStatus, ssh: { runner, sshPath: undefined, env: {}, shells }, wslRunning: vi.fn(async () => true), logger };
+      const deps = { daemonStatus, ssh: { runner, sshPath: '/usr/bin/ssh', env: {}, shells }, logger };
       expect(await dockerEngineAnswers(WSL_TARGET, deps, new AbortController().signal)).toBe(true);
       expect(shells.login).toHaveBeenCalledTimes(1);
       expect(runner.run).not.toHaveBeenCalled();

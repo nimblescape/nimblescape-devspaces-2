@@ -15,7 +15,6 @@ import { addDockerFolderToPath, dockerProcessEnv, findDockerCli, findExecutable,
 import { ownDockerCliDownload, OWN_DOCKER_CLI_VERSION, presentOwnDockerCli } from '../core/docker/ownDockerCli';
 import {
   WSL_LIST_ARGS,
-  WSL_RUNNING_ARGS,
   describeDockerHost,
   devspacesOfHost,
   dockerHostOf,
@@ -52,7 +51,7 @@ import { Messages } from '../core/messages';
 import { nodeHttpsTransport, takeUserAgentVersion } from '../core/http';
 import { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
-import { isAbortError, isoTime, systemClock, type StartedByteProcess } from '../core/ports';
+import { isoTime, systemClock, type StartedByteProcess } from '../core/ports';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
 import { monitorSettingsOf } from './monitorSettings';
 import { REMOTE_MONITOR_VOLUME } from '../core/remoteMonitor/protocol';
@@ -305,22 +304,6 @@ async function activateExtension(
     if (access === undefined) return false;
     return (access.kind === 'wsl' ? wslPath() : sshPath()) !== undefined;
   };
-  /**
-   * The names that `wsl.exe` lists with `args` (WSL_LIST_ARGS, or WSL_RUNNING_ARGS); none without WSL. Without a
-   * distribution (or without one that runs), `wsl.exe` says so with an exit code that is not 0: then there is none.
-   * Rejects when it does not answer within WSL_LIST_TIMEOUT_MS, and with an AbortError.
-   */
-  const wslList = async (args: readonly string[], signal?: AbortSignal): Promise<string[]> => {
-    const wsl = wslPath();
-    if (wsl === undefined) return [];
-    const result = await runner.run(wsl, args, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS, signal });
-    if (result.timedOut) throw new Error(`wsl.exe ${args.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
-    if (result.exitCode !== 0) {
-      logger.info(`wsl.exe ${args.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
-      return [];
-    }
-    return parseWslList(result.stdout);
-  };
   // After a login with a password in a flow of the user, Devspaces offers once per host to log in with its own key
   // (~/.ssh/devspaces_ed25519) next time; every later login of Devspaces to a host with the key uses it.
   const sshKeys = new SshKeyOffer({
@@ -427,22 +410,9 @@ async function activateExtension(
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
   });
-  // What the checks whether an engine answers need (dockerEngineAnswers): Docker is never started, a remote host gets
-  // the SSH check without questions first, and a WSL distribution that does not run is not started.
-  const engineAnswersDeps = (): DockerEngineAnswersDeps => ({
-    daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs),
-    ssh: remoteDeps(),
-    wslRunning: async (distribution, signal) => {
-      try {
-        return (await wslList(WSL_RUNNING_ARGS, signal)).some((name) => name.toLowerCase() === distribution.toLowerCase());
-      } catch (error) {
-        if (isAbortError(error)) throw error;
-        logger.info(`Whether the WSL distribution ${distribution} runs is not known: ${errorMessage(error)}`);
-        return false;
-      }
-    },
-    logger,
-  });
+  // What the checks whether an engine answers need (dockerEngineAnswers): Docker is never started, and a remote host gets
+  // the SSH check without questions first.
+  const engineAnswersDeps = (): DockerEngineAnswersDeps => ({ daemonStatus: (s, timeoutMs) => docker.daemonStatus(s, timeoutMs), ssh: remoteDeps(), logger });
   const registry = new DevspaceRegistry(paths, systemClock, { logger });
   const needsRestore = (): Promise<boolean> => registry.needsRestore();
   const sessionFiles = new SessionFiles(paths);
@@ -945,8 +915,19 @@ async function activateExtension(
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
     sshEnv: (host, callEnv) => sshKeys.dockerSshEnv(host, callEnv),
-    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host.
-    wslDistributions: () => wslList(WSL_LIST_ARGS),
+    // The WSL distributions of this Windows user, for the WSL distribution of Devspaces in the choice of the host. Without
+    // WSL, or without a distribution, `wsl.exe` says so with an exit code that is not 0: then there is none.
+    wslDistributions: async () => {
+      const wsl = wslPath();
+      if (wsl === undefined) return [];
+      const result = await runner.run(wsl, WSL_LIST_ARGS, { env: wslEnv(env), timeoutMs: WSL_LIST_TIMEOUT_MS });
+      if (result.timedOut) throw new Error(`wsl.exe ${WSL_LIST_ARGS.join(' ')} did not answer within ${WSL_LIST_TIMEOUT_MS / 1000} seconds`);
+      if (result.exitCode !== 0) {
+        logger.info(`wsl.exe ${WSL_LIST_ARGS.join(' ')} lists no distribution (exit code ${result.exitCode}): ${parseWslList(result.stderr || result.stdout).join(' ')}`);
+        return [];
+      }
+      return parseWslList(result.stdout);
+    },
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();

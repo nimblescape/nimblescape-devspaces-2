@@ -348,6 +348,10 @@ describe('the WSL distribution of Devspaces: no SSH', () => {
     });
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells(null) })).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     await expect(testRemoteDockerHost(docker, WSL_HOST, deps)).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    // The shell could not start again for docker info: the UTF-16 message of an older wsl.exe as text.
+    await expect(
+      testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, fail(Buffer.from('The operation timed out.', 'utf16le').toString('utf8'), 255)) }),
+    ).resolves.toMatchObject({ ok: false, detail: 'The operation timed out.' });
     // The shell that started is gone before docker info (the window closes): wsl.exe is there.
     await expect(testRemoteDockerHost(docker, WSL_HOST, { ...deps, shells: wslShells({ ok: true }, null) })).resolves.toEqual({
       ok: false,
@@ -397,7 +401,12 @@ describe('the WSL distribution of Devspaces: no SSH', () => {
   it('reads the runtime folder of a rootless engine only on its shell', async () => {
     const runner = { run: vi.fn(async () => ok('/run/user/9')) };
     await expect(readRootlessSocket(runner, undefined, WSL_HOST, {}, undefined, wslShells({ ok: true }, ok('/run/user/0')))).resolves.toEqual({ ok: true, socket: '/run/user/0/docker.sock' });
-    await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {}, undefined, wslShells({ ok: true }, null))).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
+    // After the check of the caller, a shell is gone only when the window closes meanwhile.
+    await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {}, undefined, wslShells({ ok: true }, null))).resolves.toEqual({
+      ok: false,
+      problem: 'unreachable',
+      detail: 'The shell of wsl.exe in wsl:devspaces ended.',
+    });
     await expect(readRootlessSocket(runner, '/usr/bin/ssh', WSL_HOST, {})).resolves.toMatchObject({ ok: false, problem: 'wslMissing' });
     // The UTF-16 error output of an older wsl.exe as text.
     const utf16 = fail(Buffer.from('sh: 1: docker: not found', 'utf16le').toString('utf8'), 1);

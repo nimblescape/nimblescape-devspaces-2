@@ -401,16 +401,14 @@ export const WSL_LIST_ARGS: readonly string[] = ['--list', '--quiet'];
 /**
  * A text that `wsl.exe` wrote (its list, or its error output), read as UTF-8, as text. An older `wsl.exe` writes UTF-16
  * also with WSL_UTF8=1: read as UTF-8, its text has a NUL after each character, and its byte order mark becomes
- * replacement characters. Both are dropped (no message and no name of a distribution has them). Any other text stays.
+ * replacement characters. Both are dropped (no message and no name of a distribution has them), which gives back text
+ * in English (ASCII); other characters of such a text stay unreadable. Any other text stays as it is.
  */
 export function wslText(text: string): string {
   return text.replace(/[\u0000\uFEFF\uFFFD]/g, '');
 }
 
-/** The arguments of `wsl.exe` that list the names of the running WSL distributions of this Windows user, one per line. */
-export const WSL_RUNNING_ARGS: readonly string[] = ['--list', '--running', '--quiet'];
-
-/** The names in the output of `wsl.exe --list --quiet` (WSL_LIST_ARGS, WSL_RUNNING_ARGS): one per line (wslText). */
+/** The names in the output of `wsl.exe --list --quiet` (WSL_LIST_ARGS): one per line (wslText). */
 export function parseWslList(stdout: string): string[] {
   return wslText(stdout)
     .split(/\r?\n/)

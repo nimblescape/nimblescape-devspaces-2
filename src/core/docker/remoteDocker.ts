@@ -111,7 +111,8 @@ function engineCheckOf(result: RunResult, timeoutMs: number): EngineCheck {
   }
   const info = result.exitCode === 0 ? parseEngineInfo(result.stdout) : undefined;
   if (info) return { ok: true, ...info };
-  const detail = (result.stderr || result.stdout).trim() || `docker info failed with exit code ${result.exitCode}.`;
+  // The error output can be the one of wsl.exe (its shell could not start again): wslText.
+  const detail = wslText(result.stderr || result.stdout).trim() || `docker info failed with exit code ${result.exitCode}.`;
   return { ok: false, problem: dockerHostProblem(detail), detail };
 }
 
@@ -262,7 +263,9 @@ export async function readRootlessSocket(
     const detail = errorMessage(error);
     return { ok: false, problem: dockerHostProblem(detail), detail };
   }
-  if (result === undefined) return WSL_NOT_FOUND;
+  // The shells before the relay have no shell for the distribution: without wsl.exe, or after a successful check (the
+  // caller's) only when the window closes meanwhile.
+  if (result === undefined) return shells === undefined ? WSL_NOT_FOUND : { ok: false, problem: 'unreachable', detail: `The shell of wsl.exe in ${host} ended.` };
   const program = access.kind === 'wsl' ? 'wsl.exe' : 'ssh';
   if (result.timedOut) return { ok: false, problem: 'unreachable', detail: `${program} did not answer within ${SSH_TIMEOUT_MS / 1000} seconds.` };
   if (result.exitCode !== 0) {
