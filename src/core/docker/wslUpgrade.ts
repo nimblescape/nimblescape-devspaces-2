@@ -12,7 +12,7 @@
 import { errorMessage } from '../errors';
 import type { Logger, ProcessRunner, RunResult } from '../ports';
 import { WSL_DISTRIBUTION, wslCommandArgs, wslEnv, wslText } from './dockerHost';
-import { WSL_POLICY_INSTALL, WSL_SETUP_LOCK, endOf, outputOf } from './wslSetup';
+import { WSL_POLICY_INSTALL, WSL_SETUP_LOCK, duration, endOf, outputOf } from './wslSetup';
 
 /** The folder of the times of the upgrade in the distribution. */
 export const UPGRADE_STATE_DIR = '/var/lib/devspaces';
@@ -47,6 +47,11 @@ export const UPGRADE_CHECK_MS = 6 * 60 * 60_000;
  * apt-daily, or apt of the user). `--with-new-pkgs` also installs a new package that an upgrade needs, but removes
  * none. The summary line of apt is in the format of apt before 3.0 or in that of apt 3.0 (`Upgrading: …`); `LC_ALL=C`
  * keeps it in English. On a failure, standard error gets the last lines of its log.
+ *
+ * The commands get no copy of the descriptor of the lock (`9>&-`): a process that a maintainer script leaves behind
+ * would hold the lock until the next start of the distribution. The script ignores SIGHUP, and so do the commands: when
+ * `wsl.exe` ends at the time limit, a hangup must not end the script in the middle of dpkg, and its trap must not
+ * remove the policy-rc.d while dpkg still runs.
  */
 export const UPGRADE_SCRIPT = `set -eu
 main() {
@@ -66,10 +71,11 @@ fi
 echo "$now" > ${UPGRADE_TRIED_FILE}
 : > "$log"
 fail() { echo "The upgrade failed. The last lines of $log:" >&2; tail -n 40 "$log" >&2; exit 1; }
-run() { "$@" >> "$log" 2>&1 || fail; }
-again() { tries=1; until "$@" >> "$log" 2>&1; do [ "$tries" -lt 3 ] || fail; tries=$((tries + 1)); sleep 30; done; }
+run() { "$@" 9>&- >> "$log" 2>&1 || fail; }
+again() { tries=1; until "$@" 9>&- >> "$log" 2>&1; do [ "$tries" -lt 3 ] || fail; tries=$((tries + 1)); sleep 30 9>&-; done; }
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 ${WSL_POLICY_INSTALL}
+trap '' HUP
 again dpkg --configure -a
 again apt-get update
 run apt-get -o DPkg::Lock::Timeout=300 -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade --with-new-pkgs
@@ -121,7 +127,7 @@ export class WslUpgrade {
    * Devspaces, and not after `dispose`. Never throws.
    */
   schedule(distribution: string): void {
-    if (this.disposed || distribution !== WSL_DISTRIBUTION || this.timer !== undefined || this.checking !== undefined) return;
+    if (this.disposed || distribution.toLowerCase() !== WSL_DISTRIBUTION || this.timer !== undefined || this.checking !== undefined) return;
     if (this.checkedAt !== undefined && Math.abs(this.now() - this.checkedAt) < UPGRADE_CHECK_MS) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
@@ -159,7 +165,8 @@ export class WslUpgrade {
       const wsl = this.deps.wslPath();
       if (wsl === undefined || this.disposed || !(await this.deps.own()) || this.disposed) return;
       await this.deps.locked(async () => {
-        if (this.disposed) return;
+        // Again under the lock: a removal in another window may have come before it.
+        if (this.disposed || !(await this.deps.own()) || this.disposed) return;
         if ((await this.deps.runs(WSL_DISTRIBUTION)) !== true) {
           counts = false;
           return;
@@ -185,7 +192,7 @@ export class WslUpgrade {
       .find((text) => text.startsWith(UPGRADE_PREFIX));
     if (result.timedOut) {
       this.deps.logger.warn(
-        `The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} did not end within ${UPGRADE_MS / 60_000} minutes; ` +
+        `The weekly upgrade of the packages of the WSL distribution ${WSL_DISTRIBUTION} did not end within ${duration(UPGRADE_MS)}; ` +
           `it may go on in the distribution. Its output is in ${UPGRADE_LOG} there.`,
       );
       return;
@@ -213,9 +220,10 @@ export class WslUpgrade {
       this.deps.logger.info(`The packages of the WSL distribution ${WSL_DISTRIBUTION} are up to date ${of}.`);
     }
     if (kept > 0) {
-      this.deps.logger.warn(
-        `The weekly upgrade kept ${kept} package(s) of the WSL distribution ${WSL_DISTRIBUTION} back: their new versions need the removal of ` +
-          `other packages, which it never does ${of}. To upgrade them, run "wsl -d ${WSL_DISTRIBUTION} -u root -- apt-get full-upgrade" in a terminal.`,
+      this.deps.logger.info(
+        `The weekly upgrade kept ${kept} package(s) of the WSL distribution ${WSL_DISTRIBUTION} back ${of}: packages on hold (apt-mark hold), ` +
+          `or new versions that need the removal of other packages, which it never does. ` +
+          `"wsl -d ${WSL_DISTRIBUTION} -u root -- apt-get full-upgrade" in a terminal upgrades the latter.`,
       );
     }
   }

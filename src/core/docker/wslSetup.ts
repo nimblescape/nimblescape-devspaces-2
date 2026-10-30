@@ -1057,6 +1057,7 @@ export function endOf(result: RunResult, timeoutMs: number): string {
   return result.timedOut ? `no end within ${duration(timeoutMs)}` : `exit code ${result.exitCode}`;
 }
 
-function duration(ms: number): string {
+/** A time limit in words: `30 minutes`, `90 seconds`. */
+export function duration(ms: number): string {
   return ms >= 120_000 ? `${Math.round(ms / 60_000)} minutes` : `${Math.round(ms / 1000)} seconds`;
 }

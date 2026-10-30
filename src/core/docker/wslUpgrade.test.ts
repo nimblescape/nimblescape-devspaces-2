@@ -76,7 +76,8 @@ describe('WslUpgrade', () => {
   it('checks a few minutes after the first use of the distribution of Devspaces, and then at most every 6 hours', async () => {
     const { subject, calls, log } = upgrade();
     subject.schedule('Ubuntu');
-    subject.schedule('devspaces');
+    // WSL takes the name in any case.
+    subject.schedule('Devspaces');
     subject.schedule('devspaces');
     await vi.advanceTimersByTimeAsync(UPGRADE_DELAY_MS - 1);
     expect(calls).toEqual([]);
@@ -117,6 +118,12 @@ describe('WslUpgrade', () => {
     expect(free.lockedTask).toHaveBeenCalledTimes(1);
     expect(free.lockedTask.mock.invocationCallOrder[0]).toBeLessThan(free.runsCheck.mock.invocationCallOrder[0]);
     expect(free.calls).toHaveLength(1);
+    // A removal in another window came between the first check of the owner and the lock.
+    const removed = upgrade();
+    removed.ownCheck.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    await removed.subject.check();
+    expect(removed.ownCheck).toHaveBeenCalledTimes(2);
+    expect(removed.calls).toEqual([]);
     const held = upgrade(undefined, true, true, false);
     await held.subject.check();
     expect(held.runsCheck).not.toHaveBeenCalled();
@@ -193,16 +200,18 @@ describe('WslUpgrade', () => {
   it('warns of packages that the upgrade kept back', async () => {
     const kept = upgrade(result(0, 'devspaces-upgrade done 0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n'));
     await kept.subject.check();
-    expect(kept.log.info).not.toHaveBeenCalled();
-    expect(kept.log.warn).toHaveBeenCalledWith(
-      'The weekly upgrade kept 2 package(s) of the WSL distribution devspaces back: their new versions need the removal of other packages, which it ' +
-        'never does (apt-get upgrade: 0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.). ' +
-        'To upgrade them, run "wsl -d devspaces -u root -- apt-get full-upgrade" in a terminal.',
-    );
+    expect(kept.log.info.mock.calls).toEqual([
+      [
+        'The weekly upgrade kept 2 package(s) of the WSL distribution devspaces back (apt-get upgrade: 0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.): ' +
+          'packages on hold (apt-mark hold), or new versions that need the removal of other packages, which it never does. ' +
+          '"wsl -d devspaces -u root -- apt-get full-upgrade" in a terminal upgrades the latter.',
+      ],
+    ]);
+    expect(kept.log.warn).not.toHaveBeenCalled();
     const both = upgrade(result(0, 'devspaces-upgrade done 3 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n'));
     await both.subject.check();
     expect(both.log.info).toHaveBeenCalledWith(expect.stringMatching(/^The packages of the WSL distribution devspaces were upgraded/));
-    expect(both.log.warn).toHaveBeenCalledWith(expect.stringMatching(/^The weekly upgrade kept 1 package\(s\)/));
+    expect(both.log.info).toHaveBeenCalledWith(expect.stringMatching(/^The weekly upgrade kept 1 package\(s\)/));
   });
 
   // Mutation: a check that does not look at `disposed` after its waits starts an upgrade of 30 minutes from a window
@@ -246,13 +255,19 @@ describe('the script of the upgrade', () => {
    * number of runs of `apt-get update` that fail (all: true). `summary`: the summary line of the stub of
    * `apt-get upgrade`. `sleep` writes its argument to `calls` and returns at once.
    */
-  function runScript(options: { failUpdate?: boolean | number; summary?: string } = {}) {
+  function runScript(options: { failUpdate?: boolean | number; summary?: string; hangup?: boolean } = {}) {
     const bin = file('bin');
     fs.mkdirSync(bin, { recursive: true });
     const stub = (name: string, first: string[], extra: string[] = []) =>
       fs.writeFileSync(
         path.join(bin, name),
-        ['#!/bin/sh', ...first, `echo "${name} $* policy=$([ -e '${file('policy-rc.d')}' ] && echo yes || echo no)" >> '${file('calls')}'`, ...extra].join('\n'),
+        [
+          '#!/bin/sh',
+          ...first,
+          `echo "${name} $* policy=$([ -e '${file('policy-rc.d')}' ] && echo yes || echo no)" >> '${file('calls')}'`,
+          `[ ! -e /proc/$$/fd/9 ] || echo "${name}" >> '${file('fd9')}'`,
+          ...extra,
+        ].join('\n'),
         { mode: 0o755 },
       );
     stub('dpkg', []);
@@ -261,6 +276,8 @@ describe('the script of the upgrade', () => {
     stub('apt-get', [], [
       `case "$*" in update) n=$(grep -c '^apt-get update' '${file('calls')}'); [ "$n" -gt ${failures} ] || { echo "E: Could not resolve deb.debian.org"; exit 100; };; esac`,
       `case "$*" in *upgrade*) echo '${options.summary ?? '3 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.'}';; esac`,
+      // The hangup of `wsl.exe` at the time limit, to the script and to the command.
+      options.hangup ? 'case "$*" in *upgrade*) kill -HUP $$ $PPID;; esac' : ':',
     ]);
     const script = UPGRADE_SCRIPT.split(UPGRADE_STATE_DIR)
       .join(state())
@@ -296,6 +313,17 @@ describe('the script of the upgrade', () => {
       const written = Number(fs.readFileSync(stamp(name), 'utf8').trim());
       expect(Math.abs(written - seconds())).toBeLessThan(60);
     }
+    // Mutation: a command with the descriptor of the lock leaves it held by a process that it leaves behind.
+    expect(fs.existsSync(file('fd9'))).toBe(false);
+  });
+
+  // Mutation: a script that ends at a hangup removes the policy-rc.d while dpkg may still run (Docker would start again
+  // and stop the running devspaces); one whose commands do not ignore it stops dpkg in the middle.
+  it('goes on after a hangup of wsl.exe', () => {
+    const run = runScript({ hangup: true });
+    expect(run.status).toBe(0);
+    expect(run.stdout.trim()).toMatch(/^devspaces-upgrade done /);
+    expect(calls()).toContain('apt-get clean policy=yes');
   });
 
   // Mutation: a script without LC_ALL=C gets a summary in the language of the distribution; one that reads only the
