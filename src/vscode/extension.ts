@@ -862,6 +862,7 @@ async function activateExtension(
     sshLogins,
     shells,
     identityFor: (host) => sshKeys.identityFor(host),
+    sshEnv: (host, callEnv) => sshKeys.dockerSshEnv(host, callEnv),
     devspaceCount: async (host) => devspacesOfHost(await registry.list(), host).length,
     onDidSwitch: async () => {
       await sidebar.render();

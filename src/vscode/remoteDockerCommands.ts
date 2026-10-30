@@ -125,6 +125,8 @@ export interface RemoteDockerDeps {
   shells?: RemoteShellAccess;
   /** The key of Devspaces for `host` when that host has it (SshCheckDeps.identityFor). */
   identityFor?(host: string): string | undefined;
+  /** The environment of a Docker call with `ssh://<host>` with that key (SshCheckDeps.sshEnv). */
+  sshEnv?(host: string, env: NodeJS.ProcessEnv): void;
   /** The number of devspaces of this computer on `host` (its registry), for the message of a removed host. */
   devspaceCount?: (host: string) => Promise<number>;
   /** After a change of the Docker host of Devspaces: the sidebar shows the devspaces of the new host. */
@@ -291,6 +293,7 @@ export class RemoteDockerCommands {
               sshLogins: this.deps.sshLogins,
               shells: this.deps.shells,
               identityFor: this.deps.identityFor,
+              sshEnv: this.deps.sshEnv,
             },
             { signal: controller.signal },
           );

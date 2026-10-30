@@ -259,10 +259,6 @@ function hostNames(value: unknown): string[] | undefined {
 }
 
 /**
- * The fields of the file that Devspaces knows; others are dropped at the next write. A Docker host that is not in the
- * list is added to it.
- */
-/**
  * Runs `update` on the record of `host` in `state`, a new one at the end when it has none. A record that knows nothing
  * more afterwards is removed, and so is the list when it is empty.
  */
@@ -279,6 +275,10 @@ function changeRecord(state: RemoteDockerStateFile, host: string, update: (recor
   else delete state.hosts;
 }
 
+/**
+ * The fields of the file that Devspaces knows; others are dropped at the next write. A Docker host that is not in the
+ * list is added to it.
+ */
 function normalize(value: unknown): RemoteDockerStateFile {
   const result: RemoteDockerStateFile = {};
   if (typeof value !== 'object' || value === null) return result;

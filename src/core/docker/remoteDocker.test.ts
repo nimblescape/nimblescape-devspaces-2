@@ -97,6 +97,25 @@ describe('testRemoteDockerHost (the test before the switch)', () => {
     expect(options?.env?.SSH_AUTH_SOCK).toBe('/tmp/agent.sock');
   });
 
+  // The key of Devspaces (sshKey.ts): the SSH check with -i, and the ssh of the Docker CLI through the wrapper.
+  it('logs in with the key of Devspaces of a host that has it, also in the ssh of the Docker CLI', async () => {
+    const docker = fakeDocker(() => info());
+    const runner = sshRunner();
+    const deps = {
+      ...sshDeps(runner),
+      identityFor: (host: string) => (host === 'box' ? '/home/me/.ssh/devspaces_ed25519' : undefined),
+      sshEnv: (host: string, env: NodeJS.ProcessEnv) => {
+        if (host === 'box') env.DEVSPACES_SSH_IDENTITY = '/home/me/.ssh/devspaces_ed25519';
+      },
+    };
+    await expect(testRemoteDockerHost(docker, 'box', deps)).resolves.toMatchObject({ ok: true });
+    expect(runner.run.mock.calls[0][1]).toEqual(expect.arrayContaining(['-i', '/home/me/.ssh/devspaces_ed25519']));
+    expect(docker.calls[0].options?.env?.DEVSPACES_SSH_IDENTITY).toBe('/home/me/.ssh/devspaces_ed25519');
+    await testRemoteDockerHost(docker, 'other', deps);
+    expect(runner.run.mock.calls[1][1]).not.toContain('-i');
+    expect(docker.calls[1].options?.env).not.toHaveProperty('DEVSPACES_SSH_IDENTITY');
+  });
+
   // As a call on that host, so that BootstrapDocker runs it with the Docker CLI of Devspaces when it is installed.
   it('runs docker info as a call of an operation on the tested host', async () => {
     const targets: unknown[] = [];

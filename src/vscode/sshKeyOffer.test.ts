@@ -169,17 +169,23 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
   });
 
   // For example a jump host that asks for a password, or a server that wants a key and a password.
-  it('does not offer the key again after a login that had it and still asked for a password', async () => {
+  it('does not offer the key again after a login that had it and still asked for a password, while the key is on the host', async () => {
     const keys = offer();
     await keys.afterLogin('box', { passwordAsked: true }, shell);
     expect(asked).toHaveLength(2);
     await keys.afterLogin('box', { passwordAsked: true }, shell);
     expect(asked).toHaveLength(2);
-    // Without the key file, the offer comes again.
+    // Without its line on the host, the offer comes again, and adds it again.
+    fs.writeFileSync(path.join(hostHome, '.ssh', 'authorized_keys'), '');
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    expect(asked.slice(2)).toEqual([`offer box ${keys.keyPath}`, 'installed box']);
+    expect(authorizedKeys()).toContain('devspaces@testbox');
+    // Without the key file too, with a new key.
     fs.rmSync(keys.keyPath);
     fs.rmSync(`${keys.keyPath}.pub`);
     await keys.afterLogin('box', { passwordAsked: true }, shell);
-    expect(asked.slice(2)).toEqual([`offer box ${keys.keyPath}`, 'installed box']);
+    expect(asked.slice(4)).toEqual([`offer box ${keys.keyPath}`, 'installed box']);
+    expect(authorizedKeys().trim().split('\n')).toHaveLength(2);
   });
 
   it('writes over no public key file that is there without its private key', async () => {
@@ -201,6 +207,22 @@ describeWithKeygen('SshKeyOffer: the offer after a login with a password', () =>
 });
 
 describeWithKeygen('SshKeyOffer: the ssh of the Docker CLI', () => {
+  it('writes the wrapper again at the next call after a failure', async () => {
+    const keys = offer();
+    await keys.afterLogin('box', { passwordAsked: true }, shell);
+    // A file where the folder of the wrapper belongs: the write fails.
+    fs.writeFileSync(path.join(dir, 'wrapper'), '');
+    await keys.prepare();
+    expect(warnings).toHaveLength(1);
+    fs.rmSync(path.join(dir, 'wrapper'));
+    const env: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    keys.dockerSshEnv('box', env);
+    await keys.prepare();
+    keys.dockerSshEnv('box', env);
+    expect(env.DEVSPACES_SSH_IDENTITY).toBe(keys.keyPath);
+    expect(fs.existsSync(path.join(dir, 'wrapper', 'ssh'))).toBe(true);
+  });
+
   it('puts the wrapper first in PATH of a call to a host with the key, after it was written, with ssh and the key', async () => {
     const keys = offer();
     await keys.afterLogin('box', { passwordAsked: true }, shell);

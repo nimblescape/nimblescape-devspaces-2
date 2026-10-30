@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { authorizedKeysCommand, devspacesKeyPath, keyComment, parsePublicKey, sshWrapper } from './sshKey';
+import { authorizedKeyPresentCommand, authorizedKeysCommand, devspacesKeyPath, keyComment, parsePublicKey, sshWrapper } from './sshKey';
 
 const BLOB = 'AAAAC3NzaC1lZDI1NTE5AAAAIHgJ3c2oQkQe4m4oY0bJ6qNnV6l0Sx5Jm8m2bq9b3n1d';
 const KEY = { type: 'ssh-ed25519', blob: BLOB };
@@ -71,6 +71,24 @@ describe('the command that adds the key to authorized_keys (run by sh in a home 
     fs.writeFileSync(file(), `ssh-ed25519 ${BLOB} renamed@other\n`);
     runCommand();
     expect(fs.readFileSync(file(), 'utf8')).toBe(`ssh-ed25519 ${BLOB} renamed@other\n`);
+  });
+
+  it('adds the key when it is only in a comment, and finds it only in a line that is no comment', () => {
+    const present = (): boolean => {
+      try {
+        execFileSync('sh', ['-c', authorizedKeyPresentCommand(KEY)], { env: { HOME: home, PATH: process.env.PATH }, cwd: os.tmpdir() });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(present()).toBe(false);
+    fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
+    fs.writeFileSync(file(), `  # ssh-ed25519 ${BLOB} devspaces@box\n`);
+    expect(present()).toBe(false);
+    runCommand();
+    expect(fs.readFileSync(file(), 'utf8')).toBe(`  # ssh-ed25519 ${BLOB} devspaces@box\nssh-ed25519 ${BLOB} devspaces@box\n`);
+    expect(present()).toBe(true);
   });
 
   it('changes neither the folder nor the umask of the shell that runs it', () => {

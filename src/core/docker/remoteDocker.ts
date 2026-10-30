@@ -159,6 +159,8 @@ export async function testRemoteDockerHost(
   const env = noPromptEnv(docker.processEnv());
   // -H decides the endpoint; DOCKER_CONTEXT would conflict with it.
   for (const key of Object.keys(env)) if (key.toUpperCase() === 'DOCKER_CONTEXT' || key.toUpperCase() === 'DOCKER_HOST') delete env[key];
+  // The `ssh` of the Docker CLI with the key of Devspaces when the host has it, as checkSshLogin logged in.
+  ssh.sshEnv?.(host, env);
   // As a call on the remote engine: with the Docker CLI of Devspaces when it is installed (BootstrapDocker.ownCli).
   return runWithDockerTarget(remoteDockerTarget(host), () =>
     runEngineInfo(docker, ['-H', sshEndpoint(host), 'info', '--format', ENGINE_INFO_FORMAT], { env, signal: options.signal }, timeoutMs),
@@ -284,6 +286,8 @@ export interface SshCheckDeps {
   shells?: RemoteShellAccess;
   /** The key of Devspaces for `host` when that host has it (sshKey.ts), for `-i`; else undefined. */
   identityFor?(host: string): string | undefined;
+  /** Changes the environment of a Docker call with `ssh://<host>` for the key of Devspaces (SshKeyOffer.dockerSshEnv). */
+  sshEnv?(host: string, env: NodeJS.ProcessEnv): void;
 }
 
 export type SshLoginCheck =

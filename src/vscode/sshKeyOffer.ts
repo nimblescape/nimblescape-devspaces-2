@@ -21,6 +21,7 @@ import type { RemoteDockerState } from '../core/storage/remoteDockerState';
 import {
   SSH_WRAPPER_IDENTITY_ENV,
   SSH_WRAPPER_SSH_ENV,
+  authorizedKeyPresentCommand,
   authorizedKeysCommand,
   devspacesKeyPath,
   keyComment,
@@ -83,6 +84,9 @@ export interface SshKeyOfferOptions {
   exists?: (file: string) => boolean;
 }
 
+/** The shell before the relay, for the commands of the key offer. */
+type KeyShell = { run(command: string, options?: { timeoutMs?: number }): Promise<RunResult> };
+
 /** What `afterLogin` needs of the login: whether it asked for the password of the account (SshLogin.passwordAsked). */
 export interface PasswordLogin {
   readonly passwordAsked: boolean;
@@ -115,10 +119,11 @@ export class SshKeyOffer {
   /**
    * Changes the environment of a Docker call with `ssh://<host>` (BootstrapDocker sshEnv): for a host with the key, the
    * folder of the wrapper `ssh` comes first in PATH, with the `ssh` of this computer and the key in its variables.
-   * Nothing for another host, without `ssh`, or before the wrapper was written.
+   * Nothing for another host, without `ssh`, or before the wrapper was written (which this tries again after a failure).
    */
   dockerSshEnv(host: string, env: NodeJS.ProcessEnv): void {
     const identity = this.identityFor(host);
+    if (identity !== undefined && this.wrapper === undefined) void this.prepare();
     const ssh = identity === undefined || this.wrapper === undefined ? undefined : this.options.sshPath();
     if (identity === undefined || ssh === undefined) return;
     putFolderFirstInPath(env, this.options.platform, this.options.wrapperFolder);
@@ -129,16 +134,17 @@ export class SshKeyOffer {
   /**
    * After the login of the shell before the relay to `host` (RemoteShellStart.afterLogin): when it asked for the
    * password, the offer, and on yes the key on the host. Not for a host that declined it, and not for a host whose
-   * login had the key already: there the password was asked for something that a key does not replace (for example a
-   * jump host, or a server that wants a key and a password). A failure is logged and shown; it never fails the login.
+   * login had the key while the key is still in its `authorized_keys`: there the password was asked for something that a
+   * key does not replace (for example a jump host, or a server that wants a key and a password). A failure is logged
+   * and shown; it never fails the login.
    */
-  async afterLogin(host: string, login: PasswordLogin, shell: { run(command: string, options?: { timeoutMs?: number }): Promise<RunResult> }): Promise<void> {
+  async afterLogin(host: string, login: PasswordLogin, shell: KeyShell): Promise<void> {
     if (!login.passwordAsked) return;
     const { state, dialogs, logger } = this.options;
     const recorded = await state.sshKey(host).catch(() => undefined);
     if (recorded === 'declined') return;
-    if (recorded === 'installed' && this.identityFor(host) !== undefined) {
-      logger.info(`The login to ${host} asked for a password although it had the key of Devspaces; the key is not offered again.`);
+    if (recorded === 'installed' && this.identityFor(host) !== undefined && (await this.keyOnHost(shell))) {
+      logger.info(`The login to ${host} asked for a password although it had the key of Devspaces, which is on the host; the key is not offered again.`);
       return;
     }
     const answer = await dialogs.offer(host, this.keyPath);
@@ -167,6 +173,17 @@ export class SshKeyOffer {
     }
   }
 
+  /** True when the key of Devspaces is in `~/.ssh/authorized_keys` on the host of `shell`; also when that is not known. */
+  private async keyOnHost(shell: KeyShell): Promise<boolean> {
+    try {
+      const present = await shell.run(authorizedKeyPresentCommand(await this.publicKey()), { timeoutMs: KEY_STEP_TIMEOUT_MS });
+      return present.exitCode !== 1;
+    } catch (error) {
+      this.options.logger.warn(`The key of Devspaces on the host could not be looked up: ${errorMessage(error)}`);
+      return true;
+    }
+  }
+
   private exists(file: string): boolean {
     return (this.options.exists ?? fs.existsSync)(file);
   }
@@ -181,16 +198,24 @@ export class SshKeyOffer {
       // ssh-keygen would write over it.
       if (this.exists(`${this.keyPath}.pub`)) throw new Error(`${this.keyPath}.pub is there without its private key; remove it, then try again.`);
       await fs.promises.mkdir(path.dirname(this.keyPath), { recursive: true, mode: 0o700 });
-      // ssh-keygen never writes over a file: another window that made the key meanwhile wins.
+      // ssh-keygen does not write over a private key (its question gets no answer: the input is empty), so another
+      // window that made the key meanwhile wins.
       const made = await runner.run(keygen, ['-q', '-t', 'ed25519', '-N', '', '-C', keyComment(computerName), '-f', this.keyPath], {
         env: quiet,
         timeoutMs: KEY_STEP_TIMEOUT_MS,
       });
-      if (made.exitCode !== 0 && !this.exists(this.keyPath)) throw new Error(`ssh-keygen failed: ${made.stderr.trim() || `exit code ${made.exitCode}`}`);
-      logger.info(`Devspaces created its SSH key ${this.keyPath}.`);
+      if (made.exitCode === 0) logger.info(`Devspaces created its SSH key ${this.keyPath}.`);
+      else if (!this.exists(this.keyPath)) throw new Error(`ssh-keygen failed: ${made.stderr.trim() || `exit code ${made.exitCode}`}`);
     }
+    return this.publicKey();
+  }
+
+  /** The public key of the key file of Devspaces. */
+  private async publicKey(): Promise<PublicKey> {
+    const keygen = this.options.sshKeygenPath();
+    if (keygen === undefined) throw new Error('ssh-keygen was not found on this computer.');
     // The public key from the private key itself, so a missing or other .pub file does not count.
-    const read = await runner.run(keygen, ['-y', '-f', this.keyPath], { env: quiet, timeoutMs: KEY_STEP_TIMEOUT_MS });
+    const read = await this.options.runner.run(keygen, ['-y', '-f', this.keyPath], { env: noPromptEnv(this.options.env), timeoutMs: KEY_STEP_TIMEOUT_MS });
     const key = read.exitCode === 0 ? parsePublicKey(read.stdout) : undefined;
     if (key === undefined) throw new Error(`the key ${this.keyPath} could not be read: ${read.stderr.trim() || 'it is no Ed25519 key without a passphrase'}`);
     return key;
