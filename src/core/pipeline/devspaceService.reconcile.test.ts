@@ -52,7 +52,7 @@ describe('reconcileInWorker', () => {
   });
 
   // A WSL distribution that does not run stays stopped: no `docker info` there, which would start it.
-  it('not on a WSL distribution that a call must leave stopped (leavesStopped), with neither Docker nor the worker asked', async () => {
+  it('in the background not on a WSL distribution that a call must leave stopped (leavesStopped), with neither Docker nor the worker asked', async () => {
     const wsl = { kind: 'remote' as const, host: 'wsl:devspaces', endpoint: 'wsl://devspaces' };
     const leavesStopped = async (host: string) => host === 'wsl:devspaces';
     const dockerRunning = vi.fn(async () => true);
@@ -60,6 +60,9 @@ describe('reconcileInWorker', () => {
     expect(await stopped.h.operations.reconcileInWorker({ passive: true })).toBe(0);
     expect(stopped.calls).toEqual([]);
     expect(dockerRunning).not.toHaveBeenCalled();
+    // The Refresh of the user (not passive) starts it, as any flow of the user does.
+    expect(await stopped.h.operations.reconcileInWorker({ passive: false })).toBe(1);
+    expect(dockerRunning).toHaveBeenCalledTimes(1);
     // While it may be started (or runs), the rebuild runs as before.
     const runs = harness({ added: 1 }, { dockerTarget: async () => wsl, leavesStopped: async () => false });
     expect(await runs.h.operations.reconcileInWorker({ passive: true })).toBe(1);

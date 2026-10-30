@@ -55,6 +55,7 @@ import { nodeHttpsTransport, takeUserAgentVersion } from '../core/http';
 import { DockerCredentialStore } from '../core/imageCheck/credentials';
 import { RegistryClient } from '../core/imageCheck/registryClient';
 import { isoTime, systemClock, type StartedByteProcess } from '../core/ports';
+import { monitorRunsPermanently } from '../core/remoteMonitor/cacheSettings';
 import { usableTimeZone } from '../core/remoteMonitor/cron';
 import { monitorSettingsOf } from './monitorSettings';
 import { REMOTE_MONITOR_VOLUME } from '../core/remoteMonitor/protocol';
@@ -661,7 +662,8 @@ async function activateExtension(
     runner,
     wslPath,
     env,
-    monitorPermanent: async (host) => (await monitorSettings.forOpen(host)).permanent === true,
+    // As monitorSettingsFor: an answer that cannot be read counts as none.
+    monitorPermanent: async (host) => monitorRunsPermanently(getSettings().stopMonitorWhenIdle, await engineRecords.monitorAnswered(host).catch(() => false)),
     logger,
   });
   wslLifetime = lifetime;

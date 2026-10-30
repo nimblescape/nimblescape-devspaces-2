@@ -102,6 +102,19 @@ describe('WslLifetime.running', () => {
     expect(await lifetime({ list: () => ok('devspaces-old\n') }).subject.running('devspaces')).toBe(false);
   });
 
+  it('logs a failure that stays once, and again after it worked', async () => {
+    let list: RunResult = { exitCode: 1, stdout: '', stderr: 'broken', timedOut: false };
+    const { subject, log } = lifetime({ list: () => list });
+    await subject.running('devspaces');
+    await subject.running('devspaces');
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    list = ok('');
+    await subject.running('devspaces');
+    list = { exitCode: 1, stdout: '', stderr: 'broken', timedOut: false };
+    await subject.running('devspaces');
+    expect(log.warn).toHaveBeenCalledTimes(2);
+  });
+
   it('is undefined, with a warning, when wsl.exe fails, does not answer, or cannot start; and without wsl.exe', async () => {
     const failing = lifetime({ list: () => ({ exitCode: 1, stdout: '', stderr: 'Wsl/Service/E_UNEXPECTED', timedOut: false }) });
     expect(await failing.subject.running('devspaces')).toBeUndefined();
@@ -182,14 +195,32 @@ describe('WslLifetime.use', () => {
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('holds an idle session'));
   });
 
-  it('starts a new session at the next use after the session ended itself (exit code 0)', async () => {
-    const { subject, started, log } = lifetime();
+  // Mutation: a background call that starts a new session after the end, so that each refresh of the sidebar keeps the
+  // distribution running, fails it.
+  it('after the session ended itself (exit code 0), only a flow of the user starts a new one; then the background may again', async () => {
+    let now = 1_000_000;
+    const { subject, started, log } = lifetime({ now: () => now });
     subject.use(WSL_HOST);
     started[0]?.exit({ exitCode: 0 });
     await vi.waitFor(() => expect(subject.holds(WSL_HOST)).toBe(false));
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('ended: no devspace and no Monitor ran there'));
     subject.use(WSL_HOST);
+    expect(started).toHaveLength(1);
+    await withSshPrompts(async () => subject.use(WSL_HOST));
     expect(started).toHaveLength(2);
+    // That one ended with an error after a minute or longer (not by itself): a call in the background starts the next one.
+    now += IDLE_RETRY_MS;
+    started[1]?.exit({ exitCode: null });
+    await vi.waitFor(() => expect(subject.holds(WSL_HOST)).toBe(false));
+    subject.use(WSL_HOST);
+    expect(started).toHaveLength(3);
+  });
+
+  it('leavesStopped asks WSL nothing while this window holds the idle session (the distribution runs)', async () => {
+    const { subject, runs } = lifetime({ list: () => ok('') });
+    subject.use(WSL_HOST);
+    expect(await subject.leavesStopped(WSL_HOST)).toBe(false);
+    expect(runs).toEqual([]);
   });
 
   it('starts no new session within a minute after one failed, with the error output in the warning; then again', async () => {

@@ -6,8 +6,9 @@
 // Devspaces"). WSL stops a distribution 15 seconds after the last `wsl.exe` process for it ended, with Docker and the
 // containers in it. From the first `wsl.exe` that a window starts there, it holds one idle session (`use`): a `wsl.exe`
 // whose script ends itself when no devspace and no Monitor ran there at two checks in a row, and at the end of its input,
-// so with the window. A Docker call in the background leaves a distribution that does not run stopped, unless its
-// Monitor runs permanently (`leavesStopped`); a flow of the user starts it. No `vscode`.
+// so with the window. After such an end, only a flow of the user starts a new one. A Docker call in the background
+// leaves a distribution that does not run stopped, unless its Monitor runs permanently (`leavesStopped`); a flow of the
+// user starts it. No `vscode`.
 import { errorMessage } from '../errors';
 import { LABEL_DEVSPACE_ID } from '../names';
 import type { Logger, ProcessRunner, StartedProcess } from '../ports';
@@ -97,16 +98,26 @@ export class WslLifetime {
   private readonly sessions = new Map<string, IdleSession>();
   /** The time of the end of the last idle session that failed, by host. */
   private readonly failedAt = new Map<string, number>();
+  /**
+   * The hosts whose last idle session ended itself because no devspace and no Monitor ran there: until a flow of the
+   * user there, a call in the background starts no new one, so that the refreshes of the sidebar do not keep the
+   * distribution running.
+   */
+  private readonly endedQuiet = new Set<string>();
   /** The last state that `leavesStopped` logged, by host: true while it leaves the distribution stopped. */
   private readonly saidStopped = new Map<string, boolean>();
+  /** The last warning of `running`, by distribution, so that a failure that stays is logged once. */
+  private readonly runningWarnings = new Map<string, string>();
   private disposed = false;
 
   constructor(private readonly deps: WslLifetimeDeps) {}
 
   /**
    * Whether the WSL distribution `distribution` runs now (`wsl.exe --list --running --quiet`; WSL compares the names
-   * without case). Undefined when that cannot be told: without `wsl.exe`, or when it fails or does not answer within
-   * WSL_RUNNING_TIMEOUT_MS (logged). Never rejects.
+   * without case). With `--quiet`, WSL answers exit code 0 and no line when no distribution runs (ListDistributionsHelper
+   * of src/windows/common/WslClient.cpp in microsoft/WSL); without it, it would say so with an exit code that is not 0.
+   * Undefined when that cannot be told: without `wsl.exe`, or when it fails or does not answer within
+   * WSL_RUNNING_TIMEOUT_MS (logged once until it works again). Never rejects.
    */
   async running(distribution: string): Promise<boolean | undefined> {
     const wsl = this.deps.wslPath();
@@ -115,10 +126,13 @@ export class WslLifetime {
       const result = await this.deps.runner.run(wsl, WSL_RUNNING_ARGS, { env: wslEnv(this.deps.env), timeoutMs: WSL_RUNNING_TIMEOUT_MS });
       if (result.timedOut) throw new Error(`it did not answer within ${WSL_RUNNING_TIMEOUT_MS / 1000} seconds`);
       if (result.exitCode !== 0) throw new Error(`exit code ${result.exitCode}: ${wslText(result.stderr || result.stdout).trim()}`);
+      this.runningWarnings.delete(distribution);
       const name = distribution.toLowerCase();
       return parseWslList(result.stdout).some((listed) => listed.toLowerCase() === name);
     } catch (error) {
-      this.deps.logger.warn(`wsl.exe ${WSL_RUNNING_ARGS.join(' ')} failed, so Devspaces does not know whether the WSL distribution ${distribution} runs: ${errorMessage(error)}`);
+      const warning = `wsl.exe ${WSL_RUNNING_ARGS.join(' ')} failed, so Devspaces does not know whether the WSL distribution ${distribution} runs: ${errorMessage(error)}`;
+      if (this.runningWarnings.get(distribution) !== warning) this.deps.logger.warn(warning);
+      this.runningWarnings.set(distribution, warning);
       return undefined;
     }
   }
@@ -126,13 +140,14 @@ export class WslLifetime {
   /**
    * Whether a Docker call on the engine `host` must not run now, because it would start a WSL distribution that does
    * not run: true only for a WSL host, outside of a flow of the user (withSshPrompts), while its Monitor does not run
-   * permanently, and when `running` says that the distribution does not run. Any other host, a flow of the user, a
-   * permanent Monitor, and a state that cannot be told give false: the call runs, and `wsl.exe` starts the
-   * distribution when it does not run. Each change of the answer for a host is logged once. Never rejects.
+   * permanently, and when `running` says that the distribution does not run. Any other host, a flow of the user, an
+   * idle session of this window there (the distribution runs), a permanent Monitor, and a state that cannot be told
+   * give false: the call runs, and `wsl.exe` starts the distribution when it does not run. Each change of the answer
+   * for a host is logged once. Never rejects.
    */
   async leavesStopped(host: string): Promise<boolean> {
     const access = hostAccessOf(host);
-    if (access?.kind !== 'wsl' || sshPromptsAllowed()) return false;
+    if (access?.kind !== 'wsl' || sshPromptsAllowed() || this.sessions.has(host)) return false;
     const stopped = !(await this.deps.monitorPermanent(host)) && (await this.running(access.distribution)) === false;
     if (stopped !== (this.saidStopped.get(host) ?? false)) {
       this.saidStopped.set(host, stopped);
@@ -149,11 +164,14 @@ export class WslLifetime {
    * Devspaces starts a `wsl.exe` for the WSL host `host` now (a shell, a connection of the relay, a connection of a
    * Docker pipe): this window holds the idle session of the host from now on, unless it holds one already, the last one
    * failed within the last minute (IDLE_RETRY_MS: it ended with an error within a minute after its start), or `wsl.exe`
-   * cannot be found. Nothing for any other host, and after `dispose`. Never throws.
+   * cannot be found. Outside of a flow of the user (withSshPrompts), also not after the last one ended itself because
+   * nothing ran there, until a flow of the user there. Nothing for any other host, and after `dispose`. Never throws.
    */
   use(host: string): void {
     const access = hostAccessOf(host);
-    if (this.disposed || access?.kind !== 'wsl' || this.sessions.has(host)) return;
+    if (this.disposed || access?.kind !== 'wsl') return;
+    if (sshPromptsAllowed()) this.endedQuiet.delete(host);
+    if (this.sessions.has(host) || this.endedQuiet.has(host)) return;
     const failed = this.failedAt.get(host);
     if (failed !== undefined && Math.abs(this.now() - failed) < this.retryMs()) return;
     const wsl = this.deps.wslPath();
@@ -179,6 +197,7 @@ export class WslLifetime {
       if (this.sessions.get(host) === session) this.sessions.delete(host);
       if (this.disposed) return;
       if (exitCode === 0 && error === undefined) {
+        this.endedQuiet.add(host);
         this.deps.logger.info(`The idle session of the WSL distribution ${access.distribution} ended: no devspace and no Monitor ran there.`);
         return;
       }
