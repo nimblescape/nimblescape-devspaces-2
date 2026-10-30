@@ -163,6 +163,21 @@ describeUnix('RemoteShell', () => {
     expect(lines).toContain('The shell on box was closed after a time without use.');
   });
 
+  it('stays open during keepOpenDuring, also after a command in it, and is closed after a time without use afterwards', async () => {
+    const process = login();
+    const shell = await RemoteShell.open(process, { logger: silentLogger, name: 'box', idleCloseMs: 100 });
+    const result = await shell.keepOpenDuring(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const ran = await shell.run('printf in');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return ran.stdout;
+    });
+    expect(result).toBe('in');
+    expect(shell.isOpen).toBe(true);
+    await expect(process.exited).resolves.toEqual({ exitCode: 0 });
+    expect(shell.isOpen).toBe(false);
+  });
+
   it('gives its process to the relay after the commands before, with the output from then on', async () => {
     let ended = 0;
     const shell = await RemoteShell.open(login(), { logger: silentLogger, name: 'box', onEnd: () => ended++ });

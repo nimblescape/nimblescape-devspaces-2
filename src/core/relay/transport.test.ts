@@ -37,12 +37,28 @@ describe('sshRelayTransport', () => {
   // A login of a flow of the user: ssh may ask, through the helper of askpassEnv, in VS Code.
   it('leaves out BatchMode and X11 and takes the environment of the questions for a login that may ask', () => {
     const prompts = { env: vi.fn((base: NodeJS.ProcessEnv) => ({ ...base, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' })) };
-    expect(sshRelayTransport(remoteDockerTarget('me@box:2222'), '/usr/bin/ssh', env, prompts)).toEqual({
+    expect(sshRelayTransport(remoteDockerTarget('me@box:2222'), '/usr/bin/ssh', env, { prompts })).toEqual({
       file: '/usr/bin/ssh',
       args: ['-x', '-o', 'ConnectTimeout=15', '-T', '-p', '2222', '-l', 'me', '--', 'box', RELAY_SHELL_COMMAND],
       env: { ...env, SSH_ASKPASS: '/storage/askpass/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' },
     });
     expect(prompts.env).toHaveBeenCalledWith(env);
+  });
+
+  // A host with the key of Devspaces (sshKey.ts): every login of Devspaces gives it to ssh.
+  it('gives the key of Devspaces with -i, before the destination', () => {
+    expect(sshRelayTransport(remoteDockerTarget('box'), '/usr/bin/ssh', env, { identity: '/home/me/.ssh/devspaces_ed25519' })?.args).toEqual([
+      '-o',
+      'BatchMode=yes',
+      '-o',
+      'ConnectTimeout=15',
+      '-T',
+      '-i',
+      '/home/me/.ssh/devspaces_ed25519',
+      '--',
+      'box',
+      RELAY_SHELL_COMMAND,
+    ]);
   });
 
   it('has no transport for the local engine and for a host that is no SSH alias or address', () => {

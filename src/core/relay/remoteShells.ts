@@ -5,6 +5,7 @@
 // The shells before the relay of this window (docs/architecture.md "The shell before the relay"): at most one per SSH
 // host, opened by the first check or Docker call before a connection of the relay to the host, used by the calls after
 // it, and taken over by the next connection of the relay to the host (takeOver). No `vscode`.
+import { errorMessage } from '../errors';
 import { abortError, isAbortError, type Logger, type RunOptions, type RunResult, type StartedByteProcess } from '../ports';
 import { currentSshPromptFlow, type SshLoginPrompts } from '../sshAskpass';
 import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } from './remoteShell';
@@ -13,6 +14,12 @@ import { RemoteShell, RemoteShellError, ShellGoneError, dockerShellCommand } fro
 export interface RemoteShellStart {
   process: StartedByteProcess;
   prompts?: SshLoginPrompts;
+  /**
+   * Runs once the shell is open (the key offer of SshKeyOffer, which may ask the user and run a command on it). The
+   * callers get the shell at once, and its commands run in order; the relay takes it over only after this step, and it
+   * is not closed for a time without use meanwhile. A failure is logged.
+   */
+  afterLogin?: (shell: RemoteShell) => Promise<void>;
 }
 
 export interface RemoteShellsOptions {
@@ -31,6 +38,8 @@ interface Entry {
   flow?: object;
   shell?: RemoteShell;
   opening?: Promise<RemoteShell>;
+  /** The step after the login (RemoteShellStart.afterLogin) while it runs; takeOver waits for it. */
+  afterLogin?: Promise<void>;
 }
 
 /** `promise`, or an AbortError as soon as `signal` aborts; the work of `promise` goes on for its other callers. */
@@ -67,6 +76,8 @@ export class RemoteShells {
     const current = this.entries.get(host);
     if (current?.shell?.isOpen) {
       if (options.fresh !== true) return Promise.resolve(current.shell);
+      // The step after its login (the key offer) ends first: it may run a command on the shell.
+      if (current.afterLogin !== undefined) return untilAborted(current.afterLogin, signal).then(() => this.open(host, signal, options));
       // Its end forgets its entry (onEnd).
       current.shell.close();
     }
@@ -83,7 +94,7 @@ export class RemoteShells {
     }
     const started = this.options.start(host);
     if (started === undefined) return Promise.resolve(undefined);
-    const { process, prompts } = started;
+    const { process, prompts, afterLogin } = started;
     const entry: Entry = { process, flow: currentSshPromptFlow() };
     const forget = () => {
       if (this.entries.get(host) === entry) this.entries.delete(host);
@@ -93,8 +104,20 @@ export class RemoteShells {
       (shell) => {
         entry.shell = shell;
         entry.opening = undefined;
-        if (this.disposed) shell.killNow();
-        else logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        if (this.disposed) {
+          shell.killNow();
+          return shell;
+        }
+        logger.info(`The shell on ${host} is open: one SSH login for the checks before the relay.`);
+        if (afterLogin !== undefined) {
+          const step: Promise<void> = shell
+            .keepOpenDuring(() => afterLogin(shell))
+            .catch((error: unknown) => logger.warn(`The step after the login on ${host} failed: ${errorMessage(error)}`))
+            .finally(() => {
+              if (entry.afterLogin === step) entry.afterLogin = undefined;
+            });
+          entry.afterLogin = step;
+        }
         return shell;
       },
       (error: unknown) => {
@@ -158,7 +181,8 @@ export class RemoteShells {
 
   /**
    * The process of the shell to `host` for a connection of the relay (RemoteShell.takeOver), also of a login that is
-   * in progress; undefined when there is none or it failed. The shell is no longer one of this window then.
+   * in progress, after the step after its login; undefined when there is none or it failed. The shell is no longer one
+   * of this window then.
    */
   async takeOver(host: string): Promise<StartedByteProcess | undefined> {
     const entry = this.entries.get(host);
@@ -169,6 +193,7 @@ export class RemoteShells {
     } catch {
       return undefined;
     }
+    await entry.afterLogin;
     return shell?.takeOver();
   }
 

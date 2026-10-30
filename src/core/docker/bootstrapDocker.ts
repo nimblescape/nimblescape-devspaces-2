@@ -191,6 +191,11 @@ export interface BootstrapDockerOptions {
    * operation on a remote engine, in place of the Docker CLI of this computer, which such calls take only without it.
    */
   ownCli?: () => string | undefined;
+  /**
+   * Changes the environment `env` of a call that logs in with `ssh://<host>`, so that the `ssh` of the Docker CLI uses
+   * the key of Devspaces when that host has it (SshKeyOffer.dockerSshEnv).
+   */
+  sshEnv?: (host: string, env: NodeJS.ProcessEnv) => void;
   /** Only for tests. Default: SSH_DROP_RETRY_DELAY_MS. */
   sshDropRetryDelayMs?: number;
   /** Only for tests. Default: cliFileIdentity. */
@@ -258,6 +263,7 @@ export class BootstrapDocker {
   private readonly onCliFound: BootstrapDockerOptions['onCliFound'];
   private readonly dockerPipe: BootstrapDockerOptions['dockerPipe'];
   private readonly remoteShell: BootstrapDockerOptions['remoteShell'];
+  private readonly sshEnv: BootstrapDockerOptions['sshEnv'];
   private readonly ownCli: BootstrapDockerOptions['ownCli'];
   private readonly sshDropRetryDelayMs: number;
   private lookedUpAt: number | undefined;
@@ -293,6 +299,7 @@ export class BootstrapDocker {
     this.onCliFound = options.onCliFound;
     this.dockerPipe = options.dockerPipe;
     this.remoteShell = options.remoteShell;
+    this.sshEnv = options.sshEnv;
     this.ownCli = options.ownCli;
     this.sshDropRetryDelayMs = options.sshDropRetryDelayMs ?? SSH_DROP_RETRY_DELAY_MS;
     this.fileIdentity = options.fileIdentity ?? cliFileIdentity;
@@ -466,7 +473,9 @@ export class BootstrapDocker {
       const env: NodeJS.ProcessEnv = { ...this.env };
       for (const name of REMOTE_CLEARED_VARIABLES) deleteEnv(env, name);
       env.DOCKER_HOST = pipe ?? sshEndpoint(target.host);
-      return pipe !== undefined ? { env } : { env, login: target.host, shellTarget: target };
+      if (pipe !== undefined) return { env };
+      this.sshEnv?.(target.host, env);
+      return { env, login: target.host, shellTarget: target };
     }
     if (target.context === undefined) return { env: this.env };
     const env: NodeJS.ProcessEnv = { ...this.env };

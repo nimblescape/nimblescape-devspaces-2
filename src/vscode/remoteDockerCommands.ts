@@ -123,6 +123,10 @@ export interface RemoteDockerDeps {
    * in VS Code (sshAskpass.ts), and the read of the socket of a rootless engine runs on it too.
    */
   shells?: RemoteShellAccess;
+  /** The key of Devspaces for `host` when that host has it (SshCheckDeps.identityFor). */
+  identityFor?(host: string): string | undefined;
+  /** The environment of a Docker call with `ssh://<host>` with that key (SshCheckDeps.sshEnv). */
+  sshEnv?(host: string, env: NodeJS.ProcessEnv): void;
   /** The number of devspaces of this computer on `host` (its registry), for the message of a removed host. */
   devspaceCount?: (host: string) => Promise<number>;
   /** After a change of the Docker host of Devspaces: the sidebar shows the devspaces of the new host. */
@@ -282,7 +286,15 @@ export class RemoteDockerCommands {
           const result = await testRemoteDockerHost(
             this.deps.docker,
             host,
-            { runner: this.deps.runner, sshPath: this.deps.sshPath(), env: this.deps.env, sshLogins: this.deps.sshLogins, shells: this.deps.shells },
+            {
+              runner: this.deps.runner,
+              sshPath: this.deps.sshPath(),
+              env: this.deps.env,
+              sshLogins: this.deps.sshLogins,
+              shells: this.deps.shells,
+              identityFor: this.deps.identityFor,
+              sshEnv: this.deps.sshEnv,
+            },
             { signal: controller.signal },
           );
           // A rootless engine: its socket is read once (ssh, without questions) and recorded with the host.
@@ -294,6 +306,7 @@ export class RemoteDockerCommands {
               sshPath: this.deps.sshPath(),
               env: this.deps.env,
               shells: this.deps.shells,
+              identityFor: this.deps.identityFor,
             }, controller.signal);
           }
           return result;

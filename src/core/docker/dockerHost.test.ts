@@ -208,6 +208,20 @@ describe('SSH aliases and the ssh command line', () => {
     ]);
   });
 
+  it('gives the key of Devspaces with -i before the destination, and only that key for the check of the key offer', () => {
+    const key = '/home/ann/.ssh/devspaces_ed25519';
+    expect(sshCommandArgs({ host: 'box', port: 2222 }, 'true', 15, { identity: key })).toEqual([
+      '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-i', key, '-p', '2222', '--', 'box', 'true',
+    ]);
+    expect(sshCommandArgs({ host: 'box' }, 'sh -s', 15, { prompts: true, identity: key })).toEqual(['-x', '-o', 'ConnectTimeout=15', '-T', '-i', key, '--', 'box', 'sh -s']);
+    expect(sshCommandArgs({ host: 'box' }, 'true', 15, { identity: key, identityOnly: true })).toEqual([
+      '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-T', '-i', key, '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
+      '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '--', 'box', 'true',
+    ]);
+    // Without a key, identityOnly changes nothing.
+    expect(sshCommandArgs({ host: 'box' }, 'true', 15, { identityOnly: true })).toEqual(sshCommandArgs({ host: 'box' }, 'true'));
+  });
+
   it('parses a recorded host back into its parts, and refuses anything else', () => {
     expect(sshTargetOf('build-box')).toEqual({ host: 'build-box' });
     expect(sshTargetOf('me@box:2222')).toEqual({ user: 'me', host: 'box', port: 2222 });

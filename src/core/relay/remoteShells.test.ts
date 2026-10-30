@@ -103,6 +103,90 @@ describeUnix('RemoteShells', () => {
     registry.dispose();
   });
 
+  // The key offer (SshKeyOffer.afterLogin) asks the user and runs a command on the shell; the other calls go on.
+  it('runs the step after the login once, gives the shell to the calls at once, and to the relay only after the step', async () => {
+    const steps: string[] = [];
+    const warnings: string[] = [];
+    let release: () => void = () => undefined;
+    const answered = new Promise<void>((resolve) => (release = resolve));
+    const registry = new RemoteShells({
+      logger: { ...silentLogger, warn: (line) => warnings.push(line) },
+      loginTimeoutMs: 5_000,
+      idleCloseMs: 50,
+      start: () => ({
+        process: runner.startBytes('sh', ['-c', 'exec sh -s']),
+        afterLogin: async (shell) => {
+          steps.push('asked');
+          // Longer than the time without use of the shell: the question of the user.
+          await answered;
+          steps.push(`ran ${(await shell.run('printf key')).stdout}`);
+        },
+      }),
+    });
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    await expect(registry.login('box')).resolves.toEqual({ ok: true });
+    const taking = registry.takeOver('box').then((taken) => {
+      steps.push('taken');
+      return taken;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(steps).toEqual(['asked']);
+    release();
+    const taken = await taking;
+    expect(taken).toBeDefined();
+    expect(steps).toEqual(['asked', 'ran key', 'taken']);
+    expect(warnings).toEqual([]);
+    taken?.kill();
+    registry.dispose();
+  });
+
+  it('ends the step after the login before a fresh login closes its shell', async () => {
+    const steps: string[] = [];
+    let release: () => void = () => undefined;
+    const answered = new Promise<void>((resolve) => (release = resolve));
+    let logins = 0;
+    const registry = new RemoteShells({
+      logger: silentLogger,
+      loginTimeoutMs: 5_000,
+      start: () => {
+        logins++;
+        const first = logins === 1;
+        return {
+          process: runner.startBytes('sh', ['-c', 'exec sh -s']),
+          afterLogin: first
+            ? async (shell) => {
+                await answered;
+                steps.push(`ran ${(await shell.run('printf key')).stdout}`);
+              }
+            : undefined,
+        };
+      },
+    });
+    await expect(registry.login('box')).resolves.toEqual({ ok: true });
+    const fresh = registry.login('box', undefined, { fresh: true }).then((result) => steps.push(`fresh ${JSON.stringify(result)}`));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(steps).toEqual([]);
+    expect(logins).toBe(1);
+    release();
+    await fresh;
+    expect(steps).toEqual(['ran key', 'fresh {"ok":true}']);
+    expect(logins).toBe(2);
+    registry.dispose();
+  });
+
+  it('gives out the shell after a step after the login that failed, and logs it', async () => {
+    const warnings: string[] = [];
+    const registry = new RemoteShells({
+      logger: { ...silentLogger, warn: (line) => warnings.push(line) },
+      loginTimeoutMs: 5_000,
+      start: () => ({ process: runner.startBytes('sh', ['-c', 'exec sh -s']), afterLogin: () => Promise.reject(new Error('no answer')) }),
+    });
+    await expect(registry.run('box', 'printf one')).resolves.toMatchObject({ stdout: 'one' });
+    await expect(registry.takeOver('box')).resolves.toBeDefined();
+    expect(warnings).toEqual(['The step after the login on box failed: no answer']);
+    registry.dispose();
+  });
+
   // The test of a host sees the SSH configuration and the host of now.
   it('logs in anew with fresh, and ends the open shell at once', async () => {
     const { registry, logins, processes } = shells();

@@ -5,9 +5,10 @@
 // What Devspaces remembers about remote Docker hosts, in `remote-docker.json` of the global storage folder: its own list
 // of SSH hosts, the Docker host of Devspaces (one host of the list, or none for the local Docker), the hosts of Docker
 // contexts that it offered once, and per host the socket of a rootless engine there (the source of the helper's socket
-// mount on that computer). Devspaces creates and changes no Docker context (docs/architecture.md "Remote Docker
-// hosts"). Every window of this computer changes the file: each change reads and writes it under the lock folder
-// `remote-docker.lock` (lockFolder.ts), so that a change of another window between the read and the write is not lost.
+// mount on that computer) and whether its account has the SSH key of Devspaces (sshKey.ts). Devspaces creates and
+// changes no Docker context (docs/architecture.md "Remote Docker hosts"). Every window of this computer changes the
+// file: each change reads and writes it under the lock folder `remote-docker.lock` (lockFolder.ts), so that a change of
+// another window between the read and the write is not lost.
 import * as fs from 'fs';
 import * as path from 'path';
 import { silentLogger, type Logger } from '../ports';
@@ -15,10 +16,17 @@ import { writeJsonAtomic } from './atomicJson';
 import { DEFAULT_LOCK_STALE_MS, DEFAULT_LOCK_TIMEOUT_MS, LockLostError, withLockFolder, type LockTimings } from './lockFolder';
 import { parseJson, readJsonTolerant, readTextFile, retryTransient } from './paths';
 
+/**
+ * The SSH key of Devspaces on a host: `installed` when Devspaces added it to `authorized_keys` there and a login with
+ * it worked (later logins use it), `declined` when the user chose not to use a key for that host.
+ */
+export type SshKeyState = 'installed' | 'declined';
+
 export interface RemoteDockerHostRecord {
   host: string;
   /** The Docker socket of a rootless engine on that computer, for example `/run/user/1000/docker.sock`. */
   rootlessSocket?: string;
+  sshKey?: SshKeyState;
 }
 
 export interface RemoteDockerStateFile {
@@ -35,6 +43,8 @@ export class RemoteDockerState {
   /** The lock folder of the changes: `<name>.lock` next to the file (`remote-docker.lock`). */
   readonly lockDir: string;
   private readonly lockTimings: LockTimings = { staleMs: DEFAULT_LOCK_STALE_MS, timeoutMs: DEFAULT_LOCK_TIMEOUT_MS };
+  /** The file as sshKeyNow read it last, by its time of change. */
+  private lastRead: { ino: number; mtimeMs: number; size: number; state: RemoteDockerStateFile } | undefined;
 
   constructor(
     readonly file: string,
@@ -80,8 +90,9 @@ export class RemoteDockerState {
 
   /**
    * Removes `host` from the list; when it is the Docker host of Devspaces, the local Docker takes its place. Its rootless
-   * socket and the devspaces on it stay. `removed`: it was in the list; `wasDockerHost`: it was the Docker host of
-   * Devspaces (both as found under the lock).
+   * socket, an installed SSH key and the devspaces on it stay; a `declined` SSH key is forgotten (also for a host that
+   * is not in the list), so the key is offered again after the host is added again.
+   * `removed`: it was in the list; `wasDockerHost`: it was the Docker host of Devspaces (both as found under the lock).
    */
   async removeHost(host: string): Promise<{ removed: boolean; wasDockerHost: boolean }> {
     let result = { removed: false, wasDockerHost: false };
@@ -89,11 +100,13 @@ export class RemoteDockerState {
       // Set on each run: the last run counts (change).
       const hosts = state.remoteHosts ?? [];
       result = { removed: hosts.includes(host) || state.dockerHost === host, wasDockerHost: state.dockerHost === host };
-      if (!result.removed) return false;
+      const declined = state.hosts?.find((entry) => entry.host === host)?.sshKey === 'declined';
+      if (!result.removed && !declined) return false;
       const rest = hosts.filter((entry) => entry !== host);
       if (rest.length > 0) state.remoteHosts = rest;
       else delete state.remoteHosts;
       if (state.dockerHost === host) delete state.dockerHost;
+      if (declined) changeRecord(state, host, (record) => delete record.sshKey);
       return true;
     });
     return result;
@@ -122,19 +135,49 @@ export class RemoteDockerState {
 
   /** Records (or with `undefined` forgets) the rootless socket of `host`. Writes only when it changes. */
   async setRootlessSocket(host: string, socket: string | undefined): Promise<void> {
-    await this.change((state) => {
-      const hosts = state.hosts ?? [];
-      const record = hosts.find((entry) => entry.host === host);
-      if (record?.rootlessSocket === socket) return false;
-      if (socket === undefined) {
-        if (!record) return false;
-        state.hosts = hosts.filter((entry) => entry !== record);
-      } else if (record) {
-        record.rootlessSocket = socket;
-      } else {
-        state.hosts = [...hosts, { host, rootlessSocket: socket }];
-      }
+    await this.changeHost(host, (record) => {
+      if (record.rootlessSocket === socket) return false;
+      if (socket === undefined) delete record.rootlessSocket;
+      else record.rootlessSocket = socket;
       return true;
+    });
+  }
+
+  /**
+   * The SSH key of Devspaces on `host` (SshKeyState), or undefined when it was never offered or not answered. Without
+   * waiting, for the arguments of an `ssh` that starts now: the file is read again only when it was replaced (each
+   * write renames a new file), or its time of change or its size changed since the last read. A file that is not there
+   * knows nothing; after another error (for example while another window renames its write into place on Windows), the
+   * last read counts.
+   */
+  sshKeyNow(host: string): SshKeyState | undefined {
+    try {
+      const stat = fs.statSync(this.file);
+      if (this.lastRead?.ino !== stat.ino || this.lastRead.mtimeMs !== stat.mtimeMs || this.lastRead.size !== stat.size) {
+        this.lastRead = { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, state: normalize(parseJson(fs.readFileSync(this.file, 'utf8'))) };
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') this.lastRead = undefined;
+    }
+    return this.lastRead?.state.hosts?.find((record) => record.host === host)?.sshKey;
+  }
+
+  /** Records (or with `undefined` forgets) the SSH key of Devspaces on `host`. Writes only when it changes. */
+  async setSshKey(host: string, key: SshKeyState | undefined): Promise<void> {
+    await this.changeHost(host, (record) => {
+      if (record.sshKey === key) return false;
+      if (key === undefined) delete record.sshKey;
+      else record.sshKey = key;
+      return true;
+    });
+  }
+
+  /** Changes the record of `host` (changeRecord) when `update` says that it changed it. */
+  private async changeHost(host: string, update: (record: RemoteDockerHostRecord) => boolean): Promise<void> {
+    await this.change((state) => {
+      let changed = false;
+      changeRecord(state, host, (record) => (changed = update(record)));
+      return changed;
     });
   }
 
@@ -211,6 +254,23 @@ function hostNames(value: unknown): string[] | undefined {
 }
 
 /**
+ * Runs `update` on the record of `host` in `state`, a new one at the end when it has none. A record that knows nothing
+ * more afterwards is removed, and so is the list when it is empty.
+ */
+function changeRecord(state: RemoteDockerStateFile, host: string, update: (record: RemoteDockerHostRecord) => void): void {
+  const hosts = state.hosts ?? [];
+  let record = hosts.find((entry) => entry.host === host);
+  if (record === undefined) {
+    record = { host };
+    hosts.push(record);
+  }
+  update(record);
+  const kept = hosts.filter((entry) => entry.rootlessSocket !== undefined || entry.sshKey !== undefined);
+  if (kept.length > 0) state.hosts = kept;
+  else delete state.hosts;
+}
+
+/**
  * The fields of the file that Devspaces knows; others are dropped at the next write. A Docker host that is not in the
  * list is added to it.
  */
@@ -232,10 +292,13 @@ function normalize(value: unknown): RemoteDockerStateFile {
     const seen = new Set<string>();
     result.hosts = record.hosts.flatMap((entry): RemoteDockerHostRecord[] => {
       if (typeof entry !== 'object' || entry === null) return [];
-      const { host, rootlessSocket } = entry as Record<string, unknown>;
+      const { host, rootlessSocket, sshKey } = entry as Record<string, unknown>;
       if (typeof host !== 'string' || host === '' || seen.has(host)) return [];
       seen.add(host);
-      return [typeof rootlessSocket === 'string' && rootlessSocket.startsWith('/') ? { host, rootlessSocket } : { host }];
+      const kept: RemoteDockerHostRecord = { host };
+      if (typeof rootlessSocket === 'string' && rootlessSocket.startsWith('/')) kept.rootlessSocket = rootlessSocket;
+      if (sshKey === 'installed' || sshKey === 'declined') kept.sshKey = sshKey;
+      return [kept];
     });
   }
   return result;

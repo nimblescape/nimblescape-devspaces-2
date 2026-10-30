@@ -80,6 +80,8 @@ export class StoragePaths {
   readonly dockerCliDir: string;
   /** The helper that asks the questions of SSH logins in VS Code and its launcher (sshAskpass.ts). */
   readonly askpassDir: string;
+  /** The wrapper `ssh` of the Docker CLI that adds the key of Devspaces (sshKey.ts sshWrapper). */
+  readonly sshWrapperDir: string;
 
   constructor(readonly root: string) {
     this.registry = path.join(root, 'registry.json');
@@ -97,6 +99,7 @@ export class StoragePaths {
     this.usedMarker = path.join(root, 'used');
     this.dockerCliDir = path.join(root, 'docker-cli');
     this.askpassDir = path.join(root, 'askpass');
+    this.sshWrapperDir = path.join(root, 'ssh-wrapper');
   }
 
   /**
