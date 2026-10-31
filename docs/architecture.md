@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how Devspaces works inside: its components, the main flows, where it keeps its data, how it names things, and how it is tested. The user guide is [guide.md](guide.md); the security model is in [security.md](security.md).
+This document describes how Devspaces works inside: its components, the main flows, where it keeps its data, how it names things, and how it is tested. The user guide is [guide.md](guide.md); the security model is in [security.md](security.md). [remote-connection.md](remote-connection.md) shows with diagrams how the parts of the connection to a remote host and to the WSL distribution of Devspaces work together.
 
 ## Overview
 
