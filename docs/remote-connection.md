@@ -170,7 +170,7 @@ The steps in words:
 2. **Docker pipe of the window.** The folder URI of the window names the address of its Docker pipe (`settings.host`). The window serves that address before `activate()` returns, but only when it is the address that this computer makes for the devspace of the window ([`serveWindowPipe`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/relay/windowPipe.ts)). Otherwise the window closes its remote connection with a message.
 3. **Open flow.** The window runs the open flow of its devspace on the Docker host of the devspace, whatever host Devspaces uses now ([`Controller.withHostOf`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/vscode/controller.ts)). The flow has a progress notification, so its SSH login may ask questions in VS Code.
 4. **Shell before the relay.** The SSH check of the host is the login of the shell before the relay. The checks that only read run on that shell as one command line each: `docker info`, the check of the helper image, the engine identity, and for a rootless engine the folder `$XDG_RUNTIME_DIR` of its socket ([`src/core/relay/remoteShell.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/relay/remoteShell.ts)).
-5. **Start of the relay.** The connection of the relay takes the login of the shell over and writes the start script into the idle shell ([`openRelayConnection`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/relay/transport.ts)). The script starts the worker container with `docker run --rm -i`. Its pipe loader reads the bundle from the first line of its input, checks the length and the SHA-256 hash, and starts the relay.
+5. **Start of the relay.** The connection of the relay takes the login of the shell over and writes the start script into the idle shell ([`openRelayConnection`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/relay/transport.ts)). The script starts the worker container with `docker run --rm -i`. Its pipe loader reads the bundle from the first line of its input, checks its SHA-256 hash against the hash on the command line, and starts the relay.
 6. **Worker.** The extension opens the stream with the target `worker`. The relay starts the worker. The extension sends `hello` and `probe`, and compares the engine identity of the worker with the identity that it read before the start. Only when they match, the connection becomes the current connection of the host, and the Docker pipe of the extension for the host starts to listen.
 7. **Operation.** The worker runs the operation `open` (see [architecture.md, Open](architecture.md#open)): it starts the container, or builds and creates it when needed, and returns the container, the remote user, and the folder.
 8. **Attach.** `activate()` returns, and VS Code lets the Dev Containers extension resolve the window. Its Docker calls go to the Docker pipe of the window. Each connection to the pipe becomes one stream with the target `docker` on the same connection of the relay. No new login is needed.
@@ -273,7 +273,7 @@ docker run --rm -i --pull never --name <worker name>
   devspaces-worker:<tag> node -e <pipe loader> /opt/devspace/channel.js <sha256> startRelay
 ```
 
-The `<engine socket>` is `/var/run/docker.sock` of the host, or the socket of a rootless engine in `$XDG_RUNTIME_DIR`. The pipe loader ([`src/core/loader/pipeLoader.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/loader/pipeLoader.ts)) stores the bundle `dist/helperChannel.js` in the container only when its length and SHA-256 hash match the command line. No code goes into an argument or a variable of the container. See [architecture.md, Pipe loading](architecture.md#pipe-loading).
+The `<engine socket>` is `/var/run/docker.sock` of the host, or the socket of a rootless engine in `$XDG_RUNTIME_DIR`. The pipe loader ([`src/core/loader/pipeLoader.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/loader/pipeLoader.ts)) stores the bundle `dist/helperChannel.js` in the container only when its line is not too long and its SHA-256 hash is the hash on the command line. No code goes into an argument or a variable of the container. See [architecture.md, Pipe loading](architecture.md#pipe-loading).
 
 The `docker run` uses the Docker CLI of the host, not the Docker CLI of Devspaces. The helper image `devspaces-worker:<tag>` must exist on the engine (`--pull never`). When it is missing, the extension builds it before the start, with a login of its own (see [Logins of a window](#logins-of-a-window)).
 
@@ -487,11 +487,11 @@ On Windows, Devspaces can use Docker Engine in its own WSL distribution `devspac
 8. **Restart**: `wsl.exe --terminate devspaces`, then a wait of up to 120 seconds for `docker info`.
 9. **Use**: Devspaces makes `wsl:devspaces` the Docker host of Devspaces, as **Use a Remote Docker Host…** does.
 
-After the setup and at the start of each window, Devspaces makes sure that its distribution is not the default distribution of WSL, and warns when the WSL integration of Docker Desktop is on for it.
+After the setup and at the start of each window, Devspaces checks whether its distribution is the default distribution of WSL, and then makes another distribution the default. It warns when the WSL integration of Docker Desktop is on for its distribution.
 
 ### Start and stop of the distribution
 
-By default, WSL stops a distribution 15 seconds after the last Windows process for it ended (`instanceIdleTimeout` of WSL), with Docker and all its containers. A service of systemd, such as `dockerd`, does not keep it running. So Devspaces holds Windows processes for the distribution while it is needed ([`src/core/docker/wslLifetime.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/docker/wslLifetime.ts), [`src/core/docker/wslKeeper.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/docker/wslKeeper.ts)):
+By default, WSL stops a distribution 15 seconds after the last Windows process for it ended (`instanceIdleTimeout` of WSL), with Docker and all its containers. A service of systemd, such as `dockerd`, does not keep it running. So Devspaces keeps Windows processes for the distribution running while it is needed ([`src/core/docker/wslLifetime.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/docker/wslLifetime.ts), [`src/core/docker/wslKeeper.ts`](https://github.com/nimblescape/nimblescape-devspaces-2/blob/main/src/core/docker/wslKeeper.ts)):
 
 ```mermaid
 flowchart LR
@@ -510,12 +510,12 @@ flowchart LR
   VS --> I
   VS -- "starts at most once a minute" --> K
   RUN -- "starts at logon" --> K
-  P -- "hold it" --> D
-  I -- "holds it while a container of Devspaces runs" --> D
-  K -- "holds it while any container runs" --> D
+  P -- "keep it running while they run" --> D
+  I -- "keeps it running while a container of Devspaces runs" --> D
+  K -- "keeps it running while any container runs" --> D
 ```
 
-- **The idle session**: from the first `wsl.exe` of a window for the distribution, the window also holds one idle session there. Every minute, it looks for a running container of Devspaces (a devspace, the Monitor, or a helper container). It ends after two checks in a row without one, or when the window closes.
+- **The idle session**: from the first `wsl.exe` of a window for the distribution, the window also runs one idle session there. Every minute, it looks for a running container of Devspaces (a devspace, the Monitor, or a helper container). It ends after two checks in a row without one, or when the window closes.
 - **The keeper**: a window also starts `wslg.exe -d devspaces -u root --cd / --shell-type none sh -c <script>`. It is not a child of VS Code, so it runs on after VS Code closed. Every minute it looks for any running container, and it ends after two checks in a row without one. A lock in the distribution (`/run/devspaces-keeper`) lets only one keeper run at a time.
 - **The start entry**: only while the Monitor of the distribution runs permanently (the answer **Keep Running**, and `devspaces.stopMonitorWhenIdle` off), the Windows user has the start entry `nimblescape Devspaces WSL devspaces`. It starts the keeper at logon, so that Docker starts the Monitor again.
 - **Work in the background** (the refresh of the sidebar, the background builds) does not start the distribution: it first asks `wsl.exe --list --running --quiet`, and when the distribution does not run, the sidebar shows its devspaces as stopped. Only while the Monitor there runs permanently, such work starts it. A flow of the user always starts it.
